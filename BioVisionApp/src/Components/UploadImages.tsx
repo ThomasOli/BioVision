@@ -1,152 +1,185 @@
-import React, { ChangeEvent, Component } from 'react';
+import React, { ChangeEvent, useState, DragEvent } from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import Button from '@mui/material/Button';
-import ListItem from '@mui/material/ListItem';
-import BorderLinearProgress from './BorderLinearProgress';
+import LinearProgress from '@mui/material/LinearProgress';
 
-interface UploadImagesProps {}
-
-interface UploadImagesState {
-  currentFile?: File;
-  previewImage?: string;
-  progress: number;
-  message: string;
-  isError: boolean;
-  imageInfos: ImageInfo[];
+interface UploadImagesProps {
 }
 
-interface ImageInfo {
-  url: string;
-  name: string;
-}
+const UploadImages: React.FC<UploadImagesProps> = (props) => {
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [previews, setPreviews] = useState<string[]>([]);
+  const [progress, setProgress] = useState(0);
+  const [message, setMessage] = useState('');
+  const [isError, setIsError] = useState(false);
+  const [showClearAll, setShowClearAll] = useState(false);
 
-export default class UploadImages extends Component<UploadImagesProps, UploadImagesState> {
-  constructor(props: UploadImagesProps) {
-    super(props);
-
-    this.state = {
-      currentFile: undefined,
-      previewImage: undefined,
-      progress: 0,
-      message: '',
-      isError: false,
-      imageInfos: [],
-    };
-  }
-
-  selectFile = (event: ChangeEvent<HTMLInputElement>) => {
+  const handleSelectFiles = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files.length > 0) {
-      const selectedFile = event.target.files[0];
+      const filesArray = Array.from(event.target.files);
 
-      this.setState({
-        currentFile: selectedFile,
-        previewImage: URL.createObjectURL(selectedFile),
-        progress: 0,
-        message: '',
-      });
+      const filePreviews = filesArray.map((file) => URL.createObjectURL(file));
+
+      setSelectedFiles(filesArray);
+      setPreviews(filePreviews);
+      setProgress(0);
+      setMessage('');
+      setShowClearAll(true);
     }
   };
 
-  upload = () => {
+  const handleUpload = () => {
     // Implement your upload logic here
+    // Example: Simulate upload progress
+    let currentProgress = 0;
+    const interval = setInterval(() => {
+      currentProgress += 10;
+      setProgress(currentProgress);
+      if (currentProgress >= 100) {
+        clearInterval(interval);
+        setSelectedFiles([]);
+        setPreviews([]);
+        setMessage('Upload completed!');
+        setShowClearAll(false);
+      }
+    }, 500);
   };
 
-  removeImage = () => {
-    this.setState({
-      currentFile: undefined,
-      previewImage: undefined,
-      progress: 0,
-      message: '',
-    });
+  const handleRemoveImage = (index: number) => {
+    const updatedFiles = [...selectedFiles];
+    const updatedPreviews = [...previews];
+
+    updatedFiles.splice(index, 1);
+    updatedPreviews.splice(index, 1);
+
+    setSelectedFiles(updatedFiles);
+    setPreviews(updatedPreviews);
+
+    if (updatedFiles.length === 0) {
+      setShowClearAll(false);
+    }
   };
 
-  render() {
-    const { currentFile, previewImage, progress, message, imageInfos, isError } = this.state;
+  const handleClearAll = () => {
+    setSelectedFiles([]);
+    setPreviews([]);
+    setShowClearAll(false);
+  };
 
-    return (
-      <div className="mg20">
-        <Box style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <label htmlFor="btn-upload">
-            <input
-              id="btn-upload"
-              name="btn-upload"
-              style={{ display: 'none' }}
-              type="file"
-              accept="image/*"
-              onChange={this.selectFile}
-            />
-            <Button className="btn-choose" variant="outlined" component="span">
-              Choose Image
-            </Button>
-          </label>
-         
-          <Button
-            className="btn-upload"
-            color="primary"
-            variant="contained"
-            component="span"
-            disabled={!currentFile}
-            onClick={this.upload}
-          >
-            Upload
-          </Button>
-          </Box>
-          {currentFile && (
-            <Box className="my20" display="flex" alignItems="center">
-              <Box width="100%" mr={1}>
-                <BorderLinearProgress />
-              </Box>
-              <Box minWidth={35}>
-                <Typography variant="body2" color="textSecondary">{`${progress}%`}</Typography>
-              </Box>
-             
-            </Box>
-            
-          )}
-       
-       <div className="file-name">{currentFile ? currentFile.name : null}</div>
-        {previewImage && (
-          <div>
-            <img className="preview my20" src={previewImage} alt="" style={{ maxWidth: '100%', maxHeight: '100px' }} />
-          </div>
-        )}
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+  };
 
-        {message && (
-          <Typography variant="subtitle2" className={`upload-message ${isError ? 'error' : ''}`}>
-            {message}
-          </Typography>
-        )}
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const files = event.dataTransfer.files;
 
-        <Typography variant="h6" className="list-header">
-          List of Images
+    if (files && files.length > 0) {
+      const filesArray = Array.from(files);
+
+      const filePreviews = filesArray.map((file) => URL.createObjectURL(file));
+
+      setSelectedFiles(filesArray);
+      setPreviews(filePreviews);
+      setProgress(0);
+      setMessage('');
+      setShowClearAll(true);
+    }
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+      <Box
+        border={2}
+        borderRadius={5}
+        borderColor="grey.300"
+        width="250px"
+        height="100px"
+        display="flex"
+        justifyContent="center"
+        alignItems="center"
+        mb={2}
+        onDragOver={handleDragOver}
+        onDrop={handleDrop}
+      >
+        <Typography variant="body1" color="textSecondary">
+          Drag & Drop Images Here
         </Typography>
-        <ul className="list-group">
-          {imageInfos &&
-            imageInfos.map((image, index) => (
-              <ListItem divider key={index}>
-                <img src={image.url} alt={image.name} height="80px" className="mr20" />
-                <a href={image.url}>{image.name}</a>
-              </ListItem>
-            ))}
-            
-        </ul>
-         <Box style={{ display: "flex", justifyContent: "space-between" }}>
-          <Button
-            className="btn-remove"
-            color="secondary"
-            variant="contained"
-            component="span"
-            disabled={!currentFile}
-            onClick={this.removeImage}
-          >
-            Remove
-          </Button>
-          <Button variant="contained" color="primary">
-            Clear All
-          </Button>
+      </Box>
+      {previews.length > 0 && (
+        <div style={{ height: '200px', overflowY: 'scroll', width: '200px', marginBottom: '20px' }}>
+          {previews.map((preview, index) => (
+            <div key={index} style={{ display: 'flex', alignItems: 'center', margin: '10px 0' }}>
+              <img src={preview} alt={`Preview ${index}`} style={{ width: '100px', height: '100px' }} />
+              <Button
+                onClick={() => handleRemoveImage(index)}
+                variant="outlined"
+                sx={{
+                  marginLeft: '20px',
+                  borderRadius: '5px',
+                  backgroundColor: 'transparent',
+                  transition: 'background-color 0.2s ease',
+                  '&:hover': {
+                    backgroundColor: '#ADD8E6',
+                  },
+                }}
+              >
+                Remove
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+      <label htmlFor="btn-upload">
+        <input
+          id="btn-upload"
+          name="btn-upload"
+          style={{ display: 'none' }}
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={handleSelectFiles}
+        />
+        <Button className="btn-choose" variant="outlined" component="span">
+          Choose Images
+        </Button>
+      </label>
+      {showClearAll && progress < 100 && (
+        <Button
+          className="btn-clear"
+          color="secondary"
+          variant="outlined"
+          component="span"
+          onClick={handleClearAll}
+          style={{ marginTop: '10px', marginBottom: '10px' }}
+        >
+          Clear All
+        </Button>
+      )}
+      {progress > 0 && progress < 100 && (
+        <Box className="my20" width="100%">
+          <LinearProgress variant="determinate" value={progress} />
+          <Typography variant="body2" color="textSecondary" align="center">{`${progress}%`}</Typography>
         </Box>
-      </div>
-    );
-  }
-}
+      )}
+      <Button
+        className="btn-upload"
+        color="primary"
+        variant="contained"
+        component="span"
+        disabled={selectedFiles.length === 0}
+        onClick={handleUpload}
+      >
+        Upload
+      </Button>
+      {message && (
+        <Typography variant="subtitle2" className={`upload-message ${isError ? 'error' : ''}`}>
+          {message}
+        </Typography>
+      )}
+    </div>
+  );
+};
+
+export default UploadImages;
