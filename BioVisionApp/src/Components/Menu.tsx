@@ -13,9 +13,10 @@ interface MenuProps {
 
 const Menu: React.FC<MenuProps> = ({ children }) => {
   return (
-    <Paper style={{ flex: "0 0 100%", height: "100vh", padding: "16px" }}>
+    <Paper style={{ flex: "0 0 100%", height: "100vh", padding: "16px", display: "flex", flexDirection: "column" }}>
       {children}
-      <div style={{ marginTop: "1px" }}>
+      <div style={{ marginTop: "1px", display: "flex", flexDirection: "column", justifyContent: "space-between", height: "100%" }}>
+      <div>
         <Box style={{ display: "flex", alignItems: "center" }}>
           <IconButton
             style={{
@@ -26,16 +27,18 @@ const Menu: React.FC<MenuProps> = ({ children }) => {
           >
             <FolderOpenIcon />
           </IconButton>
-          <p>Open Folder</p>
+          <p style={{ marginLeft: "8px" }}>Open Folder</p>
         </Box>
 
-        <UploadImages></UploadImages>
-        
-        {/* Add more buttons as needed */}
+        <UploadImages />
+        </div>
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: "100px" }}>
+          {/* Add more buttons as needed */}
+          <Button variant="contained">Auto Landmark</Button>
+          {/* Add more buttons as needed */}
+        </div>
       </div>
-      
     </Paper>
-    
   );
 };
 
