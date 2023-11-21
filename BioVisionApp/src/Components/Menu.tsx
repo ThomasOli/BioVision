@@ -4,13 +4,16 @@ import Button from "@mui/material/Button";
 import Box from "@mui/material/Box";
 import UploadImages from "./UploadImages";
 import IconButton from "@mui/material/IconButton";
+import Slider from '@mui/material/Slider';
 import FileOpenIcon from "@mui/icons-material/FileOpen";
 
 import FolderOpenIcon from "@mui/icons-material/FolderOpen";
 interface MenuProps {
   children: React.ReactNode;
 }
-
+function valuetext(value: number) {
+  return `${value}°C`;
+}
 const Menu: React.FC<MenuProps> = ({ children }) => {
   return (
     <Paper style={{ flex: "0 0 100%", height: "100vh", padding: "16px", display: "flex", flexDirection: "column" }}>
@@ -32,6 +35,12 @@ const Menu: React.FC<MenuProps> = ({ children }) => {
 
         <UploadImages />
         </div>
+        <Slider
+         aria-label="Temperature"
+  defaultValue={30}
+  getAriaValueText={valuetext}
+  color="secondary"
+/>
         <div style={{ display: "flex", justifyContent: "center", marginBottom: "100px" }}>
           {/* Add more buttons as needed */}
           <Button variant="contained">Auto Landmark</Button>
