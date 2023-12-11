@@ -1,30 +1,20 @@
-import React, { ChangeEvent, useState, DragEvent, useEffect } from 'react';
+import React, { ChangeEvent, useState, DragEvent } from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import Button from '@mui/material/Button';
 import LinearProgress from '@mui/material/LinearProgress';
-
 import { ipcRenderer } from 'electron';
-import { RootState } from '../state/store';
-import { useDispatch, useSelector } from 'react-redux';
-import { clearFiles, addFile, removeFile } from '../state/filesState/fileSlice';
-
 
 interface UploadImagesProps {
 }
 
 const UploadImages: React.FC<UploadImagesProps> = (props) => {
-
-  const files = useSelector((state: RootState) => state.files.fileArray);
-  const dispatch = useDispatch();
-
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [previews, setPreviews] = useState<string[]>([]);
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState('');
   const [isError, setIsError] = useState(false);
-  const [disableClear, setDisableClear] = useState(true);
-
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-  const [previews, setPreviews] = useState<string[]>([]);
+  const [showClearAll, setShowClearAll] = useState(false);
 
   const handleSelectFolder = () => {
     ipcRenderer.invoke('open-folder-dialog').then((result) => {
@@ -77,10 +67,9 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
       setPreviews(filePreviews);
       setProgress(0);
       setMessage('');
-      setDisableClear(false);
+      setShowClearAll(true);
     }
   };
-
 
   const handleUpload = () => {
     // Not done yet, needs actual upload to backend system
@@ -90,15 +79,12 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
       setProgress(currentProgress);
       if (currentProgress >= 100) {
         clearInterval(interval);
+        setSelectedFiles([]);
+        setPreviews([]);
         setMessage('Upload completed!');
-        setDisableClear(true);
+        setShowClearAll(false);
       }
     }, 500);
-
-    dispatch(addFile(selectedFiles));
-    setSelectedFiles([]);
-    setPreviews([]);
-    console.log(files);
   };
 
   const handleRemoveImage = (index: number) => {
@@ -112,17 +98,14 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
     setPreviews(updatedPreviews);
 
     if (updatedFiles.length === 0) {
-      setDisableClear(true);
+      setShowClearAll(false);
     }
   };
 
-
   const handleClearAll = () => {
-
-    setDisableClear(true);
-
     setSelectedFiles([]);
     setPreviews([]);
+    setShowClearAll(false);
   };
 
   const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
@@ -198,19 +181,6 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
   };
 
 
-=======
-      setSelectedFiles(filesArray);
-      setPreviews(filePreviews);
-      setProgress(0);
-      setMessage('');
-      setDisableClear(false);
-    }
-  };
-
-  useEffect(() => {
-    setDisableClear(selectedFiles.length === 0);
-  }, [selectedFiles]);
-
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
@@ -232,21 +202,23 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
         </Typography>
       </Box>
       {previews.length > 0 && (
-        <div style={{ height: '200px', overflowY: 'scroll', width: '200px', marginBottom: '20px' }}>
+        <div style={{ height: '200px', overflowY: 'scroll', width: '310px', marginBottom: '20px' }}>
           {previews.map((preview, index) => (
             <div key={index} style={{ display: 'flex', alignItems: 'center', margin: '10px 0' }}>
-              <img src={preview} alt={`Preview ${index}`} style={{ width: '100px', height: '100px' }} />
+              <img src={preview} alt={`Preview ${index}`} style={{ width: '200px', height: '100px' }} />
               <Button
                 onClick={() => handleRemoveImage(index)}
                 variant="outlined"
                 sx={{
                   marginLeft: '20px',
-                  borderRadius: '5px',
+                  marginRight: '20px',
+                 
                   backgroundColor: 'transparent',
                   transition: 'background-color 0.2s ease',
                   '&:hover': {
-                    backgroundColor: '#ADD8E6',
+                    backgroundColor: '#D1EEF8',
                   },
+                  fontSize: '10px', 
                 }}
               >
                 Remove
@@ -265,28 +237,11 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           multiple
           onChange={handleSelectFiles}
         />
+        
         <Button className="btn-choose" variant="outlined" component="span">
           Choose Images
         </Button>
-      </label>
         <Button
-          className="btn-clear"
-          color="secondary"
-          variant="outlined"
-          component="span"
-          onClick={handleClearAll}
-          disabled={disableClear}
-          style={{ marginTop: '10px', marginBottom: '10px' }}
-        >
-          Clear All
-        </Button>
-      {progress > 0 && progress < 100 && (
-        <Box className="my20" width="100%">
-          <LinearProgress variant="determinate" value={progress} />
-          <Typography variant="body2" color="textSecondary" align="center">{`${progress}%`}</Typography>
-        </Box>
-      )}
-      <Button
         className="btn-choose-folder"
         variant="outlined"
         component="span"
@@ -294,6 +249,26 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
       >
         Choose Folder
       </Button>
+      </label>
+      {showClearAll && progress < 100 && (
+        <Button
+          className="btn-clear"
+          color="secondary"
+          variant="outlined"
+          component="span"
+          onClick={handleClearAll}
+          style={{ marginTop: '10px', marginBottom: '10px' }}
+        >
+          Clear All
+        </Button>
+      )}
+      {progress > 0 && progress < 100 && (
+        <Box className="my20" width="100%">
+          <LinearProgress variant="determinate" value={progress} />
+          <Typography variant="body2" color="textSecondary" align="center">{`${progress}%`}</Typography>
+        </Box>
+      )}
+     
       <Button
         className="btn-upload"
         color="primary"

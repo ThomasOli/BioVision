@@ -6,6 +6,7 @@ import UploadImages from "./UploadImages";
 import IconButton from "@mui/material/IconButton";
 import FolderOpenIcon from "@mui/icons-material/FolderOpen";
 import Landmark from "./Landmark";
+import { Typography } from "@mui/material";
 interface MenuProps {
   children: React.ReactNode;
 }
@@ -14,11 +15,14 @@ const Menu: React.FC<MenuProps> = ({ children }) => {
   return (
     <Paper
       style={{
-        flex: "0 0 100%",
-        height: "96.5vh",
-        padding: "16px",
+       
+        height: "100vh",
+        paddingLeft: "5px",
+        paddingRight: "5px",
         display: "flex",
         flexDirection: "column",
+        width: '325px',
+        boxSizing: 'border-box',
       }}
     >
       {children}
@@ -31,23 +35,20 @@ const Menu: React.FC<MenuProps> = ({ children }) => {
           height: "100%",
         }}
       >
-        <div>
-          <Box style={{ display: "flex", alignItems: "center" }}>
-            <IconButton
-              style={{
-                backgroundColor: "transparent",
-                color: "blue",
-              }}
-              size="small"
-            >
-              <FolderOpenIcon />
-            </IconButton>
-            <p style={{ marginLeft: "8px" }}>Open Folder</p>
-          </Box>
-
+        <div 
+        style = {{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          whiteSpace: 'nowrap' 
+          
+        }}
+        >
+          <h3>Auto Landmarking Selection Menu</h3>
           <UploadImages />
         </div>
-
+        
         <Landmark></Landmark>
         <div
           style={{

@@ -57,7 +57,7 @@ const Landmark: React.FC<LandmarkProps> = () => {
           alignItems: "center",
         }}
       >
-        <label>Lock Landmarks</label>
+        <label>View Mode</label>
         <Switch
           checked={isSwitchOn}
           onChange={handleSwitchChange}
