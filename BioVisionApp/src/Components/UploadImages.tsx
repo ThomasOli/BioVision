@@ -3,9 +3,12 @@ import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import Button from '@mui/material/Button';
 import LinearProgress from '@mui/material/LinearProgress';
+
+import { ipcRenderer } from 'electron';
 import { RootState } from '../state/store';
 import { useDispatch, useSelector } from 'react-redux';
 import { clearFiles, addFile, removeFile } from '../state/filesState/fileSlice';
+
 
 interface UploadImagesProps {
 }
@@ -23,6 +26,47 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
 
+  const handleSelectFolder = () => {
+    ipcRenderer.invoke('open-folder-dialog').then((result) => {
+      if (!result.canceled && result.filePaths.length > 0) {
+        const folderPath = result.filePaths[0];
+
+        const fs = (window as any).require('fs');
+
+        fs.readdir(folderPath, async (err: NodeJS.ErrnoException | null, files: string[] | Buffer[]) => {
+          if (err) {
+            console.error(err);
+            return;
+          }
+
+          const imageFiles = files.filter((file) => /\.(jpg|jpeg|png|gif)$/i.test(file.toString()));
+
+          const filePreviews: string[] = [];
+          for (const fileName of imageFiles) {
+            const fileData = await fs.promises.readFile(`${folderPath}/${fileName}`);
+            const objectUrl = URL.createObjectURL(new Blob([fileData], { type: 'image/jpeg' }));
+            filePreviews.push(objectUrl);
+          }
+
+          const fileObjects: File[] = await Promise.all(imageFiles.map(async (file) => {
+            const fileName = file.toString();
+            const fileData = await fs.promises.readFile(`${folderPath}/${fileName}`);
+            return new File([fileData], fileName);
+          }));
+
+          setSelectedFiles(fileObjects);
+          setPreviews(filePreviews);
+          setProgress(0);
+          setMessage('');
+          setShowClearAll(true);
+        });
+      }
+    }).catch((err) => {
+      console.error(err);
+    });
+  };
+
+
   const handleSelectFiles = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files.length > 0) {
       const filesArray = Array.from(event.target.files);
@@ -39,8 +83,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
 
 
   const handleUpload = () => {
-    // Implement your upload logic here
-    // Example: Simulate upload progress
+    // Not done yet, needs actual upload to backend system
     let currentProgress = 0;
     const interval = setInterval(() => {
       currentProgress += 10;
@@ -86,15 +129,76 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
     event.preventDefault();
   };
 
-  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+  const handleFolderDrop = async (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
-    const files = event.dataTransfer.files;
+    const items = event.dataTransfer.items;
 
-    if (files && files.length > 0) {
-      const filesArray = Array.from(files);
+    if (items) {
+      const newFilesArray: File[] = [];
+      let isFolder = false;
 
-      const filePreviews = filesArray.map((file) => URL.createObjectURL(file));
+      for (let i = 0; i < items.length; i++) {
+        const entry = items[i].webkitGetAsEntry();
 
+        if (entry) {
+          if (entry.isFile) {
+            const file = items[i].getAsFile();
+            if (file) {
+              newFilesArray.push(file);
+            }
+          } else if (entry.isDirectory) {
+            isFolder = true;
+            await processEntry(entry, newFilesArray);
+          }
+        }
+      }
+
+      if (isFolder || newFilesArray.length > 0) {
+        const filteredNewFiles = newFilesArray.filter(
+          (file) => !selectedFiles.some((existingFile) => existingFile.name === file.name)
+        );
+
+        const mergedFiles = [...selectedFiles, ...filteredNewFiles];
+        const filePreviews = mergedFiles.map((file) => URL.createObjectURL(file));
+
+        setSelectedFiles(mergedFiles);
+        setPreviews(filePreviews);
+        setProgress(0);
+        setMessage('');
+        setShowClearAll(true);
+      }
+    }
+  };
+
+  const processEntry = async (entry: any, filesArray: File[]) => {
+    return new Promise<void>((resolve, reject) => {
+      if (entry.isFile) {
+        entry.file((file: File) => {
+          filesArray.push(file);
+          resolve();
+        });
+      } else if (entry.isDirectory) {
+        const directoryReader = entry.createReader();
+        const readEntries = () => {
+          directoryReader.readEntries(async (entries: any[]) => {
+            if (entries.length === 0) {
+              resolve();
+            } else {
+              for (let i = 0; i < entries.length; i++) {
+                await processEntry(entries[i], filesArray);
+              }
+              readEntries();
+            }
+          }, reject);
+        };
+
+        readEntries();
+      }
+    });
+  };
+
+
+=======
       setSelectedFiles(filesArray);
       setPreviews(filePreviews);
       setProgress(0);
@@ -106,6 +210,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
   useEffect(() => {
     setDisableClear(selectedFiles.length === 0);
   }, [selectedFiles]);
+
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
@@ -120,7 +225,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
         alignItems="center"
         mb={2}
         onDragOver={handleDragOver}
-        onDrop={handleDrop}
+        onDrop={handleFolderDrop}
       >
         <Typography variant="body1" color="textSecondary">
           Drag & Drop Images Here
@@ -181,6 +286,14 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           <Typography variant="body2" color="textSecondary" align="center">{`${progress}%`}</Typography>
         </Box>
       )}
+      <Button
+        className="btn-choose-folder"
+        variant="outlined"
+        component="span"
+        onClick={handleSelectFolder}
+      >
+        Choose Folder
+      </Button>
       <Button
         className="btn-upload"
         color="primary"

@@ -47,7 +47,7 @@ const Menu: React.FC<MenuProps> = ({ children }) => {
 
           <UploadImages />
         </div>
-       
+
         <Landmark></Landmark>
         <div
           style={{
@@ -64,5 +64,4 @@ const Menu: React.FC<MenuProps> = ({ children }) => {
     </Paper>
   );
 };
-
-export default Menu;
+export default Menu 
