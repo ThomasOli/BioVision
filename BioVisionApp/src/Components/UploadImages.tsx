@@ -1,19 +1,27 @@
-import React, { ChangeEvent, useState, DragEvent } from 'react';
+import React, { ChangeEvent, useState, DragEvent, useEffect } from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import Button from '@mui/material/Button';
 import LinearProgress from '@mui/material/LinearProgress';
+import { RootState } from '../state/store';
+import { useDispatch, useSelector } from 'react-redux';
+import { clearFiles, addFile, removeFile } from '../state/filesState/fileSlice';
 
 interface UploadImagesProps {
 }
 
 const UploadImages: React.FC<UploadImagesProps> = (props) => {
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-  const [previews, setPreviews] = useState<string[]>([]);
+
+  const files = useSelector((state: RootState) => state.files.fileArray);
+  const dispatch = useDispatch();
+
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState('');
   const [isError, setIsError] = useState(false);
-  const [showClearAll, setShowClearAll] = useState(false);
+  const [disableClear, setDisableClear] = useState(true);
+
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [previews, setPreviews] = useState<string[]>([]);
 
   const handleSelectFiles = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files.length > 0) {
@@ -25,9 +33,10 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
       setPreviews(filePreviews);
       setProgress(0);
       setMessage('');
-      setShowClearAll(true);
+      setDisableClear(false);
     }
   };
+
 
   const handleUpload = () => {
     // Implement your upload logic here
@@ -38,12 +47,15 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
       setProgress(currentProgress);
       if (currentProgress >= 100) {
         clearInterval(interval);
-        setSelectedFiles([]);
-        setPreviews([]);
         setMessage('Upload completed!');
-        setShowClearAll(false);
+        setDisableClear(true);
       }
     }, 500);
+
+    dispatch(addFile(selectedFiles));
+    setSelectedFiles([]);
+    setPreviews([]);
+    console.log(files);
   };
 
   const handleRemoveImage = (index: number) => {
@@ -57,14 +69,17 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
     setPreviews(updatedPreviews);
 
     if (updatedFiles.length === 0) {
-      setShowClearAll(false);
+      setDisableClear(true);
     }
   };
 
+
   const handleClearAll = () => {
+
+    setDisableClear(true);
+
     setSelectedFiles([]);
     setPreviews([]);
-    setShowClearAll(false);
   };
 
   const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
@@ -84,9 +99,13 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
       setPreviews(filePreviews);
       setProgress(0);
       setMessage('');
-      setShowClearAll(true);
+      setDisableClear(false);
     }
   };
+
+  useEffect(() => {
+    setDisableClear(selectedFiles.length === 0);
+  }, [selectedFiles]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
@@ -145,18 +164,17 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           Choose Images
         </Button>
       </label>
-      {showClearAll && progress < 100 && (
         <Button
           className="btn-clear"
           color="secondary"
           variant="outlined"
           component="span"
           onClick={handleClearAll}
+          disabled={disableClear}
           style={{ marginTop: '10px', marginBottom: '10px' }}
         >
           Clear All
         </Button>
-      )}
       {progress > 0 && progress < 100 && (
         <Box className="my20" width="100%">
           <LinearProgress variant="determinate" value={progress} />
