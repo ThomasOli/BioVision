@@ -53,6 +53,8 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
     }, 500);
 
     dispatch(addFile(selectedFiles));
+    setSelectedFiles([]);
+    setPreviews([]);
     console.log(files);
   };
 
@@ -102,8 +104,8 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
   };
 
   useEffect(() => {
-    setDisableClear(files.length === 0);
-  }, [files]);
+    setDisableClear(selectedFiles.length === 0);
+  }, [selectedFiles]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
@@ -184,7 +186,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
         color="primary"
         variant="contained"
         component="span"
-        disabled={files.length === 0}
+        disabled={selectedFiles.length === 0}
         onClick={handleUpload}
       >
         Upload
