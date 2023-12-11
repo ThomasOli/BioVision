@@ -20,18 +20,23 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
   const [isError, setIsError] = useState(false);
   const [disableClear, setDisableClear] = useState(true);
 
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [previews, setPreviews] = useState<string[]>([]);
+
   const handleSelectFiles = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files.length > 0) {
       const filesArray = Array.from(event.target.files);
 
-      //Redux Addition
-      dispatch(addFile(filesArray));
+      const filePreviews = filesArray.map((file) => URL.createObjectURL(file));
 
+      setSelectedFiles(filesArray);
+      setPreviews(filePreviews);
       setProgress(0);
       setMessage('');
       setDisableClear(false);
     }
   };
+
 
   const handleUpload = () => {
     // Implement your upload logic here
@@ -46,23 +51,33 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
         setDisableClear(true);
       }
     }, 500);
+
+    dispatch(addFile(selectedFiles));
+    console.log(files);
   };
 
-  const handleRemoveImage = (file: File) => {
+  const handleRemoveImage = (index: number) => {
+    const updatedFiles = [...selectedFiles];
+    const updatedPreviews = [...previews];
 
-    dispatch(removeFile(file.name))
-    if (files.length === 0) {
+    updatedFiles.splice(index, 1);
+    updatedPreviews.splice(index, 1);
+
+    setSelectedFiles(updatedFiles);
+    setPreviews(updatedPreviews);
+
+    if (updatedFiles.length === 0) {
       setDisableClear(true);
     }
-
   };
+
 
   const handleClearAll = () => {
 
     setDisableClear(true);
 
-    //Redux Addition
-    dispatch(clearFiles());
+    setSelectedFiles([]);
+    setPreviews([]);
   };
 
   const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
@@ -71,14 +86,15 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
-    const droppedFiles = event.dataTransfer.files;
+    const files = event.dataTransfer.files;
 
-    if (droppedFiles && droppedFiles.length > 0) {
-      const filesArray = Array.from(droppedFiles);
+    if (files && files.length > 0) {
+      const filesArray = Array.from(files);
 
-      //Redux Addition
-      dispatch(addFile(filesArray));
+      const filePreviews = filesArray.map((file) => URL.createObjectURL(file));
 
+      setSelectedFiles(filesArray);
+      setPreviews(filePreviews);
       setProgress(0);
       setMessage('');
       setDisableClear(false);
@@ -108,13 +124,13 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           Drag & Drop Images Here
         </Typography>
       </Box>
-      {files.length > 0 && (
+      {previews.length > 0 && (
         <div style={{ height: '200px', overflowY: 'scroll', width: '200px', marginBottom: '20px' }}>
-          {files.map((file, index) => (
+          {previews.map((preview, index) => (
             <div key={index} style={{ display: 'flex', alignItems: 'center', margin: '10px 0' }}>
-              <img src={URL.createObjectURL(file)} alt={`Preview ${index}`} style={{ width: '100px', height: '100px' }} />
+              <img src={preview} alt={`Preview ${index}`} style={{ width: '100px', height: '100px' }} />
               <Button
-                onClick={() => handleRemoveImage(file)}
+                onClick={() => handleRemoveImage(index)}
                 variant="outlined"
                 sx={{
                   marginLeft: '20px',
