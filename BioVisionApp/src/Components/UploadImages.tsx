@@ -4,17 +4,24 @@ import Typography from '@mui/material/Typography';
 import Button from '@mui/material/Button';
 import LinearProgress from '@mui/material/LinearProgress';
 import { ipcRenderer } from 'electron';
+import { useSelector, useDispatch } from 'react-redux';
+import { clearFiles, addFile, removeFile } from '../state/filesState/fileSlice';
+import { RootState } from '../state/store';
+
 
 interface UploadImagesProps {
 }
 
 const UploadImages: React.FC<UploadImagesProps> = (props) => {
+  const files = useSelector((state: RootState) => state.files.fileArray);
+  const dispatch = useDispatch();
+
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState('');
   const [isError, setIsError] = useState(false);
-  const [showClearAll, setShowClearAll] = useState(false);
+  const [disableClear, setDisableClear] = useState(true);
 
   const handleSelectFolder = () => {
     ipcRenderer.invoke('open-folder-dialog').then((result) => {
@@ -48,7 +55,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           setPreviews(filePreviews);
           setProgress(0);
           setMessage('');
-          setShowClearAll(true);
+          setDisableClear(false);
         });
       }
     }).catch((err) => {
@@ -67,11 +74,13 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
       setPreviews(filePreviews);
       setProgress(0);
       setMessage('');
-      setShowClearAll(true);
+      setDisableClear(false);
     }
   };
 
   const handleUpload = () => {
+    dispatch(addFile(selectedFiles));
+    console.log(files);
     // Not done yet, needs actual upload to backend system
     let currentProgress = 0;
     const interval = setInterval(() => {
@@ -82,7 +91,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
         setSelectedFiles([]);
         setPreviews([]);
         setMessage('Upload completed!');
-        setShowClearAll(false);
+        setDisableClear(false);
       }
     }, 500);
   };
@@ -98,14 +107,14 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
     setPreviews(updatedPreviews);
 
     if (updatedFiles.length === 0) {
-      setShowClearAll(false);
+      setDisableClear(true);
     }
   };
 
   const handleClearAll = () => {
     setSelectedFiles([]);
     setPreviews([]);
-    setShowClearAll(false);
+    setDisableClear(true);
   };
 
   const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
@@ -148,7 +157,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
         setPreviews(filePreviews);
         setProgress(0);
         setMessage('');
-        setShowClearAll(true);
+        setDisableClear(false);
       }
     }
   };
@@ -250,7 +259,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
         Choose Folder
       </Button>
       </label>
-      {showClearAll && progress < 100 && (
+      {progress < 100 && (
         <Button
           className="btn-clear"
           color="secondary"
@@ -258,6 +267,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           component="span"
           onClick={handleClearAll}
           style={{ marginTop: '10px', marginBottom: '10px' }}
+          disabled={disableClear}
         >
           Clear All
         </Button>
