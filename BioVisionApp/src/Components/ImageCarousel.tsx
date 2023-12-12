@@ -1,0 +1,75 @@
+import { useSelector, useDispatch } from "react-redux";
+import { useState, useEffect } from 'react';
+
+import { clearFiles, addFile, removeFile } from '../state/filesState/fileSlice';
+import { RootState } from '../state/store';
+import { Paper, IconButton, Card, Stack } from '@mui/material';
+import ArrowBackIosNewIcon from '@mui/icons-material/ArrowBackIosNew';
+import ArrowForwardIosIcon from '@mui/icons-material/ArrowForwardIos';
+import { Delete } from "@mui/icons-material";
+
+const ImageCarousel: React.FC = () => {
+    const files = useSelector((state: RootState) => state.files.fileArray);
+    const dispatch = useDispatch();
+    const [currentIndex, setCurrentIndex] = useState(0);
+
+    const [showNav, setshowNav] = useState(false);
+
+    const handleNext = () => {
+        setCurrentIndex((prevIndex) => (prevIndex + 1) % files.length);
+    };
+
+    const handleBack = () => {
+        setCurrentIndex((prevIndex) => (prevIndex - 1 + files.length) % files.length);
+    };
+
+    const currentFile = files[currentIndex];
+    const prevFile = files[(currentIndex - 1 + files.length) % files.length];
+    const nextFile = files[(currentIndex + 1) % files.length];
+
+    useEffect(() => {
+        if (files.length > 0){
+            setshowNav(true);
+        }
+    },[files])
+
+    const Navigation = () => {
+        return (
+            <>
+                <IconButton onClick={handleBack}>
+                    <ArrowBackIosNewIcon />
+                </IconButton>
+                <IconButton onClick={handleNext}>
+                    <ArrowForwardIosIcon />
+                </IconButton>
+                <Delete/>
+            </>
+        );
+    };
+
+    return (
+
+    <>
+        {showNav && (
+        <Stack>
+            <Card sx={{ display: 'flex', height: '20rem', alignItems: 'center', justifyContent: 'center', mb:'2rem' }}>
+
+                
+
+                {prevFile && <img src={URL.createObjectURL(prevFile)} alt="previous" style={{ width: '100px', height: 'auto' }} />}
+                {currentFile && <img src={URL.createObjectURL(currentFile)} alt="current" style={{ width: '300px', height: 'auto' }} />}
+                {nextFile && <img src={URL.createObjectURL(nextFile)} alt="next" style={{ width: '100px', height: 'auto' }} />}
+                
+            </Card>
+
+            <Card sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
+                <Navigation/>
+            </Card>
+        </Stack>
+
+        )}
+    </>
+    );
+};
+
+export default ImageCarousel;

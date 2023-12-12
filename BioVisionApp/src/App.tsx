@@ -1,5 +1,6 @@
 import React from 'react';
 import Menu from './Components/Menu';
+import ImageCarousel from './Components/ImageCarousel';
 import { useState } from 'react';
 import MainMenu from './Components/MainMenu';
 
@@ -10,7 +11,8 @@ const App: React.FC = () => {
       <div style={{
        paddingLeft: "20vw",
        paddingRight:"20vw",
-      }}><MainMenu/>
+      }}>
+        <ImageCarousel/>
       </div>
       
     </div>
