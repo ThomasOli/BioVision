@@ -52,16 +52,17 @@ const ImageCarousel: React.FC = () => {
     <>
         {showNav && (
         <Stack>
-            <Card sx={{ display: 'flex', height: '20rem', alignItems: 'center', justifyContent: 'center', mb:'2rem' }}>
+            
+            <Card sx={{ display: 'flex', height: '70vh', width:'100vh', alignItems: 'center', justifyContent: 'center', mb:'2rem' }}>
 
                 
-
-                {prevFile && <img src={URL.createObjectURL(prevFile)} alt="previous" style={{ width: '100px', height: 'auto' }} />}
-                {currentFile && <img src={URL.createObjectURL(currentFile)} alt="current" style={{ width: '300px', height: 'auto' }} />}
-                {nextFile && <img src={URL.createObjectURL(nextFile)} alt="next" style={{ width: '100px', height: 'auto' }} />}
+                {currentFile && <img src={URL.createObjectURL(currentFile)} alt="current" style={{width: '1000px', height: 'auto' }} />}
                 
             </Card>
-
+            <div style = {{display:'flex', justifyContent:'space-between'}}>
+            {prevFile && <img src={URL.createObjectURL(prevFile)} alt="previous" style={{ width: '100px', height: 'auto' }} />}
+            {nextFile && <img src={URL.createObjectURL(nextFile)} alt="next" style={{ width: '100px', height: 'auto' }} />}
+            </div>
             <Card sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
                 <Navigation/>
             </Card>
