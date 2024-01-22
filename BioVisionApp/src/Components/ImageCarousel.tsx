@@ -12,9 +12,12 @@ interface Dot {
   x: number;
   y: number;
 }
+interface ImageCarouselProps {
+  color: string;
+}
 
-const ImageCarousel: React.FC = () => {
-    const imageContainer = document.getElementById("image-container");
+const ImageCarousel: React.FC<ImageCarouselProps> = ({ color }) => {
+  const imageContainer = document.getElementById("image-container");
 
   const [dots, setDots] = useState<Dot[]>([]);
   const [imageDimensions, setImageDimensions] = useState<{
@@ -151,7 +154,7 @@ const ImageCarousel: React.FC = () => {
                   left: dot.x,
                   width: `${imageDimensions.width / 100}px`,
                   height: `${imageDimensions.width / 100}px`,
-                  backgroundColor: "red",
+                  backgroundColor: `${color}`,
                   borderRadius: "10px",
                 }}
               />

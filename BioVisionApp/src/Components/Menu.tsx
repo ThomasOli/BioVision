@@ -1,17 +1,15 @@
 import React from "react";
 import Paper from "@mui/material/Paper";
 import Button from "@mui/material/Button";
-import Box from "@mui/material/Box";
+
 import UploadImages from "./UploadImages";
-import IconButton from "@mui/material/IconButton";
-import FolderOpenIcon from "@mui/icons-material/FolderOpen";
+
 import Landmark from "./Landmark";
-import { Typography } from "@mui/material";
 interface MenuProps {
-  children: React.ReactNode;
+  onColorChange: (selectedColor: string) => void;
 }
 
-const Menu: React.FC<MenuProps> = ({ children }) => {
+const Menu: React.FC<MenuProps> = ({onColorChange}) => {
   return (
     <Paper
       style={{
@@ -25,7 +23,7 @@ const Menu: React.FC<MenuProps> = ({ children }) => {
         boxSizing: 'border-box',
       }}
     >
-      {children}
+      
       <div
         style={{
           marginTop: "1px",
@@ -49,7 +47,7 @@ const Menu: React.FC<MenuProps> = ({ children }) => {
           <UploadImages />
         </div>
         
-        <Landmark></Landmark>
+        <Landmark onColorChange={onColorChange}/>
         <div
           style={{
             display: "flex",

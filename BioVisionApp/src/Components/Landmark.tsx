@@ -22,22 +22,28 @@ import {
   FormatColorFill as FormatColorFillIcon,
 } from "@mui/icons-material";
 
-interface LandmarkProps {}
+interface LandmarkProps {
+  onColorChange: (selectedColor: string) => void;
+}
 
 function valuetext(value: number) {
   return `${value}°C`;
 }
 
-const Landmark: React.FC<LandmarkProps> = () => {
+const Landmark: React.FC<LandmarkProps> = ({onColorChange}) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
 
   const handleSwitchChange = () => {
     setIsSwitchOn((prev) => !prev);
   };
-  const [color, setColor] = React.useState("");
 
-  const handleChange = (event: SelectChangeEvent) => {
-    setColor(event.target.value as string);
+  const [color, setColor] = React.useState('red');
+
+  const handleColorChange = (event: SelectChangeEvent) => {
+    const selectedColor = event.target.value as string;
+    setColor(selectedColor);
+    // Call the onColorChange callback with the selected color
+    onColorChange(selectedColor);
   };
   const [formats, setFormats] = React.useState(() => ["bold", "italic"]);
 
@@ -112,17 +118,17 @@ const Landmark: React.FC<LandmarkProps> = () => {
                 id="demo-simple-select"
                 value={color}
                 label="color"
-                onChange={handleChange}
+                onChange={handleColorChange}
                 disabled={isSwitchOn}
               >
-                <MenuItem value={10}>Red</MenuItem>
-                <MenuItem value={20}>Orange</MenuItem>
-                <MenuItem value={30}>Yellow</MenuItem>
-                <MenuItem value={40}>Green</MenuItem>
-                <MenuItem value={50}>Blue</MenuItem>
-                <MenuItem value={60}>Purple</MenuItem>
-                <MenuItem value={70}>White</MenuItem>
-                <MenuItem value={80}>Black</MenuItem>
+                <MenuItem value={'red'}>Red</MenuItem>
+                <MenuItem value={'orange'}>Orange</MenuItem>
+                <MenuItem value={'yellow'}>Yellow</MenuItem>
+                <MenuItem value={'green'}>Green</MenuItem>
+                <MenuItem value={'blue'}>Blue</MenuItem>
+                <MenuItem value={'purple'}>Purple</MenuItem>
+                <MenuItem value={'white'}>White</MenuItem>
+                <MenuItem value={'black'}>Black</MenuItem>
               </Select>
             </FormControl>
             </Box>
