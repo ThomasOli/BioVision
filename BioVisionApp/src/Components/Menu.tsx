@@ -6,10 +6,11 @@ import UploadImages from "./UploadImages";
 
 import Landmark from "./Landmark";
 interface MenuProps {
+  onOpacityChange: (selectedOpacity: number) => void;
   onColorChange: (selectedColor: string) => void;
 }
 
-const Menu: React.FC<MenuProps> = ({onColorChange}) => {
+const Menu: React.FC<MenuProps> = ({onColorChange, onOpacityChange}) => {
   return (
     <Paper
       style={{
@@ -47,7 +48,7 @@ const Menu: React.FC<MenuProps> = ({onColorChange}) => {
           <UploadImages />
         </div>
         
-        <Landmark onColorChange={onColorChange}/>
+        <Landmark onOpacityChange = {onOpacityChange} onColorChange={onColorChange}/>
         <div
           style={{
             display: "flex",

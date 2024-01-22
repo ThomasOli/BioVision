@@ -8,15 +8,20 @@ const App: React.FC = () => {
   const handleColorChange = (selectedColor: string) => {
     setColor(selectedColor);
   };
+  const [opacity, setOpacity] = useState<number>(100);
+  const handleOpacityChange = (selectedOpacity: number) => {
+    setOpacity(selectedOpacity);
+  };
+
   return (
     <div style={{display: 'flex', height: '100vh'}}>
-      <Menu  onColorChange={handleColorChange}/>
+      <Menu  onOpacityChange = {handleOpacityChange} onColorChange={handleColorChange}/>
       <div style={{
        paddingLeft: "20vw",
        paddingRight:"20vw",
        
       }}>
-        <ImageCarousel color ={color}/>
+        <ImageCarousel color ={color} opacity={opacity}/>
       </div>
       
     </div>

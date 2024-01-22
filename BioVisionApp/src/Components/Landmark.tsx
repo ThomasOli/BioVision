@@ -24,13 +24,14 @@ import {
 
 interface LandmarkProps {
   onColorChange: (selectedColor: string) => void;
+  onOpacityChange: (selectedOpacity: number) => void;
 }
 
 function valuetext(value: number) {
   return `${value}°C`;
 }
 
-const Landmark: React.FC<LandmarkProps> = ({onColorChange}) => {
+const Landmark: React.FC<LandmarkProps> = ({onColorChange, onOpacityChange}) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
 
   const handleSwitchChange = () => {
@@ -38,6 +39,7 @@ const Landmark: React.FC<LandmarkProps> = ({onColorChange}) => {
   };
 
   const [color, setColor] = React.useState('red');
+  const [opacity, setOpacity] = React.useState<number>(100);
 
   const handleColorChange = (event: SelectChangeEvent) => {
     const selectedColor = event.target.value as string;
@@ -45,6 +47,12 @@ const Landmark: React.FC<LandmarkProps> = ({onColorChange}) => {
     // Call the onColorChange callback with the selected color
     onColorChange(selectedColor);
   };
+
+  const handleOpacityChange = (event: Event, newValue: number | number[]) => {
+    setOpacity(newValue as number)
+    onOpacityChange(newValue as number);
+  };
+
   const [formats, setFormats] = React.useState(() => ["bold", "italic"]);
 
   const handleFormat = (
@@ -140,10 +148,13 @@ const Landmark: React.FC<LandmarkProps> = ({onColorChange}) => {
           </Typography>
           <Slider
             aria-label="Transparency"
-            defaultValue={30}
+            defaultValue={opacity}
             getAriaValueText={valuetext}
             color="primary"
             disabled={isSwitchOn}
+            valueLabelDisplay="auto"
+            value={opacity}
+            onChange = {handleOpacityChange}
           />
         </Box>
         {/* Add more elements as needed */}
