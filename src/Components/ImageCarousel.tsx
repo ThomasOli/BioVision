@@ -124,6 +124,10 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
     }
   };
 
+  const handleImageListItemClick = (index: number) => {
+    setCurrentIndex(index);
+  }
+
   useEffect(() => {
     if (files.length > 0) {
       setshowNav(true);
@@ -150,6 +154,7 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
         <Stack sx={{display: 'flex', flexDirection: 'column', alignItems: 'center'}}>
           <Card
             id="image-container"
+            elevation={0}
             sx={{
               display: "flex",
               height: "70vh",
@@ -157,13 +162,18 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
               alignItems: "center",
               justifyContent: "center",
               mb: "2rem",
+              mt: "2rem",
+              backgroundColor: '#242424' // matching the background of the default color,
             }}
           >
             {currentFile && (
               <img
                 src={URL.createObjectURL(currentFile)}
                 alt="current"
-                style={{ width: "1000px", height: "auto" }}
+                style={{ width: "100%", 
+                  height: "100%", 
+                  objectFit: "contain" // Added to remove cropping of main image
+                }}
                 onClick={handleImageClick}
               />
             )}
@@ -202,6 +212,7 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
                   key={index}
                   data-index={index}
                   sx={{ width: "100px", height: "100px" }}
+                  onClick={() => handleImageListItemClick(index)}
                 >
                   <img
                     src={URL.createObjectURL(file)}
