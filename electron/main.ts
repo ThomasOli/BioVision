@@ -12,9 +12,8 @@ function createWindow() {
       contextIsolation: false,
       preload: path.join(__dirname, 'preload.js'),
     },
+    fullscreen: true,
   });
-
-  mainWindow.maximize();
 
   // Load the Vite application URL or build output
   const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
