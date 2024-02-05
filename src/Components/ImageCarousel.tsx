@@ -1,9 +1,9 @@
 import { useSelector, useDispatch } from "react-redux";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef} from "react";
 
 import { clearFiles, addFile, removeFile } from "../state/filesState/fileSlice";
 import { RootState } from "../state/store";
-import { Paper, IconButton, Card, Stack } from "@mui/material";
+import { Paper, IconButton, Card, Stack, Grid, ImageList, ImageListItem } from "@mui/material";
 import ArrowBackIosNewIcon from "@mui/icons-material/ArrowBackIosNew";
 import ArrowForwardIosIcon from "@mui/icons-material/ArrowForwardIos";
 import { Delete } from "@mui/icons-material";
@@ -18,6 +18,9 @@ interface ImageCarouselProps {
 }
 
 const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
+
+  const imageListContainerRef = useRef<HTMLDivElement>(null);
+
   const imageContainer = document.getElementById("image-container");
 
   const [dots, setDots] = useState<Dot[]>([]);
@@ -91,17 +94,39 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
 
   const handleNext = () => {
     setCurrentIndex((prevIndex) => (prevIndex + 1) % files.length);
+    scrollToCurrentImage();
   };
 
   const handleBack = () => {
     setCurrentIndex(
       (prevIndex) => (prevIndex - 1 + files.length) % files.length
     );
+    scrollToCurrentImage();
   };
+
 
   const currentFile = files[currentIndex];
   const prevFile = files[(currentIndex - 1 + files.length) % files.length];
   const nextFile = files[(currentIndex + 1) % files.length];
+
+  const scrollToCurrentImage = () => {
+    if (imageListContainerRef.current) {
+      const imageListItem = imageListContainerRef.current.querySelector(
+        `[data-index="${currentIndex}"]`
+      ) as HTMLDivElement;
+
+      if (imageListItem) {
+        imageListItem.scrollIntoView({
+          behavior: "smooth",
+          inline: "center",
+        });
+      }
+    }
+  };
+
+  const handleImageListItemClick = (index: number) => {
+    setCurrentIndex(index);
+  }
 
   useEffect(() => {
     if (files.length > 0) {
@@ -126,9 +151,10 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
   return (
     <>
       {showNav && (
-        <Stack>
+        <Stack sx={{display: 'flex', flexDirection: 'column', alignItems: 'center'}}>
           <Card
             id="image-container"
+            elevation={0}
             sx={{
               display: "flex",
               height: "70vh",
@@ -136,13 +162,18 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
               alignItems: "center",
               justifyContent: "center",
               mb: "2rem",
+              mt: "2rem",
+              backgroundColor: '#242424' // matching the background of the default color,
             }}
           >
             {currentFile && (
               <img
                 src={URL.createObjectURL(currentFile)}
                 alt="current"
-                style={{ width: "1000px", height: "auto" }}
+                style={{ width: "100%", 
+                  height: "100%", 
+                  objectFit: "contain" // Added to remove cropping of main image
+                }}
                 onClick={handleImageClick}
               />
             )}
@@ -162,22 +193,42 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
               />
             ))}
           </Card>
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
-            {prevFile && (
-              <img
-                src={URL.createObjectURL(prevFile)}
-                alt="previous"
-                style={{ width: "100px", height: "auto" }}
-              />
-            )}
-            {nextFile && (
-              <img
-                src={URL.createObjectURL(nextFile)}
-                alt="next"
-                style={{ width: "100px", height: "auto" }}
-              />
-            )}
+
+          <div
+            ref={imageListContainerRef}
+            style={{
+              overflowX: "auto",
+              maxWidth: "70%",
+            }}
+          >
+            <ImageList
+              sx={{
+                gridAutoFlow: "column",
+                justifyContent: "space-between",
+              }}
+            >
+              {files.map((file, index) => (
+                <ImageListItem
+                  key={index}
+                  data-index={index}
+                  sx={{ width: "100px", height: "100px" }}
+                  onClick={() => handleImageListItemClick(index)}
+                >
+                  <img
+                    src={URL.createObjectURL(file)}
+                    alt={`image-${index}`}
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      objectFit: "cover",
+                      border: currentIndex === index ? "3px solid lime" : "none",
+                    }}
+                  />
+                </ImageListItem>
+              ))}
+            </ImageList>
           </div>
+
           <Card
             sx={{
               display: "flex",
