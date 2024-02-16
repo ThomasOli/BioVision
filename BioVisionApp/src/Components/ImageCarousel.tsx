@@ -1,102 +1,115 @@
+import React, { useState, useEffect } from "react";
 import { useSelector, useDispatch } from "react-redux";
-import { useState, useEffect } from "react";
-
-import { clearFiles, addFile, removeFile } from "../state/filesState/fileSlice";
 import { RootState } from "../state/store";
-import { Paper, IconButton, Card, Stack } from "@mui/material";
+import { clearFiles, addFile, removeFile } from "../state/filesState/fileSlice";
+import {
+  Paper,
+  IconButton,
+  Card,
+  Stack,
+  List,
+  ListItem,
+  ListItemText,
+  Slider,
+} from "@mui/material";
 import ArrowBackIosNewIcon from "@mui/icons-material/ArrowBackIosNew";
 import ArrowForwardIosIcon from "@mui/icons-material/ArrowForwardIos";
-import { Delete } from "@mui/icons-material";
+import CloseIcon from "@mui/icons-material/Close";
+import ZoomInIcon from "@mui/icons-material/ZoomIn";
+import ZoomOutIcon from "@mui/icons-material/ZoomOut";
 
 interface Dot {
   x: number;
   y: number;
+  size: number;
 }
+
 interface ImageCarouselProps {
   color: string;
   opacity: number;
 }
 
 const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
-  const imageContainer = document.getElementById("image-container");
+  const containerWidth = 800; // Set your desired fixed width
+  const containerHeight = 600; // Set your desired fixed height
 
-  const [dots, setDots] = useState<Dot[]>([]);
+  const [dots, setDots] = useState<{ [key: string]: Dot[] }>({});
   const [imageDimensions, setImageDimensions] = useState<{
     width: number;
     height: number;
   }>({
-    width: 50 ,
-    height: 50,
+    width: containerWidth,
+    height: containerHeight,
   });
-  const [pastImageDimensions, setPastImageDimensions] = useState<{
-    width: number;
-    height: number;
-  }>({
-    width: 0,
-    height: 0,
-  });
+
+  const [dotSize] = useState<number>(10);
+  const [zoomLevel, setZoomLevel] = useState<number>(1);
+
   const handleImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
+    const currentImageKey = getCurrentImageKey();
+    const imageContainer = document.getElementById(currentImageKey);
+    if (!imageContainer) return;
 
-    if (imageContainer) {
-      const { width, height } = imageContainer.getBoundingClientRect();
-      setPastImageDimensions({ width, height });
-    }
-    const x = e.clientX;
-    const y = e.clientY;
+    const rect = imageContainer.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / zoomLevel;
+    const y = (e.clientY - rect.top) / zoomLevel;
 
-    setDots((prevDots) => [...prevDots, { x, y }]);
+    setDots((prevDots) => ({
+      ...prevDots,
+      [currentImageKey]: [...(prevDots[currentImageKey] || []), { x, y, size: dotSize }],
+    }));
   };
 
   const handleResize = () => {
-    const imageContainer = document.getElementById("image-container");
-
-    if (imageContainer) {
-      setPastImageDimensions({
-        width: imageDimensions.width,
-        height: imageDimensions.height,
-      });
-      updateDotPositions();
-    }
+    updateImageDimensions();
   };
 
-  const updateDotPositions = () => {
-   
-    const newDots = dots.map((dot) => ({
-      x: dot.x * (imageDimensions.width / pastImageDimensions.width),
-      y: dot.y * (imageDimensions.height / pastImageDimensions.height),
-    }));
-        
-      setDots(newDots);
+  const updateImageDimensions = () => {
+    const currentImageKey = getCurrentImageKey();
+    const imageContainer = document.getElementById(currentImageKey);
+
+    if (imageContainer) {
+      const { clientWidth, clientHeight } = imageContainer;
+      setImageDimensions({ width: clientWidth, height: clientHeight });
+    }
   };
 
   useEffect(() => {
-    if (imageContainer) {
-      const { left, top } = imageContainer.getBoundingClientRect();
-
-      setImageDimensions({ width: left, height: top });
-    }
-
+    updateImageDimensions();
     window.addEventListener("resize", handleResize);
 
     return () => {
       window.removeEventListener("resize", handleResize);
     };
-  }, [dots]);
+  }, []);
 
   const files = useSelector((state: RootState) => state.files.fileArray);
   const dispatch = useDispatch();
   const [currentIndex, setCurrentIndex] = useState(0);
-
-  const [showNav, setshowNav] = useState(false);
+  const [showNav, setShowNav] = useState(false);
 
   const handleNext = () => {
+    saveAnnotations();
     setCurrentIndex((prevIndex) => (prevIndex + 1) % files.length);
   };
 
   const handleBack = () => {
+    saveAnnotations();
     setCurrentIndex(
       (prevIndex) => (prevIndex - 1 + files.length) % files.length
     );
+  };
+
+  const saveAnnotations = () => {
+    const currentImageKey = getCurrentImageKey();
+    setDots((prevDots) => ({
+      ...prevDots,
+      [currentImageKey]: dots[currentImageKey] || [],
+    }));
+  };
+
+  const getCurrentImageKey = () => {
+    return `image-container-${currentIndex}`;
   };
 
   const currentFile = files[currentIndex];
@@ -105,7 +118,7 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
 
   useEffect(() => {
     if (files.length > 0) {
-      setshowNav(true);
+      setShowNav(true);
     }
   }, [files]);
 
@@ -118,75 +131,153 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
         <IconButton onClick={handleNext}>
           <ArrowForwardIosIcon />
         </IconButton>
-        <Delete />
+        <CloseIcon />
       </>
     );
+  };
+
+  const handleDotRemove = (index: number) => {
+    const currentImageKey = getCurrentImageKey();
+    setDots((prevDots) => ({
+      ...prevDots,
+      [currentImageKey]: prevDots[currentImageKey].filter((_, i) => i !== index),
+    }));
+  };
+
+  const handleZoom = (zoomIn: boolean) => {
+    if (zoomIn) {
+      setZoomLevel((prevZoom) => prevZoom * 1.1); // Increase zoom level by 10%
+    } else {
+      setZoomLevel((prevZoom) => prevZoom / 1.1); // Decrease zoom level by 10%
+    }
   };
 
   return (
     <>
       {showNav && (
-        <Stack>
-          <Card
-            id="image-container"
-            sx={{
-              display: "flex",
-              height: "70vh",
-              width: "100vh",
-              alignItems: "center",
-              justifyContent: "center",
-              mb: "2rem",
-            }}
-          >
-            {currentFile && (
-              <img
-                src={URL.createObjectURL(currentFile)}
-                alt="current"
-                style={{ width: "1000px", height: "auto" }}
-                onClick={handleImageClick}
-              />
-            )}
-            {dots.map((dot, index) => (
+        <Stack direction="column" alignItems="center">
+          <Stack direction="row">
+            <Paper
+              sx={{
+                width: "300px",
+                maxHeight: "100%",
+                overflow: "auto",
+                backgroundColor: "#fff",
+                height: `${containerHeight}px`, // Set the height to match the image container
+              }}
+            >
+              <List>
+                {(dots[getCurrentImageKey()] || []).map((dot, index) => (
+                  <ListItem key={index}>
+                    <ListItemText
+                      primary={`Dot ${index + 1}`}
+                      secondary={`(${dot.x}, ${dot.y})`}
+                    />
+                    <Stack direction="row" alignItems="center">
+                      <Slider
+                        value={dot.size}
+                        onChange={(_e, newValue) => {
+                          const newSize = newValue as number;
+                          setDots((prevDots) => {
+                            const currentImageKey = getCurrentImageKey();
+                            const updatedDots = [...prevDots[currentImageKey]];
+                            updatedDots[index].size = newSize;
+                            return {
+                              ...prevDots,
+                              [currentImageKey]: updatedDots,
+                            };
+                          });
+                        }}
+                        min={2}
+                        max={10}
+                        aria-label="Dot Size"
+                        sx={{ width: 100 }}
+                      />
+                      <IconButton onClick={() => handleDotRemove(index)}>
+                        <CloseIcon />
+                      </IconButton>
+                    </Stack>
+                  </ListItem>
+                ))}
+              </List>
+            </Paper>
+            <Card
+              id={getCurrentImageKey()}
+              sx={{
+                position: "relative",
+                display: "flex",
+                height: `${containerHeight}px`,
+                width: `${containerWidth}px`,
+                alignItems: "center",
+                justifyContent: "center",
+                mb: "2rem",
+                overflow: "hidden",
+              }}
+            >
+              {currentFile && (
+                <img
+                  src={URL.createObjectURL(currentFile)}
+                  alt="current"
+                  style={{
+                    width: `${imageDimensions.width}px`,
+                    height: `${imageDimensions.height}px`,
+                    objectFit: "contain",
+                    transformOrigin: "top left",
+                    transform: `scale(${zoomLevel})`,
+                  }}
+                  onClick={handleImageClick}
+                />
+              )}
+              {(dots[getCurrentImageKey()] || []).map((dot, index) => (
+                <div
+                  key={index}
+                  style={{
+                    position: "absolute",
+                    top: `${dot.y}px`,
+                    left: `${dot.x}px`,
+                    width: `${dot.size}px`,
+                    height: `${dot.size}px`,
+                    backgroundColor: `${color}`,
+                    borderRadius: "50%",
+                    opacity: `${opacity / 100}`,
+                    transform: "translate(-50%, -50%)",
+                  }}
+                />
+              ))}
               <div
-                key={index}
                 style={{
                   position: "absolute",
-                  top: dot.y,
-                  left: dot.x,
-                  width: `${imageDimensions.width / 100}px`,
-                  height: `${imageDimensions.width / 100}px`,
-                  backgroundColor: `${color}`,
-                  borderRadius: "10px",
-                  opacity: `${opacity/100}`
+                  top: "0",
+                  right: "0",
+                  zIndex: 1000,
                 }}
-              />
-            ))}
-          </Card>
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
+              >
+                <IconButton onClick={() => handleZoom(true)}>
+                  <ZoomInIcon sx={{ bgcolor: "transparent" }} />
+                </IconButton>
+                <IconButton onClick={() => handleZoom(false)}>
+                  <ZoomOutIcon sx={{ bgcolor: "transparent" }} />
+                </IconButton>
+              </div>
+            </Card>
+          </Stack>
+          <Stack direction="row" sx={{ backgroundColor: "#fff", padding: "10px" }}>
             {prevFile && (
               <img
                 src={URL.createObjectURL(prevFile)}
                 alt="previous"
-                style={{ width: "100px", height: "auto" }}
+                style={{ width: "100px", height: "auto", marginRight: "10px" }}
               />
             )}
             {nextFile && (
               <img
                 src={URL.createObjectURL(nextFile)}
                 alt="next"
-                style={{ width: "100px", height: "auto" }}
+                style={{ width: "100px", height: "auto", marginRight: "10px" }}
               />
             )}
-          </div>
-          <Card
-            sx={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
             <Navigation />
-          </Card>
+          </Stack>
         </Stack>
       )}
     </>
