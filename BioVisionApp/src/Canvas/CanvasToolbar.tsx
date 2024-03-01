@@ -46,7 +46,6 @@ interface CanvasToolbarProps {
   leftPosition: number
   canUndo: boolean
   canRedo: boolean
-  downloadCallback: () => void
   undoCallback: () => void
   redoCallback: () => void
   resetCallback: () => void
@@ -57,7 +56,6 @@ const CanvasToolbar = ({
   leftPosition,
   canUndo,
   canRedo,
-  downloadCallback,
   undoCallback,
   redoCallback,
   resetCallback,
@@ -71,7 +69,6 @@ const CanvasToolbar = ({
       altText: "Send to Streamlit",
       invertX: false,
       enabled: true,
-      clickCallback: downloadCallback,
     },
     {
       imgUrl: undo,
@@ -96,6 +93,10 @@ const CanvasToolbar = ({
     },
   ]
 
+  function clickCallback(): void {
+    throw new Error("Function not implemented.")
+  }
+
   return (
     <div
       style={{
@@ -115,7 +116,7 @@ const CanvasToolbar = ({
           invertX={e.invertX}
           size={ICON_SIZE}
           enabled={e.enabled}
-          clickCallback={e.clickCallback}
+          clickCallback={clickCallback}
         />
       ))}
     </div>

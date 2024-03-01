@@ -7,9 +7,9 @@ import PointTool from "./point"
 
 // TODO: Should make TS happy on the Map of selectedTool --> FabricTool
 const tools: any = {
-  circle: CircleTool,
-  freedraw: FreedrawTool,
-  transform: TransformTool,
+  // circle: CircleTool,
+  // freedraw: FreedrawTool,
+  // transform: TransformTool,
   point: PointTool
 }
 

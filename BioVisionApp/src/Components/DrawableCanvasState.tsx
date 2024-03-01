@@ -15,27 +15,22 @@ interface CanvasHistory {
 
 interface CanvasAction {
   shouldReloadCanvas: boolean // reload currentState into app canvas, on undo/redo
-  forceSendToStreamlit: boolean // send currentState back to Streamlit
 }
 
 const NO_ACTION: CanvasAction = {
   shouldReloadCanvas: false,
-  forceSendToStreamlit: false,
 }
 
 const RELOAD_CANVAS: CanvasAction = {
   shouldReloadCanvas: true,
-  forceSendToStreamlit: false,
 }
 
 const SEND_TO_STREAMLIT: CanvasAction = {
   shouldReloadCanvas: false,
-  forceSendToStreamlit: true,
 }
 
 const RELOAD_AND_SEND_TO_STREAMLIT: CanvasAction = {
   shouldReloadCanvas: true,
-  forceSendToStreamlit: true,
 }
 
 interface CanvasState {
@@ -192,7 +187,6 @@ const initialState: CanvasState = {
     redoStack: [],
   },
   action: {
-    forceSendToStreamlit: false,
     shouldReloadCanvas: false,
   },
   initialState: {},
@@ -204,7 +198,6 @@ interface CanvasStateContextProps {
   saveState: (state: Object) => void
   undo: () => void
   redo: () => void
-  forceStreamlitUpdate: () => void
   canUndo: boolean
   canRedo: boolean
   resetState: (state: Object) => void
@@ -248,7 +241,6 @@ export const CanvasStateProvider = ({
         redo,
         canUndo,
         canRedo,
-        forceStreamlitUpdate,
         resetState,
       }}
     >
