@@ -1,4 +1,4 @@
-import * as fabric from "fabric"
+import { fabric } from 'fabric';
 import FabricTool, { ConfigureCanvasProps } from "./fabrictool"
 
 class CircleTool extends FabricTool {

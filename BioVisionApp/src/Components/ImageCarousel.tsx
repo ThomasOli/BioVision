@@ -16,7 +16,6 @@ const ImageCarousel: React.FC = () => {
   const [currentIndex, setCurrentIndex] = useState(0);
 
   const [showNav, setshowNav] = useState(false);
-
   const handleNext = () => {
     setCurrentIndex((prevIndex) => (prevIndex + 1) % files.length);
   };
@@ -67,7 +66,7 @@ const ImageCarousel: React.FC = () => {
 
   return (
     <>
-      {showNav && (
+      {showNav &&(
         <Stack>
             
           <Card
@@ -77,7 +76,6 @@ const ImageCarousel: React.FC = () => {
              display: "flex",
              height: "70vh",
              width: "100vh",
-             
 
              mb: "2rem",
              mt: "2rem",

@@ -1,6 +1,6 @@
 import React, { FunctionComponent, useEffect, useRef, useState } from "react"
 
-import * as fabric from 'fabric';
+import { fabric } from 'fabric';
 
 import CanvasToolbar from "../Canvas/CanvasToolbar"
 
@@ -46,8 +46,12 @@ const DrawableCanvas = (props: CanvasProps) => {
    * State initialization
    */
   
-  const canvasRef = useRef<fabric.Canvas | null>(null);
+  const [canvas, setCanvas] = useState(new fabric.Canvas(""))
  
+  const [backgroundCanvas, setBackgroundCanvas] = useState(
+    new fabric.StaticCanvas("")
+  )
+
  const {
 
     saveState,
@@ -63,23 +67,27 @@ const DrawableCanvas = (props: CanvasProps) => {
    * NB: Remount component by changing its key instead of defining deps
    */
   useEffect(() => {
-
-    if (!canvasRef.current && width != 0) {
-        canvasRef.current = new fabric.Canvas("canvas", {
-          enableRetinaScaling: false,
-        });
-      }
     
+    const c = new fabric.Canvas("canvas", {
+      enableRetinaScaling: false,
+    })
     
 
+    const imgC = new fabric.StaticCanvas("backgroundimage-canvas", {
+      enableRetinaScaling: false,
+     
+    })
+    setCanvas(c)
+    setBackgroundCanvas(imgC)
+
     
-    return () => {
-      if (canvasRef.current) {
-        canvasRef.current.dispose();
-        canvasRef.current = null; // Resetting the ref for potential re-initialization
-      }
-    };
-  }, [])
+    // return () => {
+    //   if (canvas && backgroundCanvas) {
+    //    canvas.dispose();
+    //    backgroundCanvas.dispose();
+    //   }
+    // };
+  }, [backgroundImageURL])
 
 
   // useEffect(() => {
@@ -112,20 +120,29 @@ const DrawableCanvas = (props: CanvasProps) => {
   //     }
   //   }, [backgroundCanvas, backgroundImageURL]);
   
+  useEffect(() => {
+    if (backgroundImageURL && backgroundCanvas) {
+        fabric.Image.fromURL(backgroundImageURL, function(img){
+        backgroundCanvas.setBackgroundImage(img, backgroundCanvas.renderAll.bind(backgroundCanvas),{})
+        
+        })
+    }
+}, [backgroundImageURL, backgroundCanvas]);
+
+
+
 
   // useEffect(() => {
-  //   if (backgroundImageURL && backgroundCanvas) {
+  //   if (backgroundImageURL && backgroundCanvas ) {
   //     var bgImage = new Image();
   //     bgImage.onload = function () {
-  //       var ctx = backgroundCanvas.getElement().getContext("2d");
-  //       if (ctx) {
-  //         ctx.drawImage(bgImage, 0, 0, 100, 100);
+  //         backgroundCanvas.getContext().drawImage(bgImage, 0, 0, 100, 100);
   //         backgroundCanvas.renderAll();
-  //       }
+        
   //     };
   //     bgImage.src = backgroundImageURL;
   //   }
-  // }, [backgroundCanvas, 100, 100, backgroundImageURL]);
+  // }, [backgroundCanvas, backgroundImageURL]);
 
     //   useEffect(() => {
   //     if (shouldReloadCanvas) {
@@ -136,10 +153,10 @@ const DrawableCanvas = (props: CanvasProps) => {
 
   useEffect(() => {
     
-    if (canvasRef.current) {
+    if (canvas && width!=0) {
       // Initialize and configure the selected tool
       
-      const selectedTool = new PointTool(canvasRef.current) as FabricTool;
+      const selectedTool = new PointTool(canvas) as FabricTool;
       const cleanupToolEvents = selectedTool.configureCanvas({
         fillColor: fillColor,
         strokeWidth: strokeWidth,
@@ -147,18 +164,18 @@ const DrawableCanvas = (props: CanvasProps) => {
       });
      
       // Add event listener for mouse up event
-      canvasRef.current.on("mouse:up", () => {
-        saveState(canvasRef.current?.toJSON());
+      canvas.on("mouse:up", () => {
+        saveState(canvas.toJSON());
       });
      
       // Cleanup function to remove event listeners and any other cleanup needed
       return () => {
         cleanupToolEvents();
-        canvasRef.current?.off("mouse:up", () => {})
-        canvasRef.current?.off("mouse:dblclick", () => {})
+        canvas.off("mouse:up", () => {})
+        canvas.off("mouse:dblclick", () => {})
       };
     }
-  }, [strokeWidth, strokeColor, fillColor, drawingMode, saveState, canvasRef]); // Update dependencies as needed
+  }, [strokeWidth, strokeColor, fillColor, drawingMode, saveState, canvas]); // Update dependencies as needed
   
   
   
@@ -167,7 +184,7 @@ const DrawableCanvas = (props: CanvasProps) => {
    */
  return (
   <>
- {canvasRef && width != 0 &&
+
     <div style={{ position: "relative", height: "100%", width: "100%" }}>
       <div
         style={{
@@ -179,11 +196,18 @@ const DrawableCanvas = (props: CanvasProps) => {
          
         }}
       >
-        <img
+        <canvas
+        id = "backgroundimage-canvas"
+        width={width}
+        height={height}
+        style={{ border: "lightgrey 1px solid",  objectFit: "contain", maxWidth: "100%", maxHeight: "100%" }}
+        >
+        </canvas>
+        {/* <img
         style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
         src = {backgroundImageURL}>
         
-        </img>
+        </img> */}
       </div>
       <div
         style={{
@@ -216,7 +240,7 @@ const DrawableCanvas = (props: CanvasProps) => {
         />
       )} */}
     </div>
-}
+
     </>
   );
 };

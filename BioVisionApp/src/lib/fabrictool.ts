@@ -1,4 +1,4 @@
-import * as fabric from "fabric"
+import { fabric } from 'fabric';
 
 export interface ConfigureCanvasProps {
     fillColor: string

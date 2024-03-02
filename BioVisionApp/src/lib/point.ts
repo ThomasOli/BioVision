@@ -1,4 +1,4 @@
-import * as fabric from "fabric"
+import { fabric } from "fabric";
 import FabricTool, { ConfigureCanvasProps } from "./fabrictool"
 
 class PointTool extends FabricTool {
@@ -57,7 +57,7 @@ class PointTool extends FabricTool {
     let canvas = this._canvas
     let _clicked = o.e["button"]
     this.isMouseDown = true
-    let pointer = canvas.getScenePoint(o.e)
+    let pointer = canvas.getPointer(o.e)
     this.currentStartX = pointer.x - (this.strokeWidth / 2.)
     this.currentStartY = pointer.y //- (this._minRadius + this.strokeWidth)
     this.currentCircle = new fabric.Circle({
@@ -73,6 +73,8 @@ class PointTool extends FabricTool {
       radius: 2,
     })
     if (_clicked === 0) {
+      
+
       canvas.add(this.currentCircle)
       this._canvas.renderAll(); 
     }
