@@ -7,6 +7,7 @@ import { Paper, IconButton, Card, Stack, Grid, ImageList, ImageListItem } from "
 import ArrowBackIosNewIcon from "@mui/icons-material/ArrowBackIosNew";
 import ArrowForwardIosIcon from "@mui/icons-material/ArrowForwardIos";
 import { Delete } from "@mui/icons-material";
+import ImageCanvas from "./ImageCanvas";
 
 interface Dot {
   x: number;
@@ -167,31 +168,8 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ color, opacity }) => {
             }}
           >
             {currentFile && (
-              <img
-                src={URL.createObjectURL(currentFile)}
-                alt="current"
-                style={{ width: "100%", 
-                  height: "100%", 
-                  objectFit: "contain" // Added to remove cropping of main image
-                }}
-                onClick={handleImageClick}
-              />
+              <ImageCanvas imageUrl={URL.createObjectURL(currentFile)} opacity={opacity} color={color}/>
             )}
-            {dots.map((dot, index) => (
-              <div
-                key={index}
-                style={{
-                  position: "absolute",
-                  top: dot.y,
-                  left: dot.x,
-                  width: `${imageDimensions.width / 100}px`,
-                  height: `${imageDimensions.width / 100}px`,
-                  backgroundColor: `${color}`,
-                  borderRadius: "10px",
-                  opacity: `${opacity/100}`
-                }}
-              />
-            ))}
           </Card>
 
           <div
