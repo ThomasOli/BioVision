@@ -51,6 +51,7 @@ const DrawableCanvas = (props: CanvasProps) => {
   const [backgroundCanvas, setBackgroundCanvas] = useState(
     new fabric.StaticCanvas("")
   )
+ 
 
  const {
 
@@ -213,8 +214,8 @@ const DrawableCanvas = (props: CanvasProps) => {
         style={{
           position: "absolute",
           zIndex: 10,
-          top: "50%",
-          left: "50%",
+          top: "33%",
+          left: "33%",
           transform: "translate(-50%, -50%)",
         }}
       >
