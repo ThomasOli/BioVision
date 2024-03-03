@@ -1,5 +1,5 @@
 import { fabric } from 'fabric';
-import FabricTool, { ConfigureCanvasProps } from "./fabrictool"
+gimport FabricTool, { ConfigureCanvasProps } from "./fabrictool"
 
 class CircleTool extends FabricTool {
   isMouseDown: boolean = false
