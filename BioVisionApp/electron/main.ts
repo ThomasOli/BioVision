@@ -1,7 +1,22 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron';
 import * as path from 'path';
+const contextMenu = require('electron-context-menu');
 
 let mainWindow: BrowserWindow | null;
+
+const template = [
+  { label: 'Minimize', click: () => mainWindow?.minimize() },
+  { label: 'Maximize', click: () => mainWindow?.maximize() },
+  { type: 'separator' },
+  { label: 'Copy', click: () => mainWindow?.webContents.copy() },
+  { label: 'Paste', click: () => mainWindow?.webContents.paste() },
+  { label: 'Delete', click: () => mainWindow?.webContents.delete() },
+  { type: 'separator' },
+  { type: 'separator' },
+  { label: 'Quit', click: () => app.quit() },
+];
+
+contextMenu({ prepend: () => template });
 
 function createWindow() {
   mainWindow = new BrowserWindow({

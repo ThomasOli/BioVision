@@ -1,16 +1,41 @@
 import { useSelector, useDispatch } from "react-redux";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef} from "react";
 
 import * as fabric from "fabric";
 import { clearFiles, addFile, removeFile } from "../state/filesState/fileSlice";
 import { RootState } from "../state/store";
-import { IconButton, Card, Stack } from "@mui/material";
+import { Paper, IconButton, Card, Stack, Grid, ImageList, ImageListItem } from "@mui/material";
 import ArrowBackIosNewIcon from "@mui/icons-material/ArrowBackIosNew";
 import ArrowForwardIosIcon from "@mui/icons-material/ArrowForwardIos";
 import { Delete, Draw } from "@mui/icons-material";
 import DrawableCanvas from "./DrawableCanvas";
 import { current } from "@reduxjs/toolkit";
 const ImageCarousel: React.FC = () => {
+  const imageListContainerRef = useRef<HTMLDivElement>(null);
+  const imageContainer = document.getElementById("image-container");
+  const [imageDimensions, setImageDimensions] = useState<{
+    width: number;
+    height: number;
+  }>({
+    width: 50 ,
+    height: 50,
+  });
+  const [pastImageDimensions, setPastImageDimensions] = useState<{
+    width: number;
+    height: number;
+  }>({
+    width: 0,
+    height: 0,
+  });
+
+  const handleImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
+
+    if (imageContainer) {
+      const { width, height } = imageContainer.getBoundingClientRect();
+      setPastImageDimensions({ width, height });
+    }
+  };
+
   const files = useSelector((state: RootState) => state.files.fileArray);
   const dispatch = useDispatch();
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -29,7 +54,24 @@ const ImageCarousel: React.FC = () => {
   const prevFile = files[(currentIndex - 1 + files.length) % files.length];
   const nextFile = files[(currentIndex + 1) % files.length];
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
+  const scrollToCurrentImage = () => {
+    if (imageListContainerRef.current) {
+      const imageListItem = imageListContainerRef.current.querySelector(
+        `[data-index="${currentIndex}"]`
+      ) as HTMLDivElement;
 
+      if (imageListItem) {
+        imageListItem.scrollIntoView({
+          behavior: "smooth",
+          inline: "center",
+        });
+      }
+    }
+  };
+
+  const handleImageListItemClick = (index: number) => {
+    setCurrentIndex(index);
+  }
   useEffect(() => {
     if (currentFile) {
       const img = new Image();
@@ -67,7 +109,7 @@ const ImageCarousel: React.FC = () => {
   return (
     <>
       {showNav &&(
-        <Stack>
+        <Stack sx={{display: 'flex', flexDirection: 'column', alignItems: 'center'}}>
             
           <Card
            id="image-container"
@@ -76,13 +118,24 @@ const ImageCarousel: React.FC = () => {
              display: "flex",
              height: "70vh",
              width: "100vh",
-
+             alignItems: "center",
+             justifyContent: "center",
              mb: "2rem",
              mt: "2rem",
              backgroundColor: '#242424' // matching the background of the default color,
            }}
           >
-            
+            {currentFile && (
+              <img
+                src={URL.createObjectURL(currentFile)}
+                alt="current"
+                style={{ width: "100%", 
+                  height: "100%", 
+                  objectFit: "contain" // Added to remove cropping of main image
+                }}
+                onClick={handleImageClick}
+              />
+            )}
             <DrawableCanvas
               fillColor={"rgba(255, 165, 0, 0.3)"}
               strokeWidth={2}
@@ -97,22 +150,41 @@ const ImageCarousel: React.FC = () => {
             />
             
           </Card>
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
-            {prevFile && (
-              <img
-                src={URL.createObjectURL(prevFile)}
-                alt="previous"
-                style={{ width: "100px", height: "auto" }}
-              />
-            )}
-            {nextFile && (
-              <img
-                src={URL.createObjectURL(nextFile)}
-                alt="next"
-                style={{ width: "100px", height: "auto" }}
-              />
-            )}
+          <div
+            ref={imageListContainerRef}
+            style={{
+              overflowX: "auto",
+              maxWidth: "70%",
+            }}
+          >
+            <ImageList
+              sx={{
+                gridAutoFlow: "column",
+                justifyContent: "space-between",
+              }}
+            >
+              {files.map((file, index) => (
+                <ImageListItem
+                  key={index}
+                  data-index={index}
+                  sx={{ width: "100px", height: "100px" }}
+                  onClick={() => handleImageListItemClick(index)}
+                >
+                  <img
+                    src={URL.createObjectURL(file)}
+                    alt={`image-${index}`}
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      objectFit: "cover",
+                      border: currentIndex === index ? "3px solid lime" : "none",
+                    }}
+                  />
+                </ImageListItem>
+              ))}
+            </ImageList>
           </div>
+
           <Card
             sx={{
               display: "flex",
