@@ -73,14 +73,15 @@ const ImageCarousel: React.FC = () => {
            id="image-container"
            elevation={0}
            sx={{
-             display: "flex",
-             height: "70vh",
-             width: "100vh",
-
-             mb: "2rem",
-             mt: "2rem",
-             backgroundColor: '#242424' // matching the background of the default color,
-           }}
+            display: "flex",
+            height: "70vh",
+            width: "100vh",
+            alignItems: "center",
+            justifyContent: "center",
+            mb: "2rem",
+            mt: "2rem",
+            backgroundColor: '#242424' // matching the background of the default color,
+          }}
           >
             
             <DrawableCanvas
@@ -92,8 +93,6 @@ const ImageCarousel: React.FC = () => {
               drawingMode={"point"}
               initialDrawing={{}}
               displayToolbar={true}
-              height = {imageSize.height}
-              width = {imageSize.width}
             />
             
           </Card>

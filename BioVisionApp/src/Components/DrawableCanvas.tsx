@@ -20,8 +20,6 @@ interface CanvasProps {
   drawingMode: string;
   initialDrawing: any; // Adjust the type according to your data structure
   displayToolbar: boolean;
-  width: number;
-  height:number;
 }
 
 /**
@@ -35,8 +33,6 @@ const DrawableCanvas = (props: CanvasProps) => {
     strokeWidth,
     strokeColor,
     initialDrawing,
-    height,
-    width,
     displayToolbar,
     
   } = props;
@@ -45,22 +41,15 @@ const DrawableCanvas = (props: CanvasProps) => {
   /**
    * State initialization
    */
-  
-  const [canvas, setCanvas] = useState(new fabric.Canvas(""))
- 
-  const [backgroundCanvas, setBackgroundCanvas] = useState(
-    new fabric.StaticCanvas("")
-  )
+//  const {
 
- const {
-
-    saveState,
-    undo,
-    redo,
-    canUndo,
-    canRedo,
-    resetState,
-  } = useCanvasState();
+//     saveState,
+//     undo,
+//     redo,
+//     canUndo,
+//     canRedo,
+//     resetState,
+//   } = useCanvasState();
 
   /**
    * Initialize canvases on component mount
@@ -70,17 +59,40 @@ const DrawableCanvas = (props: CanvasProps) => {
     
     const c = new fabric.Canvas("canvas", {
       enableRetinaScaling: false,
+      selection: false,
     })
-    
 
-    const imgC = new fabric.StaticCanvas("backgroundimage-canvas", {
-      enableRetinaScaling: false,
-     
-    })
-    setCanvas(c)
-    setBackgroundCanvas(imgC)
+    fabric.Image.fromURL(backgroundImageURL, function (img) {
+      if (img) {
+        c.setDimensions({ width: img.getOriginalSize().width, height: img.getOriginalSize().height });
+        c.setBackgroundImage(img, c.renderAll.bind(c), {
+          
+        });
 
-    
+        // Add dots on top of the image
+        c.on('mouse:down', function (options) {
+          const pointer = c.getPointer(options.e);
+          const x = pointer.x;
+          const y = pointer.y;
+
+          // Create a dot
+          const dot = new fabric.Circle({
+            radius: 5,
+            fill: fillColor,
+            left: x,
+            top: y,
+            selectable: false, // Disable selection of the dot
+          });
+
+          c.add(dot);
+        });
+      }
+    });
+
+    return () => {
+      c.dispose(); // Cleanup Fabric canvas
+    };
+        
     // return () => {
     //   if (canvas && backgroundCanvas) {
     //    canvas.dispose();
@@ -91,91 +103,22 @@ const DrawableCanvas = (props: CanvasProps) => {
 
 
   // useEffect(() => {
-  //   if (!isEqual(initialState, initialDrawing)) {
-  //     canvas.loadFromJSON(initialDrawing, () => {
-  //       canvas.renderAll()
-  //       resetState(initialDrawing)
-  //     })
-  //   }
-  // }, [canvas, initialDrawing, initialState, resetState])
-
-  /**
-   * Update background image
-   */
-  // useEffect(() => {
-  //   if (backgroundCanvas && backgroundImageURL) {
-  //       //@ts-ignore 
-  //       fabric.FabricImage.fromURL(backgroundImageURL, (img) => {
-  //         // Optionally scale image to fit the canvas
-          
-  //         img.set({
-  //           originX: "left",
-  //           originY: "top",
-  //           selectable: false, // make the background image unselectable
-  //         });
-  
-  //         backgroundCanvas.add(img);
-  //         backgroundCanvas.renderAll();
-  //       });
-  //     }
-  //   }, [backgroundCanvas, backgroundImageURL]);
-  
-  useEffect(() => {
-    if (backgroundImageURL && backgroundCanvas) {
-        fabric.Image.fromURL(backgroundImageURL, function(img){
-        backgroundCanvas.setBackgroundImage(img, backgroundCanvas.renderAll.bind(backgroundCanvas),{})
-        
-        })
-    }
-}, [backgroundImageURL, backgroundCanvas]);
-
-
-
-
-  // useEffect(() => {
-  //   if (backgroundImageURL && backgroundCanvas ) {
-  //     var bgImage = new Image();
-  //     bgImage.onload = function () {
-  //         backgroundCanvas.getContext().drawImage(bgImage, 0, 0, 100, 100);
-  //         backgroundCanvas.renderAll();
-        
-  //     };
-  //     bgImage.src = backgroundImageURL;
-  //   }
-  // }, [backgroundCanvas, backgroundImageURL]);
-
-    //   useEffect(() => {
-  //     if (shouldReloadCanvas) {
-  //       canvas.loadFromJSON(currentState, () => {})
-  //   }
-  // }, [canvas, shouldReloadCanvas, currentState])
-
-
-  useEffect(() => {
     
-    if (canvas && width!=0) {
-      // Initialize and configure the selected tool
+  //   if (canvas && width!=0) {
+  //     // Initialize and configure the selected tool
       
-      const selectedTool = new PointTool(canvas) as FabricTool;
-      const cleanupToolEvents = selectedTool.configureCanvas({
-        fillColor: fillColor,
-        strokeWidth: strokeWidth,
-        strokeColor: strokeColor,
-      });
+  //     // Add event listener for mouse up event
+  //     canvas.on("mouse:up", () => {
+  //       saveState(canvas.toJSON());
+  //     });
      
-      // Add event listener for mouse up event
-      canvas.on("mouse:up", () => {
-        saveState(canvas.toJSON());
-      });
-     
-      // Cleanup function to remove event listeners and any other cleanup needed
-      return () => {
-        cleanupToolEvents();
-        canvas.off("mouse:up", () => {})
-        canvas.off("mouse:dblclick", () => {})
-      };
-    }
-  }, [strokeWidth, strokeColor, fillColor, drawingMode, saveState, canvas]); // Update dependencies as needed
+  //     // Cleanup function to remove event listeners and any other cleanup needed
+  //     return () => {
+  //       canvas.off("mouse:up", () => {})
+  //       canvas.off("mouse:dblclick", () => {})
+  //     };
+  //   }
+  // }, [strokeWidth, strokeColor, fillColor, drawingMode, saveState, canvas]); // Update dependencies as needed
   
   
   
@@ -184,62 +127,10 @@ const DrawableCanvas = (props: CanvasProps) => {
    */
  return (
   <>
-
-    <div style={{ position: "relative", height: "100%", width: "100%" }}>
-      <div
-        style={{
-          position: "absolute",
-          zIndex: 0,
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-         
-        }}
-      >
-        <canvas
-        id = "backgroundimage-canvas"
-        width={width}
-        height={height}
-        style={{ border: "lightgrey 1px solid",  objectFit: "contain", maxWidth: "100%", maxHeight: "100%" }}
-        >
-        </canvas>
-        {/* <img
-        style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
-        src = {backgroundImageURL}>
-        
-        </img> */}
-      </div>
-      <div
-        style={{
-          position: "absolute",
-          zIndex: 10,
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-        }}
-      >
         <canvas
           id="canvas"
-          width={width}
-          height={height}
-          style={{ border: "lightgrey 1px solid",  objectFit: "contain", maxWidth: "100%", maxHeight: "100%" }}
+          style={{ border: "lightgrey 1px solid"}}
         />
-
-       
-      </div>
-      {/* {displayToolbar && (
-        <CanvasToolbar
-          topPosition={height}
-          leftPosition={width}
-          canUndo={canUndo}
-          canRedo={canRedo}
-          undoCallback={undo}
-          redoCallback={redo}
-          resetCallback={() => {
-          }}
-        />
-      )} */}
-    </div>
 
     </>
   );
