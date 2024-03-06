@@ -125,7 +125,7 @@ const DrawableCanvas = (props: CanvasProps) => {
     if (backgroundImageURL && backgroundCanvas) {
         fabric.Image.fromURL(backgroundImageURL, function(img){
         backgroundCanvas.setBackgroundImage(img, backgroundCanvas.renderAll.bind(backgroundCanvas),{})
-        
+       
         })
     }
 }, [backgroundImageURL, backgroundCanvas]);
@@ -179,6 +179,20 @@ const DrawableCanvas = (props: CanvasProps) => {
   }, [strokeWidth, strokeColor, fillColor, drawingMode, saveState, canvas]); // Update dependencies as needed
   
   
+  useEffect(() => {
+    const saveCanvasState = () => {
+      dispatch(setCanvasState({ imageId: currentFile.name, canvasState: canvas.toJSON() }));
+    };
+  
+    canvas.on('object:modified', saveCanvasState);
+    canvas.on('mouse:up', saveCanvasState);
+  
+    return () => {
+      canvas.off('object:modified', saveCanvasState);
+      canvas.off('mouse:up', saveCanvasState);
+    };
+  }, [canvas, currentFile, dispatch]);
+
   
   /**
    * Render canvas w/ toolbar

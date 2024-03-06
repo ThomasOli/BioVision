@@ -10,6 +10,7 @@ import ArrowForwardIosIcon from "@mui/icons-material/ArrowForwardIos";
 import { Delete, Draw } from "@mui/icons-material";
 import DrawableCanvas from "./DrawableCanvas";
 import { current } from "@reduxjs/toolkit";
+import { setCanvasState } from "../state/canvasState/canvasSlice";
 const ImageCarousel: React.FC = () => {
   const files = useSelector((state: RootState) => state.files.fileArray);
   const dispatch = useDispatch();
@@ -17,14 +18,16 @@ const ImageCarousel: React.FC = () => {
 
   const [showNav, setshowNav] = useState(false);
   const handleNext = () => {
+    dispatch(setCanvasState({ imageId: currentFile.name, canvasState: canvas.toJSON() }));
     setCurrentIndex((prevIndex) => (prevIndex + 1) % files.length);
   };
-
+  
   const handleBack = () => {
-    setCurrentIndex(
-      (prevIndex) => (prevIndex - 1 + files.length) % files.length
-    );
+    dispatch(setCanvasState({ imageId: currentFile.name, canvasState: canvas.toJSON() }));
+    setCurrentIndex((prevIndex) => (prevIndex - 1 + files.length) % files.length);
   };
+
+
   const currentFile = files[currentIndex];
   const prevFile = files[(currentIndex - 1 + files.length) % files.length];
   const nextFile = files[(currentIndex + 1) % files.length];
@@ -36,6 +39,26 @@ const ImageCarousel: React.FC = () => {
       img.onload = () => {
         // Set state with image dimensions
         setImageSize({ width: img.naturalWidth, height: img.naturalHeight });
+
+        const canvasState = useSelector((state: RootState) => state.canvas[currentFile.name]);
+        
+        if (canvasState) {
+          const canvas = useSelector((state: RootState) => state.canvas.canvasInstance);
+          canvas.loadFromJSON(canvasState, () => {
+          canvas.renderAll();
+          });
+        } else {
+          // Create a new canvas instance
+          const newCanvas = new fabric.Canvas('canvas', {
+            enableRetinaScaling: false,
+            width: img.naturalWidth,
+            height: img.naturalHeight,
+          });
+          setCanvas(newCanvas);
+        }
+
+
+
       };
       img.src = URL.createObjectURL(currentFile);
   
