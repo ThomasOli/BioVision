@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import Menu from './Components/Menu';
+import {Grid, Stack} from '@mui/material'
 import ImageCarousel from './Components/ImageCarousel';
 
 
@@ -14,17 +15,15 @@ const App: React.FC = () => {
   };
 
   return (
-    <div style={{display: 'flex', height: '100vh'}}>
-      <Menu  onOpacityChange = {handleOpacityChange} onColorChange={handleColorChange}/>
-      <div style={{
-       paddingLeft: "20vw",
-       paddingRight:"20vw",
-       
-      }}>
+    <Grid container sx={{maxWidth: "100vw"}}>
+      <Grid item xs={4}>
+        <Menu  onOpacityChange = {handleOpacityChange} onColorChange={handleColorChange}/>
+      </Grid>
+      <Grid item xs={8}>
         <ImageCarousel color ={color} opacity={opacity}/>
-      </div>
+      </Grid>
       
-    </div>
+    </Grid>
   );
 };
 
