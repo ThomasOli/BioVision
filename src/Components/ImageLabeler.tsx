@@ -1,4 +1,4 @@
-// components/ImageLabeler.tsx
+// src/Components/ImageLabeler.tsx
 import React, { useRef, useState, useCallback } from 'react';
 import { Stage, Layer, Image as KonvaImage, Circle, Text } from 'react-konva';
 import useImageLoader from '../hooks/useImageLoader';
@@ -14,16 +14,14 @@ interface ImageLabelerProps {
   imageURL: string;
   initialPoints: Point[];
   onPointsChange: (points: Point[]) => void;
+  color: string;
+  opacity: number;
 }
 
-const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, onPointsChange }) => {
+const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, onPointsChange, color, opacity }) => {
   const [points, setPoints] = useState<Point[]>(initialPoints || []);
   const [image, imageDimensions] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
-
-  // Zoom and Pan State
-  const [scale, setScale] = useState<number>(1);
-  const [position, setPosition] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
   // Handle canvas click to add a point
   const handleCanvasClick = useCallback(
@@ -34,8 +32,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
       const pointerPosition = stage?.getPointerPosition();
       if (pointerPosition) {
         const newPoint: Point = {
-          x: (pointerPosition.x - position.x) / scale,
-          y: (pointerPosition.y - position.y) / scale,
+          x: pointerPosition.x,
+          y: pointerPosition.y,
           id: Date.now(),
         };
         const updatedPoints = [...points, newPoint];
@@ -43,7 +41,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
         onPointsChange(updatedPoints);
       }
     },
-    [image, points, onPointsChange, scale, position]
+    [image, points, onPointsChange]
   );
 
   // Export points to JSON
@@ -86,78 +84,44 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
   const handlePointDragEnd = useCallback(
     (e: KonvaEventObject<DragEvent>, id: number) => {
       const { x, y } = e.target.position();
-      const updatedPoints = points.map((p) => (p.id === id ? { ...p, x: x / scale, y: y / scale } : p));
+      const updatedPoints = points.map((p) => (p.id === id ? { ...p, x, y } : p));
       setPoints(updatedPoints);
       onPointsChange(updatedPoints);
     },
-    [points, onPointsChange, scale]
-  );
-
-  // Handle Zoom
-  const handleWheel = useCallback(
-    (e: KonvaEventObject<WheelEvent>) => {
-      e.evt.preventDefault();
-      const stage = e.target.getStage();
-      if (!stage) return;
-
-      const oldScale = stage.scaleX();
-      const pointer = stage.getPointerPosition();
-      if (!pointer) return;
-
-      const scaleBy = 1.05;
-      const direction = e.evt.deltaY > 0 ? -1 : 1;
-      const newScale = direction > 0 ? oldScale * scaleBy : oldScale / scaleBy;
-
-      setScale(newScale);
-
-      const mousePointTo = {
-        x: (pointer.x - position.x) / oldScale,
-        y: (pointer.y - position.y) / oldScale,
-      };
-
-      const newPos = {
-        x: pointer.x - mousePointTo.x * newScale,
-        y: pointer.y - mousePointTo.y * newScale,
-      };
-      setPosition(newPos);
-    },
-    [position]
+    [points, onPointsChange]
   );
 
   return (
     <div>
       {image && imageDimensions && (
         <Stage
-          width={800}
-          height={600}
+          width={800} // Adjust based on your design
+          height={600} // Adjust based on your design
           onClick={handleCanvasClick}
-          onWheel={handleWheel}
-          scaleX={scale}
-          scaleY={scale}
-          x={position.x}
-          y={position.y}
-          draggable
           ref={stageRef}
           style={{ border: '1px solid gray', marginTop: '10px', backgroundColor: '#f0f0f0' }}
         >
           <Layer>
+            {/* Render the uploaded image */}
             <KonvaImage image={image} width={imageDimensions.width} height={imageDimensions.height} />
+            {/* Render the points */}
             {points.map((point) => (
               <React.Fragment key={point.id}>
                 <Circle
-                  x={point.x * scale + position.x}
-                  y={point.y * scale + position.y}
-                  radius={5 * scale}
-                  fill="red"
+                  x={point.x}
+                  y={point.y}
+                  radius={5}
+                  fill={color}
+                  opacity={opacity / 100}
                   draggable
                   onDragEnd={(e) => handlePointDragEnd(e, point.id)}
                   onContextMenu={(e) => handlePointRightClick(e, point.id)}
                 />
                 <Text
-                  x={point.x * scale + position.x + 10}
-                  y={point.y * scale + position.y - 10}
+                  x={point.x + 10}
+                  y={point.y - 10}
                   text={`(${Math.round(point.x)}, ${Math.round(point.y)})`}
-                  fontSize={12 * scale}
+                  fontSize={12}
                   fill="black"
                 />
               </React.Fragment>
@@ -166,7 +130,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
         </Stage>
       )}
       {points.length > 0 && (
-        <button onClick={handleExport} style={{ marginTop: '10px' }}>
+        <button onClick={handleExport} style={{ marginTop: '10px', padding: '10px 20px' }}>
           Export Data as JSON
         </button>
       )}

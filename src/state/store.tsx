@@ -1,12 +1,10 @@
 import { configureStore } from "@reduxjs/toolkit";
 import fileReducer from "./filesState/fileSlice";
-import canvasReducer from './canvasState/canvasSlice';
 
 
 export const store = configureStore({
     reducer: {
         files: fileReducer,
-        canvas: canvasReducer, 
     },
 })
 

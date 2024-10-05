@@ -1,6 +1,9 @@
-// components/ImageLabelerCarousel.tsx
-import React, { useState } from 'react';
-import ImageCarousel from './ImageCarousel';
+// src/Components/ImageLabelerCarousel.tsx
+import React, { useState, useCallback } from 'react';
+import Slider from 'react-slick';
+import "slick-carousel/slick/slick.css"; 
+import "slick-carousel/slick/slick-theme.css";
+import ImageLabeler from './ImageLabeler';
 
 interface Point {
   x: number;
@@ -14,9 +17,14 @@ interface ImageData {
   labels: Point[];
 }
 
-const ImageLabelerCarousel: React.FC = () => {
+interface ImageLabelerCarouselProps {
+  color: string;
+  opacity: number;
+}
+
+const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opacity }) => {
   const [images, setImages] = useState<ImageData[]>([
-    // Initialize with some images or leave empty and add via file input
+    // Initialize with sample images or leave empty
     {
       id: 1,
       url: 'https://via.placeholder.com/800x600.png?text=Image+1',
@@ -27,17 +35,16 @@ const ImageLabelerCarousel: React.FC = () => {
       url: 'https://via.placeholder.com/800x600.png?text=Image+2',
       labels: [],
     },
-    // Add more images as needed
   ]);
 
   // Handle updating labels for a specific image
-  const handleUpdateLabels = (imageId: number, labels: Point[]) => {
+  const handleUpdateLabels = useCallback((imageId: number, labels: Point[]) => {
     setImages((prevImages) =>
       prevImages.map((img) =>
         img.id === imageId ? { ...img, labels } : img
       )
     );
-  };
+  }, []);
 
   // Handle adding new images via file input
   const handleAddImages = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -54,6 +61,11 @@ const ImageLabelerCarousel: React.FC = () => {
 
     // Reset the file input
     e.target.value = '';
+  };
+
+  // Handle deleting an image
+  const handleDeleteImage = (imageId: number) => {
+    setImages((prevImages) => prevImages.filter((img) => img.id !== imageId));
   };
 
   // Handle exporting all labeled data
@@ -75,22 +87,56 @@ const ImageLabelerCarousel: React.FC = () => {
     URL.revokeObjectURL(urlBlob);
   };
 
-  // Handle deleting an image
-  const handleDeleteImage = (imageId: number) => {
-    setImages((prevImages) => prevImages.filter((img) => img.id !== imageId));
+  const settings = {
+    dots: true,
+    infinite: false,
+    speed: 500,
+    slidesToShow: 1,
+    slidesToScroll: 1,
+    adaptiveHeight: true,
   };
 
   return (
-    <div>
-      <h2>Image Labeler Carousel</h2>
-      <input type="file" accept="image/*" multiple onChange={handleAddImages} />
-      <ImageCarousel
-        images={images}
-        onUpdateLabels={handleUpdateLabels}
-        onDeleteImage={handleDeleteImage}
+    <div style={{ padding: '20px' }}>
+      <input
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={handleAddImages}
+        style={{ marginBottom: '20px' }}
       />
+      <Slider {...settings}>
+        {images.map((image) => (
+          <div key={image.id} style={{ position: 'relative' }}>
+            <ImageLabeler
+              imageURL={image.url}
+              initialPoints={image.labels}
+              onPointsChange={(newPoints) => handleUpdateLabels(image.id, newPoints)}
+              color={color}
+              opacity={opacity}
+            />
+            {/* Delete Button */}
+            <button
+              onClick={() => handleDeleteImage(image.id)}
+              style={{
+                position: 'absolute',
+                top: '10px',
+                right: '10px',
+                padding: '5px 10px',
+                backgroundColor: 'red',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: 'pointer',
+              }}
+            >
+              Delete Image
+            </button>
+          </div>
+        ))}
+      </Slider>
       {images.length > 0 && (
-        <button onClick={handleExportAll} style={{ marginTop: '20px' }}>
+        <button onClick={handleExportAll} style={{ marginTop: '20px', padding: '10px 20px' }}>
           Export All Labeled Data as JSON
         </button>
       )}
