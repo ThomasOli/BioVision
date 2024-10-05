@@ -31,14 +31,17 @@ function valuetext(value: number) {
   return `${value}°C`;
 }
 
-const Landmark: React.FC<LandmarkProps> = ({onColorChange, onOpacityChange}) => {
+const Landmark: React.FC<LandmarkProps> = ({
+  onColorChange,
+  onOpacityChange,
+}) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
 
   const handleSwitchChange = () => {
     setIsSwitchOn((prev) => !prev);
   };
 
-  const [color, setColor] = React.useState('red');
+  const [color, setColor] = React.useState("red");
   const [opacity, setOpacity] = React.useState<number>(100);
 
   const handleColorChange = (event: SelectChangeEvent) => {
@@ -49,7 +52,7 @@ const Landmark: React.FC<LandmarkProps> = ({onColorChange, onOpacityChange}) => 
   };
 
   const handleOpacityChange = (event: Event, newValue: number | number[]) => {
-    setOpacity(newValue as number)
+    setOpacity(newValue as number);
     onOpacityChange(newValue as number);
   };
 
@@ -98,9 +101,9 @@ const Landmark: React.FC<LandmarkProps> = ({onColorChange, onOpacityChange}) => 
             aria-label="outlined primary button group"
             disabled={isSwitchOn}
           >
-            <Button>Clear</Button>
-            <Button>Undo</Button>
-            <Button>Redo</Button>
+            <Button onClick={() => console.log("clear")}>Clear</Button>
+            <Button onClick={() => console.log("undo")}>Undo</Button>
+            <Button onClick={() => console.log("redo")}>Redo</Button>
           </ButtonGroup>
           <br></br>
           <ToggleButtonGroup
@@ -119,26 +122,26 @@ const Landmark: React.FC<LandmarkProps> = ({onColorChange, onOpacityChange}) => 
               <FormatUnderlinedIcon />
             </ToggleButton>
             <Box sx={{ minWidth: 120 }}>
-            <FormControl fullWidth>
-              <InputLabel id="demo-simple-select-label">Color</InputLabel>
-              <Select
-                labelId="demo-simple-select-label"
-                id="demo-simple-select"
-                value={color}
-                label="color"
-                onChange={handleColorChange}
-                disabled={isSwitchOn}
-              >
-                <MenuItem value={'red'}>Red</MenuItem>
-                <MenuItem value={'orange'}>Orange</MenuItem>
-                <MenuItem value={'yellow'}>Yellow</MenuItem>
-                <MenuItem value={'green'}>Green</MenuItem>
-                <MenuItem value={'blue'}>Blue</MenuItem>
-                <MenuItem value={'purple'}>Purple</MenuItem>
-                <MenuItem value={'white'}>White</MenuItem>
-                <MenuItem value={'black'}>Black</MenuItem>
-              </Select>
-            </FormControl>
+              <FormControl fullWidth>
+                <InputLabel id="demo-simple-select-label">Color</InputLabel>
+                <Select
+                  labelId="demo-simple-select-label"
+                  id="demo-simple-select"
+                  value={color}
+                  label="color"
+                  onChange={handleColorChange}
+                  disabled={isSwitchOn}
+                >
+                  <MenuItem value={"red"}>Red</MenuItem>
+                  <MenuItem value={"orange"}>Orange</MenuItem>
+                  <MenuItem value={"yellow"}>Yellow</MenuItem>
+                  <MenuItem value={"green"}>Green</MenuItem>
+                  <MenuItem value={"blue"}>Blue</MenuItem>
+                  <MenuItem value={"purple"}>Purple</MenuItem>
+                  <MenuItem value={"white"}>White</MenuItem>
+                  <MenuItem value={"black"}>Black</MenuItem>
+                </Select>
+              </FormControl>
             </Box>
           </ToggleButtonGroup>
 
@@ -154,7 +157,7 @@ const Landmark: React.FC<LandmarkProps> = ({onColorChange, onOpacityChange}) => 
             disabled={isSwitchOn}
             valueLabelDisplay="auto"
             value={opacity}
-            onChange = {handleOpacityChange}
+            onChange={handleOpacityChange}
           />
         </Box>
         {/* Add more elements as needed */}
