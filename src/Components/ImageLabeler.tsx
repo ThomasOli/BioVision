@@ -1,8 +1,9 @@
 // src/Components/ImageLabeler.tsx
-import React, { useRef, useState, useCallback } from 'react';
+import React, { useRef, useState, useCallback, useEffect } from 'react';
 import { Stage, Layer, Image as KonvaImage, Circle, Text } from 'react-konva';
 import useImageLoader from '../hooks/useImageLoader';
 import { KonvaEventObject } from 'konva/lib/Node';
+import { Button, Box } from '@mui/material';
 
 interface Point {
   x: number;
@@ -18,22 +19,47 @@ interface ImageLabelerProps {
   opacity: number;
 }
 
-const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, onPointsChange, color, opacity }) => {
+const ImageLabeler: React.FC<ImageLabelerProps> = ({
+  imageURL,
+  initialPoints,
+  onPointsChange,
+  color,
+  opacity,
+}) => {
   const [points, setPoints] = useState<Point[]>(initialPoints || []);
-  const [image, imageDimensions] = useImageLoader(imageURL);
+  const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
+
+  // Zoom state (for standard view zooming, if needed)
+  // For this implementation, zooming is handled via magnified view
+  // Hence, we can remove or disable the existing zoom controls here
+
+  // Update points when initialPoints or imageURL changes
+  useEffect(() => {
+    console.log('ImageLabeler: Updating points based on new props.');
+    setPoints(initialPoints || []);
+  }, [initialPoints, imageURL]);
 
   // Handle canvas click to add a point
   const handleCanvasClick = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
-      if (!image) return;
+      if (!image || !imageDimensions) return;
 
       const stage = e.target.getStage();
       const pointerPosition = stage?.getPointerPosition();
       if (pointerPosition) {
+        // Convert pointer position to image coordinates
+        const x = (pointerPosition.x - stage!.x()) / stage!.scaleX();
+        const y = (pointerPosition.y - stage!.y()) / stage!.scaleY();
+
+        // Check if click is within image boundaries
+        if (x < 0 || y < 0 || x > imageDimensions.width || y > imageDimensions.height) {
+          return; // Click outside image area
+        }
+
         const newPoint: Point = {
-          x: pointerPosition.x,
-          y: pointerPosition.y,
+          x: x,
+          y: y,
           id: Date.now(),
         };
         const updatedPoints = [...points, newPoint];
@@ -41,7 +67,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
         onPointsChange(updatedPoints);
       }
     },
-    [image, points, onPointsChange]
+    [image, imageDimensions, points, onPointsChange]
   );
 
   // Export points to JSON
@@ -91,15 +117,23 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
     [points, onPointsChange]
   );
 
+  if (imageError) {
+    return <div style={{ color: 'red' }}>Error loading image.</div>;
+  }
+
   return (
-    <div>
+    <Box sx={{ display: 'inline-block', position: 'relative' }}>
       {image && imageDimensions && (
         <Stage
-          width={800} // Adjust based on your design
-          height={600} // Adjust based on your design
+          width={imageDimensions.width}
+          height={imageDimensions.height}
           onClick={handleCanvasClick}
           ref={stageRef}
-          style={{ border: '1px solid gray', marginTop: '10px', backgroundColor: '#f0f0f0' }}
+          style={{
+            border: '1px solid gray',
+            backgroundColor: '#f0f0f0',
+            cursor: 'crosshair',
+          }}
         >
           <Layer>
             {/* Render the uploaded image */}
@@ -110,19 +144,12 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
                 <Circle
                   x={point.x}
                   y={point.y}
-                  radius={5}
+                  radius={3}
                   fill={color}
-                  opacity={opacity / 100}
+                  opacity={opacity / 100} // Convert percentage to decimal
                   draggable
                   onDragEnd={(e) => handlePointDragEnd(e, point.id)}
                   onContextMenu={(e) => handlePointRightClick(e, point.id)}
-                />
-                <Text
-                  x={point.x + 10}
-                  y={point.y - 10}
-                  text={`(${Math.round(point.x)}, ${Math.round(point.y)})`}
-                  fontSize={12}
-                  fill="black"
                 />
               </React.Fragment>
             ))}
@@ -130,11 +157,16 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
         </Stage>
       )}
       {points.length > 0 && (
-        <button onClick={handleExport} style={{ marginTop: '10px', padding: '10px 20px' }}>
+        <Button
+          variant="contained"
+          color="primary"
+          onClick={handleExport}
+          sx={{ marginTop: '10px' }}
+        >
           Export Data as JSON
-        </button>
+        </Button>
       )}
-    </div>
+    </Box>
   );
 };
 
