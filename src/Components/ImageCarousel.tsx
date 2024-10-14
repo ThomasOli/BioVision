@@ -1,9 +1,9 @@
 // components/ImageCarousel.tsx
-import React from 'react';
-import Slider from 'react-slick';
-import 'slick-carousel/slick/slick.css'; 
-import 'slick-carousel/slick/slick-theme.css';
-import ImageLabeler from './ImageLabeler';
+import React from "react";
+import Slider from "react-slick";
+import "slick-carousel/slick/slick.css";
+import "slick-carousel/slick/slick-theme.css";
+import ImageLabeler from "./ImageLabeler";
 
 interface ImageData {
   id: number;
@@ -23,7 +23,11 @@ interface ImageCarouselProps {
   onDeleteImage: (imageId: number) => void;
 }
 
-const ImageCarousel: React.FC<ImageCarouselProps> = ({ images, onUpdateLabels, onDeleteImage }) => {
+const ImageCarousel: React.FC<ImageCarouselProps> = ({
+  images,
+  onUpdateLabels,
+  onDeleteImage,
+}) => {
   const settings = {
     dots: true,
     infinite: false,
@@ -36,10 +40,10 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ images, onUpdateLabels, o
   return (
     <Slider {...settings}>
       {images.map((image) => (
-        <div key={image.id} style={{ position: 'relative' }}>
+        <div key={image.id} style={{ position: "relative" }}>
           <ImageLabeler
-            color ={"red"}
-            opacity = {100}
+            color={"red"}
+            opacity={100}
             imageURL={image.url}
             initialPoints={image.labels}
             onPointsChange={(newPoints) => onUpdateLabels(image.id, newPoints)}
@@ -48,15 +52,15 @@ const ImageCarousel: React.FC<ImageCarouselProps> = ({ images, onUpdateLabels, o
           <button
             onClick={() => onDeleteImage(image.id)}
             style={{
-              position: 'absolute',
-              top: '10px',
-              right: '10px',
-              padding: '5px 10px',
-              backgroundColor: 'red',
-              color: 'white',
-              border: 'none',
-              borderRadius: '3px',
-              cursor: 'pointer',
+              position: "absolute",
+              top: "10px",
+              right: "10px",
+              padding: "5px 10px",
+              backgroundColor: "red",
+              color: "white",
+              border: "none",
+              borderRadius: "3px",
+              cursor: "pointer",
             }}
           >
             Delete Image

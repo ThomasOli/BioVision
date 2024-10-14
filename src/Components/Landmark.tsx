@@ -1,5 +1,7 @@
-import React, { useState } from "react";
+import React, { useState, useContext } from "react";
 import Select, { SelectChangeEvent } from "@mui/material/Select";
+
+import { MyContext } from "./MyContext";
 
 import {
   Box,
@@ -15,11 +17,11 @@ import {
   FormControl,
 } from "@mui/material";
 import {
-  ArrowDropDown as ArrowDropDownIcon,
+  // ArrowDropDown as ArrowDropDownIcon,
   FormatBold as FormatBoldIcon,
   FormatItalic as FormatItalicIcon,
   FormatUnderlined as FormatUnderlinedIcon,
-  FormatColorFill as FormatColorFillIcon,
+  // FormatColorFill as FormatColorFillIcon,
 } from "@mui/icons-material";
 
 interface LandmarkProps {
@@ -36,6 +38,8 @@ const Landmark: React.FC<LandmarkProps> = ({
   onOpacityChange,
 }) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
+
+  const { images, setImages, undo } = useContext(MyContext); // Access context here
 
   const handleSwitchChange = () => {
     setIsSwitchOn((prev) => !prev);
@@ -102,7 +106,7 @@ const Landmark: React.FC<LandmarkProps> = ({
             disabled={isSwitchOn}
           >
             <Button onClick={() => console.log("clear")}>Clear</Button>
-            <Button onClick={() => console.log("undo")}>Undo</Button>
+            <Button onClick={() => undo()}>Undo</Button>
             <Button onClick={() => console.log("redo")}>Redo</Button>
           </ButtonGroup>
           <br></br>

@@ -1,8 +1,9 @@
 // src/Components/ImageLabeler.tsx
-import React, { useRef, useState, useCallback } from 'react';
-import { Stage, Layer, Image as KonvaImage, Circle, Text } from 'react-konva';
-import useImageLoader from '../hooks/useImageLoader';
-import { KonvaEventObject } from 'konva/lib/Node';
+import React, { useRef, useState, useCallback, useContext } from "react";
+import { Stage, Layer, Image as KonvaImage, Circle, Text } from "react-konva";
+import useImageLoader from "../hooks/useImageLoader";
+import { KonvaEventObject } from "konva/lib/Node";
+import { MyContext } from "./MyContext";
 
 interface Point {
   x: number;
@@ -18,8 +19,16 @@ interface ImageLabelerProps {
   opacity: number;
 }
 
-const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, onPointsChange, color, opacity }) => {
-  const [points, setPoints] = useState<Point[]>(initialPoints || []);
+const ImageLabeler: React.FC<ImageLabelerProps> = ({
+  imageURL,
+  initialPoints,
+  onPointsChange,
+  color,
+  opacity,
+}) => {
+  const { setPoints } = useContext(MyContext);
+  const points = initialPoints;
+  const [pointsHistory, setPointsHistory] = useState<Point[]>([]);
   const [image, imageDimensions] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
 
@@ -37,8 +46,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
           id: Date.now(),
         };
         const updatedPoints = [...points, newPoint];
+        const updatedPointsHistory = [...pointsHistory, newPoint];
         setPoints(updatedPoints);
         onPointsChange(updatedPoints);
+        setPointsHistory(updatedPointsHistory);
       }
     },
     [image, points, onPointsChange]
@@ -58,11 +69,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
       })),
     };
     const jsonData = JSON.stringify(data, null, 2);
-    const blob = new Blob([jsonData], { type: 'application/json' });
+    const blob = new Blob([jsonData], { type: "application/json" });
     const url = URL.createObjectURL(blob);
 
     // Create a link to trigger download
-    const a = document.createElement('a');
+    const a = document.createElement("a");
     a.href = url;
     a.download = `labeled_data_${Date.now()}.json`;
     a.click();
@@ -84,7 +95,9 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
   const handlePointDragEnd = useCallback(
     (e: KonvaEventObject<DragEvent>, id: number) => {
       const { x, y } = e.target.position();
-      const updatedPoints = points.map((p) => (p.id === id ? { ...p, x, y } : p));
+      const updatedPoints = points.map((p) =>
+        p.id === id ? { ...p, x, y } : p
+      );
       setPoints(updatedPoints);
       onPointsChange(updatedPoints);
     },
@@ -99,11 +112,19 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
           height={600} // Adjust based on your design
           onClick={handleCanvasClick}
           ref={stageRef}
-          style={{ border: '1px solid gray', marginTop: '10px', backgroundColor: '#f0f0f0' }}
+          style={{
+            border: "1px solid gray",
+            marginTop: "10px",
+            backgroundColor: "#f0f0f0",
+          }}
         >
           <Layer>
             {/* Render the uploaded image */}
-            <KonvaImage image={image} width={imageDimensions.width} height={imageDimensions.height} />
+            <KonvaImage
+              image={image}
+              width={imageDimensions.width}
+              height={imageDimensions.height}
+            />
             {/* Render the points */}
             {points.map((point) => (
               <React.Fragment key={point.id}>
@@ -130,7 +151,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, initialPoints, on
         </Stage>
       )}
       {points.length > 0 && (
-        <button onClick={handleExport} style={{ marginTop: '10px', padding: '10px 20px' }}>
+        <button
+          onClick={handleExport}
+          style={{ marginTop: "10px", padding: "10px 20px" }}
+        >
           Export Data as JSON
         </button>
       )}

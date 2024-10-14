@@ -1,9 +1,10 @@
 // src/Components/ImageLabelerCarousel.tsx
-import React, { useState, useCallback } from 'react';
-import Slider from 'react-slick';
-import "slick-carousel/slick/slick.css"; 
+import React, { useState, useCallback, useContext } from "react";
+import Slider from "react-slick";
+import "slick-carousel/slick/slick.css";
 import "slick-carousel/slick/slick-theme.css";
-import ImageLabeler from './ImageLabeler';
+import ImageLabeler from "./ImageLabeler";
+import { MyContext } from "./MyContext";
 
 interface Point {
   x: number;
@@ -22,27 +23,16 @@ interface ImageLabelerCarouselProps {
   opacity: number;
 }
 
-const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opacity }) => {
-  const [images, setImages] = useState<ImageData[]>([
-    // Initialize with sample images or leave empty
-    {
-      id: 1,
-      url: 'https://via.placeholder.com/800x600.png?text=Image+1',
-      labels: [],
-    },
-    {
-      id: 2,
-      url: 'https://via.placeholder.com/800x600.png?text=Image+2',
-      labels: [],
-    },
-  ]);
+const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
+  color,
+  opacity,
+}) => {
+  const { images, setImages } = useContext(MyContext);
 
   // Handle updating labels for a specific image
   const handleUpdateLabels = useCallback((imageId: number, labels: Point[]) => {
     setImages((prevImages) =>
-      prevImages.map((img) =>
-        img.id === imageId ? { ...img, labels } : img
-      )
+      prevImages.map((img) => (img.id === imageId ? { ...img, labels } : img))
     );
   }, []);
 
@@ -60,7 +50,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
     setImages((prevImages) => [...prevImages, ...newImages]);
 
     // Reset the file input
-    e.target.value = '';
+    e.target.value = "";
   };
 
   // Handle deleting an image
@@ -76,11 +66,11 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
       labels,
     }));
     const jsonData = JSON.stringify(data, null, 2);
-    const blob = new Blob([jsonData], { type: 'application/json' });
+    const blob = new Blob([jsonData], { type: "application/json" });
     const urlBlob = URL.createObjectURL(blob);
 
     // Create a link to trigger download
-    const a = document.createElement('a');
+    const a = document.createElement("a");
     a.href = urlBlob;
     a.download = `all_labeled_data_${Date.now()}.json`;
     a.click();
@@ -97,21 +87,23 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
   };
 
   return (
-    <div style={{ padding: '20px' }}>
+    <div style={{ padding: "20px" }}>
       <input
         type="file"
         accept="image/*"
         multiple
         onChange={handleAddImages}
-        style={{ marginBottom: '20px' }}
+        style={{ marginBottom: "20px" }}
       />
       <Slider {...settings}>
         {images.map((image) => (
-          <div key={image.id} style={{ position: 'relative' }}>
+          <div key={image.id} style={{ position: "relative" }}>
             <ImageLabeler
               imageURL={image.url}
               initialPoints={image.labels}
-              onPointsChange={(newPoints) => handleUpdateLabels(image.id, newPoints)}
+              onPointsChange={(newPoints) =>
+                handleUpdateLabels(image.id, newPoints)
+              }
               color={color}
               opacity={opacity}
             />
@@ -119,15 +111,15 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
             <button
               onClick={() => handleDeleteImage(image.id)}
               style={{
-                position: 'absolute',
-                top: '10px',
-                right: '10px',
-                padding: '5px 10px',
-                backgroundColor: 'red',
-                color: 'white',
-                border: 'none',
-                borderRadius: '3px',
-                cursor: 'pointer',
+                position: "absolute",
+                top: "10px",
+                right: "10px",
+                padding: "5px 10px",
+                backgroundColor: "red",
+                color: "white",
+                border: "none",
+                borderRadius: "3px",
+                cursor: "pointer",
               }}
             >
               Delete Image
@@ -136,7 +128,10 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
         ))}
       </Slider>
       {images.length > 0 && (
-        <button onClick={handleExportAll} style={{ marginTop: '20px', padding: '10px 20px' }}>
+        <button
+          onClick={handleExportAll}
+          style={{ marginTop: "20px", padding: "10px 20px" }}
+        >
           Export All Labeled Data as JSON
         </button>
       )}
