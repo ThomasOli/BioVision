@@ -13,6 +13,7 @@ interface MenuProps {
 const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange }) => {
   return (
     <Paper
+    elevation={9}
       style={{
         height: "100vh",
         paddingLeft: "5px",

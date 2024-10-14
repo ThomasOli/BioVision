@@ -1,3 +1,4 @@
+// src/Components/UploadImages.tsx
 import React, { ChangeEvent, useState, DragEvent } from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
@@ -5,14 +6,12 @@ import Button from '@mui/material/Button';
 import LinearProgress from '@mui/material/LinearProgress';
 import { ipcRenderer } from 'electron';
 import { useSelector, useDispatch } from 'react-redux';
-import { clearFiles, addFile, removeFile } from '../state/filesState/fileSlice';
+import { clearFiles, addFiles, removeFile } from '../state/filesState/fileSlice';
 import { RootState } from '../state/store';
 
+interface UploadImagesProps {}
 
-interface UploadImagesProps {
-}
-
-const UploadImages: React.FC<UploadImagesProps> = (props) => {
+const UploadImages: React.FC<UploadImagesProps> = () => {
   const files = useSelector((state: RootState) => state.files.fileArray);
   const dispatch = useDispatch();
 
@@ -30,39 +29,53 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
 
         const fs = (window as any).require('fs');
 
-        fs.readdir(folderPath, async (err: NodeJS.ErrnoException | null, files: string[] | Buffer[]) => {
+        fs.readdir(folderPath, { encoding: 'utf8' }, async (err: NodeJS.ErrnoException | null, files: string[]) => {
           if (err) {
             console.error(err);
+            setIsError(true);
+            setMessage('Failed to read the folder.');
             return;
           }
 
-          const imageFiles = files.filter((file) => /\.(jpg|jpeg|png|gif)$/i.test(file.toString()));
+          const imageFiles = files.filter((file) => /\.(jpg|jpeg|png|gif)$/i.test(file));
 
           const filePreviews: string[] = [];
+          const fileObjects: File[] = [];
+
           for (const fileName of imageFiles) {
-            const fileData = await fs.promises.readFile(`${folderPath}/${fileName}`);
-            const objectUrl = URL.createObjectURL(new Blob([fileData], { type: 'image/jpeg' }));
-            filePreviews.push(objectUrl);
+            try {
+              const filePath = `${folderPath}/${fileName}`;
+              const fileData = fs.readFileSync(filePath); // Synchronously read file
+              const uint8Array = new Uint8Array(fileData); // Convert Buffer to Uint8Array
+              const file = new File([uint8Array], fileName, { type: 'image/jpeg' }); // Create File object
+              fileObjects.push(file);
+              const objectUrl = URL.createObjectURL(file);
+              filePreviews.push(objectUrl);
+            } catch (readErr) {
+              console.error(`Failed to read or process file ${fileName}:`, readErr);
+              setIsError(true);
+              setMessage(`Failed to read or process file ${fileName}.`);
+            }
           }
 
-          const fileObjects: File[] = await Promise.all(imageFiles.map(async (file) => {
-            const fileName = file.toString();
-            const fileData = await fs.promises.readFile(`${folderPath}/${fileName}`);
-            return new File([fileData], fileName);
-          }));
-
-          setSelectedFiles(fileObjects);
-          setPreviews(filePreviews);
-          setProgress(0);
-          setMessage('');
-          setDisableClear(false);
+          if (fileObjects.length > 0) {
+            setSelectedFiles(fileObjects);
+            setPreviews(filePreviews);
+            setProgress(0);
+            setMessage('');
+            setDisableClear(false);
+          } else {
+            setIsError(true);
+            setMessage('No valid image files found in the selected folder.');
+          }
         });
       }
     }).catch((err) => {
       console.error(err);
+      setIsError(true);
+      setMessage('An error occurred while selecting the folder.');
     });
   };
-
 
   const handleSelectFiles = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files.length > 0) {
@@ -79,9 +92,17 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
   };
 
   const handleUpload = () => {
-    dispatch(addFile(selectedFiles));
-    console.log(files);
-    // Not done yet, needs actual upload to backend system
+    if (selectedFiles.length === 0) {
+      setMessage('No files to upload.');
+      setIsError(true);
+      return;
+    }
+
+    dispatch(addFiles(selectedFiles));
+    console.log('Uploaded Files:', selectedFiles);
+    console.log('Redux Store Files:', files);
+
+    // Simulate upload progress
     let currentProgress = 0;
     const interval = setInterval(() => {
       currentProgress += 10;
@@ -100,8 +121,11 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
     const updatedFiles = [...selectedFiles];
     const updatedPreviews = [...previews];
 
-    updatedFiles.splice(index, 1);
-    updatedPreviews.splice(index, 1);
+    const removedFile = updatedFiles.splice(index, 1)[0];
+    const removedPreview = updatedPreviews.splice(index, 1)[0];
+
+    // Revoke the object URL to free memory
+    URL.revokeObjectURL(removedPreview);
 
     setSelectedFiles(updatedFiles);
     setPreviews(updatedPreviews);
@@ -112,9 +136,14 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
   };
 
   const handleClearAll = () => {
+    // Revoke all object URLs
+    previews.forEach((preview) => URL.revokeObjectURL(preview));
     setSelectedFiles([]);
     setPreviews([]);
     setDisableClear(true);
+    dispatch(clearFiles());
+    setMessage('');
+    setIsError(false);
   };
 
   const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
@@ -130,7 +159,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
       let isFolder = false;
 
       for (let i = 0; i < items.length; i++) {
-        const entry = items[i].webkitGetAsEntry();
+        const entry = items[i].webkitGetAsEntry(); // Now, this is allowed because we've extended the interface
 
         if (entry) {
           if (entry.isFile) {
@@ -162,17 +191,21 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
     }
   };
 
-  const processEntry = async (entry: any, filesArray: File[]) => {
+  const processEntry = async (entry: FileSystemEntry, filesArray: File[]) => {
     return new Promise<void>((resolve, reject) => {
       if (entry.isFile) {
-        entry.file((file: File) => {
+        const fileEntry = entry as FileSystemFileEntry;
+        fileEntry.file((file: File) => {
           filesArray.push(file);
           resolve();
+        }, (err) => {
+          console.error('Error reading file entry:', err);
+          reject(err);
         });
       } else if (entry.isDirectory) {
-        const directoryReader = entry.createReader();
+        const directoryReader = (entry as FileSystemDirectoryEntry).createReader();
         const readEntries = () => {
-          directoryReader.readEntries(async (entries: any[]) => {
+          directoryReader.readEntries(async (entries: FileSystemEntry[]) => {
             if (entries.length === 0) {
               resolve();
             } else {
@@ -181,15 +214,16 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
               }
               readEntries();
             }
-          }, reject);
+          }, (err) => {
+            console.error('Error reading directory entries:', err);
+            reject(err);
+          });
         };
 
         readEntries();
       }
     });
   };
-
-
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
@@ -221,13 +255,12 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
                 sx={{
                   marginLeft: '20px',
                   marginRight: '20px',
-                 
                   backgroundColor: 'transparent',
                   transition: 'background-color 0.2s ease',
                   '&:hover': {
                     backgroundColor: '#D1EEF8',
                   },
-                  fontSize: '10px', 
+                  fontSize: '10px',
                 }}
               >
                 Remove
@@ -236,7 +269,7 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           ))}
         </div>
       )}
-      <label htmlFor="btn-upload">
+      <label htmlFor="btn-upload" style={{ display: 'flex', gap: '10px' }}>
         <input
           id="btn-upload"
           name="btn-upload"
@@ -246,20 +279,19 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           multiple
           onChange={handleSelectFiles}
         />
-        
         <Button className="btn-choose" variant="outlined" component="span">
           Choose Images
         </Button>
         <Button
-        className="btn-choose-folder"
-        variant="outlined"
-        component="span"
-        onClick={handleSelectFolder}
-      >
-        Choose Folder
-      </Button>
+          className="btn-choose-folder"
+          variant="outlined"
+          component="span"
+          onClick={handleSelectFolder}
+        >
+          Choose Folder
+        </Button>
       </label>
-      {progress < 100 && (
+      {previews.length > 0 && (
         <Button
           className="btn-clear"
           color="secondary"
@@ -278,7 +310,6 @@ const UploadImages: React.FC<UploadImagesProps> = (props) => {
           <Typography variant="body2" color="textSecondary" align="center">{`${progress}%`}</Typography>
         </Box>
       )}
-     
       <Button
         className="btn-upload"
         color="primary"

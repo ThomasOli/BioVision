@@ -240,3 +240,4 @@ export const CanvasStateProvider = ({
 export const useCanvasState = () => {
   return useContext(CanvasStateContext);
 };
+
