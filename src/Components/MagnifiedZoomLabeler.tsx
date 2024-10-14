@@ -155,7 +155,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                   <Circle
                     x={point.x}
                     y={point.y}
-                    radius={2} // Fixed radius
+                    radius={0.5} // Fixed radius
                     fill={color}
                     opacity={opacity / 100} // Convert percentage to decimal
                     draggable
@@ -163,10 +163,10 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                     onContextMenu={(e) => handlePointRightClick(e, point.id)}
                   />
                   <Text
-                    x={point.x + 3}
-                    y={point.y - 7}
+                    x={point.x + 2}
+                    y={point.y - 4}
                     text={(index+1).toString()}
-                    fontSize={5} // Fixed font size
+                    fontSize={3} // Fixed font size
                     fill={color}
                   />
                 </React.Fragment>

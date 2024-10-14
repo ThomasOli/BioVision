@@ -1,6 +1,6 @@
 // src/Components/ImageLabeler.tsx
 import React, { useRef, useState, useCallback, useEffect } from 'react';
-import { Stage, Layer, Image as KonvaImage, Circle, Text } from 'react-konva';
+import { Stage, Layer, Image as KonvaImage, Circle } from 'react-konva';
 import useImageLoader from '../hooks/useImageLoader';
 import { KonvaEventObject } from 'konva/lib/Node';
 import { Button, Box } from '@mui/material';
