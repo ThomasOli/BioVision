@@ -16,7 +16,6 @@ interface Point {
 interface ImageLabelerProps {
   imageURL: string;
   initialPoints: Point[];
-  initialHistory: Point[];
   onPointsChange: (points: Point[]) => void;
   color: string;
   opacity: number;
@@ -25,7 +24,6 @@ interface ImageLabelerProps {
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
   imageURL,
   initialPoints,
-  initialHistory,
   onPointsChange,
   color,
   opacity,
@@ -34,7 +32,9 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   // ----------------------------------------------------
 
-  const [history, setHistory] = useState<Point[]>(initialHistory || []); // Store past states (e.g., canvas data URL)
+  const { setPoints2 } = useContext(MyContext)
+
+  const [history, setHistory] = useState<Point[]>([]); // Store past states (e.g., canvas data URL)
   const [future, setFuture] = useState<Point[]>([]); // Store future states for redo
   const [usedClear, setUsedClear] = useState(false)
 
@@ -75,17 +75,17 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   const redo = useCallback(() => {
     if (future.length === 0) return; // Ensure there is something to redo
 
-    const newRedoPoint = future[future.length - 1]; // Get the last element from future
+    const newUndoPoint = future[future.length - 1]; // Get the last element from future
     // console.log("newRedoPoint is", newRedoPoint);
 
     const newFuture = [...future];  // Copy the future array
     newFuture.splice(-1, 1);        // Remove the last element from future
     setFuture(newFuture);           // Update future state
 
-    const newHistory = [...history, newRedoPoint]; // Add the redo point back to history
+    const newHistory = [...history, newUndoPoint]; // Add the redo point back to history
     setHistory(newHistory);                        // Update history state
 
-    const newPoints = [...points, newRedoPoint];   // Add the redo point back to points
+    const newPoints = [...points, newUndoPoint];   // Add the redo point back to points
     setPoints(newPoints);                          // Update points state
 
     // console.log("the new points are", newPoints);
@@ -156,6 +156,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         pushToHistory(newPoint)
         onPointsChange(updatedPoints);
         // console.log("history is: ", history)
+        setPoints2(0, newPoint)
+        
       }
     },
     [image, imageDimensions, points, onPointsChange]
@@ -264,8 +266,9 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       </Button>
       )}
       
+       {/* ---------------------------- */}
 
-      {history.length > 0 && (
+      {/* {history.length > 0 && (
         <Button
           variant="contained"
           color="primary"
@@ -287,14 +290,19 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         </Button>
       )}
 
-      <Button
-        variant="contained"
-        color="primary"
-        onClick={clear}
-        sx={{ marginTop: '10px' }}
-      >
-        clear
-      </Button>
+      {points.length > 0 && (
+        <Button
+          variant="contained"
+          color="primary"
+          onClick={clear}
+          sx={{ marginTop: '10px' }}
+        >
+          clear
+        </Button>
+      )} */}
+
+
+       {/* ---------------------------- */}
 
     </Box>
   );

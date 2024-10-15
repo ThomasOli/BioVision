@@ -39,7 +39,7 @@ const Landmark: React.FC<LandmarkProps> = ({
 }) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
 
-  const { clear, undo } = useContext(MyContext); // Access context here
+  const { undo, redo, clear } = useContext(MyContext); // Access context here
 
   const handleSwitchChange = () => {
     setIsSwitchOn((prev) => !prev);
@@ -107,7 +107,7 @@ const Landmark: React.FC<LandmarkProps> = ({
           >
             <Button onClick={() => clear()}>Clear</Button>
             <Button onClick={() => undo()}>Undo</Button>
-            <Button onClick={() => console.log("redo")}>Redo</Button>
+            <Button onClick={() => redo()}>Redo</Button>
           </ButtonGroup>
           <br></br>
           <ToggleButtonGroup

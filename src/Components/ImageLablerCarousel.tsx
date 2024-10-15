@@ -10,6 +10,7 @@ import ArrowForwardIosIcon from '@mui/icons-material/ArrowForwardIos';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ZoomInIcon from '@mui/icons-material/ZoomIn';
 import MagnifiedImageLabeler from './MagnifiedZoomLabeler';
+import { MyContext } from './MyContext';
 interface ImageLabelerCarouselProps {
   color: string;
   opacity: number;
@@ -31,20 +32,7 @@ interface ImageData {
 const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opacity }) => {
   // CHANGE THIS
   // const images = useSelector((state: RootState) => state.files.fileArray);
-  const images = [
-    {
-      id: 1,
-      url: "https://via.placeholder.com/800x600.png?text=Image+1",
-      labels: [],
-      labelHistory: []
-    },
-    {
-      id: 2,
-      url: "https://via.placeholder.com/800x600.png?text=Image+2",
-      labels: [],
-      labelHistory: []
-    },
-  ];
+  const {images, setSelectedImage} = useContext(MyContext)
 
 
   const dispatch = useDispatch<AppDispatch>();
@@ -76,10 +64,12 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
 
   const handleNext = useCallback(() => {
     setCurrentIndex((prevIndex) => (prevIndex + 1) % totalImages);
+    setSelectedImage((prevIndex) => (prevIndex + 1) % totalImages)
   }, [totalImages]);
 
   const handlePrev = useCallback(() => {
     setCurrentIndex((prevIndex) => (prevIndex - 1 + totalImages) % totalImages);
+    setSelectedImage((prevIndex) => (prevIndex - 1 + totalImages) % totalImages)
   }, [totalImages]);
 
   const handleKeyDown = useCallback(
@@ -207,7 +197,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
             key={images[currentIndex].id}
             imageURL={images[currentIndex].url}
             initialPoints={images[currentIndex].labels}
-            initialHistory={images[currentIndex].labelHistory}
             onPointsChange={(newPoints) => handleUpdateLabels(images[currentIndex].id, newPoints)}
             color={color}
             opacity={opacity}
