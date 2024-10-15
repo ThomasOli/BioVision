@@ -36,67 +36,47 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   const [history, setHistory] = useState<Point[]>(initialHistory || []); // Store past states (e.g., canvas data URL)
   const [future, setFuture] = useState<Point[]>([]); // Store future states for redo
+  const [usedClear, setUsedClear] = useState(false)
 
   const pushToHistory = useCallback((newState: Point) => {
     setHistory((prev) => [...prev, newState]);
     setFuture([]); // Clear future when a new action is made
   }, []);
 
- const undo = useCallback(() => {
-    const newRedoPoint = history[history.length - 1]
-    console.log("  newRedoPoint is ")
-    console.log(newRedoPoint)
-    const newHistory = [...history]
-    newHistory.splice(-1, 1)
-    setHistory(newHistory)
+  const undo = useCallback(() => {
+    if (usedClear) {
+      console.log("undo cler")
+      setFuture([])
 
-    const newFuture = [...future, newRedoPoint]
-    setFuture(newFuture)
+      setPoints(history);
 
-    const newPoints = [...points];  // Create a copy of the array
-    newPoints.splice(-1, 1);       // Remove the last element using splice
-    setPoints(newPoints);
-
-    console.log("the new points is ")
-    console.log(newPoints)
-
-    console.log("the new history is ")
-    console.log(history)
-
-    console.log("the new future is ")
-    console.log(future)
-  }, [points]);
-
-  // const redo = useCallback(() => {
-  //   const newUndoPoint = future[future.length - 1]
-  //   console.log("  newUndoPoint is ")
-  //   console.log(newUndoPoint)
-  //   const newFuture = [...future]
-  //   newFuture.splice(-1, 1)
-  //   setFuture(newFuture)
-
-  //   const newHistory = [...history, newUndoPoint]
-  //   setHistory(newHistory)
-
-  //   const newPoints = [...points];  
-  //   newPoints.push(newUndoPoint);       
-  //   setPoints(newPoints);
-
-  //   console.log("the new points is ")
-  //   console.log(newPoints)
-
-  //   console.log("the new history is ")
-  //   console.log(history)
-
-  //   console.log("the new history is ")
-  //   console.log(history)
-  // }, [points]);
+      setUsedClear(false)
+    } else {
+      const newRedoPoint = history[history.length - 1]
+      // console.log("  newRedoPoint is ")
+      // console.log(newRedoPoint)
+      const newHistory = [...history]
+      newHistory.splice(-1, 1)
+      setHistory(newHistory)
+  
+      const newFuture = [...future, newRedoPoint]
+      setFuture(newFuture)
+  
+      const newPoints = [...points];  // Create a copy of the array
+      newPoints.splice(-1, 1);       // Remove the last element using splice
+      setPoints(newPoints);
+  
+      // console.log("the new points are", newPoints);
+      // console.log("the new history is", newHistory);
+      // console.log("the new future is", newFuture);
+    }
+  }, [points, future, history]);
 
   const redo = useCallback(() => {
     if (future.length === 0) return; // Ensure there is something to redo
 
     const newRedoPoint = future[future.length - 1]; // Get the last element from future
-    console.log("newRedoPoint is", newRedoPoint);
+    // console.log("newRedoPoint is", newRedoPoint);
 
     const newFuture = [...future];  // Copy the future array
     newFuture.splice(-1, 1);        // Remove the last element from future
@@ -108,10 +88,28 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     const newPoints = [...points, newRedoPoint];   // Add the redo point back to points
     setPoints(newPoints);                          // Update points state
 
-    console.log("the new points are", newPoints);
-    console.log("the new history is", newHistory);
-    console.log("the new future is", newFuture);
-}, [points, future, history]);
+    // console.log("the new points are", newPoints);
+    // console.log("the new history is", newHistory);
+    // console.log("the new future is", newFuture);
+  }, [points, future, history]);
+
+  const clear = useCallback(() => {
+    // Save the current points to history so that undo can bring them back
+    const newHistory = [...history];  // Add the current points to history
+    newHistory.concat(points)
+    setHistory(newHistory);
+    // console.log("history is ", history)
+
+    // Clear the points by setting it to an empty array
+    setPoints([]);
+
+    // Optionally reset future, since clearing might represent a new action that prevents redo
+    setFuture([]);  
+
+    // console.log("Points cleared.");
+    // console.log("History updated:", newHistory);
+    setUsedClear(true)
+  }, [points, future, history]);
 
 
   // ----------------------------------------------------
@@ -157,8 +155,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         setPoints(updatedPoints);
         pushToHistory(newPoint)
         onPointsChange(updatedPoints);
-        console.log("history is: ")
-        console.log(history)
+        // console.log("history is: ", history)
       }
     },
     [image, imageDimensions, points, onPointsChange]
@@ -289,6 +286,15 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
           redo
         </Button>
       )}
+
+      <Button
+        variant="contained"
+        color="primary"
+        onClick={clear}
+        sx={{ marginTop: '10px' }}
+      >
+        clear
+      </Button>
 
     </Box>
   );
