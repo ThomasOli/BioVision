@@ -1,9 +1,11 @@
 // src/Components/ImageLabeler.tsx
-import React, { useRef, useState, useCallback, useEffect } from 'react';
+import React, { useRef, useState, useCallback, useEffect, useContext } from 'react';
 import { Stage, Layer, Image as KonvaImage, Circle } from 'react-konva';
 import useImageLoader from '../hooks/useImageLoader';
 import { KonvaEventObject } from 'konva/lib/Node';
 import { Button, Box } from '@mui/material';
+import { MyContext } from './MyContext';
+import { HistoryRounded } from '@mui/icons-material';
 
 interface Point {
   x: number;
@@ -14,6 +16,7 @@ interface Point {
 interface ImageLabelerProps {
   imageURL: string;
   initialPoints: Point[];
+  initialHistory: Point[];
   onPointsChange: (points: Point[]) => void;
   color: string;
   opacity: number;
@@ -22,13 +25,65 @@ interface ImageLabelerProps {
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
   imageURL,
   initialPoints,
+  initialHistory,
   onPointsChange,
   color,
   opacity,
 }) => {
   const [points, setPoints] = useState<Point[]>(initialPoints || []);
+
+  // ----------------------------------------------------
+
+  const [history, setHistory] = useState<Point[]>(initialHistory || []); // Store past states (e.g., canvas data URL)
+  const [future, setFuture] = useState<Point[]>([]); // Store future states for redo
+
+  const pushToHistory = useCallback((newState: Point) => {
+    setHistory((prev) => [...prev, newState]);
+    setFuture([]); // Clear future when a new action is made
+  }, []);
+
+ const undo = useCallback(() => {
+    if (history.length === 0)
+      return
+
+    setHistory((prev) => {
+      const newFuture = prev[prev.length - 1];
+      setFuture((future) => [...future, newFuture]);
+      return prev.slice(-1, 1); // Remove the last state from history
+    });
+
+    const newPoints = [...points];  // Create a copy of the array
+    // console.log("there are " + newPoints.length + " points before undo ") 
+    newPoints.splice(-1, 1);       // Remove the last element using splice
+    // console.log("there are " + newPoints.length + " points after undo ") 
+    setPoints(newPoints);
+    // console.log(points) 
+    console.log("there are this many points in history: " + history.length)
+  }, [points]);
+
+  const redo = useCallback(() => {
+    setFuture((prev) => {
+      if (prev.length === 0) return prev;
+
+      const newHistory = prev[0];
+      setHistory((history) => [...history, newHistory]);
+      return prev.slice(1); // Remove the first state from future
+    });
+
+    const newPoints = [...points];  // Create a copy of the array
+    console.log("there are " + newPoints.length + " points before redo ") 
+    newPoints.splice(-1, 1);       // Remove the last element using splice
+    console.log("there are " + newPoints.length + " points after redo ") 
+    setPoints(newPoints);   
+    // console.log(points) 
+  }, [points]);
+
+  // ----------------------------------------------------
+
+
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
+  
 
   // Zoom state (for standard view zooming, if needed)
   // For this implementation, zooming is handled via magnified view
@@ -63,10 +118,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
           id: Date.now(),
         };
         const updatedPoints = [...points, newPoint];
-        const updatedPointsHistory = [...pointsHistory, newPoint];
         setPoints(updatedPoints);
+        console.log("there are " + updatedPoints.length + " after click")
+        pushToHistory(newPoint)
         onPointsChange(updatedPoints);
-        setPointsHistory(updatedPointsHistory);
+        console.log(history)
       }
     },
     [image, imageDimensions, points, onPointsChange]
@@ -166,14 +222,25 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       )}
       {points.length > 0 && (
         <Button
+        variant="contained"
+        color="primary"
+        onClick={handleExport}
+        sx={{ marginTop: '10px' }}
+      >
+        Export Data as JSON
+      </Button>
+      )}
+      {history.length > 0 && (
+        <Button
           variant="contained"
           color="primary"
-          onClick={handleExport}
+          onClick={undo}
           sx={{ marginTop: '10px' }}
         >
-          Export Data as JSON
+          undo
         </Button>
       )}
+        
     </Box>
   );
 };

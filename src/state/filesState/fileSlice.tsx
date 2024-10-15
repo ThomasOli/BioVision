@@ -11,6 +11,7 @@ interface ImageData {
   id: number;
   url: string;
   labels: Point[];
+  labelHistory: Point[]
 }
 
 interface FilesState {

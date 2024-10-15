@@ -39,7 +39,7 @@ const Landmark: React.FC<LandmarkProps> = ({
 }) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
 
-  const { images, setImages, undo } = useContext(MyContext); // Access context here
+  const { clear, undo } = useContext(MyContext); // Access context here
 
   const handleSwitchChange = () => {
     setIsSwitchOn((prev) => !prev);
@@ -105,7 +105,7 @@ const Landmark: React.FC<LandmarkProps> = ({
             aria-label="outlined primary button group"
             disabled={isSwitchOn}
           >
-            <Button onClick={() => console.log("clear")}>Clear</Button>
+            <Button onClick={() => clear()}>Clear</Button>
             <Button onClick={() => undo()}>Undo</Button>
             <Button onClick={() => console.log("redo")}>Redo</Button>
           </ButtonGroup>

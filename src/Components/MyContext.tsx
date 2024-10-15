@@ -10,6 +10,7 @@ interface ImageData {
   id: number;
   url: string;
   labels: Point[];
+  labelHistory: Point[]
 }
 
 interface Action {
@@ -24,18 +25,22 @@ export const canvasStateReducer = (
     case "undo":
       console.log(state);
       return state;
+    case "clear":
+      console.log("clear")
+      state.labels = []
+      return state
     default:
       throw console.error();
   }
 };
-// Create a context
+
 export const MyContext = createContext<MyContextProps>({} as MyContextProps);
 
 interface MyContextProps {
   images: ImageData[];
   setImages: React.Dispatch<React.SetStateAction<ImageData[]>>;
+  clear: () => void;
   undo: () => void;
-  setPoints: React.Dispatch<React.SetStateAction<Point[]>>;
 }
 
 export const MyContextProvider = ({
@@ -46,21 +51,23 @@ export const MyContextProvider = ({
       id: 1,
       url: "https://via.placeholder.com/800x600.png?text=Image+1",
       labels: [],
+      labelHistory: []
     },
     {
       id: 2,
       url: "https://via.placeholder.com/800x600.png?text=Image+2",
       labels: [],
+      labelHistory: []
     },
   ]);
 
   const [canvasState, dispatch] = useReducer(canvasStateReducer, images[0]);
-  const [points, setPoints] = useState<Point[]>([]);
 
   const undo = useCallback(() => dispatch({ type: "undo" }), [dispatch]);
+  const clear = useCallback(() => dispatch({ type: "clear" }), [dispatch]);
 
   return (
-    <MyContext.Provider value={{ images, setImages, undo, setPoints }}>
+    <MyContext.Provider value={{ images, setImages, clear,  undo, }}>
       {children}
     </MyContext.Provider>
   );

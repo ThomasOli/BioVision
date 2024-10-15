@@ -1,5 +1,5 @@
 // src/Components/ImageLabelerCarousel.tsx
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useState } from 'react';
 import ImageLabeler from './ImageLabeler';
 import { useSelector, useDispatch } from 'react-redux';
 import { RootState, AppDispatch } from '../state/store';
@@ -15,8 +15,38 @@ interface ImageLabelerCarouselProps {
   opacity: number;
 }
 
+interface Point {
+  x: number;
+  y: number;
+  id: number;
+}
+
+interface ImageData {
+  id: number;
+  url: string;
+  labels: Point[];
+  labelHistory: Point[]
+}
+
 const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opacity }) => {
-  const images = useSelector((state: RootState) => state.files.fileArray);
+  // CHANGE THIS
+  // const images = useSelector((state: RootState) => state.files.fileArray);
+  const images = [
+    {
+      id: 1,
+      url: "https://via.placeholder.com/800x600.png?text=Image+1",
+      labels: [],
+      labelHistory: []
+    },
+    {
+      id: 2,
+      url: "https://via.placeholder.com/800x600.png?text=Image+2",
+      labels: [],
+      labelHistory: []
+    },
+  ];
+
+
   const dispatch = useDispatch<AppDispatch>();
 
   const [currentIndex, setCurrentIndex] = useState<number>(0);
@@ -174,9 +204,10 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
           }}
         >
           <ImageLabeler
-            key={images[currentIndex].id} // Ensure component remounts when image changes
+            key={images[currentIndex].id}
             imageURL={images[currentIndex].url}
             initialPoints={images[currentIndex].labels}
+            initialHistory={images[currentIndex].labelHistory}
             onPointsChange={(newPoints) => handleUpdateLabels(images[currentIndex].id, newPoints)}
             color={color}
             opacity={opacity}
