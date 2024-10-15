@@ -67,24 +67,52 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     console.log(future)
   }, [points]);
 
+  // const redo = useCallback(() => {
+  //   const newUndoPoint = future[future.length - 1]
+  //   console.log("  newUndoPoint is ")
+  //   console.log(newUndoPoint)
+  //   const newFuture = [...future]
+  //   newFuture.splice(-1, 1)
+  //   setFuture(newFuture)
+
+  //   const newHistory = [...history, newUndoPoint]
+  //   setHistory(newHistory)
+
+  //   const newPoints = [...points];  
+  //   newPoints.push(newUndoPoint);       
+  //   setPoints(newPoints);
+
+  //   console.log("the new points is ")
+  //   console.log(newPoints)
+
+  //   console.log("the new history is ")
+  //   console.log(history)
+
+  //   console.log("the new history is ")
+  //   console.log(history)
+  // }, [points]);
+
   const redo = useCallback(() => {
-    const newFuture = [...future]
-    const newUndoPoint = newFuture[-1]
-    console.log("new undo point is ")
-    console.log(newUndoPoint)
-    newFuture.splice(-1, 1)
-    setFuture(newFuture)
+    if (future.length === 0) return; // Ensure there is something to redo
 
-    setHistory([...history, newUndoPoint])
+    const newRedoPoint = future[future.length - 1]; // Get the last element from future
+    console.log("newRedoPoint is", newRedoPoint);
 
-    const newPoints = [...points];  // Create a copy of the array
-    // console.log("there are " + newPoints.length + " points before undo ") 
-    newPoints.push(newUndoPoint);       // Remove the last element using splice
-    // console.log("there are " + newPoints.length + " points after undo ") 
-    setPoints(newPoints);
-    // console.log(points) 
-    console.log("there are this many points in history: " + history.length)
-  }, [points]);
+    const newFuture = [...future];  // Copy the future array
+    newFuture.splice(-1, 1);        // Remove the last element from future
+    setFuture(newFuture);           // Update future state
+
+    const newHistory = [...history, newRedoPoint]; // Add the redo point back to history
+    setHistory(newHistory);                        // Update history state
+
+    const newPoints = [...points, newRedoPoint];   // Add the redo point back to points
+    setPoints(newPoints);                          // Update points state
+
+    console.log("the new points are", newPoints);
+    console.log("the new history is", newHistory);
+    console.log("the new future is", newFuture);
+}, [points, future, history]);
+
 
   // ----------------------------------------------------
 
