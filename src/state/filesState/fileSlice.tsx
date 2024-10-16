@@ -1,5 +1,5 @@
 // src/state/filesState/fileSlice.ts
-import { createSlice, PayloadAction } from '@reduxjs/toolkit';
+import { createSlice, PayloadAction } from "@reduxjs/toolkit";
 
 interface Point {
   x: number;
@@ -11,7 +11,7 @@ interface ImageData {
   id: number;
   url: string;
   labels: Point[];
-  labelHistory: Point[]
+  labelHistory: Point[];
 }
 
 interface FilesState {
@@ -23,7 +23,7 @@ const initialState: FilesState = {
 };
 
 const fileSlice = createSlice({
-  name: 'files',
+  name: "files",
   initialState,
   reducers: {
     addFiles: (state, action: PayloadAction<File[]>) => {
@@ -35,13 +35,20 @@ const fileSlice = createSlice({
       state.fileArray = [...state.fileArray, ...newImages];
     },
     removeFile: (state, action: PayloadAction<number>) => {
-      const imageToRemove = state.fileArray.find((img) => img.id === action.payload);
+      const imageToRemove = state.fileArray.find(
+        (img) => img.id === action.payload
+      );
       if (imageToRemove) {
         URL.revokeObjectURL(imageToRemove.url); // Revoke URL to free memory
       }
-      state.fileArray = state.fileArray.filter((image) => image.id !== action.payload);
+      state.fileArray = state.fileArray.filter(
+        (image) => image.id !== action.payload
+      );
     },
-    updateLabels: (state, action: PayloadAction<{ id: number; labels: Point[] }>) => {
+    updateLabels: (
+      state,
+      action: PayloadAction<{ id: number; labels: Point[] }>
+    ) => {
       const { id, labels } = action.payload;
       const image = state.fileArray.find((img) => img.id === id);
       if (image) {
@@ -57,6 +64,7 @@ const fileSlice = createSlice({
   },
 });
 
-export const { addFiles, removeFile, updateLabels, clearFiles } = fileSlice.actions;
+export const { addFiles, removeFile, updateLabels, clearFiles } =
+  fileSlice.actions;
 
 export default fileSlice.reducer;

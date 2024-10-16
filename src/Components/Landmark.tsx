@@ -39,7 +39,7 @@ const Landmark: React.FC<LandmarkProps> = ({
 }) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
 
-  const { undo, redo, clear } = useContext(UndoRedoClearContext); 
+  const { undo, redo, clear } = useContext(UndoRedoClearContext);
 
   const handleSwitchChange = () => {
     setIsSwitchOn((prev) => !prev);

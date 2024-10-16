@@ -1,13 +1,22 @@
 // src/hooks/useImageLoader.ts
-import { useState, useEffect } from 'react';
+import { useState, useEffect } from "react";
 
-const useImageLoader = (url: string): [HTMLImageElement | null, { width: number; height: number } | null, boolean] => {
+const useImageLoader = (
+  url: string
+): [
+  HTMLImageElement | null,
+  { width: number; height: number } | null,
+  boolean
+] => {
   const [image, setImage] = useState<HTMLImageElement | null>(null);
-  const [dimensions, setDimensions] = useState<{ width: number; height: number } | null>(null);
+  const [dimensions, setDimensions] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const [error, setError] = useState<boolean>(false);
-// src/constants.ts
- const MAX_IMAGE_WIDTH = 800;
- const MAX_IMAGE_HEIGHT = 600;
+  // src/constants.ts
+  const MAX_IMAGE_WIDTH = 800;
+  const MAX_IMAGE_HEIGHT = 600;
 
   useEffect(() => {
     const img = new Image();

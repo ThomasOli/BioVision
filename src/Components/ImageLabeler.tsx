@@ -1,10 +1,16 @@
 // src/Components/ImageLabeler.tsx
-import React, { useRef, useState, useCallback, useEffect, useContext } from 'react';
-import { Stage, Layer, Image as KonvaImage, Circle } from 'react-konva';
-import useImageLoader from '../hooks/useImageLoader';
-import { KonvaEventObject } from 'konva/lib/Node';
-import { Button, Box } from '@mui/material';
-import { UndoRedoClearContext } from './UndoRedoClearContext';
+import React, {
+  useRef,
+  useState,
+  useCallback,
+  useEffect,
+  useContext,
+} from "react";
+import { Stage, Layer, Image as KonvaImage, Circle } from "react-konva";
+import useImageLoader from "../hooks/useImageLoader";
+import { KonvaEventObject } from "konva/lib/Node";
+import { Button, Box } from "@mui/material";
+import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 interface Point {
   x: number;
@@ -31,11 +37,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   // ----------------------------------------------------
 
-  const { setPoints2 } = useContext(UndoRedoClearContext)
+  const { setPoints2 } = useContext(UndoRedoClearContext);
 
   const [history, setHistory] = useState<Point[]>([]); // Store past states (e.g., canvas data URL)
   const [future, setFuture] = useState<Point[]>([]); // Store future states for redo
-  const [usedClear, setUsedClear] = useState(false)
+  const [usedClear, setUsedClear] = useState(false);
 
   const pushToHistory = useCallback((newState: Point) => {
     setHistory((prev) => [...prev, newState]);
@@ -44,27 +50,27 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   const undo = useCallback(() => {
     if (usedClear) {
-      console.log("undo cler")
-      setFuture([])
+      console.log("undo cler");
+      setFuture([]);
 
       setPoints(history);
 
-      setUsedClear(false)
+      setUsedClear(false);
     } else {
-      const newRedoPoint = history[history.length - 1]
+      const newRedoPoint = history[history.length - 1];
       // console.log("  newRedoPoint is ")
       // console.log(newRedoPoint)
-      const newHistory = [...history]
-      newHistory.splice(-1, 1)
-      setHistory(newHistory)
-  
-      const newFuture = [...future, newRedoPoint]
-      setFuture(newFuture)
-  
-      const newPoints = [...points];  // Create a copy of the array
-      newPoints.splice(-1, 1);       // Remove the last element using splice
+      const newHistory = [...history];
+      newHistory.splice(-1, 1);
+      setHistory(newHistory);
+
+      const newFuture = [...future, newRedoPoint];
+      setFuture(newFuture);
+
+      const newPoints = [...points]; // Create a copy of the array
+      newPoints.splice(-1, 1); // Remove the last element using splice
       setPoints(newPoints);
-  
+
       // console.log("the new points are", newPoints);
       // console.log("the new history is", newHistory);
       // console.log("the new future is", newFuture);
@@ -77,15 +83,15 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     const newUndoPoint = future[future.length - 1]; // Get the last element from future
     // console.log("newRedoPoint is", newRedoPoint);
 
-    const newFuture = [...future];  // Copy the future array
-    newFuture.splice(-1, 1);        // Remove the last element from future
-    setFuture(newFuture);           // Update future state
+    const newFuture = [...future]; // Copy the future array
+    newFuture.splice(-1, 1); // Remove the last element from future
+    setFuture(newFuture); // Update future state
 
     const newHistory = [...history, newUndoPoint]; // Add the redo point back to history
-    setHistory(newHistory);                        // Update history state
+    setHistory(newHistory); // Update history state
 
-    const newPoints = [...points, newUndoPoint];   // Add the redo point back to points
-    setPoints(newPoints);                          // Update points state
+    const newPoints = [...points, newUndoPoint]; // Add the redo point back to points
+    setPoints(newPoints); // Update points state
 
     // console.log("the new points are", newPoints);
     // console.log("the new history is", newHistory);
@@ -94,8 +100,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   const clear = useCallback(() => {
     // Save the current points to history so that undo can bring them back
-    const newHistory = [...history];  // Add the current points to history
-    newHistory.concat(points)
+    const newHistory = [...history]; // Add the current points to history
+    newHistory.concat(points);
     setHistory(newHistory);
     // console.log("history is ", history)
 
@@ -103,16 +109,14 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     setPoints([]);
 
     // Optionally reset future, since clearing might represent a new action that prevents redo
-    setFuture([]);  
+    setFuture([]);
 
     // console.log("Points cleared.");
     // console.log("History updated:", newHistory);
-    setUsedClear(true)
+    setUsedClear(true);
   }, [points, future, history]);
 
-
   // ----------------------------------------------------
-
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
@@ -148,7 +152,12 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         const y = (pointerPosition.y - stage!.y()) / stage!.scaleY();
 
         // Check if click is within image boundaries
-        if (x < 0 || y < 0 || x > imageDimensions.width || y > imageDimensions.height) {
+        if (
+          x < 0 ||
+          y < 0 ||
+          x > imageDimensions.width ||
+          y > imageDimensions.height
+        ) {
           return; // Click outside image area
         }
 
@@ -159,11 +168,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         };
         const updatedPoints = [...points, newPoint];
         setPoints(updatedPoints);
-        pushToHistory(newPoint)
+        pushToHistory(newPoint);
         onPointsChange(updatedPoints);
         // console.log("history is: ", history)
-        setPoints2(0, newPoint)
-        
+        setPoints2(0, newPoint);
       }
     },
     [image, imageDimensions, points, onPointsChange]
@@ -195,11 +203,13 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   }, [points, imageDimensions, imageURL]);
 
   if (imageError) {
-    return <div style={{ color: 'red' }}>Error loading image.</div>;
+    return <div style={{ color: "red" }}>Error loading image.</div>;
   }
 
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center'}}>
+    <Box
+      sx={{ display: "flex", flexDirection: "column", alignItems: "center" }}
+    >
       {image && imageDimensions && (
         <>
           <Stage
@@ -208,10 +218,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
             onClick={handleCanvasClick}
             ref={stageRef}
             style={{
-              border: '1px solid gray',
-              backgroundColor: '#f0f0f0',
-              cursor: 'crosshair',
-              marginRight: 'auto',
+              border: "1px solid gray",
+              backgroundColor: "#f0f0f0",
+              cursor: "crosshair",
+              marginRight: "auto",
             }}
             scaleX={scale}
             scaleY={scale}
@@ -243,7 +253,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
               variant="contained"
               color="primary"
               onClick={handleExport}
-              sx={{ alignSelf: 'flex-start', marginTop: '10px' }} // Align left below the canvas
+              sx={{ alignSelf: "flex-start", marginTop: "10px" }} // Align left below the canvas
             >
               Export Data as JSON
             </Button>
