@@ -31,7 +31,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   color,
   opacity,
 }) => {
-  const { setPoints, pushToHistory, points } = useContext(UndoRedoClearContext);
+  const { addPoint, points } = useContext(UndoRedoClearContext);
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
@@ -77,8 +77,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
           id: Date.now(),
         };
 
-        pushToHistory(newPoint);
-        setPoints(newPoint);
+        // pushToHistory(newPoint);
+        addPoint(newPoint);
       }
     },
     [image, imageDimensions, onPointsChange]

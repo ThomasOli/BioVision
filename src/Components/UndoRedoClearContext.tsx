@@ -26,15 +26,17 @@ interface UndoRedoClearContextProps {
   clear: () => void;
   usedClear: boolean;
   setUsedClear: React.Dispatch<React.SetStateAction<boolean>>;
-  setPoints: (newPoint: Point) => void;
+  addPoint: (newPoint: Point) => void;
   setSelectedImage: React.Dispatch<React.SetStateAction<number>>;
-  pushToHistory: (newState: Point) => void;
+  // pushToHistory: (newState: Point) => void;
   points: Point[];
 }
 
 export const UndoRedoClearContextProvider = ({
   children,
 }: React.PropsWithChildren<{}>) => {
+  // CHANGE THIS
+  // need to get files from upload / system
   const [images, setImages] = useState<ImageData[]>([
     {
       id: 1,
@@ -52,26 +54,27 @@ export const UndoRedoClearContextProvider = ({
     },
   ]);
 
-  const [selectedImage, setSelectedImage] = useState(0); // Store past states (e.g., canvas data URL)
-  const [usedClear, setUsedClear] = useState(false); // Store past states (e.g., canvas data URL)
+  const [selectedImage, setSelectedImage] = useState(0);
+  const [usedClear, setUsedClear] = useState(false);
 
   let points = images[selectedImage].labels;
 
-  const pushToHistory = useCallback((newState: Point) => {
-    const newImages = [...images];
+  // const pushToHistory = useCallback((newPoint: Point) => {
+  //   const newImages = [...images];
 
-    let history = images[selectedImage].history;
-    let future = images[selectedImage].future;
+  //   // add point to history
+  //   images[selectedImage].history = [
+  //     ...newImages[selectedImage].history,
+  //     newPoint,
+  //   ];
 
-    history = [...newImages[selectedImage].history, newState];
-    future = [];
+  //   // clear future array
+  //   images[selectedImage].future = [];
 
-    setImages(newImages);
-  }, []);
+  //   setImages(newImages);
+  // }, []);
 
   const undo = () => {
-    console.log("undo from MyContext");
-
     const newImages = [...images];
     let image = newImages[selectedImage];
 
@@ -104,7 +107,7 @@ export const UndoRedoClearContextProvider = ({
     }
   };
 
-  const setPoints = (newPoint: Point) => {
+  const addPoint = (newPoint: Point) => {
     const updatedImages = [...images];
     let image = updatedImages[selectedImage];
 
@@ -176,9 +179,9 @@ export const UndoRedoClearContextProvider = ({
         clear,
         usedClear,
         setUsedClear,
-        setPoints,
+        addPoint,
         setSelectedImage,
-        pushToHistory,
+        // pushToHistory,
         points,
       }}
     >
