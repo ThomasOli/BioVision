@@ -20,7 +20,6 @@ interface Point {
 
 interface ImageLabelerProps {
   imageURL: string;
-  initialPoints: Point[];
   onPointsChange: (points: Point[]) => void;
   color: string;
   opacity: number;
@@ -28,104 +27,15 @@ interface ImageLabelerProps {
 
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
   imageURL,
-  initialPoints,
   onPointsChange,
   color,
   opacity,
 }) => {
-  const [points, setPoints] = useState<Point[]>(initialPoints || []);
-
-  // ----------------------------------------------------
-
-  const { setPoints2 } = useContext(UndoRedoClearContext);
-
-  const [history, setHistory] = useState<Point[]>([]); // Store past states (e.g., canvas data URL)
-  const [future, setFuture] = useState<Point[]>([]); // Store future states for redo
-  const [usedClear, setUsedClear] = useState(false);
-
-  const pushToHistory = useCallback((newState: Point) => {
-    setHistory((prev) => [...prev, newState]);
-    setFuture([]); // Clear future when a new action is made
-  }, []);
-
-  const undo = useCallback(() => {
-    if (usedClear) {
-      console.log("undo cler");
-      setFuture([]);
-
-      setPoints(history);
-
-      setUsedClear(false);
-    } else {
-      const newRedoPoint = history[history.length - 1];
-      // console.log("  newRedoPoint is ")
-      // console.log(newRedoPoint)
-      const newHistory = [...history];
-      newHistory.splice(-1, 1);
-      setHistory(newHistory);
-
-      const newFuture = [...future, newRedoPoint];
-      setFuture(newFuture);
-
-      const newPoints = [...points]; // Create a copy of the array
-      newPoints.splice(-1, 1); // Remove the last element using splice
-      setPoints(newPoints);
-
-      // console.log("the new points are", newPoints);
-      // console.log("the new history is", newHistory);
-      // console.log("the new future is", newFuture);
-    }
-  }, [points, future, history]);
-
-  const redo = useCallback(() => {
-    if (future.length === 0) return; // Ensure there is something to redo
-
-    const newUndoPoint = future[future.length - 1]; // Get the last element from future
-    // console.log("newRedoPoint is", newRedoPoint);
-
-    const newFuture = [...future]; // Copy the future array
-    newFuture.splice(-1, 1); // Remove the last element from future
-    setFuture(newFuture); // Update future state
-
-    const newHistory = [...history, newUndoPoint]; // Add the redo point back to history
-    setHistory(newHistory); // Update history state
-
-    const newPoints = [...points, newUndoPoint]; // Add the redo point back to points
-    setPoints(newPoints); // Update points state
-
-    // console.log("the new points are", newPoints);
-    // console.log("the new history is", newHistory);
-    // console.log("the new future is", newFuture);
-  }, [points, future, history]);
-
-  const clear = useCallback(() => {
-    // Save the current points to history so that undo can bring them back
-    const newHistory = [...history]; // Add the current points to history
-    newHistory.concat(points);
-    setHistory(newHistory);
-    // console.log("history is ", history)
-
-    // Clear the points by setting it to an empty array
-    setPoints([]);
-
-    // Optionally reset future, since clearing might represent a new action that prevents redo
-    setFuture([]);
-
-    // console.log("Points cleared.");
-    // console.log("History updated:", newHistory);
-    setUsedClear(true);
-  }, [points, future, history]);
-
-  // ----------------------------------------------------
+  const { setPoints, pushToHistory, points } = useContext(UndoRedoClearContext);
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
   const [scale, setScale] = useState(1); // State for scaling
-
-  // Update points when initialPoints or imageURL changes
-  useEffect(() => {
-    setPoints(initialPoints || []);
-  }, [initialPoints, imageURL]);
 
   // Adjust the scale based on available screen space
   useEffect(() => {
@@ -166,15 +76,12 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
           y: y,
           id: Date.now(),
         };
-        const updatedPoints = [...points, newPoint];
-        setPoints(updatedPoints);
+
         pushToHistory(newPoint);
-        onPointsChange(updatedPoints);
-        // console.log("history is: ", history)
-        setPoints2(0, newPoint);
+        setPoints(newPoint);
       }
     },
-    [image, imageDimensions, points, onPointsChange]
+    [image, imageDimensions, onPointsChange]
   );
 
   // Export points to JSON
@@ -200,7 +107,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     a.download = `labeled_data_${Date.now()}.json`;
     a.click();
     URL.revokeObjectURL(url);
-  }, [points, imageDimensions, imageURL]);
+  }, [imageDimensions, imageURL]);
 
   if (imageError) {
     return <div style={{ color: "red" }}>Error loading image.</div>;

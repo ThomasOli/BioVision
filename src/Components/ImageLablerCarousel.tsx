@@ -205,7 +205,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
           <ImageLabeler
             key={images[currentIndex].id}
             imageURL={images[currentIndex].url}
-            initialPoints={images[currentIndex].labels}
             onPointsChange={(newPoints) =>
               handleUpdateLabels(images[currentIndex].id, newPoints)
             }

@@ -27,8 +27,10 @@ interface UndoRedoClearContextProps {
   clear: () => void;
   usedClear: boolean;
   setUsedClear: React.Dispatch<React.SetStateAction<boolean>>;
-  setPoints2: (selectedImage: number, newPoint: Point) => void;
+  setPoints: (newPoint: Point) => void;
   setSelectedImage: React.Dispatch<React.SetStateAction<number>>;
+  pushToHistory: (newState: Point) => void;
+  points: Point[];
 }
 
 export const UndoRedoClearContextProvider = ({
@@ -53,6 +55,8 @@ export const UndoRedoClearContextProvider = ({
 
   const [selectedImage, setSelectedImage] = useState(0); // Store past states (e.g., canvas data URL)
   const [usedClear, setUsedClear] = useState(false); // Store past states (e.g., canvas data URL)
+
+  let points = images[selectedImage].labels;
 
   const pushToHistory = useCallback((newState: Point) => {
     const newImages = [...images];
@@ -101,7 +105,7 @@ export const UndoRedoClearContextProvider = ({
     }
   };
 
-  const setPoints2 = (selectedImage: number, newPoint: Point) => {
+  const setPoints = (newPoint: Point) => {
     const updatedImages = [...images];
     let image = updatedImages[selectedImage];
 
@@ -173,8 +177,10 @@ export const UndoRedoClearContextProvider = ({
         clear,
         usedClear,
         setUsedClear,
-        setPoints2,
+        setPoints,
         setSelectedImage,
+        pushToHistory,
+        points,
       }}
     >
       {children}
