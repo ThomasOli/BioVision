@@ -98,7 +98,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
 
   if (totalImages === 0) {
     return (
-      <Box sx={{ padding: '20px', textAlign: 'center' }}>
+      <Box sx={{ padding: '20px', textAlign: 'center', marginLeft: '100px'  }}>
         <Typography variant="h5" sx={{ marginBottom: '10px' }}>
           No images available.
         </Typography>
@@ -119,6 +119,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
+        marginLeft: '100px' 
       }}
     >
       {/* Top Bar with Delete and Zoom Buttons */}
@@ -250,7 +251,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
             a.click();
             URL.revokeObjectURL(urlBlob);
           }}
-          sx={{ marginTop: '10px' }}
+          sx={{ marginTop: '10px', alignSelf: 'flex-end' }}
         >
           Export All Labeled Data
         </Button>

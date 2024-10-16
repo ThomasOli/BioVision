@@ -117,17 +117,24 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
-  
-
-  // Zoom state (for standard view zooming, if needed)
-  // For this implementation, zooming is handled via magnified view
-  // Hence, we can remove or disable the existing zoom controls here
+  const [scale, setScale] = useState(1); // State for scaling
 
   // Update points when initialPoints or imageURL changes
   useEffect(() => {
-    console.log('ImageLabeler: Updating points based on new props.');
     setPoints(initialPoints || []);
   }, [initialPoints, imageURL]);
+
+  // Adjust the scale based on available screen space
+  useEffect(() => {
+    if (imageDimensions) {
+      const availableWidth = window.innerWidth * 0.6; // Reserve 60% of screen width
+      const availableHeight = window.innerHeight * 0.6; // Reserve 60% of screen height
+
+      const widthScale = availableWidth / imageDimensions.width;
+      const heightScale = availableHeight / imageDimensions.height;
+      setScale(Math.min(widthScale, heightScale));
+    }
+  }, [imageDimensions]);
 
   // Handle canvas click to add a point
   const handleCanvasClick = useCallback(
@@ -137,7 +144,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       const stage = e.target.getStage();
       const pointerPosition = stage?.getPointerPosition();
       if (pointerPosition) {
-        // Convert pointer position to image coordinates
+        // Convert pointer position to image coordinates considering the scale
         const x = (pointerPosition.x - stage!.x()) / stage!.scaleX();
         const y = (pointerPosition.y - stage!.y()) / stage!.scaleY();
 
@@ -188,121 +195,63 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     URL.revokeObjectURL(url);
   }, [points, imageDimensions, imageURL]);
 
-  // Remove a point
-  const handlePointRightClick = useCallback(
-    (e: KonvaEventObject<PointerEvent>, id: number) => {
-      e.evt.preventDefault();
-      const updatedPoints = points.filter((point) => point.id !== id);
-      setPoints(updatedPoints);
-      onPointsChange(updatedPoints);
-    },
-    [points, onPointsChange]
-  );
-
-  // Handle point drag end
-  const handlePointDragEnd = useCallback(
-    (e: KonvaEventObject<DragEvent>, id: number) => {
-      const { x, y } = e.target.position();
-      const updatedPoints = points.map((p) =>
-        p.id === id ? { ...p, x, y } : p
-      );
-      setPoints(updatedPoints);
-      onPointsChange(updatedPoints);
-    },
-    [points, onPointsChange]
-  );
-
   if (imageError) {
     return <div style={{ color: 'red' }}>Error loading image.</div>;
   }
 
   return (
-    <Box sx={{ display: 'inline-block', position: 'relative' }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center'}}>
       {image && imageDimensions && (
-        <Stage
-          width={imageDimensions.width}
-          height={imageDimensions.height}
-          onClick={handleCanvasClick}
-          ref={stageRef}
-          style={{
-            border: '1px solid gray',
-            backgroundColor: '#f0f0f0',
-            cursor: 'crosshair',
-          }}
-        >
-          <Layer>
-            {/* Render the uploaded image */}
-            <KonvaImage
-              image={image}
-              width={imageDimensions.width}
-              height={imageDimensions.height}
-            />
-            {/* Render the points */}
-            {points.map((point) => (
-              <React.Fragment key={point.id}>
-                <Circle
-                  x={point.x}
-                  y={point.y}
-                  radius={3}
-                  fill={color}
-                  opacity={opacity / 100} // Convert percentage to decimal
-                  draggable
-                  onDragEnd={(e) => handlePointDragEnd(e, point.id)}
-                  onContextMenu={(e) => handlePointRightClick(e, point.id)}
-                />
-              </React.Fragment>
-            ))}
-          </Layer>
-        </Stage>
-      )}
-      {points.length > 0 && (
-        <Button
-        variant="contained"
-        color="primary"
-        onClick={handleExport}
-        sx={{ marginTop: '10px' }}
-      >
-        Export Data as JSON
-      </Button>
-      )}
-      
-       {/* ---------------------------- */}
+        <>
+          <Stage
+            width={imageDimensions.width * scale}
+            height={imageDimensions.height * scale}
+            onClick={handleCanvasClick}
+            ref={stageRef}
+            style={{
+              border: '1px solid gray',
+              backgroundColor: '#f0f0f0',
+              cursor: 'crosshair',
+              marginRight: 'auto',
+            }}
+            scaleX={scale}
+            scaleY={scale}
+          >
+            <Layer>
+              {/* Render the uploaded image */}
+              <KonvaImage
+                image={image}
+                width={imageDimensions.width}
+                height={imageDimensions.height}
+              />
+              {/* Render the points */}
+              {points.map((point) => (
+                <React.Fragment key={point.id}>
+                  <Circle
+                    x={point.x}
+                    y={point.y}
+                    radius={3}
+                    fill={color}
+                    opacity={opacity / 100} // Convert percentage to decimal
+                  />
+                </React.Fragment>
+              ))}
+            </Layer>
+          </Stage>
 
-      {/* {history.length > 0 && (
-        <Button
-          variant="contained"
-          color="primary"
-          onClick={undo}
-          sx={{ marginTop: '10px' }}
-        >
-          undo
-        </Button>
+          {points.length > 0 && (
+            <Button
+              variant="contained"
+              color="primary"
+              onClick={handleExport}
+              sx={{ alignSelf: 'flex-start', marginTop: '10px' }} // Align left below the canvas
+            >
+              Export Data as JSON
+            </Button>
+          )}
+        </>
       )}
 
-      {future.length > 0 && (
-        <Button
-          variant="contained"
-          color="primary"
-          onClick={redo}
-          sx={{ marginTop: '10px' }}
-        >
-          redo
-        </Button>
-      )}
-
-      {points.length > 0 && (
-        <Button
-          variant="contained"
-          color="primary"
-          onClick={clear}
-          sx={{ marginTop: '10px' }}
-        >
-          clear
-        </Button>
-      )} */}
-
-
-       {/* ---------------------------- */}
 
     </Box>
   );

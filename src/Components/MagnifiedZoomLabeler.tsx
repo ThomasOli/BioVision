@@ -84,27 +84,27 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     [image, imageDimensions, points, onPointsChange, scale]
   );
 
-  // Remove a point
-  const handlePointRightClick = useCallback(
-    (e: KonvaEventObject<PointerEvent>, id: number) => {
-      e.evt.preventDefault();
-      const updatedPoints = points.filter((point) => point.id !== id);
-      setPoints(updatedPoints);
-      onPointsChange(updatedPoints);
-    },
-    [points, onPointsChange]
-  );
+  // // Remove a point
+  // const handlePointRightClick = useCallback(
+  //   (e: KonvaEventObject<PointerEvent>, id: number) => {
+  //     e.evt.preventDefault();
+  //     const updatedPoints = points.filter((point) => point.id !== id);
+  //     setPoints(updatedPoints);
+  //     onPointsChange(updatedPoints);
+  //   },
+  //   [points, onPointsChange]
+  // );
 
-  // Handle point drag end
-  const handlePointDragEnd = useCallback(
-    (e: KonvaEventObject<DragEvent>, id: number) => {
-      const { x, y } = e.target.position();
-      const updatedPoints = points.map((p) => (p.id === id ? { ...p, x: x / scale, y: y / scale } : p));
-      setPoints(updatedPoints);
-      onPointsChange(updatedPoints);
-    },
-    [points, onPointsChange, scale]
-  );
+  // // Handle point drag end
+  // const handlePointDragEnd = useCallback(
+  //   (e: KonvaEventObject<DragEvent>, id: number) => {
+  //     const { x, y } = e.target.position();
+  //     const updatedPoints = points.map((p) => (p.id === id ? { ...p, x: x / scale, y: y / scale } : p));
+  //     setPoints(updatedPoints);
+  //     onPointsChange(updatedPoints);
+  //   },
+  //   [points, onPointsChange, scale]
+  // );
 
   if (imageError) {
     return <div style={{ color: 'red' }}>Error loading image.</div>;
@@ -158,9 +158,9 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                     radius={0.5} // Fixed radius
                     fill={color}
                     opacity={opacity / 100} // Convert percentage to decimal
-                    draggable
-                    onDragEnd={(e) => handlePointDragEnd(e, point.id)}
-                    onContextMenu={(e) => handlePointRightClick(e, point.id)}
+                    // draggable
+                    // onDragEnd={(e) => handlePointDragEnd(e, point.id)}
+                    // onContextMenu={(e) => handlePointRightClick(e, point.id)}
                   />
                   <Text
                     x={point.x + 2}
