@@ -11,15 +11,10 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import ZoomInIcon from "@mui/icons-material/ZoomIn";
 import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
+
 interface ImageLabelerCarouselProps {
   color: string;
   opacity: number;
-}
-
-interface Point {
-  x: number;
-  y: number;
-  id: number;
 }
 
 const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({

@@ -1,5 +1,4 @@
-import { selectClasses } from "@mui/material";
-import { createContext, useState, useReducer, useCallback } from "react";
+import { createContext, useState, useCallback } from "react";
 
 interface Point {
   x: number;
