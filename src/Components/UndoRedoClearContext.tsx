@@ -1,4 +1,4 @@
-import { createContext, useState, useCallback } from "react";
+import { createContext, useCallback, useState } from "react";
 
 interface Point {
   x: number;
@@ -28,7 +28,6 @@ interface UndoRedoClearContextProps {
   setUsedClear: React.Dispatch<React.SetStateAction<boolean>>;
   addPoint: (newPoint: Point) => void;
   setSelectedImage: React.Dispatch<React.SetStateAction<number>>;
-  // pushToHistory: (newState: Point) => void;
   points: Point[];
 }
 
@@ -59,22 +58,7 @@ export const UndoRedoClearContextProvider = ({
 
   let points = images[selectedImage].labels;
 
-  // const pushToHistory = useCallback((newPoint: Point) => {
-  //   const newImages = [...images];
-
-  //   // add point to history
-  //   images[selectedImage].history = [
-  //     ...newImages[selectedImage].history,
-  //     newPoint,
-  //   ];
-
-  //   // clear future array
-  //   images[selectedImage].future = [];
-
-  //   setImages(newImages);
-  // }, []);
-
-  const undo = () => {
+  const undo = useCallback(() => {
     const newImages = [...images];
     let image = newImages[selectedImage];
 
@@ -86,8 +70,8 @@ export const UndoRedoClearContextProvider = ({
       setImages(newImages);
     } else {
       const newRedoPoint = image.history[image.history.length - 1];
-      console.log("history is: ", images[selectedImage].history);
-      console.log("newRedoPoint is: ", newRedoPoint);
+      // console.log("history is: ", images[selectedImage].history);
+      // console.log("newRedoPoint is: ", newRedoPoint);
 
       const newHistory = [...image.history];
       newHistory.splice(-1, 1);
@@ -105,7 +89,7 @@ export const UndoRedoClearContextProvider = ({
       // console.log("the new future is", newFuture);
       setImages(newImages);
     }
-  };
+  }, [images]);
 
   const addPoint = (newPoint: Point) => {
     const updatedImages = [...images];
@@ -117,16 +101,16 @@ export const UndoRedoClearContextProvider = ({
     setImages(updatedImages);
   };
 
-  const redo = () => {
-    console.log("redo from MyContext");
-    console.log(images[selectedImage].labels);
+  const redo = useCallback(() => {
+    // console.log("redo from MyContext");
+    // console.log(images[selectedImage].labels);
     const newImages = [...images];
     let image = newImages[selectedImage];
 
     if (image.future.length === 0) return; // Ensure there is something to redo
 
     const newUndoPoint = image.future[image.future.length - 1]; // Get the last element from future
-    console.log("newUndoPoint is", newUndoPoint);
+    // console.log("newUndoPoint is", newUndoPoint);
 
     const newFuture = [...image.future]; // Copy the future array
     newFuture.splice(-1, 1); // Remove the last element from future
@@ -142,11 +126,11 @@ export const UndoRedoClearContextProvider = ({
     // console.log("the new history is", newHistory);
     // console.log("the new future is", newFuture);
     setImages(newImages);
-  };
+  }, [points]);
 
-  const clear = () => {
-    console.log("clear from MyContext");
-    console.log(images[selectedImage].labels);
+  const clear = useCallback(() => {
+    // console.log("clear from MyContext");
+    // console.log(images[selectedImage].labels);
     const newImages = [...images];
     let image = newImages[selectedImage];
 
@@ -167,7 +151,7 @@ export const UndoRedoClearContextProvider = ({
     setUsedClear(true);
 
     setImages(newImages);
-  };
+  }, [points]);
 
   return (
     <UndoRedoClearContext.Provider
@@ -181,7 +165,6 @@ export const UndoRedoClearContextProvider = ({
         setUsedClear,
         addPoint,
         setSelectedImage,
-        // pushToHistory,
         points,
       }}
     >

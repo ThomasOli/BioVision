@@ -35,7 +35,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
-  const [scale, setScale] = useState(1); // State for scaling
+  const [scale, setScale] = useState(1);
 
   // Adjust the scale based on available screen space
   useEffect(() => {
