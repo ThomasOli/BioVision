@@ -1,7 +1,7 @@
 import React, { useState, useContext } from "react";
 import Select, { SelectChangeEvent } from "@mui/material/Select";
 
-import { MyContext } from "./MyContext";
+import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 import {
   Box,
@@ -39,7 +39,7 @@ const Landmark: React.FC<LandmarkProps> = ({
 }) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
 
-  const { undo, redo, clear } = useContext(MyContext); // Access context here
+  const { undo, redo, clear } = useContext(UndoRedoClearContext); 
 
   const handleSwitchChange = () => {
     setIsSwitchOn((prev) => !prev);

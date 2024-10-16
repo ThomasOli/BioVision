@@ -4,7 +4,7 @@ import Menu from "./Components/Menu";
 import { Grid } from "@mui/material";
 import ImageLabelerCarousel from "./Components/ImageLablerCarousel";
 
-import { MyContextProvider } from "./Components/MyContext";
+import { UndoRedoClearContextProvider } from "./Components/UndoRedoClearContext";
 
 const App: React.FC = () => {
   const [color, setColor] = useState<string>("red");
@@ -18,7 +18,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <MyContextProvider>
+    <UndoRedoClearContextProvider>
       <Grid container sx={{ maxWidth: "100vw", height: "100vh" }}>
         <Grid item xs={4}>
           <Menu
@@ -30,7 +30,7 @@ const App: React.FC = () => {
           <ImageLabelerCarousel color={color} opacity={opacity} />
         </Grid>
       </Grid>
-    </MyContextProvider>
+    </UndoRedoClearContextProvider>
   );
 };
 

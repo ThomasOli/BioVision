@@ -4,8 +4,7 @@ import { Stage, Layer, Image as KonvaImage, Circle } from 'react-konva';
 import useImageLoader from '../hooks/useImageLoader';
 import { KonvaEventObject } from 'konva/lib/Node';
 import { Button, Box } from '@mui/material';
-import { MyContext } from './MyContext';
-import { HistoryRounded } from '@mui/icons-material';
+import { UndoRedoClearContext } from './UndoRedoClearContext';
 
 interface Point {
   x: number;
@@ -32,7 +31,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   // ----------------------------------------------------
 
-  const { setPoints2 } = useContext(MyContext)
+  const { setPoints2 } = useContext(UndoRedoClearContext)
 
   const [history, setHistory] = useState<Point[]>([]); // Store past states (e.g., canvas data URL)
   const [future, setFuture] = useState<Point[]>([]); // Store future states for redo
@@ -251,8 +250,6 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
           )}
         </>
       )}
-
-
     </Box>
   );
 };

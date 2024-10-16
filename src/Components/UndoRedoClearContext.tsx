@@ -15,9 +15,9 @@ interface ImageData {
   future: Point[]
 }
 
-export const MyContext = createContext<MyContextProps>({} as MyContextProps);
+export const UndoRedoClearContext = createContext<UndoRedoClearContextProps>({} as UndoRedoClearContextProps);
 
-interface MyContextProps {
+interface UndoRedoClearContextProps {
   images: ImageData[];
   setImages: React.Dispatch<React.SetStateAction<ImageData[]>>;
   undo: () => void;
@@ -29,7 +29,7 @@ interface MyContextProps {
   setSelectedImage: React.Dispatch<React.SetStateAction<number>>
 }
 
-export const MyContextProvider = ({
+export const UndoRedoClearContextProvider = ({
   children,
 }: React.PropsWithChildren<{}>) => {
   const [images, setImages] = useState<ImageData[]>([
@@ -163,8 +163,8 @@ export const MyContextProvider = ({
   }
 
   return (
-    <MyContext.Provider value={{ images, setImages, undo, redo, clear, usedClear, setUsedClear, setPoints2, setSelectedImage}}>
+    <UndoRedoClearContext.Provider value={{ images, setImages, undo, redo, clear, usedClear, setUsedClear, setPoints2, setSelectedImage}}>
       {children}
-    </MyContext.Provider>
+    </UndoRedoClearContext.Provider>
   );
 };

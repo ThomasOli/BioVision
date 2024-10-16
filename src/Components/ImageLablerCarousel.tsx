@@ -10,7 +10,7 @@ import ArrowForwardIosIcon from '@mui/icons-material/ArrowForwardIos';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ZoomInIcon from '@mui/icons-material/ZoomIn';
 import MagnifiedImageLabeler from './MagnifiedZoomLabeler';
-import { MyContext } from './MyContext';
+import { UndoRedoClearContext } from './UndoRedoClearContext';
 interface ImageLabelerCarouselProps {
   color: string;
   opacity: number;
@@ -32,7 +32,7 @@ interface ImageData {
 const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opacity }) => {
   // CHANGE THIS
   // const images = useSelector((state: RootState) => state.files.fileArray);
-  const {images, setSelectedImage} = useContext(MyContext)
+  const {images, setSelectedImage} = useContext(UndoRedoClearContext)
 
 
   const dispatch = useDispatch<AppDispatch>();
