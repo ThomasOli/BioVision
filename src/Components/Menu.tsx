@@ -10,21 +10,20 @@ interface MenuProps {
   onColorChange: (selectedColor: string) => void;
 }
 
-const Menu: React.FC<MenuProps> = ({onColorChange, onOpacityChange}) => {
+const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange }) => {
   return (
     <Paper
-    elevation={9}
+      elevation={9}
       style={{
         height: "100vh",
         paddingLeft: "5px",
         paddingRight: "5px",
         display: "flex",
         flexDirection: "column",
-        width: '325px',
-        boxSizing: 'border-box',
+        width: "325px",
+        boxSizing: "border-box",
       }}
     >
-      
       <div
         style={{
           marginTop: "1px",
@@ -34,21 +33,24 @@ const Menu: React.FC<MenuProps> = ({onColorChange, onOpacityChange}) => {
           height: "100%",
         }}
       >
-        <div 
-        style = {{
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "center",
-          whiteSpace: 'nowrap' 
-          
-        }}
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            whiteSpace: "nowrap",
+          }}
         >
           <h3>Auto Landmarking Selection Menu</h3>
           <UploadImages />
         </div>
-        
-        <Landmark onOpacityChange = {onOpacityChange} onColorChange={onColorChange}/>
+
+        <Landmark
+          onOpacityChange={onOpacityChange}
+          onColorChange={onColorChange}
+        />
+
         <div
           style={{
             display: "flex",
@@ -64,4 +66,4 @@ const Menu: React.FC<MenuProps> = ({onColorChange, onOpacityChange}) => {
     </Paper>
   );
 };
-export default Menu 
+export default Menu;
