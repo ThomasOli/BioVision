@@ -15,11 +15,9 @@ import {
   FormControl,
 } from "@mui/material";
 import {
-  ArrowDropDown as ArrowDropDownIcon,
   FormatBold as FormatBoldIcon,
   FormatItalic as FormatItalicIcon,
   FormatUnderlined as FormatUnderlinedIcon,
-  FormatColorFill as FormatColorFillIcon,
 } from "@mui/icons-material";
 
 interface LandmarkProps {
