@@ -1,10 +1,10 @@
 // src/Components/MagnifiedImageLabeler.tsx
-import React, { useRef, useState, useCallback, useEffect } from 'react';
-import { Modal, Box, IconButton } from '@mui/material';
-import CloseIcon from '@mui/icons-material/Close';
-import { Stage, Layer, Image as KonvaImage, Circle, Text } from 'react-konva';
-import useImageLoader from '../hooks/useImageLoader';
-import { KonvaEventObject } from 'konva/lib/Node';
+import React, { useRef, useState, useCallback, useEffect } from "react";
+import { Modal, Box, IconButton } from "@mui/material";
+import CloseIcon from "@mui/icons-material/Close";
+import { Stage, Layer, Image as KonvaImage, Circle, Text } from "react-konva";
+import useImageLoader from "../hooks/useImageLoader";
+import { KonvaEventObject } from "konva/lib/Node";
 
 interface Point {
   x: number;
@@ -36,7 +36,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   const stageRef = useRef<any>(null);
   // Update points when initialPoints or imageURL changes
   useEffect(() => {
-    console.log('MagnifiedImageLabeler: Updating points based on new props.');
+    console.log("MagnifiedImageLabeler: Updating points based on new props.");
     setPoints(initialPoints || []);
   }, [initialPoints, imageURL]);
 
@@ -67,7 +67,12 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
         const y = (pointerPosition.y - stage!.y()) / scale;
 
         // Check if click is within image boundaries
-        if (x < 0 || y < 0 || x > imageDimensions.width || y > imageDimensions.height) {
+        if (
+          x < 0 ||
+          y < 0 ||
+          x > imageDimensions.width ||
+          y > imageDimensions.height
+        ) {
           return; // Click outside image area
         }
 
@@ -107,27 +112,32 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   // );
 
   if (imageError) {
-    return <div style={{ color: 'red' }}>Error loading image.</div>;
+    return <div style={{ color: "red" }}>Error loading image.</div>;
   }
 
   return (
-    <Modal open={open} onClose={onClose} aria-labelledby="magnified-image-labeler" closeAfterTransition>
+    <Modal
+      open={open}
+      onClose={onClose}
+      aria-labelledby="magnified-image-labeler"
+      closeAfterTransition
+    >
       <Box
         sx={{
-          position: 'absolute' as 'absolute',
-          top: '50%',
-          left: '50%',
-          transform: 'translate(-50%, -50%)',
+          position: "absolute" as "absolute",
+          top: "50%",
+          left: "50%",
+          transform: "translate(-50%, -50%)",
           maxWidth: MAX_WIDTH,
           maxHeight: MAX_HEIGHT,
-          bgcolor: 'background.paper',
+          bgcolor: "background.paper",
           boxShadow: 24,
           p: 2,
-          outline: 'none',
-          overflow: 'auto', // To handle images larger than the viewport
+          outline: "none",
+          overflow: "auto", // To handle images larger than the viewport
         }}
       >
-        <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+        <Box sx={{ display: "flex", justifyContent: "flex-end" }}>
           <IconButton onClick={onClose} aria-label="Close Magnified View">
             <CloseIcon />
           </IconButton>
@@ -139,16 +149,20 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
             onClick={handleCanvasClick}
             ref={stageRef}
             style={{
-              border: '1px solid gray',
-              backgroundColor: '#f0f0f0',
-              cursor: 'crosshair',
-              display: 'block',
-              margin: '0 auto',
+              border: "1px solid gray",
+              backgroundColor: "#f0f0f0",
+              cursor: "crosshair",
+              display: "block",
+              margin: "0 auto",
             }}
           >
             <Layer scaleX={scale} scaleY={scale}>
               {/* Render the uploaded image */}
-              <KonvaImage image={image} width={imageDimensions.width} height={imageDimensions.height} />
+              <KonvaImage
+                image={image}
+                width={imageDimensions.width}
+                height={imageDimensions.height}
+              />
               {/* Render the points */}
               {points.map((point, index) => (
                 <React.Fragment key={point.id}>
@@ -165,7 +179,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                   <Text
                     x={point.x + 2}
                     y={point.y - 4}
-                    text={(index+1).toString()}
+                    text={(index + 1).toString()}
                     fontSize={3} // Fixed font size
                     fill={color}
                   />
