@@ -11,14 +11,15 @@ interface ImageData {
   id: number;
   url: string;
   labels: Point[];
-  labelHistory: Point[];
+  history: Point[];
+  future: Point[];
 }
 
 interface FilesState {
   fileArray: ImageData[];
 }
 
-const initialState: FilesState = {
+export const initialState: FilesState = {
   fileArray: [],
 };
 
@@ -31,8 +32,11 @@ const fileSlice = createSlice({
         id: Date.now() + Math.random(), // Generate a unique ID
         url: URL.createObjectURL(file),
         labels: [],
+        history: [] as Point[],
+        future: [] as Point[],
       }));
       state.fileArray = [...state.fileArray, ...newImages];
+      console.log(state.fileArray);
     },
     removeFile: (state, action: PayloadAction<number>) => {
       const imageToRemove = state.fileArray.find(
