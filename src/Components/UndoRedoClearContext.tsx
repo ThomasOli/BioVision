@@ -1,4 +1,6 @@
-import { createContext, useCallback, useState } from "react";
+import { createContext, useCallback, useState, useEffect } from "react";
+import { useSelector } from "react-redux"; // Import useSelector
+import { RootState } from "../state/store"; // Adjust the import based on your store setup
 
 interface Point {
   x: number;
@@ -34,29 +36,45 @@ interface UndoRedoClearContextProps {
 export const UndoRedoClearContextProvider = ({
   children,
 }: React.PropsWithChildren<{}>) => {
+  const fileArray = useSelector((state: RootState) => state.files.fileArray); // Access fileArray from the Redux store
+  console.log(fileArray);
+
   // CHANGE THIS
   // need to get files from upload / system
-  const [images, setImages] = useState<ImageData[]>([
-    {
-      id: 1,
-      url: "https://via.placeholder.com/800x600.png?text=Image+1",
-      labels: [],
-      history: [],
-      future: [],
-    },
-    {
-      id: 2,
-      url: "https://via.placeholder.com/800x600.png?text=Image+2",
-      labels: [],
-      history: [],
-      future: [],
-    },
-  ]);
-
+  let [images, setImages] = useState<ImageData[]>([]);
   const [selectedImage, setSelectedImage] = useState(0);
   const [usedClear, setUsedClear] = useState(false);
+  let points = [] as Point[];
 
-  let points = images[selectedImage].labels;
+  // Add useEffect to update images when fileArray changes
+  useEffect(() => {
+    if (fileArray.length > 0) {
+      setImages((prevImages) => {
+        const existingIds = new Set(prevImages.map((image) => image.id)); // Create a set of existing image IDs
+        const newImages = fileArray.filter(
+          (image) => !existingIds.has(image.id)
+        ); // Filter out duplicates
+
+        const oldImagesLength = newImages.length;
+
+        // Filter out images that are no longer in fileArray
+        const updatedImages = prevImages.filter((image) =>
+          fileArray.some((file) => file.id === image.id)
+        );
+
+        const newImagesLength = updatedImages.length;
+
+        if (newImagesLength == 0) setSelectedImage(0);
+        else if (oldImagesLength < newImagesLength) {
+          if (selectedImage != 0) setSelectedImage(updatedImages.length - 1); // Set to last image if out of bounds
+        }
+
+        return [...updatedImages, ...newImages]; // Merge new data with previous state
+      });
+    }
+  }, [fileArray]); // Dependency array includes fileArray
+
+  if (images.length > 0) points = images[selectedImage].labels;
 
   const undo = useCallback(() => {
     const newImages = [...images];
@@ -91,15 +109,25 @@ export const UndoRedoClearContextProvider = ({
     }
   }, [images]);
 
-  const addPoint = (newPoint: Point) => {
+  // const addPoint = (newPoint: Point) => {
+  //   const updatedImages = [...images];
+  //   let image = updatedImages[selectedImage];
+
+  //   image.labels.push(newPoint);
+  //   image.history.push(newPoint);
+
+  //   setImages(updatedImages);
+  // };
+
+  function addPoint(newPoint: Point) {
     const updatedImages = [...images];
-    let image = updatedImages[selectedImage];
+    let image = { ...updatedImages[selectedImage] }; // Create a new object
+    image.labels = [...image.labels, newPoint]; // Update labels immutably
+    image.history = [...image.history, newPoint]; // Update history immutably
 
-    image.labels.push(newPoint);
-    image.history.push(newPoint);
-
+    updatedImages[selectedImage] = image; // Replace the old image with the new one
     setImages(updatedImages);
-  };
+  }
 
   const redo = useCallback(() => {
     // console.log("redo from MyContext");
