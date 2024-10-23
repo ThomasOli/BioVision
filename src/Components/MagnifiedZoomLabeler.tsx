@@ -1,10 +1,11 @@
 // src/Components/MagnifiedImageLabeler.tsx
-import React, { useRef, useState, useCallback, useEffect } from "react";
+import React, { useRef, useState, useCallback, useEffect, useContext } from "react";
 import { Modal, Box, IconButton } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import { Stage, Layer, Image as KonvaImage, Circle, Text } from "react-konva";
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
+import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 interface Point {
   x: number;
@@ -14,31 +15,26 @@ interface Point {
 
 interface MagnifiedImageLabelerProps {
   imageURL: string;
-  initialPoints: Point[];
   onPointsChange: (points: Point[]) => void;
   color: string;
   opacity: number;
   open: boolean;
   onClose: () => void;
+  mode: boolean;
 }
 
 const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   imageURL,
-  initialPoints,
   onPointsChange,
   color,
   opacity,
   open,
   onClose,
+  mode,
 }) => {
-  const [points, setPoints] = useState<Point[]>(initialPoints || []);
+  const { addPoint, points, undo, redo } = useContext(UndoRedoClearContext);
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
-  // Update points when initialPoints or imageURL changes
-  useEffect(() => {
-    console.log("MagnifiedImageLabeler: Updating points based on new props.");
-    setPoints(initialPoints || []);
-  }, [initialPoints, imageURL]);
 
   // Define maximum dimensions for the magnified view
   const MAX_WIDTH = window.innerWidth * 0.9;
@@ -53,11 +49,18 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   };
 
   const scale = calculateScale();
-
+  const baseRadius = 1;
+  const getScaledRadius = useCallback(() => {
+    if (!imageDimensions) return baseRadius;
+    const imageDiagonal = Math.sqrt(
+      Math.pow(imageDimensions.width, 2) + Math.pow(imageDimensions.height, 2)
+    );
+    return Math.max(baseRadius, imageDiagonal * 0.002); // 0.3% of diagonal length
+  }, [imageDimensions]);
   // Handle canvas click to add a point
   const handleCanvasClick = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
-      if (!image || !imageDimensions) return;
+      if (!image || !imageDimensions || mode) return;
 
       const stage = e.target.getStage();
       const pointerPosition = stage?.getPointerPosition();
@@ -81,13 +84,36 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
           y: y,
           id: Date.now(),
         };
-        const updatedPoints = [...points, newPoint];
-        setPoints(updatedPoints);
-        onPointsChange(updatedPoints);
+        addPoint(newPoint);
+
       }
     },
     [image, imageDimensions, points, onPointsChange, scale]
   );
+
+  const getTextConfig = useCallback(() => {
+    if (!imageDimensions) return { fontSize: 7, offsetX: 5, offsetY: 5 };
+    const imageDiagonal = Math.sqrt(
+      Math.pow(imageDimensions.width, 2) + Math.pow(imageDimensions.height, 2)
+    );
+    const fontSize = Math.max(6, imageDiagonal * 0.007); // 0.8% of diagonal length
+    return { fontSize };
+  }, [imageDimensions]);
+  
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === 'z') {
+        e.preventDefault();
+        undo();
+      } else if (e.ctrlKey && e.key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [undo, redo]);
 
   // // Remove a point
   // const handlePointRightClick = useCallback(
@@ -169,7 +195,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                   <Circle
                     x={point.x}
                     y={point.y}
-                    radius={0.5} // Fixed radius
+                    radius={getScaledRadius()} // Fixed radius
                     fill={color}
                     opacity={opacity / 100} // Convert percentage to decimal
                     // draggable
@@ -177,11 +203,12 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                     // onContextMenu={(e) => handlePointRightClick(e, point.id)}
                   />
                   <Text
-                    x={point.x + 2}
-                    y={point.y - 4}
+                    x={point.x + 2.5}
+                    y={point.y - 8}
                     text={(index + 1).toString()}
-                    fontSize={3} // Fixed font size
+                    fontSize={getTextConfig().fontSize} // Fixed font size
                     fill={color}
+                    opacity={opacity/100}
                   />
                 </React.Fragment>
               ))}

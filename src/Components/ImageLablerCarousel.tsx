@@ -15,11 +15,13 @@ import { UndoRedoClearContext } from "./UndoRedoClearContext";
 interface ImageLabelerCarouselProps {
   color: string;
   opacity: number;
+  isSwitchOn: boolean;
 }
 
 const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   color,
   opacity,
+  isSwitchOn,
 }) => {
   // CHANGE THIS
   // const images = useSelector((state: RootState) => state.files.fileArray);
@@ -205,6 +207,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
             }
             color={color}
             opacity={opacity}
+            mode={isSwitchOn}
           />
         </Box>
 
@@ -264,7 +267,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       {/* Magnified Image Labeler Modal */}
       <MagnifiedImageLabeler
         imageURL={images[currentIndex].url}
-        initialPoints={images[currentIndex].labels}
         onPointsChange={(newPoints: { x: number; y: number; id: number }[]) =>
           handleUpdateLabels(images[currentIndex].id, newPoints)
         }
@@ -272,6 +274,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         opacity={opacity}
         open={isMagnified}
         onClose={toggleMagnifiedView}
+        mode={isSwitchOn}
       />
     </Box>
   );

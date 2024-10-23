@@ -6,7 +6,7 @@ import React, {
   useEffect,
   useContext,
 } from "react";
-import { Stage, Layer, Image as KonvaImage, Circle } from "react-konva";
+import { Stage, Layer, Image as KonvaImage, Circle,Text } from "react-konva";
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
 import { Button, Box } from "@mui/material";
@@ -23,6 +23,7 @@ interface ImageLabelerProps {
   onPointsChange: (points: Point[]) => void;
   color: string;
   opacity: number;
+  mode: boolean;
 }
 
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
@@ -30,12 +31,23 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   onPointsChange,
   color,
   opacity,
+  mode,
 }) => {
-  const { addPoint, points } = useContext(UndoRedoClearContext);
+  const { addPoint, points, undo, redo } = useContext(UndoRedoClearContext);
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
   const [scale, setScale] = useState(1);
+
+  // Add this calculation for dynamic radius
+  const baseRadius = 3;
+  const getScaledRadius = useCallback(() => {
+    if (!imageDimensions) return baseRadius;
+    const imageDiagonal = Math.sqrt(
+      Math.pow(imageDimensions.width, 2) + Math.pow(imageDimensions.height, 2)
+    );
+    return Math.max(baseRadius, imageDiagonal * 0.003); // 0.3% of diagonal length
+  }, [imageDimensions]);
 
   // Adjust the scale based on available screen space
   useEffect(() => {
@@ -49,11 +61,27 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     }
   }, [imageDimensions]);
 
+  // Add this useEffect for keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === 'z') {
+        e.preventDefault();
+        undo();
+      } else if (e.ctrlKey && e.key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [undo, redo]);
+
   // Handle canvas click to add a point
   const handleCanvasClick = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
-      if (!image || !imageDimensions) return;
-
+      
+      if (!image || !imageDimensions || mode) return;
       const stage = e.target.getStage();
       const pointerPosition = stage?.getPointerPosition();
       if (pointerPosition) {
@@ -109,6 +137,15 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     URL.revokeObjectURL(url);
   }, [imageDimensions, imageURL]);
 
+  const getTextConfig = useCallback(() => {
+    if (!imageDimensions) return { fontSize: 7, offsetX: 5, offsetY: 5 };
+    const imageDiagonal = Math.sqrt(
+      Math.pow(imageDimensions.width, 2) + Math.pow(imageDimensions.height, 2)
+    );
+    const fontSize = Math.max(7, imageDiagonal * 0.01); // 0.8% of diagonal length
+    return { fontSize };
+  }, [imageDimensions]);
+
   if (imageError) {
     return <div style={{ color: "red" }}>Error loading image.</div>;
   }
@@ -141,14 +178,24 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                 height={imageDimensions.height}
               />
               {/* Render the points */}
-              {points.map((point) => (
+              {points.map((point, index) => (
                 <React.Fragment key={point.id}>
                   <Circle
                     x={point.x}
                     y={point.y}
-                    radius={3}
+                    radius={getScaledRadius()}
                     fill={color}
-                    opacity={opacity / 100} // Convert percentage to decimal
+                    opacity={opacity / 100}
+                  />
+                  <Text
+                    x={point.x + 4}
+                    y={point.y - 11}
+                    text={(index + 1).toString()}
+                    fontSize={getTextConfig().fontSize}
+                    fill={color}
+                    align="left"
+                    verticalAlign="middle"
+                    opacity={opacity/100}
                   />
                 </React.Fragment>
               ))}

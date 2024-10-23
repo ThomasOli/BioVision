@@ -124,7 +124,7 @@ export const UndoRedoClearContextProvider = ({
     let image = { ...updatedImages[selectedImage] }; // Create a new object
     image.labels = [...image.labels, newPoint]; // Update labels immutably
     image.history = [...image.history, newPoint]; // Update history immutably
-
+    image.future = [];
     updatedImages[selectedImage] = image; // Replace the old image with the new one
     setImages(updatedImages);
   }

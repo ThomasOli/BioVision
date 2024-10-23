@@ -15,24 +15,28 @@ import {
   FormatUnderlined as FormatUnderlinedIcon,
 } from "@mui/icons-material";
 import { HexColorPicker } from "react-colorful";
+import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 interface LandmarkProps {
   onColorChange: (selectedColor: string) => void;
   onOpacityChange: (selectedOpacity: number) => void;
+  onSwitchChange: () => void;
 }
 
 function valuetext(value: number) {
   return `${value}°C`;
 }
 
-const Landmark: React.FC<LandmarkProps> = ({ onColorChange, onOpacityChange }) => {
+const Landmark: React.FC<LandmarkProps> = ({ onColorChange, onOpacityChange, onSwitchChange }) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
   const [color, setColor] = useState("#ff0000"); // Default to red color
   const [opacity, setOpacity] = useState<number>(100);
   const [formats, setFormats] = useState(() => ["bold", "italic"]);
+  const { clear, undo, redo } = React.useContext(UndoRedoClearContext);
 
   const handleSwitchChange = () => {
     setIsSwitchOn((prev) => !prev);
+    onSwitchChange();
   };
 
   const handleColorChange = (newColor: string) => {
@@ -89,9 +93,9 @@ const Landmark: React.FC<LandmarkProps> = ({ onColorChange, onOpacityChange }) =
             aria-label="outlined primary button group"
             disabled={isSwitchOn}
           >
-            <Button>Clear</Button>
-            <Button>Undo</Button>
-            <Button>Redo</Button>
+            <Button onClick={() => clear()}>Clear</Button>
+            <Button onClick={() => undo()}>Undo</Button>
+            <Button onClick={() => redo()}>Redo</Button>
           </ButtonGroup>
 
           <br />

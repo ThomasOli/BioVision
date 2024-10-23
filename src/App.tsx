@@ -7,9 +7,15 @@ import ImageLabelerCarousel from "./Components/ImageLablerCarousel";
 import { UndoRedoClearContextProvider } from "./Components/UndoRedoClearContext";
 
 const App: React.FC = () => {
+  
   const [color, setColor] = useState<string>("red");
   const handleColorChange = (selectedColor: string) => {
     setColor(selectedColor);
+  };
+
+  const [isSwitchOn, setIsSwitchOn] = useState(false);
+  const handleSwitchChange = () => {
+    setIsSwitchOn((prev) => !prev);
   };
 
   const [opacity, setOpacity] = useState<number>(100);
@@ -24,10 +30,11 @@ const App: React.FC = () => {
           <Menu
             onOpacityChange={handleOpacityChange}
             onColorChange={handleColorChange}
+            onSwitchChange={handleSwitchChange}
           />
         </Grid>
         <Grid item xs={8}>
-          <ImageLabelerCarousel color={color} opacity={opacity} />
+          <ImageLabelerCarousel color={color} opacity={opacity} isSwitchOn={isSwitchOn} />
         </Grid>
       </Grid>
     </UndoRedoClearContextProvider>

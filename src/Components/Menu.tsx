@@ -8,9 +8,10 @@ import Landmark from "./Landmark";
 interface MenuProps {
   onOpacityChange: (selectedOpacity: number) => void;
   onColorChange: (selectedColor: string) => void;
+  onSwitchChange: () => void;
 }
 
-const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange }) => {
+const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchChange }) => {
   return (
     <Paper
       elevation={9}
@@ -49,6 +50,7 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange }) => {
         <Landmark
           onOpacityChange={onOpacityChange}
           onColorChange={onColorChange}
+          onSwitchChange={onSwitchChange}
         />
 
         <div
