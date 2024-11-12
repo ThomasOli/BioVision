@@ -39,8 +39,6 @@ export const UndoRedoClearContextProvider = ({
   const fileArray = useSelector((state: RootState) => state.files.fileArray); // Access fileArray from the Redux store
   console.log(fileArray);
 
-  // CHANGE THIS
-  // need to get files from upload / system
   let [images, setImages] = useState<ImageData[]>([]);
   const [selectedImage, setSelectedImage] = useState(0);
   const [usedClear, setUsedClear] = useState(false);

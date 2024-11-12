@@ -27,7 +27,11 @@ function valuetext(value: number) {
   return `${value}°C`;
 }
 
-const Landmark: React.FC<LandmarkProps> = ({ onColorChange, onOpacityChange, onSwitchChange }) => {
+const Landmark: React.FC<LandmarkProps> = ({
+  onColorChange,
+  onOpacityChange,
+  onSwitchChange,
+}) => {
   const [isSwitchOn, setIsSwitchOn] = useState(false);
   const [color, setColor] = useState("#ff0000"); // Default to red color
   const [opacity, setOpacity] = useState<number>(100);

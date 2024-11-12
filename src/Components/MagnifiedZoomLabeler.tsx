@@ -1,5 +1,11 @@
 // src/Components/MagnifiedImageLabeler.tsx
-import React, { useRef, useState, useCallback, useEffect, useContext } from "react";
+import React, {
+  useRef,
+  useState,
+  useCallback,
+  useEffect,
+  useContext,
+} from "react";
 import { Modal, Box, IconButton } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import { Stage, Layer, Image as KonvaImage, Circle, Text } from "react-konva";
@@ -85,7 +91,6 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
           id: Date.now(),
         };
         addPoint(newPoint);
-
       }
     },
     [image, imageDimensions, points, onPointsChange, scale]
@@ -99,20 +104,20 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     const fontSize = Math.max(6, imageDiagonal * 0.007); // 0.8% of diagonal length
     return { fontSize };
   }, [imageDimensions]);
-  
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === 'z') {
+      if (e.ctrlKey && e.key === "z") {
         e.preventDefault();
         undo();
-      } else if (e.ctrlKey && e.key === 'y') {
+      } else if (e.ctrlKey && e.key === "y") {
         e.preventDefault();
         redo();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [undo, redo]);
 
   // // Remove a point
@@ -208,7 +213,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                     text={(index + 1).toString()}
                     fontSize={getTextConfig().fontSize} // Fixed font size
                     fill={color}
-                    opacity={opacity/100}
+                    opacity={opacity / 100}
                   />
                 </React.Fragment>
               ))}

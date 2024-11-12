@@ -6,7 +6,7 @@ import React, {
   useEffect,
   useContext,
 } from "react";
-import { Stage, Layer, Image as KonvaImage, Circle,Text } from "react-konva";
+import { Stage, Layer, Image as KonvaImage, Circle, Text } from "react-konva";
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
 import { Button, Box } from "@mui/material";
@@ -51,36 +51,41 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   // Adjust the scale based on available screen space
   useEffect(() => {
-    if (imageDimensions) {
-      const availableWidth = window.innerWidth * 0.6; // Reserve 60% of screen width
-      const availableHeight = window.innerHeight * 0.6; // Reserve 60% of screen height
+    const updateScale = () => {
+      if (imageDimensions) {
+        const availableWidth = window.innerWidth * 0.6; // Reserve 60% of screen width
+        const availableHeight = window.innerHeight * 0.6; // Reserve 60% of screen height
 
-      const widthScale = availableWidth / imageDimensions.width;
-      const heightScale = availableHeight / imageDimensions.height;
-      setScale(Math.min(widthScale, heightScale));
-    }
+        const widthScale = availableWidth / imageDimensions.width;
+        const heightScale = availableHeight / imageDimensions.height;
+        setScale(Math.min(widthScale, heightScale));
+      }
+    };
+
+    updateScale(); // Initial scale calculation
+    window.addEventListener("resize", updateScale); // Add resize event listener
+    return () => window.removeEventListener("resize", updateScale); // Cleanup
   }, [imageDimensions]);
 
   // Add this useEffect for keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === 'z') {
+      if (e.ctrlKey && e.key === "z") {
         e.preventDefault();
         undo();
-      } else if (e.ctrlKey && e.key === 'y') {
+      } else if (e.ctrlKey && e.key === "y") {
         e.preventDefault();
         redo();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [undo, redo]);
 
   // Handle canvas click to add a point
   const handleCanvasClick = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
-      
       if (!image || !imageDimensions || mode) return;
       const stage = e.target.getStage();
       const pointerPosition = stage?.getPointerPosition();
@@ -165,7 +170,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
               border: "1px solid gray",
               backgroundColor: "#f0f0f0",
               cursor: "crosshair",
-              marginRight: "auto",
+              marginRight: "20%",
             }}
             scaleX={scale}
             scaleY={scale}
@@ -195,7 +200,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                     fill={color}
                     align="left"
                     verticalAlign="middle"
-                    opacity={opacity/100}
+                    opacity={opacity / 100}
                   />
                 </React.Fragment>
               ))}

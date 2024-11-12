@@ -23,8 +23,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   opacity,
   isSwitchOn,
 }) => {
-  // CHANGE THIS
-  // const images = useSelector((state: RootState) => state.files.fileArray);
   const { images, setSelectedImage } = useContext(UndoRedoClearContext);
 
   const dispatch = useDispatch<AppDispatch>();
