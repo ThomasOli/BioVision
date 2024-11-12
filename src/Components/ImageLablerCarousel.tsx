@@ -111,7 +111,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         padding: "20px",
         maxWidth: "1000px",
         margin: "0 auto",
-        // position: "relative",
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
@@ -160,7 +159,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       {/* Carousel Container */}
       <Box
         sx={{
-          // position: "relative",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -177,9 +175,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
               sx={{
                 position: "relative",
                 marginRight: "10px",
-                // left: "-40px", // Adjusted position to avoid overlap
-                // top: "50%",
-                // transform: "translateY(-50%)",
                 backgroundColor: "rgba(255,255,255,0.7)",
                 "&:hover": {
                   backgroundColor: "rgba(255,255,255,1)",
@@ -220,11 +215,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
               disabled={totalImages === 1}
               aria-label="Next Image"
               sx={{
-                // position: "absolute",
                 marginLeft: "10px",
-                // right: "-40px", // Adjusted position to avoid overlap
-                // top: "50%",
-                // transform: "translateY(-50%)",
                 backgroundColor: "rgba(255,255,255,0.7)",
                 "&:hover": {
                   backgroundColor: "rgba(255,255,255,1)",
