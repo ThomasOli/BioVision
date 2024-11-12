@@ -111,7 +111,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         padding: "20px",
         maxWidth: "1000px",
         margin: "0 auto",
-        position: "relative",
+        // position: "relative",
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
@@ -160,7 +160,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       {/* Carousel Container */}
       <Box
         sx={{
-          position: "relative",
+          // position: "relative",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -168,26 +168,29 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         }}
       >
         {/* Left Navigation Arrow */}
-        <Tooltip title="Previous Image">
-          <IconButton
-            onClick={handlePrev}
-            disabled={totalImages === 1}
-            aria-label="Previous Image"
-            sx={{
-              position: "absolute",
-              left: "-40px", // Adjusted position to avoid overlap
-              top: "50%",
-              transform: "translateY(-50%)",
-              backgroundColor: "rgba(255,255,255,0.7)",
-              "&:hover": {
-                backgroundColor: "rgba(255,255,255,1)",
-              },
-              zIndex: 2,
-            }}
-          >
-            <ArrowBackIosIcon />
-          </IconButton>
-        </Tooltip>
+        <div>
+          <Tooltip title="Previous Image">
+            <IconButton
+              onClick={handlePrev}
+              disabled={totalImages === 1}
+              aria-label="Previous Image"
+              sx={{
+                position: "relative",
+                marginRight: "10px",
+                // left: "-40px", // Adjusted position to avoid overlap
+                // top: "50%",
+                // transform: "translateY(-50%)",
+                backgroundColor: "rgba(255,255,255,0.7)",
+                "&:hover": {
+                  backgroundColor: "rgba(255,255,255,1)",
+                },
+                zIndex: 2,
+              }}
+            >
+              <ArrowBackIosIcon />
+            </IconButton>
+          </Tooltip>
+        </div>
 
         {/* Image Labeler */}
         <Box
@@ -210,26 +213,29 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         </Box>
 
         {/* Right Navigation Arrow */}
-        <Tooltip title="Next Image">
-          <IconButton
-            onClick={handleNext}
-            disabled={totalImages === 1}
-            aria-label="Next Image"
-            sx={{
-              position: "absolute",
-              right: "-40px", // Adjusted position to avoid overlap
-              top: "50%",
-              transform: "translateY(-50%)",
-              backgroundColor: "rgba(255,255,255,0.7)",
-              "&:hover": {
-                backgroundColor: "rgba(255,255,255,1)",
-              },
-              zIndex: 2,
-            }}
-          >
-            <ArrowForwardIosIcon />
-          </IconButton>
-        </Tooltip>
+        <div>
+          <Tooltip title="Next Image">
+            <IconButton
+              onClick={handleNext}
+              disabled={totalImages === 1}
+              aria-label="Next Image"
+              sx={{
+                // position: "absolute",
+                marginLeft: "10px",
+                // right: "-40px", // Adjusted position to avoid overlap
+                // top: "50%",
+                // transform: "translateY(-50%)",
+                backgroundColor: "rgba(255,255,255,0.7)",
+                "&:hover": {
+                  backgroundColor: "rgba(255,255,255,1)",
+                },
+                zIndex: 2,
+              }}
+            >
+              <ArrowForwardIosIcon />
+            </IconButton>
+          </Tooltip>
+        </div>
       </Box>
 
       {/* Carousel Information and Export Button */}
