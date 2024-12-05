@@ -170,7 +170,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
               border: "1px solid gray",
               backgroundColor: "#f0f0f0",
               cursor: "crosshair",
-              marginRight: "20%",
+              // marginRight: "20%",
             }}
             scaleX={scale}
             scaleY={scale}
