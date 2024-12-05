@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect } from "react";
 import Paper from "@mui/material/Paper";
 import Button from "@mui/material/Button";
 
@@ -12,6 +12,34 @@ interface MenuProps {
 }
 
 const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchChange }) => {
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === "n") {
+        e.preventDefault();
+        const event = new CustomEvent("open-upload-dialog");
+        window.dispatchEvent(event);
+      }
+    };
+  
+    window.addEventListener("keydown", handleKeyDown);
+  
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    const openUploadDialog = () => {
+      document.getElementById("btn-upload")?.click();
+    };
+  
+    window.addEventListener("open-upload-dialog", openUploadDialog);
+  
+    return () => {
+      window.removeEventListener("open-upload-dialog", openUploadDialog);
+    };
+  }, []);
   return (
     <Paper
       elevation={9}
