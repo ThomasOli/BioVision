@@ -1,21 +1,7 @@
 import { createContext, useCallback, useState, useEffect } from "react";
 import { useSelector } from "react-redux"; // Import useSelector
 import { RootState } from "../state/store"; // Adjust the import based on your store setup
-
-interface Point {
-  x: number;
-  y: number;
-  id: number;
-}
-
-interface ImageData {
-  id: number;
-  url: string;
-  labels: Point[];
-  history: Point[];
-  future: Point[];
-}
-
+import { Point, ImageData } from "../types/Image";
 export const UndoRedoClearContext = createContext<UndoRedoClearContextProps>(
   {} as UndoRedoClearContextProps
 );
@@ -37,7 +23,6 @@ export const UndoRedoClearContextProvider = ({
   children,
 }: React.PropsWithChildren<{}>) => {
   const fileArray = useSelector((state: RootState) => state.files.fileArray); // Access fileArray from the Redux store
-  console.log(fileArray);
 
   let [images, setImages] = useState<ImageData[]>([]);
   const [selectedImage, setSelectedImage] = useState(0);
@@ -45,139 +30,127 @@ export const UndoRedoClearContextProvider = ({
   let points = [] as Point[];
 
   // Add useEffect to update images when fileArray changes
+
   useEffect(() => {
-    if (fileArray.length > 0) {
-      setImages((prevImages) => {
-        const existingIds = new Set(prevImages.map((image) => image.id)); // Create a set of existing image IDs
-        const newImages = fileArray.filter(
-          (image) => !existingIds.has(image.id)
-        ); // Filter out duplicates
+    setImages((prevImages) => {
+      const existingIds = new Set(prevImages.map((image) => image.id));
+      
+      // Initialize new files with required properties
+      const newImages = fileArray
+        .filter((file) => !existingIds.has(file.id))
+        .map((file) => ({
+          ...file,
+          labels: [],
+          history: [],
+          future: []
+        }));
 
-        const oldImagesLength = newImages.length;
+      // Keep only images that still exist in fileArray
+      const updatedImages = prevImages.filter((image) =>
+        fileArray.some((file) => file.id === image.id)
+      );
 
-        // Filter out images that are no longer in fileArray
-        const updatedImages = prevImages.filter((image) =>
-          fileArray.some((file) => file.id === image.id)
-        );
+      return [...updatedImages, ...newImages];
+    });
+  }, [fileArray]); 
 
-        const newImagesLength = updatedImages.length;
-
-        if (newImagesLength == 0) setSelectedImage(0);
-        else if (oldImagesLength < newImagesLength) {
-          if (selectedImage != 0) setSelectedImage(updatedImages.length - 1); // Set to last image if out of bounds
-        }
-
-        return [...updatedImages, ...newImages]; // Merge new data with previous state
-      });
+  useEffect(() => {
+    // Logic: If selection is out of bounds (e.g. we deleted the selected image), reset it.
+    if (selectedImage >= images.length) {
+        setSelectedImage(Math.max(0, images.length - 1));
     }
-  }, [fileArray]); // Dependency array includes fileArray
+  }, [images.length, selectedImage]);
 
   if (images.length > 0) points = images[selectedImage].labels;
 
-  const undo = useCallback(() => {
-    const newImages = [...images];
-    let image = newImages[selectedImage];
 
-    if (usedClear) {
-      image.future = [];
-      image.labels = image.history;
+const undo = useCallback(() => {
+  setImages((prevImages) => {
+    const newImages = [...prevImages];
+    
+    const activeImage = { ...newImages[selectedImage] };
 
-      setUsedClear(false);
-      setImages(newImages);
-    } else {
-      const newRedoPoint = image.history[image.history.length - 1];
-      // console.log("history is: ", images[selectedImage].history);
-      // console.log("newRedoPoint is: ", newRedoPoint);
+    if (activeImage.history.length === 0) return prevImages;
 
-      const newHistory = [...image.history];
-      newHistory.splice(-1, 1);
-      image.history = newHistory;
+    const previousSnapshot = activeImage.history[activeImage.history.length - 1];
 
-      const newFuture = [...image.future, newRedoPoint];
-      image.future = newFuture;
+    activeImage.future = [...activeImage.future, activeImage.labels];
 
-      const newPoints = [...image.labels]; // Create a copy of the array
-      newPoints.splice(-1, 1); // Remove the last element using splice
-      image.labels = newPoints;
+    activeImage.labels = previousSnapshot;
 
-      // console.log("the new points are", newPoints);
-      // console.log("the new history is", newHistory);
-      // console.log("the new future is", newFuture);
-      setImages(newImages);
-    }
-  }, [images]);
+    const newHistory = [...activeImage.history];
+    newHistory.pop();
+    activeImage.history = newHistory;
 
-  // const addPoint = (newPoint: Point) => {
-  //   const updatedImages = [...images];
-  //   let image = updatedImages[selectedImage];
+    newImages[selectedImage] = activeImage;
 
-  //   image.labels.push(newPoint);
-  //   image.history.push(newPoint);
+    return newImages;
+  });
+}, [selectedImage]); 
 
-  //   setImages(updatedImages);
-  // };
 
   function addPoint(newPoint: Point) {
-    const updatedImages = [...images];
-    let image = { ...updatedImages[selectedImage] }; // Create a new object
-    image.labels = [...image.labels, newPoint]; // Update labels immutably
-    image.history = [...image.history, newPoint]; // Update history immutably
-    image.future = [];
-    updatedImages[selectedImage] = image; // Replace the old image with the new one
-    setImages(updatedImages);
+    setImages((prevImages) => {
+       const updatedImages = [...prevImages];
+       const activeImage = { ...updatedImages[selectedImage] }; 
+
+       activeImage.history = [...activeImage.history, activeImage.labels];
+
+       activeImage.labels = [...activeImage.labels, newPoint];
+
+       activeImage.future = [];
+
+       updatedImages[selectedImage] = activeImage;
+       return updatedImages;
+    });
   }
 
   const redo = useCallback(() => {
-    // console.log("redo from MyContext");
-    // console.log(images[selectedImage].labels);
-    const newImages = [...images];
-    let image = newImages[selectedImage];
+    setImages((prevImages) => {    
+      const newImages = [...prevImages];
+      const activeImage = {...newImages[selectedImage]};
 
-    if (image.future.length === 0) return; // Ensure there is something to redo
+      if (activeImage.future.length === 0) return prevImages;
+      const itemRestored = activeImage.future[activeImage.future.length - 1];
 
-    const newUndoPoint = image.future[image.future.length - 1]; // Get the last element from future
-    // console.log("newUndoPoint is", newUndoPoint);
+      const newFuture = [...activeImage.future];
+      newFuture.pop();
+      activeImage.future = newFuture;
 
-    const newFuture = [...image.future]; // Copy the future array
-    newFuture.splice(-1, 1); // Remove the last element from future
-    image.future = newFuture; // Update future state
+      activeImage.history = [...activeImage.history, activeImage.labels]
 
-    const newHistory = [...image.history, newUndoPoint]; // Add the redo point back to history
-    image.history = newHistory; // Update history state
-
-    const newPoints = [...image.labels, newUndoPoint]; // Add the redo point back to points
-    image.labels = newPoints; // Update points state
-
-    // console.log("the new points are", newPoints);
-    // console.log("the new history is", newHistory);
-    // console.log("the new future is", newFuture);
-    setImages(newImages);
-  }, [points]);
+      if(Array.isArray(itemRestored)){
+        activeImage.labels = itemRestored;
+      }
+      else{
+        activeImage.labels = [...activeImage.labels, itemRestored]
+      }
+      newImages[selectedImage] = activeImage
+      return newImages
+    })
+  }, [selectedImage]);
 
   const clear = useCallback(() => {
-    // console.log("clear from MyContext");
-    // console.log(images[selectedImage].labels);
-    const newImages = [...images];
-    let image = newImages[selectedImage];
+    setImages((prevImages) => {
 
-    // Save the current points to history so that undo can bring them back
-    const newHistory = [...image.history]; // Add the current points to history
-    newHistory.concat(image.labels);
-    image.history = newHistory;
-    // console.log("history is ", history)
+      const newImages = [...prevImages];
+      const activeImage = { ...newImages[selectedImage] };
+      
+      if (activeImage.labels.length > 0){
+        activeImage.history = [...activeImage.history, activeImage.labels]
+      }
+      activeImage.labels = [];
+        
+      activeImage.future = [];
 
-    // Clear the points by setting it to an empty array
-    image.labels = [];
+      newImages[selectedImage] = activeImage;
 
-    // Optionally reset future, since clearing might represent a new action that prevents redo
-    image.future = [];
+      return newImages;
+    })
 
-    // console.log("Points cleared.");
-    // console.log("History updated:", newHistory);
     setUsedClear(true);
 
-    setImages(newImages);
-  }, [points]);
+  }, [selectedImage]);
 
   return (
     <UndoRedoClearContext.Provider

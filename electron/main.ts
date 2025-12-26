@@ -1,18 +1,22 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron';
-import * as path from 'path';
-import { download } from 'electron-dl';
-const contextMenu = require('electron-context-menu');
+import { app, BrowserWindow, ipcMain, dialog } from "electron";
+import fs from "fs";
+import * as path from "path";
+import { spawn } from "child_process";
+
+const contextMenu = require("electron-context-menu");
 
 let mainWindow: BrowserWindow | null;
+const userDataDir = app.getPath("userData");
+const projectRoot = path.join(userDataDir, "fossil-model");
 
 const template = [
-  { label: 'Minimize', click: () => mainWindow?.minimize() },
-  { label: 'Maximize', click: () => mainWindow?.maximize() },
-  { type: 'separator' },
-  { label: 'Copy', click: () => mainWindow?.webContents.copy() },
-  { label: 'Paste', click: () => mainWindow?.webContents.paste() },
-  { label: 'Delete', click: () => mainWindow?.webContents.delete() },
-  { type: 'separator' },
+  { label: "Minimize", click: () => mainWindow?.minimize() },
+  { label: "Maximize", click: () => mainWindow?.maximize() },
+  { type: "separator" },
+  { label: "Copy", click: () => mainWindow?.webContents.copy() },
+  { label: "Paste", click: () => mainWindow?.webContents.paste() },
+  { label: "Delete", click: () => mainWindow?.webContents.delete() },
+  { type: "separator" },
   // {
   //   label: 'Save Image',
   //   visible: (params: { mediaType?: string }) => params.mediaType === 'image',
@@ -38,8 +42,8 @@ const template = [
   //     }
   //   },
   // },
-  { type: 'separator' },
-  { label: 'Quit', click: () => app.quit() },
+  { type: "separator" },
+  { label: "Quit", click: () => app.quit() },
 ];
 
 contextMenu({ prepend: () => template });
@@ -51,7 +55,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(__dirname, "preload.js"),
     },
   });
 
@@ -61,33 +65,123 @@ function createWindow() {
   if (VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(VITE_DEV_SERVER_URL);
   } else {
-    mainWindow.loadFile(path.join(__dirname, 'index.html'));
+    mainWindow.loadFile(path.join(__dirname, "index.html"));
   }
 
-  mainWindow.on('closed', () => {
+  mainWindow.on("closed", () => {
     mainWindow = null;
   });
 }
 
-app.on('ready', createWindow);
+app.on("ready", createWindow);
 
-ipcMain.handle('open-folder-dialog', async (event, arg) => {
+function runPython(args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const pyPath = "python"; 
+    const proc = spawn(pyPath, args);
+
+    let out = "";
+    let err = "";
+
+    proc.stdout.on("data", (d) => (out += d.toString()));
+    proc.stderr.on("data", (d) => (err += d.toString()));
+
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(err || `Python exited with code ${code}`));
+      }
+      resolve(out.trim());
+    });
+  });
+}
+
+ipcMain.handle("ml:train", async () => {
+  const tag = "fossils";
+  try {
+    await runPython([
+      path.join(__dirname, "../backend/prepare_dataset.py"),
+      projectRoot,
+      tag,
+    ]);
+
+    const out = await runPython([
+      path.join(__dirname, "../backend/train_shape_model.py"),
+      projectRoot,
+      tag,
+    ]);
+
+    return { ok: true, output: out };
+  } catch (e: any) {
+    console.error("Training failed:", e);
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle("ml:save-labels", async (_event, data) => {
+  const labelsDir = path.join(projectRoot, "labels");
+  const imagesDir = path.join(projectRoot, "images");
+
+  fs.mkdirSync(labelsDir, { recursive: true });
+  fs.mkdirSync(imagesDir, { recursive: true });
+
+  const srcImagePath = data.originalImagePath;
+  const destImagePath = path.join(imagesDir, data.imageFilename);
+  if (!fs.existsSync(destImagePath)) {
+    fs.copyFileSync(srcImagePath, destImagePath);
+  }
+
+  const labelPath = path.join(labelsDir, `${data.imageFilename}.json`);
+  fs.writeFileSync(
+    labelPath,
+    JSON.stringify(
+      {
+        imageFilename: data.imageFilename,
+        landmarks: data.landmarks,
+      },
+      null,
+      2
+    )
+  );
+
+  return { ok: true };
+});
+
+ipcMain.handle("ml:predict", async(_event, imagePath: string, tag: string) =>{
+  try{
+    const out = await runPython([
+      path.join(__dirname, "../backend/predict.py"),
+      projectRoot,
+      tag,
+      imagePath,
+    ]);
+
+    const data = JSON.parse(out);
+    return{ok: true, data};
+  }
+  catch(e: any){
+    console.error("Prediction failed:", e)
+    return { ok: false, error: e.message };
+
+  }
+})
+
+ipcMain.handle("open-folder-dialog", async (event, arg) => {
   if (mainWindow) {
     const result = await dialog.showOpenDialog(mainWindow, {
-      properties: ['openDirectory'],
+      properties: ["openDirectory"],
     });
     return result;
   }
   return null;
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") {
     app.quit();
   }
 });
 
-app.on('activate', () => {
+app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
   }

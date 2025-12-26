@@ -1,18 +1,30 @@
 import React, { useEffect } from "react";
 import Paper from "@mui/material/Paper";
 import Button from "@mui/material/Button";
-
+import { useSelector } from "react-redux";
 import UploadImages from "./UploadImages";
-
+import type { RootState } from "../state/store";
 import Landmark from "./Landmark";
+import { ImageData } from "../types/Image";
 interface MenuProps {
   onOpacityChange: (selectedOpacity: number) => void;
   onColorChange: (selectedColor: string) => void;
   onSwitchChange: () => void;
 }
 
-const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchChange }) => {
+async function saveLabels(fileArray: ImageData[]) {
+  await window.api.saveLabels(fileArray)
+}
 
+const Menu: React.FC<MenuProps> = ({
+  onColorChange,
+  onOpacityChange,
+  onSwitchChange,
+}) => {
+  const fileArray = useSelector((state: RootState) => state.files.fileArray);
+  const handleAutoLandmarkClick = async () => {
+    await saveLabels(fileArray);
+  };
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === "n") {
@@ -21,9 +33,9 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
         window.dispatchEvent(event);
       }
     };
-  
+
     window.addEventListener("keydown", handleKeyDown);
-  
+
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
@@ -33,9 +45,9 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
     const openUploadDialog = () => {
       document.getElementById("btn-upload")?.click();
     };
-  
+
     window.addEventListener("open-upload-dialog", openUploadDialog);
-  
+
     return () => {
       window.removeEventListener("open-upload-dialog", openUploadDialog);
     };
@@ -89,7 +101,9 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
           }}
         >
           {/* Add more buttons as needed */}
-          <Button variant="contained">Auto Landmark</Button>
+          <Button variant="contained" onClick={handleAutoLandmarkClick}>
+            Auto Landmark
+          </Button>{" "}
           {/* Add more buttons as needed */}
         </div>
       </div>

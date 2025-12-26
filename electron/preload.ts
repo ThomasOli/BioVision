@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import { ImageData } from '../src/types/Image';
 
 // --------- Expose some API to the Renderer process ---------
 contextBridge.exposeInMainWorld('ipcRenderer', withPrototype(ipcRenderer))
@@ -22,6 +23,14 @@ function withPrototype(obj: Record<string, any>) {
   }
   return obj
 }
+
+
+// Expose custom APIs
+contextBridge.exposeInMainWorld("api", {
+  saveLabels: (data : ImageData[]) => ipcRenderer.invoke("ml:save-labels", data),
+  trainModel: () => ipcRenderer.invoke("ml:train"),
+  predictImage: (imagePath: string) => ipcRenderer.invoke("ml:predict", imagePath),
+});
 
 // --------- Preload scripts loading ---------
 function domReady(condition: DocumentReadyState[] = ['complete', 'interactive']) {
