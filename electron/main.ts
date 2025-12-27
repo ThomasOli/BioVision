@@ -53,8 +53,8 @@ function createWindow() {
     width: 800,
     height: 600,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
+      contextIsolation: true, // ← REQUIRED
+      nodeIntegration: false,
       preload: path.join(__dirname, "preload.js"),
     },
   });
@@ -77,7 +77,7 @@ app.on("ready", createWindow);
 
 function runPython(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const pyPath = "python"; 
+    const pyPath = "python";
     const proc = spawn(pyPath, args);
 
     let out = "";
@@ -117,37 +117,35 @@ ipcMain.handle("ml:train", async () => {
   }
 });
 
-ipcMain.handle("ml:save-labels", async (_event, data) => {
+ipcMain.handle("ml:save-labels", async (_event, images) => {
   const labelsDir = path.join(projectRoot, "labels");
-  const imagesDir = path.join(projectRoot, "images");
-
   fs.mkdirSync(labelsDir, { recursive: true });
-  fs.mkdirSync(imagesDir, { recursive: true });
 
-  const srcImagePath = data.originalImagePath;
-  const destImagePath = path.join(imagesDir, data.imageFilename);
-  if (!fs.existsSync(destImagePath)) {
-    fs.copyFileSync(srcImagePath, destImagePath);
+  for (const image of images) {
+    const labelPath = path.join(
+      labelsDir,
+      image.filename.replace(path.extname(image.filename), ".json")
+    );
+    fs.writeFileSync(
+      labelPath,
+      JSON.stringify(
+        {
+          imageFilename: image.filename,
+          imagePath: image.path, // IMPORTANT
+          landmarks: image.labels,
+        },
+        null,
+        2
+      )
+    );
   }
-
-  const labelPath = path.join(labelsDir, `${data.imageFilename}.json`);
-  fs.writeFileSync(
-    labelPath,
-    JSON.stringify(
-      {
-        imageFilename: data.imageFilename,
-        landmarks: data.landmarks,
-      },
-      null,
-      2
-    )
-  );
 
   return { ok: true };
 });
 
-ipcMain.handle("ml:predict", async(_event, imagePath: string, tag: string) =>{
-  try{
+
+ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string) => {
+  try {
     const out = await runPython([
       path.join(__dirname, "../backend/predict.py"),
       projectRoot,
@@ -156,23 +154,36 @@ ipcMain.handle("ml:predict", async(_event, imagePath: string, tag: string) =>{
     ]);
 
     const data = JSON.parse(out);
-    return{ok: true, data};
-  }
-  catch(e: any){
-    console.error("Prediction failed:", e)
+    return { ok: true, data };
+  } catch (e: any) {
+    console.error("Prediction failed:", e);
     return { ok: false, error: e.message };
-
   }
-})
+});
 
-ipcMain.handle("open-folder-dialog", async (event, arg) => {
-  if (mainWindow) {
-    const result = await dialog.showOpenDialog(mainWindow, {
-      properties: ["openDirectory"],
-    });
-    return result;
+ipcMain.handle("select-image-folder", async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ["openDirectory"],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { canceled: true };
   }
-  return null;
+
+  const folderPath = result.filePaths[0];
+
+  const images = fs
+    .readdirSync(folderPath)
+    .filter((f) => /\.(jpg|jpeg|png)$/i.test(f))
+    .map((file) => ({
+      filename: file,
+      path: path.join(folderPath, file),
+    }));
+
+  return {
+    canceled: false,
+    images,
+  };
 });
 
 app.on("window-all-closed", () => {

@@ -5,15 +5,16 @@ import { useSelector } from "react-redux";
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
 import Landmark from "./Landmark";
-import { ImageData } from "../types/Image";
+import { AnnotatedImage  } from "../types/Image";
 interface MenuProps {
   onOpacityChange: (selectedOpacity: number) => void;
   onColorChange: (selectedColor: string) => void;
   onSwitchChange: () => void;
 }
 
-async function saveLabels(fileArray: ImageData[]) {
-  await window.api.saveLabels(fileArray)
+async function saveLabels(fileArray: AnnotatedImage []) {
+   console.log(fileArray)
+  await window.api.saveLabels(fileArray) 
 }
 
 const Menu: React.FC<MenuProps> = ({

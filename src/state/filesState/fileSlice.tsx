@@ -7,16 +7,17 @@ interface Point {
   id: number;
 }
 
-interface ImageData {
+interface AnnotatedImage  {
   id: number;
   url: string;
+  filename: string;
   labels: Point[];
-  history: Point[];
-  future: Point[];
+  history: Point[][];
+  future: Point[][];
 }
 
 interface FilesState {
-  fileArray: ImageData[];
+  fileArray: AnnotatedImage [];
 }
 
 export const initialState: FilesState = {
@@ -31,9 +32,10 @@ const fileSlice = createSlice({
       const newImages = action.payload.map((file) => ({
         id: Date.now() + Math.random(), // Generate a unique ID
         url: URL.createObjectURL(file),
+        filename: file.name,
         labels: [],
-        history: [] as Point[],
-        future: [] as Point[],
+        history: [] as Point[][],
+        future: [] as Point[][],
       }));
       state.fileArray = [...state.fileArray, ...newImages];
       console.log(state.fileArray);

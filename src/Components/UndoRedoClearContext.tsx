@@ -1,19 +1,17 @@
 import { createContext, useCallback, useState, useEffect } from "react";
 import { useSelector } from "react-redux"; // Import useSelector
 import { RootState } from "../state/store"; // Adjust the import based on your store setup
-import { Point, ImageData } from "../types/Image";
+import { Point, AnnotatedImage  } from "../types/Image";
 export const UndoRedoClearContext = createContext<UndoRedoClearContextProps>(
   {} as UndoRedoClearContextProps
 );
 
 interface UndoRedoClearContextProps {
-  images: ImageData[];
-  setImages: React.Dispatch<React.SetStateAction<ImageData[]>>;
+  images: AnnotatedImage [];
+  setImages: React.Dispatch<React.SetStateAction<AnnotatedImage []>>;
   undo: () => void;
   redo: () => void;
   clear: () => void;
-  usedClear: boolean;
-  setUsedClear: React.Dispatch<React.SetStateAction<boolean>>;
   addPoint: (newPoint: Point) => void;
   setSelectedImage: React.Dispatch<React.SetStateAction<number>>;
   points: Point[];
@@ -24,9 +22,8 @@ export const UndoRedoClearContextProvider = ({
 }: React.PropsWithChildren<{}>) => {
   const fileArray = useSelector((state: RootState) => state.files.fileArray); // Access fileArray from the Redux store
 
-  let [images, setImages] = useState<ImageData[]>([]);
+  let [images, setImages] = useState<AnnotatedImage []>([]);
   const [selectedImage, setSelectedImage] = useState(0);
-  const [usedClear, setUsedClear] = useState(false);
   let points = [] as Point[];
 
   // Add useEffect to update images when fileArray changes
@@ -65,6 +62,7 @@ export const UndoRedoClearContextProvider = ({
 
 
 const undo = useCallback(() => {
+  
   setImages((prevImages) => {
     const newImages = [...prevImages];
     
@@ -148,7 +146,6 @@ const undo = useCallback(() => {
       return newImages;
     })
 
-    setUsedClear(true);
 
   }, [selectedImage]);
 
@@ -160,8 +157,6 @@ const undo = useCallback(() => {
         undo,
         redo,
         clear,
-        usedClear,
-        setUsedClear,
         addPoint,
         setSelectedImage,
         points,

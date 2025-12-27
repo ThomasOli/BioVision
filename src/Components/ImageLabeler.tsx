@@ -117,6 +117,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     [image, imageDimensions, onPointsChange]
   );
 
+  useEffect(() => {
+    onPointsChange(points);
+  }, [points, onPointsChange])
+
   // Export points to JSON
   const handleExport = useCallback(() => {
     if (!imageDimensions) return;

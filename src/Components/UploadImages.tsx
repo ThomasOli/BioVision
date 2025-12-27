@@ -4,12 +4,10 @@ import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
 import Button from "@mui/material/Button";
 import LinearProgress from "@mui/material/LinearProgress";
-import { ipcRenderer } from "electron";
 import { useSelector, useDispatch } from "react-redux";
 import {
   clearFiles,
   addFiles,
-  removeFile,
 } from "../state/filesState/fileSlice";
 import { RootState } from "../state/store";
 
@@ -26,76 +24,40 @@ const UploadImages: React.FC<UploadImagesProps> = () => {
   const [isError, setIsError] = useState(false);
   const [disableClear, setDisableClear] = useState(true);
 
-  const handleSelectFolder = () => {
-    ipcRenderer
-      .invoke("open-folder-dialog")
-      .then((result) => {
-        if (!result.canceled && result.filePaths.length > 0) {
-          const folderPath = result.filePaths[0];
 
-          const fs = (window as any).require("fs");
+const handleSelectFolder = async () => {
+  try {
+    const result = await window.api.selectImageFolder();
 
-          fs.readdir(
-            folderPath,
-            { encoding: "utf8" },
-            async (err: NodeJS.ErrnoException | null, files: string[]) => {
-              if (err) {
-                console.error(err);
-                setIsError(true);
-                setMessage("Failed to read the folder.");
-                return;
-              }
+    if (result.canceled) return;
 
-              const imageFiles = files.filter((file) =>
-                /\.(jpg|jpeg|png|gif)$/i.test(file)
-              );
+    const fileObjects: File[] = [];
+    const filePreviews: string[] = [];
 
-              const filePreviews: string[] = [];
-              const fileObjects: File[] = [];
+    for (const img of result.images) {
+      const byteArray = Uint8Array.from(
+        atob(img.buffer),
+        (c) => c.charCodeAt(0)
+      );
 
-              for (const fileName of imageFiles) {
-                try {
-                  const filePath = `${folderPath}/${fileName}`;
-                  const fileData = fs.readFileSync(filePath); // Synchronously read file
-                  const uint8Array = new Uint8Array(fileData); // Convert Buffer to Uint8Array
-                  const file = new File([uint8Array], fileName, {
-                    type: "image/jpeg",
-                  }); // Create File object
-                  fileObjects.push(file);
-                  const objectUrl = URL.createObjectURL(file);
-                  filePreviews.push(objectUrl);
-                } catch (readErr) {
-                  console.error(
-                    `Failed to read or process file ${fileName}:`,
-                    readErr
-                  );
-                  setIsError(true);
-                  setMessage(`Failed to read or process file ${fileName}.`);
-                }
-              }
-
-              if (fileObjects.length > 0) {
-                setSelectedFiles(fileObjects);
-                setPreviews(filePreviews);
-                setProgress(0);
-                setMessage("");
-                setDisableClear(false);
-              } else {
-                setIsError(true);
-                setMessage(
-                  "No valid image files found in the selected folder."
-                );
-              }
-            }
-          );
-        }
-      })
-      .catch((err) => {
-        console.error(err);
-        setIsError(true);
-        setMessage("An error occurred while selecting the folder.");
+      const file = new File([byteArray], img.name, {
+        type: "image/jpeg",
       });
-  };
+
+      fileObjects.push(file);
+      filePreviews.push(URL.createObjectURL(file));
+    }
+
+    setSelectedFiles(fileObjects);
+    setPreviews(filePreviews);
+    setDisableClear(false);
+    setMessage("");
+  } catch (err) {
+    console.error(err);
+    setIsError(true);
+    setMessage("Failed to load folder.");
+  }
+};
 
   const handleSelectFiles = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files.length > 0) {
