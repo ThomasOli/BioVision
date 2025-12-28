@@ -9,11 +9,11 @@ def predict_image(project_root, tag, image_path):
     predictor_path = os.path.join(modeldir, f"predictor_{tag}.dat")
 
     if not os.path.exists(predictor_path):
-        raise FileNotFoundError("Cannot find model at {predictor_path}")
+        raise FileNotFoundError(f"Cannot find model at {predictor_path}")
 
     img = cv2.imread(image_path)
     if img is None:
-        raise RuntimeError("Could not read image {image_path}")
+        raise RuntimeError(f"Could not read image {image_path}")
     
     h,w = img.shape[:2]
     rect = dlib.rectangle(left=0, top=0, right=w-1, bottom=h-1)

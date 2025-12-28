@@ -37,7 +37,7 @@ const Menu: React.FC<MenuProps> = ({
     setIsTraining(true);
     await saveLabels(fileArray);
 
-    const result = await window.api.trainModel(modelName);
+    const result = await window.api.trainModel(modelName.trim());
 
     if (!result.ok) {
       throw new Error(result.error);
@@ -49,7 +49,7 @@ const Menu: React.FC<MenuProps> = ({
     setModelName("");
   } catch (err) {
     console.error(err);
-    alert("Training failed. Check logs.");
+    alert(`Training failed. ${err}`);
   } finally {
     setIsTraining(false);
   }

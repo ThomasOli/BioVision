@@ -22,6 +22,7 @@ XML Tree format
 def json_to_dlib_xml(project_root, tag):
   labels_dir = os.path.join(project_root, "labels")
   xmldir = os.path.join(project_root, "xml")
+  images_dir = os.path.join(project_root, "images")
 
   os.makedirs(xmldir, exist_ok=True)
   out_xml_path = os.path.join(xmldir, f"train_{tag}.xml")
@@ -37,9 +38,9 @@ def json_to_dlib_xml(project_root, tag):
     with open(jp, "r") as f:
       data = json.load(f)
     
-    
-    image_filename = data["imageFilename"]
-    image_path = data["imagePath"]
+    image_filename = data.get("imageFilename")
+
+    image_path = os.path.join(images_dir, image_filename) if image_filename else None
     landmarks = data["landmarks"]
 
     # image_path = os.path.join(images_dir, image_filename)

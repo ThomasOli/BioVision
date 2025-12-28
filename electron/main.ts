@@ -131,7 +131,6 @@ ipcMain.handle("ml:save-labels", async (_event, images) => {
       path.join(labelsDir, img.filename.replace(/\.\w+$/, ".json")),
       JSON.stringify({
         imageFilename: img.filename,
-        imagePath: destImagePath,
         landmarks: img.labels,
       }, null, 2)
     );

@@ -30,7 +30,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   // Helper to close only if not training
   const handleClose = () => {
     if (!isTraining) {
-      setModelName(" ")
+      setModelName("")
       setOpen(false)
     }
   };
