@@ -25,39 +25,13 @@ const UploadImages: React.FC<UploadImagesProps> = () => {
   const [disableClear, setDisableClear] = useState(true);
 
 
-const handleSelectFolder = async () => {
-  try {
+  const handleSelectFolder = async () => {
     const result = await window.api.selectImageFolder();
+    if(result.canceled) return;
 
-    if (result.canceled) return;
-
-    const fileObjects: File[] = [];
-    const filePreviews: string[] = [];
-
-    for (const img of result.images) {
-      const byteArray = Uint8Array.from(
-        atob(img.buffer),
-        (c) => c.charCodeAt(0)
-      );
-
-      const file = new File([byteArray], img.name, {
-        type: "image/jpeg",
-      });
-
-      fileObjects.push(file);
-      filePreviews.push(URL.createObjectURL(file));
-    }
-
-    setSelectedFiles(fileObjects);
-    setPreviews(filePreviews);
-    setDisableClear(false);
-    setMessage("");
-  } catch (err) {
-    console.error(err);
-    setIsError(true);
-    setMessage("Failed to load folder.");
-  }
-};
+    setSelectedFiles(result.image);
+    setPreviews(result.images.map(img => `file://${img.path}`));
+  };
 
   const handleSelectFiles = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files.length > 0) {
@@ -87,7 +61,7 @@ const handleSelectFolder = async () => {
     // Simulate upload progress
     let currentProgress = 0;
     const interval = setInterval(() => {
-      currentProgress += 10;
+      currentProgress += 50;
       setProgress(currentProgress);
       if (currentProgress >= 100) {
         clearInterval(interval);

@@ -21,7 +21,6 @@ XML Tree format
 '''
 def json_to_dlib_xml(project_root, tag):
   labels_dir = os.path.join(project_root, "labels")
-  images_dir = os.path.join(project_root, "images")
   xmldir = os.path.join(project_root, "xml")
 
   os.makedirs(xmldir, exist_ok=True)
@@ -37,11 +36,13 @@ def json_to_dlib_xml(project_root, tag):
   for jp in json_paths:
     with open(jp, "r") as f:
       data = json.load(f)
-
+    
+    
     image_filename = data["imageFilename"]
+    image_path = data["imagePath"]
     landmarks = data["landmarks"]
 
-    image_path = os.path.join(images_dir, image_filename)
+    # image_path = os.path.join(images_dir, image_filename)
     if not os.path.exists(image_path):
       raise FileNotFoundError(f"Image {image_path} not found for {jp}")
 
@@ -55,7 +56,7 @@ def json_to_dlib_xml(project_root, tag):
     width = right - left
     height = bottom - top
 
-    image_el = ET.SubElement(images_el, "image", file=os.path.join("images", image_filename))
+    image_el = ET.SubElement(images_el, "image", file=image_path)
     box_el = ET.SubElement(image_el, "box",
                            top=str(top), left=str(left),
                            width=str(width), height=str(height))

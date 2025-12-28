@@ -105,8 +105,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         }
 
         const newPoint: Point = {
-          x: x,
-          y: y,
+          x: Math.round(x),
+          y: Math.round(y),
           id: Date.now(),
         };
 

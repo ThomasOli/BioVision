@@ -9,6 +9,7 @@ interface Point {
 
 interface AnnotatedImage  {
   id: number;
+  path: string;
   url: string;
   filename: string;
   labels: Point[];
@@ -31,6 +32,7 @@ const fileSlice = createSlice({
     addFiles: (state, action: PayloadAction<File[]>) => {
       const newImages = action.payload.map((file) => ({
         id: Date.now() + Math.random(), // Generate a unique ID
+        path: file.path,
         url: URL.createObjectURL(file),
         filename: file.name,
         labels: [],

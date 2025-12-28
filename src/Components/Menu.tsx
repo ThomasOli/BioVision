@@ -1,20 +1,21 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import Paper from "@mui/material/Paper";
 import Button from "@mui/material/Button";
 import { useSelector } from "react-redux";
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
 import Landmark from "./Landmark";
-import { AnnotatedImage  } from "../types/Image";
+import { AnnotatedImage } from "../types/Image";
+import { TrainModelDialog } from "./PopUp";
 interface MenuProps {
   onOpacityChange: (selectedOpacity: number) => void;
   onColorChange: (selectedColor: string) => void;
   onSwitchChange: () => void;
 }
 
-async function saveLabels(fileArray: AnnotatedImage []) {
-   console.log(fileArray)
-  await window.api.saveLabels(fileArray) 
+async function saveLabels(fileArray: AnnotatedImage[]) {
+  console.log(fileArray);
+  await window.api.saveLabels(fileArray);
 }
 
 const Menu: React.FC<MenuProps> = ({
@@ -22,10 +23,38 @@ const Menu: React.FC<MenuProps> = ({
   onOpacityChange,
   onSwitchChange,
 }) => {
+  const [openTrainDialog, setOpenTrainDialog] = useState(false);
+  const [modelName, setModelName] = useState("");
+  const [isTraining, setIsTraining] = useState(false);
+
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
-  const handleAutoLandmarkClick = async () => {
+
+  const handleTrainConfirm = async () => {
+  const name = modelName.trim();
+  if (!name) return;
+
+  try {
+    setIsTraining(true);
     await saveLabels(fileArray);
-  };
+
+    const result = await window.api.trainModel(modelName);
+
+    if (!result.ok) {
+      throw new Error(result.error);
+    }
+
+    console.log("Training output:", result.output);
+
+    setOpenTrainDialog(false);
+    setModelName("");
+  } catch (err) {
+    console.error(err);
+    alert("Training failed. Check logs.");
+  } finally {
+    setIsTraining(false);
+  }
+};
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === "n") {
@@ -66,6 +95,7 @@ const Menu: React.FC<MenuProps> = ({
         boxSizing: "border-box",
       }}
     >
+      <TrainModelDialog handleTrainConfirm={handleTrainConfirm} open={openTrainDialog} setOpen={setOpenTrainDialog} modelName={modelName} isTraining={isTraining} setModelName={setModelName}/> 
       <div
         style={{
           marginTop: "1px",
@@ -102,9 +132,14 @@ const Menu: React.FC<MenuProps> = ({
           }}
         >
           {/* Add more buttons as needed */}
-          <Button variant="contained" onClick={handleAutoLandmarkClick}>
-            Auto Landmark
-          </Button>{" "}
+          <Button
+            variant="contained"
+            color="secondary"
+            onClick={() => setOpenTrainDialog(true)}
+          >
+            Train Model
+          </Button>
+
           {/* Add more buttons as needed */}
         </div>
       </div>

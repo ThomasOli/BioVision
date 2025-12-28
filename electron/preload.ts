@@ -27,7 +27,7 @@ function withPrototype(obj: Record<string, any>) {
 
 contextBridge.exposeInMainWorld("api", {
   saveLabels: (data : AnnotatedImage []) => ipcRenderer.invoke("ml:save-labels", data),
-  trainModel: () => ipcRenderer.invoke("ml:train"),
+  trainModel: (modelName: string) => ipcRenderer.invoke("ml:train", modelName),
   predictImage: (imagePath: string) => ipcRenderer.invoke("ml:predict", imagePath),
   selectImageFolder: () => ipcRenderer.invoke("select-image-folder"),
 });

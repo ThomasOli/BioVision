@@ -7,7 +7,7 @@ const contextMenu = require("electron-context-menu");
 
 let mainWindow: BrowserWindow | null;
 const userDataDir = app.getPath("userData");
-const projectRoot = path.join(userDataDir, "fossil-model");
+const projectRoot = path.join(userDataDir, "training-model");
 
 const template = [
   { label: "Minimize", click: () => mainWindow?.minimize() },
@@ -95,19 +95,18 @@ function runPython(args: string[]): Promise<string> {
   });
 }
 
-ipcMain.handle("ml:train", async () => {
-  const tag = "fossils";
+ipcMain.handle("ml:train", async (_event, modelName) => {
   try {
     await runPython([
       path.join(__dirname, "../backend/prepare_dataset.py"),
       projectRoot,
-      tag,
+      modelName,
     ]);
 
     const out = await runPython([
       path.join(__dirname, "../backend/train_shape_model.py"),
       projectRoot,
-      tag,
+      modelName,
     ]);
 
     return { ok: true, output: out };
@@ -117,32 +116,29 @@ ipcMain.handle("ml:train", async () => {
   }
 });
 
+
 ipcMain.handle("ml:save-labels", async (_event, images) => {
+  const imagesDir = path.join(projectRoot, "images");
   const labelsDir = path.join(projectRoot, "labels");
+
+  fs.mkdirSync(imagesDir, { recursive: true });
   fs.mkdirSync(labelsDir, { recursive: true });
 
-  for (const image of images) {
-    const labelPath = path.join(
-      labelsDir,
-      image.filename.replace(path.extname(image.filename), ".json")
-    );
+  for (const img of images) {
+    const destImagePath = path.join(imagesDir, img.filename);
+    fs.copyFileSync(img.path, destImagePath);
     fs.writeFileSync(
-      labelPath,
-      JSON.stringify(
-        {
-          imageFilename: image.filename,
-          imagePath: image.path, // IMPORTANT
-          landmarks: image.labels,
-        },
-        null,
-        2
-      )
+      path.join(labelsDir, img.filename.replace(/\.\w+$/, ".json")),
+      JSON.stringify({
+        imageFilename: img.filename,
+        imagePath: destImagePath,
+        landmarks: img.labels,
+      }, null, 2)
     );
   }
 
   return { ok: true };
 });
-
 
 ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string) => {
   try {
@@ -160,6 +156,8 @@ ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string) => {
     return { ok: false, error: e.message };
   }
 });
+
+
 
 ipcMain.handle("select-image-folder", async () => {
   const result = await dialog.showOpenDialog({
