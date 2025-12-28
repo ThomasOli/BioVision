@@ -30,6 +30,8 @@ contextBridge.exposeInMainWorld("api", {
   trainModel: (modelName: string) => ipcRenderer.invoke("ml:train", modelName),
   predictImage: (imagePath: string) => ipcRenderer.invoke("ml:predict", imagePath),
   selectImageFolder: () => ipcRenderer.invoke("select-image-folder"),
+  getProjectRoot: () => ipcRenderer.invoke("ml:get-project-root"),
+  selectProjectRoot: () => ipcRenderer.invoke("ml:select-project-root"),
 });
 
 // --------- Preload scripts loading ---------

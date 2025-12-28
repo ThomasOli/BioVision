@@ -7,7 +7,29 @@ const contextMenu = require("electron-context-menu");
 
 let mainWindow: BrowserWindow | null;
 const userDataDir = app.getPath("userData");
-const projectRoot = path.join(userDataDir, "training-model");
+const defaultProjectRoot = path.join(userDataDir, "training-model");
+const configPath = path.join(userDataDir, "biovision-config.json");
+
+function loadProjectRoot() {
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed.projectRoot && typeof parsed.projectRoot === "string") {
+      return parsed.projectRoot;
+    }
+  } catch (e) {
+    // ignore and fall back to default
+  }
+  return defaultProjectRoot;
+}
+
+function persistProjectRoot(root: string) {
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify({ projectRoot: root }, null, 2));
+}
+
+let projectRoot = loadProjectRoot();
+fs.mkdirSync(projectRoot, { recursive: true });
 
 const template = [
   { label: "Minimize", click: () => mainWindow?.minimize() },
@@ -94,6 +116,27 @@ function runPython(args: string[]): Promise<string> {
     });
   });
 }
+
+ipcMain.handle("ml:get-project-root", async () => {
+  return { projectRoot };
+});
+
+ipcMain.handle("ml:select-project-root", async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ["openDirectory", "createDirectory"],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { canceled: true };
+  }
+
+  const selectedPath = result.filePaths[0];
+  projectRoot = selectedPath;
+  fs.mkdirSync(projectRoot, { recursive: true });
+  persistProjectRoot(projectRoot);
+
+  return { canceled: false, projectRoot };
+});
 
 ipcMain.handle("ml:train", async (_event, modelName) => {
   try {

@@ -8,6 +8,8 @@ declare global {
       trainModel: (modelName: string) => Promise<any>;
       predictImage: (imagePath: string) => Promise<any>;
       selectImageFolder: () => Promise<any>;
+      getProjectRoot: () => Promise<{ projectRoot: string }>;
+      selectProjectRoot: () => Promise<{ canceled?: boolean; projectRoot?: string }>;
     };
   }
 }
