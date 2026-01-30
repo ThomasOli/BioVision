@@ -109,7 +109,7 @@ const App: React.FC = () => {
         sx={{
           width: "100vw",
           height: "100vh",
-          minWidth: 800,
+          minWidth: 880,
           minHeight: 500,
           bgcolor: "#fff",
           display: "flex",

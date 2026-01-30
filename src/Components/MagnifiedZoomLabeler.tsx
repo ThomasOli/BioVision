@@ -1,7 +1,6 @@
 // src/Components/MagnifiedImageLabeler.tsx
 import React, {
   useRef,
-  useState,
   useCallback,
   useEffect,
   useContext,
