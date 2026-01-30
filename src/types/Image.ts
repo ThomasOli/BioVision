@@ -4,6 +4,12 @@ export interface Point {
   id: number;
 }
 
+export interface BoundingBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
 
 export interface AnnotatedImage {
   id: number;
@@ -13,4 +19,5 @@ export interface AnnotatedImage {
   labels: Point[];
   history: Point[][];
   future: Point[][];
+  boundingBox?: BoundingBox;
 }

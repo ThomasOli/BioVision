@@ -47,15 +47,23 @@ def json_to_dlib_xml(project_root, tag):
     if not os.path.exists(image_path):
       raise FileNotFoundError(f"Image {image_path} not found for {jp}")
 
-    xs = [lm["x"] for lm in landmarks]
-    ys = [lm["y"] for lm in landmarks]
-    margin = 10
-    left = max(min(xs) - margin, 0)
-    top = max(min(ys) - margin, 0)
-    right = max(xs) + margin
-    bottom = max(ys) + margin
-    width = right - left
-    height = bottom - top
+    # Use custom bounding box if provided, otherwise auto-generate from landmarks
+    if "boundingBox" in data and data["boundingBox"]:
+      bbox = data["boundingBox"]
+      left = bbox["left"]
+      top = bbox["top"]
+      width = bbox["width"]
+      height = bbox["height"]
+    else:
+      xs = [lm["x"] for lm in landmarks]
+      ys = [lm["y"] for lm in landmarks]
+      margin = 10
+      left = max(min(xs) - margin, 0)
+      top = max(min(ys) - margin, 0)
+      right = max(xs) + margin
+      bottom = max(ys) + margin
+      width = right - left
+      height = bottom - top
 
     image_el = ET.SubElement(images_el, "image", file=image_path)
     box_el = ET.SubElement(image_el, "box",
