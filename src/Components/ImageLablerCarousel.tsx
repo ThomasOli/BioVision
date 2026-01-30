@@ -1,16 +1,32 @@
 // src/Components/ImageLabelerCarousel.tsx
-import React, { useCallback, useContext, useEffect, useState } from "react";
-import ImageLabeler from "./ImageLabeler";
+import React, { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useDispatch } from "react-redux";
-import { AppDispatch } from "../state/store";
-import { removeFile, updateLabels } from "../state/filesState/fileSlice";
-import { Button, IconButton, Box, Typography, Tooltip } from "@mui/material";
-import ArrowBackIosIcon from "@mui/icons-material/ArrowBackIos";
-import ArrowForwardIosIcon from "@mui/icons-material/ArrowForwardIos";
-import DeleteIcon from "@mui/icons-material/Delete";
-import ZoomInIcon from "@mui/icons-material/ZoomIn";
+import {
+  Button,
+  IconButton,
+  Box,
+  Typography,
+  Tooltip,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+} from "@mui/material";
+import Paper from "@mui/material/Paper";
+import Stack from "@mui/material/Stack";
+
+import ImageLabeler from "./ImageLabeler";
 import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
+
+import { AppDispatch } from "../state/store";
+import { removeFile, updateLabels } from "../state/filesState/fileSlice";
+
+import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
+import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
+import DeleteOutlineRoundedIcon from "@mui/icons-material/DeleteOutlineRounded";
+import ZoomInRoundedIcon from "@mui/icons-material/ZoomInRounded";
 
 interface ImageLabelerCarouselProps {
   color: string;
@@ -18,20 +34,26 @@ interface ImageLabelerCarouselProps {
   isSwitchOn: boolean;
 }
 
-const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
-  color,
-  opacity,
-  isSwitchOn,
-}) => {
+const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opacity, isSwitchOn }) => {
   const { images, setSelectedImage } = useContext(UndoRedoClearContext);
-
   const dispatch = useDispatch<AppDispatch>();
 
-  const [currentIndex, setCurrentIndex] = useState<number>(0);
-
-  const [isMagnified, setIsMagnified] = useState<boolean>(false);
-
   const totalImages = images.length;
+
+  const [currentIndex, setCurrentIndex] = useState<number>(0);
+  const [isMagnified, setIsMagnified] = useState<boolean>(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  useEffect(() => {
+    if (totalImages === 0) {
+      setCurrentIndex(0);
+      return;
+    }
+    setCurrentIndex((prev) => Math.min(prev, totalImages - 1));
+  }, [totalImages]);
+
+  const current = useMemo(() => (totalImages ? images[currentIndex] : null), [images, currentIndex, totalImages]);
+  const hasLandmarks = Boolean(current?.labels?.length);
 
   const handleUpdateLabels = useCallback(
     (id: number, labels: { x: number; y: number; id: number }[]) => {
@@ -45,233 +67,323 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       dispatch(removeFile(id));
       setCurrentIndex((prevIndex) => {
         const newTotal = totalImages - 1;
-        if (newTotal === 0) return 0;
-        return prevIndex >= newTotal ? 0 : prevIndex;
+        if (newTotal <= 0) return 0;
+        if (prevIndex >= newTotal) return newTotal - 1;
+        return prevIndex;
       });
     },
     [dispatch, totalImages]
   );
 
   const handleNext = useCallback(() => {
-    setCurrentIndex((prevIndex) => (prevIndex + 1) % totalImages);
-    setSelectedImage((prevIndex) => (prevIndex + 1) % totalImages);
-  }, [totalImages]);
+    if (totalImages <= 1) return;
+    setCurrentIndex((prev) => (prev + 1) % totalImages);
+    setSelectedImage((prev) => (prev + 1) % totalImages);
+  }, [totalImages, setSelectedImage]);
 
   const handlePrev = useCallback(() => {
-    setCurrentIndex((prevIndex) => (prevIndex - 1 + totalImages) % totalImages);
-    setSelectedImage(
-      (prevIndex) => (prevIndex - 1 + totalImages) % totalImages
-    );
-  }, [totalImages]);
+    if (totalImages <= 1) return;
+    setCurrentIndex((prev) => (prev - 1 + totalImages) % totalImages);
+    setSelectedImage((prev) => (prev - 1 + totalImages) % totalImages);
+  }, [totalImages, setSelectedImage]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
-      if (e.key === "ArrowRight") {
-        handleNext();
-      } else if (e.key === "ArrowLeft") {
-        handlePrev();
-      }
+      if (e.key === "ArrowRight") handleNext();
+      else if (e.key === "ArrowLeft") handlePrev();
     },
     [handleNext, handlePrev]
   );
 
   useEffect(() => {
     window.addEventListener("keydown", handleKeyDown);
-
-    // Clean up the event listener on component unmount
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-    };
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [handleKeyDown]);
 
-  const toggleMagnifiedView = () => {
-    setIsMagnified((prev) => !prev);
-  };
+  const toggleMagnifiedView = () => setIsMagnified((prev) => !prev);
+
+  // Export only CURRENT image's labels (only shown if it has landmarks)
+  const exportCurrent = useCallback(async () => {
+    if (!current || !current.labels?.length) return;
+
+    const dims = await new Promise<{ width: number; height: number } | null>((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      img.onerror = () => resolve(null);
+      img.src = current.url;
+    });
+
+    const data = {
+      imageURL: current.url,
+      imageDimensions: dims,
+      points: current.labels.map(({ x, y, id }: any) => ({ x: Math.round(x), y: Math.round(y), id })),
+    };
+
+    const jsonData = JSON.stringify(data, null, 2);
+    const blob = new Blob([jsonData], { type: "application/json" });
+    const urlBlob = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = urlBlob;
+    a.download = `labeled_data_${Date.now()}.json`;
+    a.click();
+
+    URL.revokeObjectURL(urlBlob);
+  }, [current]);
+
+  const exportAll = useCallback(() => {
+    const data = images.map(({ id, url, labels }) => ({ id, url, labels }));
+    const jsonData = JSON.stringify(data, null, 2);
+    const blob = new Blob([jsonData], { type: "application/json" });
+    const urlBlob = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = urlBlob;
+    a.download = `all_labeled_data_${Date.now()}.json`;
+    a.click();
+
+    URL.revokeObjectURL(urlBlob);
+  }, [images]);
 
   if (totalImages === 0) {
     return (
-      <Box sx={{ padding: "20px", textAlign: "center", marginLeft: "100px" }}>
-        <Typography variant="h5" sx={{ marginBottom: "10px" }}>
-          No images available.
+      <Paper
+        elevation={0}
+        sx={{
+          width: "min(900px, 100%)",
+          p: 3,
+          bgcolor: "#fbfbfb",
+          border: "1px solid #e5e7eb",
+          borderRadius: "14px",
+          textAlign: "center",
+        }}
+      >
+        <Typography sx={{ fontWeight: 800, fontSize: 18, color: "#0f172a", mb: 1 }}>No images available.</Typography>
+        <Typography sx={{ fontSize: 13, color: "#64748b", maxWidth: 520, mx: "auto" }}>
+          Press <strong>Ctrl+N</strong> to upload images, or use the left sidebar to begin labeling.
         </Typography>
-        <Typography
-          variant="body1"
-          sx={{ maxWidth: "400px", margin: "0 auto" }}
-        >
-          Press <strong>Ctrl+N</strong> to select images to upload, or manually
-          select an image using the left sidebar to start labeling.
-        </Typography>
-      </Box>
+      </Paper>
     );
   }
 
   return (
-    <Box
+    <Paper
+      elevation={0}
       sx={{
-        padding: "20px",
-        maxWidth: "1000px",
-        margin: "0 auto",
+        width: "100%",
+        height: "100%",
+        minWidth: 0,
+        minHeight: 0,
+        bgcolor: "#fbfbfb",
+        border: "1px solid #e5e7eb",
+        borderRadius: "14px",
+        p: 2,
         display: "flex",
         flexDirection: "column",
-        alignItems: "center",
-        marginLeft: "100px",
+        gap: 1.5,
+        boxSizing: "border-box",
       }}
     >
-      {/* Top Bar with Delete and Zoom Buttons */}
+      {/* Toolbar */}
       <Box
         sx={{
           width: "100%",
           display: "flex",
-          justifyContent: "flex-end",
-          gap: "10px",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 1,
+          minWidth: 0,
         }}
       >
-        <Tooltip title="Delete Image">
-          <IconButton
-            onClick={() => handleDeleteImage(images[currentIndex].id)}
-            aria-label="Delete Image"
+        <Box sx={{ minWidth: 0 }}>
+          <Typography sx={{ fontWeight: 800, fontSize: 13, color: "#0f172a" }}>
+            Image {currentIndex + 1} / {totalImages}
+          </Typography>
+          <Typography sx={{ fontSize: 12, color: "#64748b" }}>Use ← / → to navigate • Ctrl+N to add</Typography>
+        </Box>
+
+        <Stack direction="row" spacing={1} alignItems="center" sx={{ flexShrink: 0 }}>
+          {/* Export current (only if current has landmarks) */}
+          {hasLandmarks && (
+            <Button
+              variant="outlined"
+              size="small"
+              onClick={exportCurrent}
+              sx={{
+                textTransform: "none",
+                borderRadius: "10px",
+                fontWeight: 700,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Export Current (JSON)
+            </Button>
+          )}
+
+          {/* Export all */}
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={exportAll}
             sx={{
-              backgroundColor: "rgba(255,255,255,0.7)",
-              "&:hover": {
-                backgroundColor: "rgba(255,255,255,1)",
-              },
+              textTransform: "none",
+              borderRadius: "10px",
+              fontWeight: 700,
+              whiteSpace: "nowrap",
             }}
           >
-            <DeleteIcon />
-          </IconButton>
-        </Tooltip>
-        <Tooltip title="Magnify Image">
-          <IconButton
-            onClick={toggleMagnifiedView}
-            aria-label="Magnify Image"
-            sx={{
-              backgroundColor: "rgba(255,255,255,0.7)",
-              "&:hover": {
-                backgroundColor: "rgba(255,255,255,1)",
-              },
-            }}
-          >
-            <ZoomInIcon />
-          </IconButton>
-        </Tooltip>
+            Export All (JSON)
+          </Button>
+
+          <Tooltip title="Magnify">
+            <IconButton
+              onClick={toggleMagnifiedView}
+              aria-label="Magnify"
+              sx={{
+                bgcolor: "rgba(255,255,255,0.9)",
+                border: "1px solid #e5e7eb",
+                "&:hover": { bgcolor: "#fff" },
+                transition: "all 0.15s ease",
+              }}
+            >
+              <ZoomInRoundedIcon />
+            </IconButton>
+          </Tooltip>
+
+          <Tooltip title="Delete">
+            <IconButton
+              onClick={() => setConfirmOpen(true)}
+              aria-label="Delete"
+              sx={{
+                bgcolor: "rgba(255,255,255,0.9)",
+                border: "1px solid #e5e7eb",
+                color: "#dc2626",
+                "&:hover": { bgcolor: "#fff" },
+                transition: "all 0.15s ease",
+              }}
+            >
+              <DeleteOutlineRoundedIcon />
+            </IconButton>
+          </Tooltip>
+        </Stack>
       </Box>
 
-      {/* Carousel Container */}
+      {/* Image area */}
       <Box
         sx={{
+          position: "relative",
+          width: "100%",
+          flex: 1,
+          minHeight: 0,
+          minWidth: 0,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          marginTop: "10px",
+          bgcolor: "#fff",
+          border: "1px solid #e5e7eb",
+          borderRadius: "14px",
+          overflow: "hidden",
         }}
       >
-        {/* Left Navigation Arrow */}
-        <div>
-          <Tooltip title="Previous Image">
-            <IconButton
-              onClick={handlePrev}
-              disabled={totalImages === 1}
-              aria-label="Previous Image"
-              sx={{
-                position: "relative",
-                marginRight: "10px",
-                backgroundColor: "rgba(255,255,255,0.7)",
-                "&:hover": {
-                  backgroundColor: "rgba(255,255,255,1)",
-                },
-                zIndex: 2,
-              }}
-            >
-              <ArrowBackIosIcon />
-            </IconButton>
-          </Tooltip>
-        </div>
-
-        {/* Image Labeler */}
-        <Box
+        <IconButton
+          onClick={handlePrev}
+          disabled={totalImages === 1}
+          aria-label="Previous"
           sx={{
-            display: "flex",
-            justifyContent: "center",
-            alignItems: "center",
+            position: "absolute",
+            left: 10,
+            top: "50%",
+            transform: "translateY(-50%)",
+            bgcolor: "rgba(255,255,255,0.9)",
+            border: "1px solid #e5e7eb",
+            "&:hover": { bgcolor: "#fff" },
+            transition: "all 0.15s ease",
           }}
         >
-          <ImageLabeler
-            key={images[currentIndex].id}
-            imageURL={images[currentIndex].url}
-            onPointsChange={(newPoints) =>
-              handleUpdateLabels(images[currentIndex].id, newPoints)
-            }
-            color={color}
-            opacity={opacity}
-            mode={isSwitchOn}
-          />
-        </Box>
+          <ChevronLeftRoundedIcon />
+        </IconButton>
 
-        {/* Right Navigation Arrow */}
-        <div>
-          <Tooltip title="Next Image">
-            <IconButton
-              onClick={handleNext}
-              disabled={totalImages === 1}
-              aria-label="Next Image"
-              sx={{
-                marginLeft: "10px",
-                backgroundColor: "rgba(255,255,255,0.7)",
-                "&:hover": {
-                  backgroundColor: "rgba(255,255,255,1)",
-                },
-                zIndex: 2,
-              }}
-            >
-              <ArrowForwardIosIcon />
-            </IconButton>
-          </Tooltip>
-        </div>
-      </Box>
+        {current && (
+          <Box sx={{ width: "100%", height: "100%", minWidth: 0, minHeight: 0 }}>
+            <ImageLabeler
+              key={current.id}
+              imageURL={current.url}
+              onPointsChange={(newPoints) => handleUpdateLabels(current.id, newPoints)}
+              color={color}
+              opacity={opacity}
+              mode={isSwitchOn}
+            />
+          </Box>
+        )}
 
-      {/* Carousel Information and Export Button */}
-      <Box sx={{ textAlign: "center", marginTop: "20px" }}>
-        <Typography variant="body1" sx={{ marginBottom: "10px" }}>
-          Image {currentIndex + 1} of {totalImages}
-        </Typography>
-        <Button
-          variant="contained"
-          color="primary"
-          onClick={() => {
-            const data = images.map(({ id, url, labels }) => ({
-              id,
-              url,
-              labels,
-            }));
-            const jsonData = JSON.stringify(data, null, 2);
-            const blob = new Blob([jsonData], { type: "application/json" });
-            const urlBlob = URL.createObjectURL(blob);
-
-            const a = document.createElement("a");
-            a.href = urlBlob;
-            a.download = `all_labeled_data_${Date.now()}.json`;
-            a.click();
-            URL.revokeObjectURL(urlBlob);
+        <IconButton
+          onClick={handleNext}
+          disabled={totalImages === 1}
+          aria-label="Next"
+          sx={{
+            position: "absolute",
+            right: 10,
+            top: "50%",
+            transform: "translateY(-50%)",
+            bgcolor: "rgba(255,255,255,0.9)",
+            border: "1px solid #e5e7eb",
+            "&:hover": { bgcolor: "#fff" },
+            transition: "all 0.15s ease",
           }}
-          sx={{ marginTop: "10px", alignSelf: "flex-end" }}
         >
-          Export All Labeled Data
-        </Button>
+          <ChevronRightRoundedIcon />
+        </IconButton>
       </Box>
 
-      {/* Magnified Image Labeler Modal */}
-      <MagnifiedImageLabeler
-        imageURL={images[currentIndex].url}
-        onPointsChange={(newPoints: { x: number; y: number; id: number }[]) =>
-          handleUpdateLabels(images[currentIndex].id, newPoints)
-        }
-        color={color}
-        opacity={opacity}
-        open={isMagnified}
-        onClose={toggleMagnifiedView}
-        mode={isSwitchOn}
-      />
-    </Box>
+      {/* Delete confirmation dialog */}
+      <Dialog open={confirmOpen} onClose={() => setConfirmOpen(false)} aria-labelledby="confirm-delete-title">
+        <DialogTitle id="confirm-delete-title" sx={{ fontWeight: 800 }}>
+          Delete this image?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ color: "#64748b" }}>
+            This will remove the current image and its labels from the session. This cannot be undone.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ px: 2, pb: 2 }}>
+          <Button
+            onClick={() => setConfirmOpen(false)}
+            variant="outlined"
+            sx={{ textTransform: "none", borderRadius: "10px", fontWeight: 700 }}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={() => {
+              if (current) handleDeleteImage(current.id);
+              setConfirmOpen(false);
+            }}
+            variant="contained"
+            sx={{
+              textTransform: "none",
+              borderRadius: "10px",
+              fontWeight: 800,
+              bgcolor: "#dc2626",
+              "&:hover": { bgcolor: "#b91c1c" },
+            }}
+          >
+            Delete
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {current && (
+        <MagnifiedImageLabeler
+          imageURL={current.url}
+          onPointsChange={(newPoints) => handleUpdateLabels(current.id, newPoints)}
+          color={color}
+          opacity={opacity}
+          open={isMagnified}
+          onClose={toggleMagnifiedView}
+          mode={isSwitchOn}
+        />
+      )}
+    </Paper>
   );
 };
 

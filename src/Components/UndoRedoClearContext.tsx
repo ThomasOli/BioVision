@@ -1,10 +1,8 @@
-import { createContext, useCallback, useState, useEffect } from "react";
-import { useSelector } from "react-redux"; // Import useSelector
-import { RootState } from "../state/store"; // Adjust the import based on your store setup
+// src/Components/UndoRedoClearContext.tsx
+import React, { createContext, useCallback, useEffect, useMemo, useState } from "react";
+import { useSelector } from "react-redux";
+import { RootState } from "../state/store";
 import { Point, AnnotatedImage } from "../types/Image";
-export const UndoRedoClearContext = createContext<UndoRedoClearContextProps>(
-  {} as UndoRedoClearContextProps
-);
 
 interface UndoRedoClearContextProps {
   images: AnnotatedImage[];
@@ -17,137 +15,169 @@ interface UndoRedoClearContextProps {
   points: Point[];
 }
 
-export const UndoRedoClearContextProvider = ({
-  children,
-}: React.PropsWithChildren<{}>) => {
-  const fileArray = useSelector((state: RootState) => state.files.fileArray); // Access fileArray from the Redux store
+export const UndoRedoClearContext = createContext<UndoRedoClearContextProps>({} as UndoRedoClearContextProps);
 
-  let [images, setImages] = useState<AnnotatedImage[]>([]);
-  const [selectedImage, setSelectedImage] = useState(0);
-  let points = [] as Point[];
+export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildren<{}>) => {
+  const fileArray = useSelector((state: RootState) => state.files.fileArray);
 
-  // Add useEffect to update images when fileArray changes
+  const [images, setImages] = useState<AnnotatedImage[]>([]);
+  const [selectedImage, setSelectedImage] = useState<number>(0);
 
+  // Keep images in sync with Redux fileArray
   useEffect(() => {
     setImages((prevImages) => {
-      const existingIds = new Set(prevImages.map((image) => image.id));
+      const existingIds = new Set(prevImages.map((img) => img.id));
 
-      // Initialize new files with required properties
-      const newImages = fileArray
+      const newImages: AnnotatedImage[] = fileArray
         .filter((file) => !existingIds.has(file.id))
         .map((file) => ({
           ...file,
           labels: [],
-          history: [],
-          future: [],
+          history: [], // expected Point[][]
+          future: [], // expected Point[][]
         }));
 
-      // Keep only images that still exist in fileArray
-      const updatedImages = prevImages.filter((image) =>
-        fileArray.some((file) => file.id === image.id)
-      );
+      const updatedImages = prevImages.filter((img) => fileArray.some((file) => file.id === img.id));
 
       return [...updatedImages, ...newImages];
     });
   }, [fileArray]);
 
+  // Clamp selectedImage whenever images length changes
   useEffect(() => {
-    // Logic: If selection is out of bounds (e.g. we deleted the selected image), reset it.
-    if (selectedImage >= images.length) {
-      setSelectedImage(Math.max(0, images.length - 1));
-    }
-  }, [images.length, selectedImage]);
+    setSelectedImage((prev) => {
+      if (images.length === 0) return 0;
+      return Math.min(Math.max(prev, 0), images.length - 1);
+    });
+  }, [images.length]);
 
-  if (images.length > 0) points = images[selectedImage].labels;
+  // Safe derived index (still useful for callers during transitions)
+  const safeSelectedIndex = useMemo(() => {
+    if (images.length === 0) return 0;
+    return Math.min(Math.max(selectedImage, 0), images.length - 1);
+  }, [selectedImage, images.length]);
+
+  // Current points for the active image
+  const points = useMemo<Point[]>(() => {
+    if (images.length === 0) return [];
+    const img = images[safeSelectedIndex];
+    return img?.labels ?? [];
+  }, [images, safeSelectedIndex]);
 
   const undo = useCallback(() => {
-    if (images.length > 0) {
-      setImages((prevImages) => {
-        const newImages = [...prevImages];
+    setImages((prevImages) => {
+      if (prevImages.length === 0) return prevImages;
 
-        const activeImage = { ...newImages[selectedImage] };
+      const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+      const currentImg = prevImages[idx];
+      if (!currentImg) return prevImages;
 
-        if (activeImage.history.length === 0) return prevImages;
+      if (!currentImg.history || currentImg.history.length === 0) return prevImages;
 
-        const previousSnapshot =
-          activeImage.history[activeImage.history.length - 1];
+      const newImages = [...prevImages];
+      const activeImage = { ...currentImg };
 
-        activeImage.future = [...activeImage.future, activeImage.labels];
+      // Last snapshot
+      const previousSnapshot = activeImage.history[activeImage.history.length - 1];
 
-        activeImage.labels = previousSnapshot;
+      // Move current labels to future (store snapshot copy)
+      activeImage.future = [...(activeImage.future ?? []), [...activeImage.labels]];
 
-        const newHistory = [...activeImage.history];
-        newHistory.pop();
-        activeImage.history = newHistory;
+      // Restore snapshot (copy)
+      activeImage.labels = [...previousSnapshot];
 
-        newImages[selectedImage] = activeImage;
+      // Pop history
+      const newHistory = [...activeImage.history];
+      newHistory.pop();
+      activeImage.history = newHistory;
 
-        return newImages;
-      });
-    }
+      newImages[idx] = activeImage;
+      return newImages;
+    });
   }, [selectedImage]);
 
-  function addPoint(newPoint: Point) {
-    setImages((prevImages) => {
-      const updatedImages = [...prevImages];
-      const activeImage = { ...updatedImages[selectedImage] };
-
-      activeImage.history = [...activeImage.history, activeImage.labels];
-
-      activeImage.labels = [...activeImage.labels, newPoint];
-
-      activeImage.future = [];
-
-      updatedImages[selectedImage] = activeImage;
-      return updatedImages;
-    });
-  }
-
   const redo = useCallback(() => {
-    if (images.length > 0) {
-      setImages((prevImages) => {
-        const newImages = [...prevImages];
-        const activeImage = { ...newImages[selectedImage] };
+    setImages((prevImages) => {
+      if (prevImages.length === 0) return prevImages;
 
-        if (activeImage.future.length === 0) return prevImages;
-        const itemRestored = activeImage.future[activeImage.future.length - 1];
+      const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+      const currentImg = prevImages[idx];
+      if (!currentImg) return prevImages;
 
-        const newFuture = [...activeImage.future];
-        newFuture.pop();
-        activeImage.future = newFuture;
+      if (!currentImg.future || currentImg.future.length === 0) return prevImages;
 
-        activeImage.history = [...activeImage.history, activeImage.labels];
+      const newImages = [...prevImages];
+      const activeImage = { ...currentImg };
 
-        if (Array.isArray(itemRestored)) {
-          activeImage.labels = itemRestored;
-        } else {
-          activeImage.labels = [...activeImage.labels, itemRestored];
-        }
-        newImages[selectedImage] = activeImage;
-        return newImages;
-      });
-    }
+      const restoredSnapshot = activeImage.future[activeImage.future.length - 1];
+
+      // Pop future
+      const newFuture = [...activeImage.future];
+      newFuture.pop();
+      activeImage.future = newFuture;
+
+      // Push current labels to history (snapshot copy)
+      activeImage.history = [...(activeImage.history ?? []), [...activeImage.labels]];
+
+      // Restore snapshot (copy)
+      activeImage.labels = [...restoredSnapshot];
+
+      newImages[idx] = activeImage;
+      return newImages;
+    });
   }, [selectedImage]);
 
   const clear = useCallback(() => {
-    if (images.length > 0) {
+    setImages((prevImages) => {
+      if (prevImages.length === 0) return prevImages;
+
+      const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+      const currentImg = prevImages[idx];
+      if (!currentImg) return prevImages;
+
+      const newImages = [...prevImages];
+      const activeImage = { ...currentImg };
+
+      if (activeImage.labels.length > 0) {
+        // Save snapshot copy
+        activeImage.history = [...(activeImage.history ?? []), [...activeImage.labels]];
+      }
+
+      activeImage.labels = [];
+      activeImage.future = [];
+
+      newImages[idx] = activeImage;
+      return newImages;
+    });
+  }, [selectedImage]);
+
+  const addPoint = useCallback(
+    (newPoint: Point) => {
       setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
         const newImages = [...prevImages];
-        const activeImage = { ...newImages[selectedImage] };
+        const activeImage = { ...currentImg };
 
-        if (activeImage.labels.length > 0) {
-          activeImage.history = [...activeImage.history, activeImage.labels];
-        }
-        activeImage.labels = [];
+        // Save snapshot copy before change
+        activeImage.history = [...(activeImage.history ?? []), [...activeImage.labels]];
 
+        // Add point
+        activeImage.labels = [...activeImage.labels, newPoint];
+
+        // Clear redo stack
         activeImage.future = [];
 
-        newImages[selectedImage] = activeImage;
-
+        newImages[idx] = activeImage;
         return newImages;
       });
-    }
-  }, [selectedImage]);
+    },
+    [selectedImage]
+  );
 
   return (
     <UndoRedoClearContext.Provider
