@@ -175,6 +175,7 @@ ipcMain.handle("ml:save-labels", async (_event, images) => {
       JSON.stringify({
         imageFilename: img.filename,
         landmarks: img.labels,
+        boundingBox: img.boundingBox,
       }, null, 2)
     );
   }
