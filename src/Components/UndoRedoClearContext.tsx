@@ -1,4 +1,4 @@
-import { createContext, useCallback, useState, useEffect } from "react";
+import { createContext, useCallback, useState, useEffect, useMemo } from "react";
 import { useSelector } from "react-redux"; // Import useSelector
 import { RootState } from "../state/store"; // Adjust the import based on your store setup
 import { Point, AnnotatedImage } from "../types/Image";
@@ -51,21 +51,25 @@ export const UndoRedoClearContextProvider = ({
     });
   }, [fileArray]);
 
-  useEffect(() => {
-    // Logic: If selection is out of bounds (e.g. we deleted the selected image), reset it.
-    if (selectedImage >= images.length) {
-      setSelectedImage(Math.max(0, images.length - 1));
-    }
-  }, [images.length, selectedImage]);
+  // Compute a safe selected index
+  const safeSelectedIndex = useMemo(() => {
+    if (images.length === 0) return 0;
+    if (selectedImage >= images.length) return images.length - 1;
+    if (selectedImage < 0) return 0;
+    return selectedImage;
+  }, [selectedImage, images.length]);
 
-  if (images.length > 0) points = images[selectedImage].labels;
+  // Safely get points - use safeSelectedIndex
+  if (images.length > 0 && images[safeSelectedIndex]) {
+    points = images[safeSelectedIndex].labels;
+  }
 
   const undo = useCallback(() => {
-    if (images.length > 0) {
+    if (images.length > 0 && safeSelectedIndex < images.length) {
       setImages((prevImages) => {
         const newImages = [...prevImages];
 
-        const activeImage = { ...newImages[selectedImage] };
+        const activeImage = { ...newImages[safeSelectedIndex] };
 
         if (activeImage.history.length === 0) return prevImages;
 
@@ -80,12 +84,12 @@ export const UndoRedoClearContextProvider = ({
         newHistory.pop();
         activeImage.history = newHistory;
 
-        newImages[selectedImage] = activeImage;
+        newImages[safeSelectedIndex] = activeImage;
 
         return newImages;
       });
     }
-  }, [selectedImage]);
+  }, [safeSelectedIndex, images.length]);
 
   function addPoint(newPoint: Point) {
     setImages((prevImages) => {
