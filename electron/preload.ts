@@ -32,6 +32,11 @@ contextBridge.exposeInMainWorld("api", {
   selectImageFolder: () => ipcRenderer.invoke("select-image-folder"),
   getProjectRoot: () => ipcRenderer.invoke("ml:get-project-root"),
   selectProjectRoot: () => ipcRenderer.invoke("ml:select-project-root"),
+  listModels: () => ipcRenderer.invoke("ml:list-models"),
+  deleteModel: (modelName: string) => ipcRenderer.invoke("ml:delete-model", modelName),
+  renameModel: (oldName: string, newName: string) => ipcRenderer.invoke("ml:rename-model", oldName, newName),
+  getModelInfo: (modelName: string) => ipcRenderer.invoke("ml:get-model-info", modelName),
+  selectImages: () => ipcRenderer.invoke("select-images"),
 });
 
 // --------- Preload scripts loading ---------

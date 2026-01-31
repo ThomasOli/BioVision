@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { useSelector } from "react-redux";
-import { Copy, FolderOpen, Loader2 } from "lucide-react";
+import { Copy, FolderOpen, Loader2, Home } from "lucide-react";
 import { toast } from "sonner";
 
 import UploadImages from "./UploadImages";
@@ -29,6 +29,9 @@ interface MenuProps {
   onSwitchChange: () => void;
   toolMode: ToolMode;
   onToolModeChange: (mode: ToolMode) => void;
+  onNavigateToLanding?: () => void;
+  openTrainDialogOnMount?: boolean;
+  onTrainDialogOpened?: () => void;
 }
 
 async function saveLabels(fileArray: AnnotatedImage[]) {
@@ -41,8 +44,19 @@ const Menu: React.FC<MenuProps> = ({
   onSwitchChange,
   toolMode,
   onToolModeChange,
+  onNavigateToLanding,
+  openTrainDialogOnMount,
+  onTrainDialogOpened,
 }) => {
   const [openTrainDialog, setOpenTrainDialog] = useState(false);
+
+  // Handle opening train dialog from navigation
+  useEffect(() => {
+    if (openTrainDialogOnMount) {
+      setOpenTrainDialog(true);
+      onTrainDialogOpened?.();
+    }
+  }, [openTrainDialogOnMount, onTrainDialogOpened]);
   const [modelName, setModelName] = useState("");
   const [isTraining, setIsTraining] = useState(false);
   const [modelPath, setModelPath] = useState("");
@@ -171,13 +185,36 @@ const Menu: React.FC<MenuProps> = ({
             className="flex flex-col gap-4 p-4"
           >
             {/* Header */}
-            <motion.div variants={sidebarItem} className="text-center">
-              <h1 className="text-xl font-bold text-foreground">
-                Auto Landmarking
-              </h1>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Select Model • Import • Annotate
-              </p>
+            <motion.div variants={sidebarItem}>
+              <div className="flex items-center gap-2">
+                {onNavigateToLanding && (
+                  <motion.div {...buttonHover} {...buttonTap}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={onNavigateToLanding}
+                          className="shrink-0"
+                        >
+                          <Home className="h-5 w-5" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="right">
+                        Back to Home
+                      </TooltipContent>
+                    </Tooltip>
+                  </motion.div>
+                )}
+                <div className="flex-1 text-center">
+                  <h1 className="text-xl font-bold text-foreground">
+                    Auto Landmarking
+                  </h1>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Select Model • Import • Annotate
+                  </p>
+                </div>
+              </div>
             </motion.div>
 
             {/* Model Card */}

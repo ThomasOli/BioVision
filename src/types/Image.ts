@@ -26,3 +26,14 @@ export interface AnnotatedImage {
 
 // Tool modes for the annotation workflow
 export type ToolMode = 'box' | 'landmark' | 'select';
+
+// App navigation views
+export type AppView = 'landing' | 'workspace' | 'models' | 'inference';
+
+// Trained model metadata
+export interface TrainedModel {
+  name: string;
+  path: string;
+  size: number;
+  createdAt: Date;
+}

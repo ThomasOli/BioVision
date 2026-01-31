@@ -240,6 +240,121 @@ ipcMain.handle("select-image-folder", async () => {
   };
 });
 
+// Select individual image files for inference
+ipcMain.handle("select-images", async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ["openFile", "multiSelections"],
+    filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "bmp", "tiff", "tif"] }],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { canceled: true };
+  }
+
+  const files = result.filePaths.map((filePath) => ({
+    path: filePath,
+    name: path.basename(filePath),
+  }));
+
+  return { canceled: false, files };
+});
+
+// List trained models in the models directory
+ipcMain.handle("ml:list-models", async () => {
+  try {
+    const modelsDir = path.join(projectRoot, "models");
+
+    if (!fs.existsSync(modelsDir)) {
+      fs.mkdirSync(modelsDir, { recursive: true });
+      return { ok: true, models: [] };
+    }
+
+    const files = fs.readdirSync(modelsDir);
+    const models = files
+      .filter((f) => f.endsWith(".dat"))
+      .map((file) => {
+        const filePath = path.join(modelsDir, file);
+        const stats = fs.statSync(filePath);
+        return {
+          name: file.replace(/\.dat$/, ""),
+          path: filePath,
+          size: stats.size,
+          createdAt: stats.birthtime,
+        };
+      })
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    return { ok: true, models };
+  } catch (e: any) {
+    console.error("Failed to list models:", e);
+    return { ok: false, error: e.message };
+  }
+});
+
+// Delete a trained model
+ipcMain.handle("ml:delete-model", async (_event, modelName: string) => {
+  try {
+    const modelPath = path.join(projectRoot, "models", `${modelName}.dat`);
+
+    if (!fs.existsSync(modelPath)) {
+      return { ok: false, error: "Model not found" };
+    }
+
+    fs.unlinkSync(modelPath);
+    return { ok: true };
+  } catch (e: any) {
+    console.error("Failed to delete model:", e);
+    return { ok: false, error: e.message };
+  }
+});
+
+// Rename a trained model
+ipcMain.handle("ml:rename-model", async (_event, oldName: string, newName: string) => {
+  try {
+    const oldPath = path.join(projectRoot, "models", `${oldName}.dat`);
+    const newPath = path.join(projectRoot, "models", `${newName}.dat`);
+
+    if (!fs.existsSync(oldPath)) {
+      return { ok: false, error: "Model not found" };
+    }
+
+    if (fs.existsSync(newPath)) {
+      return { ok: false, error: "A model with that name already exists" };
+    }
+
+    fs.renameSync(oldPath, newPath);
+    return { ok: true };
+  } catch (e: any) {
+    console.error("Failed to rename model:", e);
+    return { ok: false, error: e.message };
+  }
+});
+
+// Get info about a specific model
+ipcMain.handle("ml:get-model-info", async (_event, modelName: string) => {
+  try {
+    const modelPath = path.join(projectRoot, "models", `${modelName}.dat`);
+
+    if (!fs.existsSync(modelPath)) {
+      return { ok: false, error: "Model not found" };
+    }
+
+    const stats = fs.statSync(modelPath);
+    return {
+      ok: true,
+      model: {
+        name: modelName,
+        path: modelPath,
+        size: stats.size,
+        createdAt: stats.birthtime,
+      },
+    };
+  } catch (e: any) {
+    console.error("Failed to get model info:", e);
+    return { ok: false, error: e.message };
+  }
+});
+
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();

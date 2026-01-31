@@ -9,14 +9,28 @@ import { Toaster } from "@/Components/ui/sonner"
 import Menu from "./Components/Menu"
 import ImageLabelerCarousel from "./Components/ImageLablerCarousel"
 import { UndoRedoClearContextProvider } from "./Components/UndoRedoClearContext"
-import { ToolMode } from "./types/Image"
+import { LandingPage } from "./Components/LandingPage"
+import { MyModelsPage } from "./Components/MyModelsPage"
+import { InferencePage } from "./Components/InferencePage"
+import { ToolMode, AppView } from "./types/Image"
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
 const App: React.FC = () => {
-  const [color, setColor] = useState<string>("red")
+  // Navigation state
+  const [currentView, setCurrentView] = useState<AppView>("landing")
+  const [openTrainDialogOnMount, setOpenTrainDialogOnMount] = useState(false)
+  const [selectedModelForInference, setSelectedModelForInference] = useState<string>("")
+
+  // Workspace state
+  const [color, setColor] = useState<string>(() =>
+    localStorage.getItem("biovision-default-color") || "red"
+  )
   const [isSwitchOn, setIsSwitchOn] = useState(false)
-  const [opacity, setOpacity] = useState<number>(100)
+  const [opacity, setOpacity] = useState<number>(() => {
+    const saved = localStorage.getItem("biovision-default-opacity")
+    return saved ? parseInt(saved, 10) : 100
+  })
   const [toolMode, setToolMode] = useState<ToolMode>("box")
 
   const handleColorChange = (selectedColor: string) => setColor(selectedColor)
@@ -111,63 +125,119 @@ const App: React.FC = () => {
     document.body.style.userSelect = "none"
   }
 
+  const handleNavigate = (view: AppView) => {
+    setCurrentView(view)
+    // Reset flags when navigating away
+    if (view !== "workspace") {
+      setOpenTrainDialogOnMount(false)
+    }
+    if (view !== "inference") {
+      setSelectedModelForInference("")
+    }
+  }
+
+  const handleOpenTrainDialog = () => {
+    setOpenTrainDialogOnMount(true)
+  }
+
+  const handleSelectModelForInference = (modelName: string) => {
+    setSelectedModelForInference(modelName)
+  }
+
+  // Render workspace (annotation view)
+  const renderWorkspace = () => (
+    <div
+      ref={pageRef}
+      className="w-screen h-screen min-w-[880px] min-h-[500px] bg-background flex overflow-auto"
+    >
+      {/* Left: menu container */}
+      <motion.div
+        animate={{ width: menuWidth }}
+        transition={{ duration: 0.15, ease: "easeOut" }}
+        className="shrink-0 h-full overflow-hidden border-r bg-card"
+      >
+        <div
+          ref={menuWrapRef}
+          className="h-full overflow-y-auto overflow-x-hidden bg-card"
+        >
+          <Menu
+            onOpacityChange={handleOpacityChange}
+            onColorChange={handleColorChange}
+            onSwitchChange={handleSwitchChange}
+            toolMode={toolMode}
+            onToolModeChange={handleToolModeChange}
+            onNavigateToLanding={() => handleNavigate("landing")}
+            openTrainDialogOnMount={openTrainDialogOnMount}
+            onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
+          />
+        </div>
+      </motion.div>
+
+      {/* Drag handle */}
+      <div
+        onMouseDown={startDrag}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize menu"
+        className={cn(
+          "w-2.5 shrink-0 cursor-col-resize relative bg-transparent",
+          "hover:bg-primary/5 transition-colors",
+          "after:content-[''] after:absolute after:top-0 after:bottom-0 after:left-1/2",
+          "after:-translate-x-1/2 after:w-0.5 after:bg-border after:opacity-95"
+        )}
+      />
+
+      {/* Right: fills ALL remaining space */}
+      <div className="flex-1 h-full bg-muted/30 overflow-hidden flex min-w-0">
+        <div className="w-full h-full min-w-0 min-h-0 p-2 box-border flex">
+          <div className="w-full h-full min-w-0 min-h-0 flex">
+            <ImageLabelerCarousel
+              color={color}
+              opacity={opacity}
+              isSwitchOn={isSwitchOn}
+              toolMode={toolMode}
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+
+  // Render content based on current view
+  const renderContent = () => {
+    switch (currentView) {
+      case "landing":
+        return (
+          <LandingPage
+            onNavigate={handleNavigate}
+            onOpenTrainDialog={handleOpenTrainDialog}
+          />
+        )
+      case "models":
+        return (
+          <MyModelsPage
+            onNavigate={handleNavigate}
+            onSelectModelForInference={handleSelectModelForInference}
+          />
+        )
+      case "inference":
+        return (
+          <InferencePage
+            onNavigate={handleNavigate}
+            initialModel={selectedModelForInference}
+          />
+        )
+      case "workspace":
+      default:
+        return renderWorkspace()
+    }
+  }
+
   return (
     <ThemeProvider defaultTheme="system" storageKey="biovision-ui-theme">
       <TooltipProvider>
         <UndoRedoClearContextProvider>
-          <div
-            ref={pageRef}
-            className="w-screen h-screen min-w-[880px] min-h-[500px] bg-background flex overflow-auto"
-          >
-            {/* Left: menu container */}
-            <motion.div
-              animate={{ width: menuWidth }}
-              transition={{ duration: 0.15, ease: "easeOut" }}
-              className="shrink-0 h-full overflow-hidden border-r bg-card"
-            >
-              <div
-                ref={menuWrapRef}
-                className="h-full overflow-y-auto overflow-x-hidden bg-card"
-              >
-                <Menu
-                  onOpacityChange={handleOpacityChange}
-                  onColorChange={handleColorChange}
-                  onSwitchChange={handleSwitchChange}
-                  toolMode={toolMode}
-                  onToolModeChange={handleToolModeChange}
-                />
-              </div>
-            </motion.div>
-
-            {/* Drag handle */}
-            <div
-              onMouseDown={startDrag}
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="Resize menu"
-              className={cn(
-                "w-2.5 shrink-0 cursor-col-resize relative bg-transparent",
-                "hover:bg-primary/5 transition-colors",
-                "after:content-[''] after:absolute after:top-0 after:bottom-0 after:left-1/2",
-                "after:-translate-x-1/2 after:w-0.5 after:bg-border after:opacity-95"
-              )}
-            />
-
-            {/* Right: fills ALL remaining space */}
-            <div className="flex-1 h-full bg-muted/30 overflow-hidden flex min-w-0">
-              <div className="w-full h-full min-w-0 min-h-0 p-2 box-border flex">
-                <div className="w-full h-full min-w-0 min-h-0 flex">
-                  <ImageLabelerCarousel
-                    color={color}
-                    opacity={opacity}
-                    isSwitchOn={isSwitchOn}
-                    toolMode={toolMode}
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
-
+          {renderContent()}
           <Toaster position="bottom-center" />
         </UndoRedoClearContextProvider>
       </TooltipProvider>
