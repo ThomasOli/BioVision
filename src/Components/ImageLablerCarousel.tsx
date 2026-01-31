@@ -8,7 +8,8 @@ import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 import { AppDispatch } from "../state/store";
-import { removeFile, updateLabels } from "../state/filesState/fileSlice";
+import { removeFile, updateBoxes } from "../state/filesState/fileSlice";
+import { ToolMode, BoundingBox } from "../types/Image";
 
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent } from "@/Components/ui/card";
@@ -32,12 +33,14 @@ interface ImageLabelerCarouselProps {
   color: string;
   opacity: number;
   isSwitchOn: boolean;
+  toolMode: ToolMode;
 }
 
 const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   color,
   opacity,
   isSwitchOn,
+  toolMode,
 }) => {
   const { images, setSelectedImage } = useContext(UndoRedoClearContext);
   const dispatch = useDispatch<AppDispatch>();
@@ -61,11 +64,11 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     () => (totalImages ? images[currentIndex] : null),
     [images, currentIndex, totalImages]
   );
-  const hasLandmarks = Boolean(current?.labels?.length);
+  const hasAnnotations = Boolean(current?.boxes?.length);
 
-  const handleUpdateLabels = useCallback(
-    (id: number, labels: { x: number; y: number; id: number }[]) => {
-      dispatch(updateLabels({ id, labels }));
+  const handleUpdateBoxes = useCallback(
+    (id: number, boxes: BoundingBox[]) => {
+      dispatch(updateBoxes({ id, boxes }));
     },
     [dispatch]
   );
@@ -113,7 +116,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const toggleMagnifiedView = () => setIsMagnified((prev) => !prev);
 
   const exportCurrent = useCallback(async () => {
-    if (!current || !current.labels?.length) return;
+    if (!current || !current.boxes?.length) return;
 
     const dims = await new Promise<{ width: number; height: number } | null>(
       (resolve) => {
@@ -128,10 +131,16 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     const data = {
       imageURL: current.url,
       imageDimensions: dims,
-      points: current.labels.map(({ x, y, id }: { x: number; y: number; id: number }) => ({
-        x: Math.round(x),
-        y: Math.round(y),
-        id,
+      boxes: current.boxes.map((box) => ({
+        left: box.left,
+        top: box.top,
+        width: box.width,
+        height: box.height,
+        landmarks: box.landmarks.map(({ x, y, id }) => ({
+          x: Math.round(x),
+          y: Math.round(y),
+          id,
+        })),
       })),
     };
 
@@ -148,7 +157,21 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   }, [current]);
 
   const exportAll = useCallback(() => {
-    const data = images.map(({ id, url, labels }) => ({ id, url, labels }));
+    const data = images.map(({ id, url, boxes }) => ({
+      id,
+      url,
+      boxes: boxes.map((box) => ({
+        left: box.left,
+        top: box.top,
+        width: box.width,
+        height: box.height,
+        landmarks: box.landmarks.map(({ x, y, id }) => ({
+          x: Math.round(x),
+          y: Math.round(y),
+          id,
+        })),
+      })),
+    }));
     const jsonData = JSON.stringify(data, null, 2);
     const blob = new Blob([jsonData], { type: "application/json" });
     const urlBlob = URL.createObjectURL(blob);
@@ -192,7 +215,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
-            {hasLandmarks && (
+            {hasAnnotations && (
               <motion.div {...buttonHover} {...buttonTap}>
                 <Button
                   variant="outline"
@@ -279,12 +302,13 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
               >
                 <ImageLabeler
                   imageURL={current.url}
-                  onPointsChange={(newPoints) =>
-                    handleUpdateLabels(current.id, newPoints)
+                  onBoxesChange={(newBoxes) =>
+                    handleUpdateBoxes(current.id, newBoxes)
                   }
                   color={color}
                   opacity={opacity}
                   mode={isSwitchOn}
+                  toolMode={toolMode}
                 />
               </motion.div>
             )}
@@ -350,14 +374,15 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         {current && (
           <MagnifiedImageLabeler
             imageURL={current.url}
-            onPointsChange={(newPoints) =>
-              handleUpdateLabels(current.id, newPoints)
+            onBoxesChange={(newBoxes) =>
+              handleUpdateBoxes(current.id, newBoxes)
             }
             color={color}
             opacity={opacity}
             open={isMagnified}
             onClose={toggleMagnifiedView}
             mode={isSwitchOn}
+            toolMode={toolMode}
           />
         )}
       </Card>

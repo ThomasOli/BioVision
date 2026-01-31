@@ -1,24 +1,9 @@
 // src/state/filesState/fileSlice.ts
 import { createSlice, PayloadAction } from "@reduxjs/toolkit";
-
-interface Point {
-  x: number;
-  y: number;
-  id: number;
-}
-
-interface AnnotatedImage  {
-  id: number;
-  path: string;
-  url: string;
-  filename: string;
-  labels: Point[];
-  history: Point[][];
-  future: Point[][];
-}
+import { BoundingBox, AnnotatedImage } from "../../types/Image";
 
 interface FilesState {
-  fileArray: AnnotatedImage [];
+  fileArray: AnnotatedImage[];
 }
 
 export const initialState: FilesState = {
@@ -31,13 +16,14 @@ const fileSlice = createSlice({
   reducers: {
     addFiles: (state, action: PayloadAction<File[]>) => {
       const newImages = action.payload.map((file) => ({
-        id: Date.now() + Math.random(), // Generate a unique ID
+        id: Date.now() + Math.random(),
         path: file.path,
         url: URL.createObjectURL(file),
         filename: file.name,
-        labels: [],
-        history: [] as Point[][],
-        future: [] as Point[][],
+        boxes: [] as BoundingBox[],
+        selectedBoxId: null,
+        history: [] as BoundingBox[][],
+        future: [] as BoundingBox[][],
       }));
       state.fileArray = [...state.fileArray, ...newImages];
       console.log(state.fileArray);
@@ -47,32 +33,32 @@ const fileSlice = createSlice({
         (img) => img.id === action.payload
       );
       if (imageToRemove) {
-        URL.revokeObjectURL(imageToRemove.url); // Revoke URL to free memory
+        URL.revokeObjectURL(imageToRemove.url);
       }
       state.fileArray = state.fileArray.filter(
         (image) => image.id !== action.payload
       );
     },
-    updateLabels: (
+    updateBoxes: (
       state,
-      action: PayloadAction<{ id: number; labels: Point[] }>
+      action: PayloadAction<{ id: number; boxes: BoundingBox[] }>
     ) => {
-      const { id, labels } = action.payload;
+      const { id, boxes } = action.payload;
       const image = state.fileArray.find((img) => img.id === id);
       if (image) {
-        image.labels = labels;
+        image.boxes = boxes;
       }
     },
     clearFiles: (state) => {
       state.fileArray.forEach((image) => {
-        URL.revokeObjectURL(image.url); // Revoke all URLs
+        URL.revokeObjectURL(image.url);
       });
       state.fileArray = [];
     },
   },
 });
 
-export const { addFiles, removeFile, updateLabels, clearFiles } =
+export const { addFiles, removeFile, updateBoxes, clearFiles } =
   fileSlice.actions;
 
 export default fileSlice.reducer;

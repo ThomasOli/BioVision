@@ -170,11 +170,25 @@ ipcMain.handle("ml:save-labels", async (_event, images) => {
   for (const img of images) {
     const destImagePath = path.join(imagesDir, img.filename);
     fs.copyFileSync(img.path, destImagePath);
+
+    // Export boxes with nested landmarks
+    const boxes = (img.boxes || []).map((box: any) => ({
+      left: box.left,
+      top: box.top,
+      width: box.width,
+      height: box.height,
+      landmarks: (box.landmarks || []).map((lm: any) => ({
+        x: lm.x,
+        y: lm.y,
+        id: lm.id,
+      })),
+    }));
+
     fs.writeFileSync(
       path.join(labelsDir, img.filename.replace(/\.\w+$/, ".json")),
       JSON.stringify({
         imageFilename: img.filename,
-        landmarks: img.labels,
+        boxes: boxes,
       }, null, 2)
     );
   }

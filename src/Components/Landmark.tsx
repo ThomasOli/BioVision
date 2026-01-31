@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { HexColorPicker } from "react-colorful";
-import { Trash2, Undo2, Redo2, X, ChevronDown } from "lucide-react";
+import { Trash2, Undo2, Redo2, X, ChevronDown, Square, Circle as CircleIcon, MousePointer2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Switch } from "@/Components/ui/switch";
@@ -23,11 +23,15 @@ import { Separator } from "@/Components/ui/separator";
 import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 import { buttonHover, buttonTap, cardHover } from "@/lib/animations";
+import { ToolMode } from "../types/Image";
+import { ScrollArea } from "@/Components/ui/scroll-area";
 
 interface LandmarkProps {
   onColorChange: (selectedColor: string) => void;
   onOpacityChange: (selectedOpacity: number) => void;
   onSwitchChange: () => void;
+  toolMode: ToolMode;
+  onToolModeChange: (mode: ToolMode) => void;
 }
 
 const isValidHex = (v: string) => /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$/.test(v);
@@ -54,6 +58,8 @@ const Landmark: React.FC<LandmarkProps> = ({
   onColorChange,
   onOpacityChange,
   onSwitchChange,
+  toolMode,
+  onToolModeChange,
 }) => {
   const [previewOnly, setPreviewOnly] = useState(false);
   const [color, setColor] = useState("#ff0000");
@@ -61,7 +67,7 @@ const Landmark: React.FC<LandmarkProps> = ({
   const [opacity, setOpacity] = useState<number>(100);
   const [colorOpen, setColorOpen] = useState(false);
 
-  const { clear, undo, redo } = React.useContext(UndoRedoClearContext);
+  const { clear, undo, redo, boxes, selectedBoxId, selectBox, deleteBox } = React.useContext(UndoRedoClearContext);
 
   const swatches = useMemo(
     () => [
@@ -116,6 +122,9 @@ const Landmark: React.FC<LandmarkProps> = ({
 
   const opacity01 = opacity / 100;
 
+  // Total landmarks across all boxes
+  const totalLandmarks = boxes.reduce((sum, box) => sum + box.landmarks.length, 0);
+
   return (
     <TooltipProvider>
       <motion.div variants={cardHover} initial="initial" whileHover="hover">
@@ -123,7 +132,7 @@ const Landmark: React.FC<LandmarkProps> = ({
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
               <CardTitle className="text-sm font-semibold tracking-wide uppercase">
-                Landmark Tools
+                Annotation Tools
               </CardTitle>
             </div>
             <div className="flex items-center justify-between pt-1">
@@ -156,12 +165,135 @@ const Landmark: React.FC<LandmarkProps> = ({
 
             <motion.div
               animate={{
-                maxHeight: previewOnly ? 0 : 900,
+                maxHeight: previewOnly ? 0 : 1200,
                 opacity: previewOnly ? 0 : 1,
               }}
               transition={{ duration: 0.3, ease: "easeInOut" }}
               className={cn("space-y-4 overflow-hidden", previewOnly && "pointer-events-none")}
             >
+              {/* Tool Mode Toggle */}
+              <div className="space-y-2">
+                <Label className="text-xs font-semibold text-muted-foreground">
+                  Tool Mode
+                </Label>
+                <div className="flex items-center justify-center gap-2">
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <motion.div {...buttonHover} {...buttonTap}>
+                        <Button
+                          variant={toolMode === "box" ? "default" : "outline"}
+                          size="sm"
+                          onClick={() => onToolModeChange("box")}
+                          className="flex-1"
+                        >
+                          <Square className="h-4 w-4 mr-1" />
+                          Box
+                        </Button>
+                      </motion.div>
+                    </TooltipTrigger>
+                    <TooltipContent>Draw bounding boxes</TooltipContent>
+                  </Tooltip>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <motion.div {...buttonHover} {...buttonTap}>
+                        <Button
+                          variant={toolMode === "landmark" ? "default" : "outline"}
+                          size="sm"
+                          onClick={() => onToolModeChange("landmark")}
+                          className="flex-1"
+                        >
+                          <CircleIcon className="h-4 w-4 mr-1" />
+                          Landmark
+                        </Button>
+                      </motion.div>
+                    </TooltipTrigger>
+                    <TooltipContent>Place landmarks inside boxes</TooltipContent>
+                  </Tooltip>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <motion.div {...buttonHover} {...buttonTap}>
+                        <Button
+                          variant={toolMode === "select" ? "default" : "outline"}
+                          size="sm"
+                          onClick={() => onToolModeChange("select")}
+                          className="flex-1"
+                        >
+                          <MousePointer2 className="h-4 w-4 mr-1" />
+                          Select
+                        </Button>
+                      </motion.div>
+                    </TooltipTrigger>
+                    <TooltipContent>Select and resize boxes</TooltipContent>
+                  </Tooltip>
+                </div>
+              </div>
+
+              <Separator />
+
+              {/* Boxes List */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs font-semibold text-muted-foreground">
+                    Bounding Boxes
+                  </Label>
+                  <span className="text-xs text-muted-foreground">
+                    {boxes.length} box{boxes.length !== 1 ? "es" : ""}, {totalLandmarks} landmark{totalLandmarks !== 1 ? "s" : ""}
+                  </span>
+                </div>
+
+                {boxes.length === 0 ? (
+                  <div className="rounded-lg border bg-muted/50 px-3 py-2">
+                    <p className="text-xs text-muted-foreground text-center">
+                      No boxes yet. Use Box mode to draw one.
+                    </p>
+                  </div>
+                ) : (
+                  <ScrollArea className="max-h-32">
+                    <div className="space-y-1">
+                      {boxes.map((box, index) => (
+                        <div
+                          key={box.id}
+                          className={cn(
+                            "flex items-center justify-between px-2 py-1.5 rounded-md text-xs cursor-pointer transition-colors",
+                            selectedBoxId === box.id
+                              ? "bg-primary/20 border border-primary/40"
+                              : "bg-muted/50 hover:bg-muted"
+                          )}
+                          onClick={() => selectBox(box.id)}
+                        >
+                          <span className="font-medium">
+                            Box {index + 1}
+                            <span className="text-muted-foreground ml-2">
+                              ({box.landmarks.length} pts)
+                            </span>
+                          </span>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6 text-destructive hover:bg-destructive/10"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  deleteBox(box.id);
+                                }}
+                              >
+                                <Trash2 className="h-3 w-3" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Delete box</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                )}
+              </div>
+
+              <Separator />
+
               {/* Action buttons */}
               <div className="flex justify-center">
                 <div className="flex items-center gap-6 rounded-full border bg-muted/50 px-3 py-1.5">
@@ -178,7 +310,7 @@ const Landmark: React.FC<LandmarkProps> = ({
                         </Button>
                       </motion.div>
                     </TooltipTrigger>
-                    <TooltipContent>Clear all landmarks</TooltipContent>
+                    <TooltipContent>Clear all boxes and landmarks</TooltipContent>
                   </Tooltip>
 
                   <Tooltip>

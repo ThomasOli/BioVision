@@ -4,13 +4,25 @@ export interface Point {
   id: number;
 }
 
+export interface BoundingBox {
+  id: number;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  landmarks: Point[];
+}
 
 export interface AnnotatedImage {
   id: number;
   path: string;
   url: string;
   filename: string;
-  labels: Point[];
-  history: Point[][];
-  future: Point[][];
+  boxes: BoundingBox[];
+  selectedBoxId: number | null;
+  history: BoundingBox[][];
+  future: BoundingBox[][];
 }
+
+// Tool modes for the annotation workflow
+export type ToolMode = 'box' | 'landmark' | 'select';

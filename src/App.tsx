@@ -9,6 +9,7 @@ import { Toaster } from "@/Components/ui/sonner"
 import Menu from "./Components/Menu"
 import ImageLabelerCarousel from "./Components/ImageLablerCarousel"
 import { UndoRedoClearContextProvider } from "./Components/UndoRedoClearContext"
+import { ToolMode } from "./types/Image"
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
@@ -16,10 +17,12 @@ const App: React.FC = () => {
   const [color, setColor] = useState<string>("red")
   const [isSwitchOn, setIsSwitchOn] = useState(false)
   const [opacity, setOpacity] = useState<number>(100)
+  const [toolMode, setToolMode] = useState<ToolMode>("box")
 
   const handleColorChange = (selectedColor: string) => setColor(selectedColor)
   const handleSwitchChange = () => setIsSwitchOn((prev) => !prev)
   const handleOpacityChange = (selectedOpacity: number) => setOpacity(selectedOpacity)
+  const handleToolModeChange = (mode: ToolMode) => setToolMode(mode)
 
   // Responsive bounds for menu
   const [isXs, setIsXs] = useState(window.innerWidth < 600)
@@ -130,6 +133,8 @@ const App: React.FC = () => {
                   onOpacityChange={handleOpacityChange}
                   onColorChange={handleColorChange}
                   onSwitchChange={handleSwitchChange}
+                  toolMode={toolMode}
+                  onToolModeChange={handleToolModeChange}
                 />
               </div>
             </motion.div>
@@ -152,7 +157,12 @@ const App: React.FC = () => {
             <div className="flex-1 h-full bg-muted/30 overflow-hidden flex min-w-0">
               <div className="w-full h-full min-w-0 min-h-0 p-2 box-border flex">
                 <div className="w-full h-full min-w-0 min-h-0 flex">
-                  <ImageLabelerCarousel color={color} opacity={opacity} isSwitchOn={isSwitchOn} />
+                  <ImageLabelerCarousel
+                    color={color}
+                    opacity={opacity}
+                    isSwitchOn={isSwitchOn}
+                    toolMode={toolMode}
+                  />
                 </div>
               </div>
             </div>

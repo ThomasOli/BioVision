@@ -2,7 +2,14 @@
 import React, { createContext, useCallback, useEffect, useMemo, useState } from "react";
 import { useSelector } from "react-redux";
 import { RootState } from "../state/store";
-import { Point, AnnotatedImage } from "../types/Image";
+import { Point, BoundingBox, AnnotatedImage } from "../types/Image";
+
+// Deep clone helper for boxes
+const cloneBoxes = (boxes: BoundingBox[]): BoundingBox[] =>
+  boxes.map((box) => ({
+    ...box,
+    landmarks: box.landmarks.map((lm) => ({ ...lm })),
+  }));
 
 interface UndoRedoClearContextProps {
   images: AnnotatedImage[];
@@ -10,14 +17,24 @@ interface UndoRedoClearContextProps {
   undo: () => void;
   redo: () => void;
   clear: () => void;
-  addPoint: (newPoint: Point) => void;
+  // Box operations
+  boxes: BoundingBox[];
+  selectedBoxId: number | null;
+  addBox: (box: Omit<BoundingBox, "id" | "landmarks">) => void;
+  deleteBox: (boxId: number) => void;
+  selectBox: (boxId: number | null) => void;
+  updateBox: (boxId: number, updates: Partial<Omit<BoundingBox, "id" | "landmarks">>) => void;
+  // Landmark operations (now takes boxId)
+  addLandmark: (boxId: number, point: Omit<Point, "id">) => void;
+  deleteLandmark: (boxId: number, pointId: number) => void;
   setSelectedImage: React.Dispatch<React.SetStateAction<number>>;
+  // Legacy points (all landmarks from all boxes, for backward compat)
   points: Point[];
 }
 
 export const UndoRedoClearContext = createContext<UndoRedoClearContextProps>({} as UndoRedoClearContextProps);
 
-export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildren<{}>) => {
+export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildren<object>) => {
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
 
   const [images, setImages] = useState<AnnotatedImage[]>([]);
@@ -32,9 +49,10 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         .filter((file) => !existingIds.has(file.id))
         .map((file) => ({
           ...file,
-          labels: [],
-          history: [], // expected Point[][]
-          future: [], // expected Point[][]
+          boxes: [],
+          selectedBoxId: null,
+          history: [],
+          future: [],
         }));
 
       const updatedImages = prevImages.filter((img) => fileArray.some((file) => file.id === img.id));
@@ -51,18 +69,42 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     });
   }, [images.length]);
 
-  // Safe derived index (still useful for callers during transitions)
+  // Safe derived index
   const safeSelectedIndex = useMemo(() => {
     if (images.length === 0) return 0;
     return Math.min(Math.max(selectedImage, 0), images.length - 1);
   }, [selectedImage, images.length]);
 
-  // Current points for the active image
-  const points = useMemo<Point[]>(() => {
+  // Current boxes for the active image
+  const boxes = useMemo<BoundingBox[]>(() => {
     if (images.length === 0) return [];
     const img = images[safeSelectedIndex];
-    return img?.labels ?? [];
+    return img?.boxes ?? [];
   }, [images, safeSelectedIndex]);
+
+  // Current selected box ID
+  const selectedBoxId = useMemo<number | null>(() => {
+    if (images.length === 0) return null;
+    const img = images[safeSelectedIndex];
+    return img?.selectedBoxId ?? null;
+  }, [images, safeSelectedIndex]);
+
+  // Legacy: all points from all boxes (for backward compat)
+  const points = useMemo<Point[]>(() => {
+    return boxes.flatMap((box) => box.landmarks);
+  }, [boxes]);
+
+  // Helper to save snapshot before change
+  const saveSnapshot = useCallback(
+    (activeImage: AnnotatedImage): AnnotatedImage => {
+      return {
+        ...activeImage,
+        history: [...(activeImage.history ?? []), cloneBoxes(activeImage.boxes)],
+        future: [],
+      };
+    },
+    []
+  );
 
   const undo = useCallback(() => {
     setImages((prevImages) => {
@@ -80,16 +122,24 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       // Last snapshot
       const previousSnapshot = activeImage.history[activeImage.history.length - 1];
 
-      // Move current labels to future (store snapshot copy)
-      activeImage.future = [...(activeImage.future ?? []), [...activeImage.labels]];
+      // Move current boxes to future
+      activeImage.future = [...(activeImage.future ?? []), cloneBoxes(activeImage.boxes)];
 
-      // Restore snapshot (copy)
-      activeImage.labels = [...previousSnapshot];
+      // Restore snapshot
+      activeImage.boxes = cloneBoxes(previousSnapshot);
 
       // Pop history
       const newHistory = [...activeImage.history];
       newHistory.pop();
       activeImage.history = newHistory;
+
+      // Keep selectedBoxId valid
+      if (activeImage.selectedBoxId !== null) {
+        const stillExists = activeImage.boxes.some((b) => b.id === activeImage.selectedBoxId);
+        if (!stillExists) {
+          activeImage.selectedBoxId = activeImage.boxes.length > 0 ? activeImage.boxes[0].id : null;
+        }
+      }
 
       newImages[idx] = activeImage;
       return newImages;
@@ -116,11 +166,19 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       newFuture.pop();
       activeImage.future = newFuture;
 
-      // Push current labels to history (snapshot copy)
-      activeImage.history = [...(activeImage.history ?? []), [...activeImage.labels]];
+      // Push current boxes to history
+      activeImage.history = [...(activeImage.history ?? []), cloneBoxes(activeImage.boxes)];
 
-      // Restore snapshot (copy)
-      activeImage.labels = [...restoredSnapshot];
+      // Restore snapshot
+      activeImage.boxes = cloneBoxes(restoredSnapshot);
+
+      // Keep selectedBoxId valid
+      if (activeImage.selectedBoxId !== null) {
+        const stillExists = activeImage.boxes.some((b) => b.id === activeImage.selectedBoxId);
+        if (!stillExists) {
+          activeImage.selectedBoxId = activeImage.boxes.length > 0 ? activeImage.boxes[0].id : null;
+        }
+      }
 
       newImages[idx] = activeImage;
       return newImages;
@@ -138,12 +196,13 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       const newImages = [...prevImages];
       const activeImage = { ...currentImg };
 
-      if (activeImage.labels.length > 0) {
-        // Save snapshot copy
-        activeImage.history = [...(activeImage.history ?? []), [...activeImage.labels]];
+      if (activeImage.boxes.length > 0) {
+        // Save snapshot before clearing
+        activeImage.history = [...(activeImage.history ?? []), cloneBoxes(activeImage.boxes)];
       }
 
-      activeImage.labels = [];
+      activeImage.boxes = [];
+      activeImage.selectedBoxId = null;
       activeImage.future = [];
 
       newImages[idx] = activeImage;
@@ -151,8 +210,8 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     });
   }, [selectedImage]);
 
-  const addPoint = useCallback(
-    (newPoint: Point) => {
+  const addBox = useCallback(
+    (boxData: Omit<BoundingBox, "id" | "landmarks">) => {
       setImages((prevImages) => {
         if (prevImages.length === 0) return prevImages;
 
@@ -161,22 +220,161 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         if (!currentImg) return prevImages;
 
         const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        const newBox: BoundingBox = {
+          ...boxData,
+          id: Date.now(),
+          landmarks: [],
+        };
+
+        activeImage.boxes = [...activeImage.boxes, newBox];
+        activeImage.selectedBoxId = newBox.id;
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
+  const deleteBox = useCallback(
+    (boxId: number) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        activeImage.boxes = activeImage.boxes.filter((b) => b.id !== boxId);
+
+        // Update selectedBoxId if deleted
+        if (activeImage.selectedBoxId === boxId) {
+          activeImage.selectedBoxId = activeImage.boxes.length > 0 ? activeImage.boxes[0].id : null;
+        }
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
+  const selectBox = useCallback(
+    (boxId: number | null) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        // Don't save snapshot for selection changes
+        const newImages = [...prevImages];
         const activeImage = { ...currentImg };
-
-        // Save snapshot copy before change
-        activeImage.history = [...(activeImage.history ?? []), [...activeImage.labels]];
-
-        // Add point
-        activeImage.labels = [...activeImage.labels, newPoint];
-
-        // Clear redo stack
-        activeImage.future = [];
+        activeImage.selectedBoxId = boxId;
 
         newImages[idx] = activeImage;
         return newImages;
       });
     },
     [selectedImage]
+  );
+
+  const updateBox = useCallback(
+    (boxId: number, updates: Partial<Omit<BoundingBox, "id" | "landmarks">>) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        activeImage.boxes = activeImage.boxes.map((box) => {
+          if (box.id === boxId) {
+            return { ...box, ...updates };
+          }
+          return box;
+        });
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
+  const addLandmark = useCallback(
+    (boxId: number, pointData: Omit<Point, "id">) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        const newPoint: Point = {
+          ...pointData,
+          id: Date.now(),
+        };
+
+        activeImage.boxes = activeImage.boxes.map((box) => {
+          if (box.id === boxId) {
+            return {
+              ...box,
+              landmarks: [...box.landmarks, newPoint],
+            };
+          }
+          return box;
+        });
+
+        // Auto-select the box where landmark was added
+        activeImage.selectedBoxId = boxId;
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
+  const deleteLandmark = useCallback(
+    (boxId: number, pointId: number) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        activeImage.boxes = activeImage.boxes.map((box) => {
+          if (box.id === boxId) {
+            return {
+              ...box,
+              landmarks: box.landmarks.filter((lm) => lm.id !== pointId),
+            };
+          }
+          return box;
+        });
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
   );
 
   return (
@@ -187,7 +385,14 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         undo,
         redo,
         clear,
-        addPoint,
+        boxes,
+        selectedBoxId,
+        addBox,
+        deleteBox,
+        selectBox,
+        updateBox,
+        addLandmark,
+        deleteLandmark,
         setSelectedImage,
         points,
       }}

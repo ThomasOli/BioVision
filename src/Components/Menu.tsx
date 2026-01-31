@@ -7,7 +7,7 @@ import { toast } from "sonner";
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
 import Landmark from "./Landmark";
-import { AnnotatedImage } from "../types/Image";
+import { AnnotatedImage, ToolMode } from "../types/Image";
 import { TrainModelDialog } from "./PopUp";
 
 import { cn } from "@/lib/utils";
@@ -27,6 +27,8 @@ interface MenuProps {
   onOpacityChange: (selectedOpacity: number) => void;
   onColorChange: (selectedColor: string) => void;
   onSwitchChange: () => void;
+  toolMode: ToolMode;
+  onToolModeChange: (mode: ToolMode) => void;
 }
 
 async function saveLabels(fileArray: AnnotatedImage[]) {
@@ -37,6 +39,8 @@ const Menu: React.FC<MenuProps> = ({
   onColorChange,
   onOpacityChange,
   onSwitchChange,
+  toolMode,
+  onToolModeChange,
 }) => {
   const [openTrainDialog, setOpenTrainDialog] = useState(false);
   const [modelName, setModelName] = useState("");
@@ -273,6 +277,8 @@ const Menu: React.FC<MenuProps> = ({
                 onOpacityChange={onOpacityChange}
                 onColorChange={onColorChange}
                 onSwitchChange={onSwitchChange}
+                toolMode={toolMode}
+                onToolModeChange={onToolModeChange}
               />
             </motion.div>
 
