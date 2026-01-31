@@ -1,26 +1,27 @@
 import React, { useEffect, useMemo, useState } from "react";
-import Paper from "@mui/material/Paper";
-import Button from "@mui/material/Button";
-import Typography from "@mui/material/Typography";
-import Box from "@mui/material/Box";
-import Tooltip from "@mui/material/Tooltip";
-import Divider from "@mui/material/Divider";
-import Snackbar from "@mui/material/Snackbar";
-import Alert from "@mui/material/Alert";
-import CircularProgress from "@mui/material/CircularProgress";
+import { motion } from "framer-motion";
 import { useSelector } from "react-redux";
+import { Copy, FolderOpen, Loader2 } from "lucide-react";
+import { toast } from "sonner";
+
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
 import Landmark from "./Landmark";
 import { AnnotatedImage } from "../types/Image";
 import { TrainModelDialog } from "./PopUp";
 
-const scrollbarStyles = `
-  .custom-scrollbar::-webkit-scrollbar { width: 8px; }
-  .custom-scrollbar::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 4px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
-`;
+import { cn } from "@/lib/utils";
+import { Button } from "@/Components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
+import { Separator } from "@/Components/ui/separator";
+import { ScrollArea } from "@/Components/ui/scroll-area";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  TooltipProvider,
+} from "@/Components/ui/tooltip";
+import { sidebarContainer, sidebarItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
 
 interface MenuProps {
   onOpacityChange: (selectedOpacity: number) => void;
@@ -32,47 +33,21 @@ async function saveLabels(fileArray: AnnotatedImage[]) {
   await window.api.saveLabels(fileArray);
 }
 
-const cardSx = {
-  width: "100%",
-  p: "12px",
-  boxSizing: "border-box" as const,
-  backgroundColor: "#fbfbfb", // updated theme color
-  border: "1px solid #e5e7eb",
-  borderRadius: "10px",
-  boxShadow: "0 1px 0 rgba(255,255,255,0.6)",
-  display: "flex",
-  flexDirection: "column" as const,
-  gap: "10px",
-};
-
-const labelSx = {
-  fontWeight: 700,
-  fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-  fontSize: "12px",
-  color: "#475569",
-  letterSpacing: "0.02em",
-  textTransform: "uppercase" as const,
-};
-
-const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchChange }) => {
+const Menu: React.FC<MenuProps> = ({
+  onColorChange,
+  onOpacityChange,
+  onSwitchChange,
+}) => {
   const [openTrainDialog, setOpenTrainDialog] = useState(false);
   const [modelName, setModelName] = useState("");
   const [isTraining, setIsTraining] = useState(false);
   const [modelPath, setModelPath] = useState("");
 
-  // UI feedback
-  const [snackOpen, setSnackOpen] = useState(false);
-  const [snackMsg, setSnackMsg] = useState<string>("");
-  const [snackSeverity, setSnackSeverity] = useState<"success" | "error" | "info">("info");
-
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
-  const canTrain = useMemo(() => (fileArray?.length ?? 0) > 0 && !isTraining, [fileArray, isTraining]);
-
-  const showSnack = (message: string, severity: "success" | "error" | "info" = "info") => {
-    setSnackMsg(message);
-    setSnackSeverity(severity);
-    setSnackOpen(true);
-  };
+  const canTrain = useMemo(
+    () => (fileArray?.length ?? 0) > 0 && !isTraining,
+    [fileArray, isTraining]
+  );
 
   useEffect(() => {
     const fetchProjectRoot = async () => {
@@ -81,11 +56,10 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
         if (result?.projectRoot) setModelPath(result.projectRoot);
       } catch (err) {
         console.error("Failed to load model path", err);
-        showSnack("Failed to load model location.", "error");
+        toast.error("Failed to load model location.");
       }
     };
     fetchProjectRoot();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleSelectModelPath = async () => {
@@ -93,11 +67,11 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
       const result = await window.api.selectProjectRoot();
       if (!result?.canceled && result?.projectRoot) {
         setModelPath(result.projectRoot);
-        showSnack("Model location updated.", "success");
+        toast.success("Model location updated.");
       }
     } catch (err) {
       console.error("Failed to select model path", err);
-      showSnack("Failed to select model location.", "error");
+      toast.error("Failed to select model location.");
     }
   };
 
@@ -105,23 +79,22 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
     if (!modelPath) return;
     try {
       await navigator.clipboard.writeText(modelPath);
-      showSnack("Path copied.", "success");
+      toast.success("Path copied.");
     } catch (err) {
       console.error("Clipboard copy failed", err);
-      showSnack("Could not copy path.", "error");
+      toast.error("Could not copy path.");
     }
   };
 
   const handleOpenFolder = async () => {
     if (!modelPath) return;
     try {
-      // Optional: if you have an IPC method for this, use it.
-      // @ts-expect-error - API may not exist in your preload yet
+      // @ts-expect-error - API may not exist in preload yet
       if (window.api?.openPath) await window.api.openPath(modelPath);
-      else showSnack("Open folder is not implemented yet.", "info");
+      else toast.info("Open folder is not implemented yet.");
     } catch (err) {
       console.error("Failed to open folder", err);
-      showSnack("Could not open folder.", "error");
+      toast.error("Could not open folder.");
     }
   };
 
@@ -131,11 +104,11 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
 
     try {
       setIsTraining(true);
-      showSnack("Saving labels…", "info");
+      toast.info("Saving labels...");
 
       await saveLabels(fileArray);
 
-      showSnack("Training model…", "info");
+      toast.info("Training model...");
       const result = await window.api.trainModel(name);
 
       if (!result.ok) throw new Error(result.error);
@@ -144,16 +117,15 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
 
       setOpenTrainDialog(false);
       setModelName("");
-      showSnack("Training complete.", "success");
+      toast.success("Training complete.");
     } catch (err) {
       console.error(err);
-      showSnack(`Training failed. ${String(err)}`, "error");
+      toast.error(`Training failed. ${String(err)}`);
     } finally {
       setIsTraining(false);
     }
   };
 
-  // Keyboard shortcut: Ctrl+N opens upload dialog
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === "n") {
@@ -171,31 +143,13 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
       document.getElementById("btn-upload")?.click();
     };
     window.addEventListener("open-upload-dialog", openUploadDialog);
-    return () => window.removeEventListener("open-upload-dialog", openUploadDialog);
+    return () =>
+      window.removeEventListener("open-upload-dialog", openUploadDialog);
   }, []);
 
   return (
-    <>
-      <style>{scrollbarStyles}</style>
-
-      <Paper
-        elevation={9}
-        sx={{
-          height: "100vh",
-          display: "flex",
-          flexDirection: "column",
-
-          // allow parent container to control width
-          width: "100%",
-          maxWidth: "none",
-          minWidth: 0,
-
-          boxSizing: "border-box",
-          overflow: "hidden",
-          background: "#fbfbfb", // updated theme color
-          borderRadius: 0,
-        }}
-      >
+    <TooltipProvider>
+      <div className="flex h-screen w-full flex-col overflow-hidden bg-background">
         <TrainModelDialog
           handleTrainConfirm={handleTrainConfirm}
           open={openTrainDialog}
@@ -205,247 +159,174 @@ const Menu: React.FC<MenuProps> = ({ onColorChange, onOpacityChange, onSwitchCha
           setModelName={setModelName}
         />
 
-        {/* Scrollable content */}
-        <Box
-          className="custom-scrollbar"
-          sx={{
-            flex: 1,
-            minWidth: 0,
-            overflowY: "auto",
-            overflowX: "hidden",
-            p: 2,
-            display: "flex",
-            flexDirection: "column",
-            gap: 1.5,
-          }}
-        >
-          {/* Header */}
-          <Box sx={{ mb: 0.5, textAlign: "center" }}>
-            <Typography
-              variant="h6"
-              sx={{
-                m: 0,
-                textAlign: "center",
-                fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-                fontSize: "20px",
-                fontWeight: 700,
-                color: "#0f172a",
-                lineHeight: 1.2,
-              }}
-            >
-              Auto Landmarking
-            </Typography>
+        <ScrollArea className="flex-1">
+          <motion.div
+            variants={sidebarContainer}
+            initial="hidden"
+            animate="visible"
+            className="flex flex-col gap-4 p-4"
+          >
+            {/* Header */}
+            <motion.div variants={sidebarItem} className="text-center">
+              <h1 className="text-xl font-bold text-foreground">
+                Auto Landmarking
+              </h1>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Select Model • Import • Annotate
+              </p>
+            </motion.div>
 
-            <Typography
-              variant="body2"
-              sx={{
-                mt: 0.5,
-                textAlign: "center",
-                color: "#64748b",
-                fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-                fontSize: "12px",
-              }}
-            >
-              Select Model • Import • Annotate
-            </Typography>
-          </Box>
+            {/* Model Card */}
+            <motion.div variants={sidebarItem}>
+              <motion.div variants={cardHover} initial="initial" whileHover="hover">
+                <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
+                  <CardHeader className="pb-3">
+                    <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                      Model
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-semibold text-foreground">
+                          Model location
+                        </p>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <p className="truncate font-mono text-xs text-muted-foreground">
+                              {modelPath || "Loading..."}
+                            </p>
+                          </TooltipTrigger>
+                          <TooltipContent side="bottom" align="start">
+                            {modelPath || "Loading..."}
+                          </TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <motion.div {...buttonHover} {...buttonTap}>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={handleSelectModelPath}
+                          className="shrink-0 font-semibold"
+                        >
+                          Browse...
+                        </Button>
+                      </motion.div>
+                    </div>
 
-          {/* Model */}
-          <Box sx={cardSx}>
-            <Typography sx={labelSx}>Model</Typography>
+                    <div className="flex gap-2">
+                      <motion.div {...buttonHover} {...buttonTap}>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={handleCopyPath}
+                          disabled={!modelPath}
+                          className="text-xs font-semibold text-primary"
+                        >
+                          <Copy className="mr-1.5 h-3 w-3" />
+                          Copy path
+                        </Button>
+                      </motion.div>
+                      <motion.div {...buttonHover} {...buttonTap}>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={handleOpenFolder}
+                          disabled={!modelPath}
+                          className="text-xs font-semibold text-primary"
+                        >
+                          <FolderOpen className="mr-1.5 h-3 w-3" />
+                          Open folder
+                        </Button>
+                      </motion.div>
+                    </div>
+                  </CardContent>
+                </Card>
+              </motion.div>
+            </motion.div>
 
-            <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 1 }}>
-              <Box sx={{ minWidth: 0 }}>
-                <Typography
-                  sx={{
-                    fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-                    fontWeight: 600,
-                    fontSize: "13px",
-                    color: "#1f2937",
-                    mb: 0.25,
-                  }}
-                >
-                  Model location
-                </Typography>
+            {/* Image Upload Card */}
+            <motion.div variants={sidebarItem}>
+              <motion.div variants={cardHover} initial="initial" whileHover="hover">
+                <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
+                  <CardHeader className="pb-3">
+                    <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                      Image Upload
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <UploadImages />
+                    <Separator />
+                    <p className="text-xs text-muted-foreground">
+                      {fileArray?.length
+                        ? `${fileArray.length} image(s) loaded`
+                        : "No images loaded"}
+                    </p>
+                  </CardContent>
+                </Card>
+              </motion.div>
+            </motion.div>
 
-                <Tooltip title={modelPath || "Loading..."} placement="bottom-start">
-                  <Typography
-                    sx={{
-                      fontFamily: '"Fira Code", "SFMono-Regular", Consolas, monospace',
-                      color: "#334155",
-                      fontSize: "11.5px",
-                      maxWidth: "100%",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {modelPath || "Loading..."}
-                  </Typography>
-                </Tooltip>
-              </Box>
+            {/* Landmark Controls */}
+            <motion.div variants={sidebarItem}>
+              <Landmark
+                onOpacityChange={onOpacityChange}
+                onColorChange={onColorChange}
+                onSwitchChange={onSwitchChange}
+              />
+            </motion.div>
 
-              <Box sx={{ display: "flex", gap: 1, flexShrink: 0 }}>
-                <Button
-                  size="small"
-                  variant="outlined"
-                  onClick={handleSelectModelPath}
-                  sx={{
-                    textTransform: "none",
-                    borderRadius: "10px",
-                    px: 1.25,
-                    fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-                    fontSize: "12px",
-                    fontWeight: 600,
-                    borderColor: "#d1d5db",
-                    color: "#111827",
-                    "&:hover": { borderColor: "#9ca3af", backgroundColor: "#f9fafb" },
-                  }}
-                >
-                  Browse…
-                </Button>
-              </Box>
-            </Box>
+            {/* Training Card */}
+            <motion.div variants={sidebarItem}>
+              <motion.div variants={cardHover} initial="initial" whileHover="hover">
+                <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
+                  <CardHeader className="pb-3">
+                    <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                      Training
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <p
+                      className={cn(
+                        "text-xs",
+                        canTrain ? "text-muted-foreground" : "text-destructive"
+                      )}
+                    >
+                      {canTrain
+                        ? "Ready to train."
+                        : "Add images to enable training."}
+                    </p>
+                  </CardContent>
+                </Card>
+              </motion.div>
+            </motion.div>
 
-            <Box sx={{ display: "flex", gap: 1 }}>
-              <Button
-                size="small"
-                variant="text"
-                onClick={handleCopyPath}
-                disabled={!modelPath}
-                sx={{
-                  textTransform: "none",
-                  borderRadius: "10px",
-                  px: 1.25,
-                  fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-                  fontSize: "12px",
-                  fontWeight: 600,
-                  color: "#2563eb",
-                  "&:hover": { backgroundColor: "rgba(37, 99, 235, 0.08)" },
-                }}
-              >
-                Copy path
-              </Button>
-
-              <Button
-                size="small"
-                variant="text"
-                onClick={handleOpenFolder}
-                disabled={!modelPath}
-                sx={{
-                  textTransform: "none",
-                  borderRadius: "10px",
-                  px: 1.25,
-                  fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-                  fontSize: "12px",
-                  fontWeight: 600,
-                  color: "#2563eb",
-                  "&:hover": { backgroundColor: "rgba(37, 99, 235, 0.08)" },
-                }}
-              >
-                Open folder
-              </Button>
-            </Box>
-          </Box>
-
-          {/* Input */}
-          <Box sx={{ ...cardSx, gap: "12px" }}>
-            <Box sx={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-              <Typography sx={labelSx}>Image Upload</Typography>
-            </Box>
-
-            <UploadImages />
-
-            <Divider sx={{ borderColor: "#e5e7eb" }} />
-
-            <Typography
-              sx={{
-                fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-                fontSize: "12px",
-                color: "#64748b",
-              }}
-            >
-              {fileArray?.length ? `${fileArray.length} image(s) loaded` : "No images loaded"}
-            </Typography>
-          </Box>
-
-          {/* Landmark controls */}
-          <Landmark onOpacityChange={onOpacityChange} onColorChange={onColorChange} onSwitchChange={onSwitchChange} />
-
-          {/* Training */}
-          <Box sx={{ ...cardSx, gap: "10px" }}>
-            <Typography sx={labelSx}>Training</Typography>
-
-            <Typography
-              sx={{
-                fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-                fontSize: "12px",
-                color: canTrain ? "#64748b" : "#b91c1c",
-              }}
-            >
-              {canTrain ? "Ready to train." : "Add images to enable training."}
-            </Typography>
-          </Box>
-
-          {/* Spacer */}
-          <Box sx={{ height: 86 }} />
-        </Box>
+            {/* Spacer for footer */}
+            <div className="h-24" />
+          </motion.div>
+        </ScrollArea>
 
         {/* Sticky footer */}
-        <Box
-          sx={{
-            borderTop: "1px solid #e5e7eb",
-            backgroundColor: "#fbfbfb",
-            p: 2,
-            display: "flex",
-            justifyContent: "center",
-          }}
-        >
-          <Button
-            variant="contained"
-            disabled={!canTrain}
-            onClick={() => setOpenTrainDialog(true)}
-            sx={{
-              backgroundColor: "#3b82f6",
-              color: "white",
-              fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-              fontWeight: 700,
-              fontSize: "14px",
-              padding: "10px 18px",
-              borderRadius: "10px",
-              textTransform: "none",
-              width: "100%",
-              maxWidth: "280px",
-              transition: "all 0.2s ease",
-              "&:hover": {
-                backgroundColor: "#2563eb",
-                transform: "translateY(-1px)",
-                boxShadow: "0 10px 22px rgba(59, 130, 246, 0.28)",
-              },
-              "&:disabled": {
-                backgroundColor: "#93c5fd",
-                color: "#ffffff",
-              },
-            }}
-            startIcon={isTraining ? <CircularProgress size={16} sx={{ color: "white" }} /> : undefined}
-          >
-            {isTraining ? "Training…" : "Train model"}
-          </Button>
-        </Box>
-      </Paper>
-
-      {/* Snackbar */}
-      <Snackbar
-        open={snackOpen}
-        autoHideDuration={3500}
-        onClose={() => setSnackOpen(false)}
-        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-      >
-        <Alert onClose={() => setSnackOpen(false)} severity={snackSeverity} variant="filled">
-          {snackMsg}
-        </Alert>
-      </Snackbar>
-    </>
+        <div className="border-t bg-background p-4">
+          <motion.div {...buttonHover} {...buttonTap}>
+            <Button
+              className="w-full font-bold"
+              disabled={!canTrain}
+              onClick={() => setOpenTrainDialog(true)}
+            >
+              {isTraining ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Training...
+                </>
+              ) : (
+                "Train model"
+              )}
+            </Button>
+          </motion.div>
+        </div>
+      </div>
+    </TooltipProvider>
   );
 };
 

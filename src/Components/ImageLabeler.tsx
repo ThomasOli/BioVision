@@ -1,9 +1,7 @@
-// src/Components/ImageLabeler.tsx
 import React, { useRef, useState, useCallback, useEffect, useContext, useMemo } from "react";
 import { Stage, Layer, Image as KonvaImage, Circle, Text } from "react-konva";
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
-import { Box } from "@mui/material";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 interface Point {
@@ -20,14 +18,23 @@ interface ImageLabelerProps {
   mode: boolean;
 }
 
-const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, onPointsChange, color, opacity, mode }) => {
+const ImageLabeler: React.FC<ImageLabelerProps> = ({
+  imageURL,
+  onPointsChange,
+  color,
+  opacity,
+  mode,
+}) => {
   const { addPoint, points, undo, redo } = useContext(UndoRedoClearContext);
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<any>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [containerSize, setContainerSize] = useState<{ w: number; h: number }>({ w: 800, h: 600 });
+  const [containerSize, setContainerSize] = useState<{ w: number; h: number }>({
+    w: 800,
+    h: 600,
+  });
 
   const [scale, setScale] = useState(1);
 
@@ -50,13 +57,17 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, onPointsChange, c
   const baseRadius = 3;
   const getScaledRadius = useCallback(() => {
     if (!imageDimensions) return baseRadius;
-    const imageDiagonal = Math.sqrt(imageDimensions.width ** 2 + imageDimensions.height ** 2);
+    const imageDiagonal = Math.sqrt(
+      imageDimensions.width ** 2 + imageDimensions.height ** 2
+    );
     return Math.max(baseRadius, imageDiagonal * 0.003);
   }, [imageDimensions]);
 
   const getTextFontSize = useMemo(() => {
     if (!imageDimensions) return 7;
-    const imageDiagonal = Math.sqrt(imageDimensions.width ** 2 + imageDimensions.height ** 2);
+    const imageDiagonal = Math.sqrt(
+      imageDimensions.width ** 2 + imageDimensions.height ** 2
+    );
     return Math.max(7, imageDiagonal * 0.01);
   }, [imageDimensions]);
 
@@ -95,7 +106,13 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, onPointsChange, c
       const x = (pointerPosition.x - stage!.x()) / stage!.scaleX();
       const y = (pointerPosition.y - stage!.y()) / stage!.scaleY();
 
-      if (x < 0 || y < 0 || x > imageDimensions.width || y > imageDimensions.height) return;
+      if (
+        x < 0 ||
+        y < 0 ||
+        x > imageDimensions.width ||
+        y > imageDimensions.height
+      )
+        return;
 
       addPoint({ x: Math.round(x), y: Math.round(y), id: Date.now() });
     },
@@ -106,38 +123,19 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, onPointsChange, c
     onPointsChange(points);
   }, [points, onPointsChange]);
 
-  if (imageError) return <div style={{ color: "red" }}>Error loading image.</div>;
+  if (imageError) {
+    return <div className="text-destructive">Error loading image.</div>;
+  }
 
   const stageW = imageDimensions ? imageDimensions.width * scale : 0;
   const stageH = imageDimensions ? imageDimensions.height * scale : 0;
 
   return (
-    <Box
+    <div
       ref={containerRef}
-      sx={{
-        width: "100%",
-        height: "100%",
-        minWidth: 0,
-        minHeight: 0,
-        display: "flex",
-        flexDirection: "column",
-      }}
+      className="flex h-full w-full min-h-0 min-w-0 flex-col"
     >
-      <Box
-        sx={{
-          flex: 1,
-          minHeight: 0,
-          minWidth: 0,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          bgcolor: "#f8fafc",
-          border: "1px solid #e5e7eb",
-          borderRadius: "14px",
-          p: 2,
-          boxSizing: "border-box",
-        }}
-      >
+      <div className="flex flex-1 min-h-0 min-w-0 items-center justify-center rounded-xl border bg-muted/30 p-4">
         {image && imageDimensions && (
           <Stage
             width={stageW}
@@ -149,16 +147,26 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, onPointsChange, c
             style={{
               borderRadius: "10px",
               overflow: "hidden",
-              border: "1px solid #e5e7eb",
-              backgroundColor: "#ffffff",
+              border: "1px solid hsl(var(--border))",
+              backgroundColor: "hsl(var(--background))",
               cursor: mode ? "default" : "crosshair",
             }}
           >
             <Layer>
-              <KonvaImage image={image} width={imageDimensions.width} height={imageDimensions.height} />
+              <KonvaImage
+                image={image}
+                width={imageDimensions.width}
+                height={imageDimensions.height}
+              />
               {points.map((point, index) => (
                 <React.Fragment key={point.id}>
-                  <Circle x={point.x} y={point.y} radius={getScaledRadius()} fill={color} opacity={opacity / 100} />
+                  <Circle
+                    x={point.x}
+                    y={point.y}
+                    radius={getScaledRadius()}
+                    fill={color}
+                    opacity={opacity / 100}
+                  />
                   <Text
                     x={point.x + 4}
                     y={point.y - 11}
@@ -172,8 +180,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({ imageURL, onPointsChange, c
             </Layer>
           </Stage>
         )}
-      </Box>
-    </Box>
+      </div>
+    </div>
   );
 };
 

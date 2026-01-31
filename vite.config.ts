@@ -22,7 +22,9 @@ export default defineConfig({
       renderer: {},
     }),
   ],
-  optimizeDeps: {
-    include: ['@emotion/styled'],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
   },
 })

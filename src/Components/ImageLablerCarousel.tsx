@@ -1,20 +1,7 @@
-// src/Components/ImageLabelerCarousel.tsx
 import React, { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useDispatch } from "react-redux";
-import {
-  Button,
-  IconButton,
-  Box,
-  Typography,
-  Tooltip,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogContentText,
-  DialogActions,
-} from "@mui/material";
-import Paper from "@mui/material/Paper";
-import Stack from "@mui/material/Stack";
+import { motion, AnimatePresence } from "framer-motion";
+import { ChevronLeft, ChevronRight, Trash2, ZoomIn } from "lucide-react";
 
 import ImageLabeler from "./ImageLabeler";
 import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
@@ -23,10 +10,23 @@ import { UndoRedoClearContext } from "./UndoRedoClearContext";
 import { AppDispatch } from "../state/store";
 import { removeFile, updateLabels } from "../state/filesState/fileSlice";
 
-import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
-import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
-import DeleteOutlineRoundedIcon from "@mui/icons-material/DeleteOutlineRounded";
-import ZoomInRoundedIcon from "@mui/icons-material/ZoomInRounded";
+import { Button } from "@/Components/ui/button";
+import { Card, CardContent } from "@/Components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/Components/ui/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  TooltipProvider,
+} from "@/Components/ui/tooltip";
+import { carouselImage, buttonHover, buttonTap, modalContent } from "@/lib/animations";
 
 interface ImageLabelerCarouselProps {
   color: string;
@@ -34,7 +34,11 @@ interface ImageLabelerCarouselProps {
   isSwitchOn: boolean;
 }
 
-const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opacity, isSwitchOn }) => {
+const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
+  color,
+  opacity,
+  isSwitchOn,
+}) => {
   const { images, setSelectedImage } = useContext(UndoRedoClearContext);
   const dispatch = useDispatch<AppDispatch>();
 
@@ -43,6 +47,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [isMagnified, setIsMagnified] = useState<boolean>(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [direction, setDirection] = useState(0);
 
   useEffect(() => {
     if (totalImages === 0) {
@@ -52,7 +57,10 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
     setCurrentIndex((prev) => Math.min(prev, totalImages - 1));
   }, [totalImages]);
 
-  const current = useMemo(() => (totalImages ? images[currentIndex] : null), [images, currentIndex, totalImages]);
+  const current = useMemo(
+    () => (totalImages ? images[currentIndex] : null),
+    [images, currentIndex, totalImages]
+  );
   const hasLandmarks = Boolean(current?.labels?.length);
 
   const handleUpdateLabels = useCallback(
@@ -77,12 +85,14 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
 
   const handleNext = useCallback(() => {
     if (totalImages <= 1) return;
+    setDirection(1);
     setCurrentIndex((prev) => (prev + 1) % totalImages);
     setSelectedImage((prev) => (prev + 1) % totalImages);
   }, [totalImages, setSelectedImage]);
 
   const handlePrev = useCallback(() => {
     if (totalImages <= 1) return;
+    setDirection(-1);
     setCurrentIndex((prev) => (prev - 1 + totalImages) % totalImages);
     setSelectedImage((prev) => (prev - 1 + totalImages) % totalImages);
   }, [totalImages, setSelectedImage]);
@@ -102,21 +112,27 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
 
   const toggleMagnifiedView = () => setIsMagnified((prev) => !prev);
 
-  // Export only CURRENT image's labels (only shown if it has landmarks)
   const exportCurrent = useCallback(async () => {
     if (!current || !current.labels?.length) return;
 
-    const dims = await new Promise<{ width: number; height: number } | null>((resolve) => {
-      const img = new Image();
-      img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
-      img.onerror = () => resolve(null);
-      img.src = current.url;
-    });
+    const dims = await new Promise<{ width: number; height: number } | null>(
+      (resolve) => {
+        const img = new Image();
+        img.onload = () =>
+          resolve({ width: img.naturalWidth, height: img.naturalHeight });
+        img.onerror = () => resolve(null);
+        img.src = current.url;
+      }
+    );
 
     const data = {
       imageURL: current.url,
       imageDimensions: dims,
-      points: current.labels.map(({ x, y, id }: any) => ({ x: Math.round(x), y: Math.round(y), id })),
+      points: current.labels.map(({ x, y, id }: { x: number; y: number; id: number }) => ({
+        x: Math.round(x),
+        y: Math.round(y),
+        id,
+      })),
     };
 
     const jsonData = JSON.stringify(data, null, 2);
@@ -147,243 +163,205 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({ color, opac
 
   if (totalImages === 0) {
     return (
-      <Paper
-        elevation={0}
-        sx={{
-          width: "min(900px, 100%)",
-          p: 3,
-          bgcolor: "#fbfbfb",
-          border: "1px solid #e5e7eb",
-          borderRadius: "14px",
-          textAlign: "center",
-        }}
-      >
-        <Typography sx={{ fontWeight: 800, fontSize: 18, color: "#0f172a", mb: 1 }}>No images available.</Typography>
-        <Typography sx={{ fontSize: 13, color: "#64748b", maxWidth: 520, mx: "auto" }}>
-          Press <strong>Ctrl+N</strong> to upload images, or use the left sidebar to begin labeling.
-        </Typography>
-      </Paper>
+      <Card className="w-full max-w-[900px] border-border/50 bg-card/50 backdrop-blur-sm">
+        <CardContent className="p-6 text-center">
+          <h2 className="mb-2 text-lg font-bold text-foreground">
+            No images available.
+          </h2>
+          <p className="mx-auto max-w-[520px] text-sm text-muted-foreground">
+            Press <strong>Ctrl+N</strong> to upload images, or use the left
+            sidebar to begin labeling.
+          </p>
+        </CardContent>
+      </Card>
     );
   }
 
   return (
-    <Paper
-      elevation={0}
-      sx={{
-        width: "100%",
-        height: "100%",
-        minWidth: 0,
-        minHeight: 0,
-        bgcolor: "#fbfbfb",
-        border: "1px solid #e5e7eb",
-        borderRadius: "14px",
-        p: 2,
-        display: "flex",
-        flexDirection: "column",
-        gap: 1.5,
-        boxSizing: "border-box",
-      }}
-    >
-      {/* Toolbar */}
-      <Box
-        sx={{
-          width: "100%",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 1,
-          minWidth: 0,
-        }}
-      >
-        <Box sx={{ minWidth: 0 }}>
-          <Typography sx={{ fontWeight: 800, fontSize: 13, color: "#0f172a" }}>
-            Image {currentIndex + 1} / {totalImages}
-          </Typography>
-          <Typography sx={{ fontSize: 12, color: "#64748b" }}>Use ← / → to navigate • Ctrl+N to add</Typography>
-        </Box>
+    <TooltipProvider>
+      <Card className="flex h-full w-full min-h-0 min-w-0 flex-col gap-3 border-border/50 bg-card/50 p-4 backdrop-blur-sm">
+        {/* Toolbar */}
+        <div className="flex w-full items-center justify-between gap-2">
+          <div className="min-w-0">
+            <p className="text-sm font-bold text-foreground">
+              Image {currentIndex + 1} / {totalImages}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Use ← / → to navigate • Ctrl+N to add
+            </p>
+          </div>
 
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ flexShrink: 0 }}>
-          {/* Export current (only if current has landmarks) */}
-          {hasLandmarks && (
+          <div className="flex shrink-0 items-center gap-2">
+            {hasLandmarks && (
+              <motion.div {...buttonHover} {...buttonTap}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={exportCurrent}
+                  className="font-bold"
+                >
+                  Export Current (JSON)
+                </Button>
+              </motion.div>
+            )}
+
+            <motion.div {...buttonHover} {...buttonTap}>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={exportAll}
+                className="font-bold"
+              >
+                Export All (JSON)
+              </Button>
+            </motion.div>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <motion.div {...buttonHover} {...buttonTap}>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={toggleMagnifiedView}
+                    aria-label="Magnify"
+                  >
+                    <ZoomIn className="h-4 w-4" />
+                  </Button>
+                </motion.div>
+              </TooltipTrigger>
+              <TooltipContent>Magnify</TooltipContent>
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <motion.div {...buttonHover} {...buttonTap}>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={() => setConfirmOpen(true)}
+                    aria-label="Delete"
+                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </motion.div>
+              </TooltipTrigger>
+              <TooltipContent>Delete</TooltipContent>
+            </Tooltip>
+          </div>
+        </div>
+
+        {/* Image area */}
+        <div className="relative flex flex-1 min-h-0 min-w-0 items-center justify-center overflow-hidden rounded-xl border bg-background">
+          <motion.div {...buttonHover} {...buttonTap}>
             <Button
-              variant="outlined"
-              size="small"
-              onClick={exportCurrent}
-              sx={{
-                textTransform: "none",
-                borderRadius: "10px",
-                fontWeight: 700,
-                whiteSpace: "nowrap",
-              }}
+              variant="outline"
+              size="icon"
+              onClick={handlePrev}
+              disabled={totalImages === 1}
+              aria-label="Previous"
+              className="absolute left-2 top-1/2 z-10 -translate-y-1/2 bg-background/90 backdrop-blur-sm"
             >
-              Export Current (JSON)
+              <ChevronLeft className="h-4 w-4" />
             </Button>
-          )}
+          </motion.div>
 
-          {/* Export all */}
-          <Button
-            variant="outlined"
-            size="small"
-            onClick={exportAll}
-            sx={{
-              textTransform: "none",
-              borderRadius: "10px",
-              fontWeight: 700,
-              whiteSpace: "nowrap",
-            }}
-          >
-            Export All (JSON)
-          </Button>
+          <AnimatePresence mode="wait" custom={direction}>
+            {current && (
+              <motion.div
+                key={current.id}
+                custom={direction}
+                variants={carouselImage}
+                initial="enter"
+                animate="center"
+                exit="exit"
+                className="h-full w-full min-h-0 min-w-0"
+              >
+                <ImageLabeler
+                  imageURL={current.url}
+                  onPointsChange={(newPoints) =>
+                    handleUpdateLabels(current.id, newPoints)
+                  }
+                  color={color}
+                  opacity={opacity}
+                  mode={isSwitchOn}
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
 
-          <Tooltip title="Magnify">
-            <IconButton
-              onClick={toggleMagnifiedView}
-              aria-label="Magnify"
-              sx={{
-                bgcolor: "rgba(255,255,255,0.9)",
-                border: "1px solid #e5e7eb",
-                "&:hover": { bgcolor: "#fff" },
-                transition: "all 0.15s ease",
-              }}
+          <motion.div {...buttonHover} {...buttonTap}>
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={handleNext}
+              disabled={totalImages === 1}
+              aria-label="Next"
+              className="absolute right-2 top-1/2 z-10 -translate-y-1/2 bg-background/90 backdrop-blur-sm"
             >
-              <ZoomInRoundedIcon />
-            </IconButton>
-          </Tooltip>
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </motion.div>
+        </div>
 
-          <Tooltip title="Delete">
-            <IconButton
-              onClick={() => setConfirmOpen(true)}
-              aria-label="Delete"
-              sx={{
-                bgcolor: "rgba(255,255,255,0.9)",
-                border: "1px solid #e5e7eb",
-                color: "#dc2626",
-                "&:hover": { bgcolor: "#fff" },
-                transition: "all 0.15s ease",
-              }}
+        {/* Delete confirmation dialog */}
+        <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+          <DialogContent asChild>
+            <motion.div
+              variants={modalContent}
+              initial="hidden"
+              animate="visible"
+              exit="exit"
             >
-              <DeleteOutlineRoundedIcon />
-            </IconButton>
-          </Tooltip>
-        </Stack>
-      </Box>
-
-      {/* Image area */}
-      <Box
-        sx={{
-          position: "relative",
-          width: "100%",
-          flex: 1,
-          minHeight: 0,
-          minWidth: 0,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          bgcolor: "#fff",
-          border: "1px solid #e5e7eb",
-          borderRadius: "14px",
-          overflow: "hidden",
-        }}
-      >
-        <IconButton
-          onClick={handlePrev}
-          disabled={totalImages === 1}
-          aria-label="Previous"
-          sx={{
-            position: "absolute",
-            left: 10,
-            top: "50%",
-            transform: "translateY(-50%)",
-            bgcolor: "rgba(255,255,255,0.9)",
-            border: "1px solid #e5e7eb",
-            "&:hover": { bgcolor: "#fff" },
-            transition: "all 0.15s ease",
-          }}
-        >
-          <ChevronLeftRoundedIcon />
-        </IconButton>
+              <DialogHeader>
+                <DialogTitle className="font-bold">
+                  Delete this image?
+                </DialogTitle>
+                <DialogDescription>
+                  This will remove the current image and its labels from the
+                  session. This cannot be undone.
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter className="gap-2 sm:gap-0">
+                <motion.div {...buttonHover} {...buttonTap}>
+                  <Button
+                    variant="outline"
+                    onClick={() => setConfirmOpen(false)}
+                  >
+                    Cancel
+                  </Button>
+                </motion.div>
+                <motion.div {...buttonHover} {...buttonTap}>
+                  <Button
+                    variant="destructive"
+                    onClick={() => {
+                      if (current) handleDeleteImage(current.id);
+                      setConfirmOpen(false);
+                    }}
+                  >
+                    Delete
+                  </Button>
+                </motion.div>
+              </DialogFooter>
+            </motion.div>
+          </DialogContent>
+        </Dialog>
 
         {current && (
-          <Box sx={{ width: "100%", height: "100%", minWidth: 0, minHeight: 0 }}>
-            <ImageLabeler
-              key={current.id}
-              imageURL={current.url}
-              onPointsChange={(newPoints) => handleUpdateLabels(current.id, newPoints)}
-              color={color}
-              opacity={opacity}
-              mode={isSwitchOn}
-            />
-          </Box>
+          <MagnifiedImageLabeler
+            imageURL={current.url}
+            onPointsChange={(newPoints) =>
+              handleUpdateLabels(current.id, newPoints)
+            }
+            color={color}
+            opacity={opacity}
+            open={isMagnified}
+            onClose={toggleMagnifiedView}
+            mode={isSwitchOn}
+          />
         )}
-
-        <IconButton
-          onClick={handleNext}
-          disabled={totalImages === 1}
-          aria-label="Next"
-          sx={{
-            position: "absolute",
-            right: 10,
-            top: "50%",
-            transform: "translateY(-50%)",
-            bgcolor: "rgba(255,255,255,0.9)",
-            border: "1px solid #e5e7eb",
-            "&:hover": { bgcolor: "#fff" },
-            transition: "all 0.15s ease",
-          }}
-        >
-          <ChevronRightRoundedIcon />
-        </IconButton>
-      </Box>
-
-      {/* Delete confirmation dialog */}
-      <Dialog open={confirmOpen} onClose={() => setConfirmOpen(false)} aria-labelledby="confirm-delete-title">
-        <DialogTitle id="confirm-delete-title" sx={{ fontWeight: 800 }}>
-          Delete this image?
-        </DialogTitle>
-        <DialogContent>
-          <DialogContentText sx={{ color: "#64748b" }}>
-            This will remove the current image and its labels from the session. This cannot be undone.
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions sx={{ px: 2, pb: 2 }}>
-          <Button
-            onClick={() => setConfirmOpen(false)}
-            variant="outlined"
-            sx={{ textTransform: "none", borderRadius: "10px", fontWeight: 700 }}
-          >
-            Cancel
-          </Button>
-          <Button
-            onClick={() => {
-              if (current) handleDeleteImage(current.id);
-              setConfirmOpen(false);
-            }}
-            variant="contained"
-            sx={{
-              textTransform: "none",
-              borderRadius: "10px",
-              fontWeight: 800,
-              bgcolor: "#dc2626",
-              "&:hover": { bgcolor: "#b91c1c" },
-            }}
-          >
-            Delete
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      {current && (
-        <MagnifiedImageLabeler
-          imageURL={current.url}
-          onPointsChange={(newPoints) => handleUpdateLabels(current.id, newPoints)}
-          color={color}
-          opacity={opacity}
-          open={isMagnified}
-          onClose={toggleMagnifiedView}
-          mode={isSwitchOn}
-        />
-      )}
-    </Paper>
+      </Card>
+    </TooltipProvider>
   );
 };
 
