@@ -246,4 +246,7 @@ This project is part of a senior project at the University of Florida.
 
 ## Contributors
 
-- Thomas Oliwa
+- Thomas Olinger
+- Taebok Kim
+- Manas Adepu
+- Jun Tianzhong
