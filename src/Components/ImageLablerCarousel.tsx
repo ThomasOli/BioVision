@@ -1,15 +1,15 @@
 import React, { useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { useDispatch } from "react-redux";
-import { motion, AnimatePresence } from "framer-motion";
+import { useDispatch, useSelector } from "react-redux";
+import { motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Trash2, ZoomIn } from "lucide-react";
 
 import ImageLabeler from "./ImageLabeler";
 import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
-import { AppDispatch } from "../state/store";
+import { AppDispatch, RootState } from "../state/store";
 import { removeFile, updateBoxes } from "../state/filesState/fileSlice";
-import { ToolMode, BoundingBox } from "../types/Image";
+import { BoundingBox } from "../types/Image";
 
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent } from "@/Components/ui/card";
@@ -27,43 +27,54 @@ import {
   TooltipTrigger,
   TooltipProvider,
 } from "@/Components/ui/tooltip";
-import { carouselImage, buttonHover, buttonTap, modalContent } from "@/lib/animations";
+import { buttonHover, buttonTap } from "@/lib/animations";
 
 interface ImageLabelerCarouselProps {
   color: string;
   opacity: number;
   isSwitchOn: boolean;
-  toolMode: ToolMode;
 }
 
 const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   color,
   opacity,
   isSwitchOn,
-  toolMode,
 }) => {
   const { images, setSelectedImage } = useContext(UndoRedoClearContext);
   const dispatch = useDispatch<AppDispatch>();
 
-  const totalImages = images.length;
+  // Get Redux state directly to avoid sync issues during deletion
+  const reduxFileArray = useSelector((state: RootState) => state.files.fileArray);
 
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [isMagnified, setIsMagnified] = useState<boolean>(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [direction, setDirection] = useState(0);
 
+  // Use Context images for display, but check Redux for "has images" to avoid race conditions
+  const totalImages = images.length;
+  const hasAnyImages = reduxFileArray.length > 0 || images.length > 0;
+
+  // Clamp index when images array changes
   useEffect(() => {
     if (totalImages === 0) {
       setCurrentIndex(0);
+      setSelectedImage(0);
       return;
     }
-    setCurrentIndex((prev) => Math.min(prev, totalImages - 1));
-  }, [totalImages]);
+    if (currentIndex >= totalImages) {
+      const newIndex = totalImages - 1;
+      setCurrentIndex(newIndex);
+      setSelectedImage(newIndex);
+    }
+  }, [totalImages, currentIndex, setSelectedImage]);
 
-  const current = useMemo(
-    () => (totalImages ? images[currentIndex] : null),
-    [images, currentIndex, totalImages]
-  );
+  // Get current image safely
+  const current = useMemo(() => {
+    if (totalImages === 0) return null;
+    const safeIndex = Math.min(Math.max(currentIndex, 0), totalImages - 1);
+    return images[safeIndex] ?? null;
+  }, [images, currentIndex, totalImages]);
+
   const hasAnnotations = Boolean(current?.boxes?.length);
 
   const handleUpdateBoxes = useCallback(
@@ -73,32 +84,47 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     [dispatch]
   );
 
-  const handleDeleteImage = useCallback(
-    (id: number) => {
-      dispatch(removeFile(id));
-      setCurrentIndex((prevIndex) => {
-        const newTotal = totalImages - 1;
-        if (newTotal <= 0) return 0;
-        if (prevIndex >= newTotal) return newTotal - 1;
-        return prevIndex;
-      });
-    },
-    [dispatch, totalImages]
-  );
+  const handleDeleteImage = useCallback(() => {
+    if (!current) return;
+
+    const idToDelete = current.id;
+
+    // Close dialog first
+    setConfirmOpen(false);
+
+    // Use Redux state for accurate index calculation (it updates synchronously)
+    const reduxIndex = reduxFileArray.findIndex(img => img.id === idToDelete);
+    const reduxTotal = reduxFileArray.length;
+    const newTotal = reduxTotal - 1;
+
+    if (newTotal > 0) {
+      // If we're deleting the last image, go to the previous one
+      // Otherwise stay at the same index (which will show the next image)
+      const newIndex = reduxIndex >= newTotal ? newTotal - 1 : reduxIndex;
+      setCurrentIndex(newIndex);
+      setSelectedImage(newIndex);
+    } else {
+      setCurrentIndex(0);
+      setSelectedImage(0);
+    }
+
+    // Dispatch the deletion
+    dispatch(removeFile(idToDelete));
+  }, [current, reduxFileArray, dispatch, setSelectedImage]);
 
   const handleNext = useCallback(() => {
     if (totalImages <= 1) return;
-    setDirection(1);
-    setCurrentIndex((prev) => (prev + 1) % totalImages);
-    setSelectedImage((prev) => (prev + 1) % totalImages);
-  }, [totalImages, setSelectedImage]);
+    const newIndex = (currentIndex + 1) % totalImages;
+    setCurrentIndex(newIndex);
+    setSelectedImage(newIndex);
+  }, [totalImages, currentIndex, setSelectedImage]);
 
   const handlePrev = useCallback(() => {
     if (totalImages <= 1) return;
-    setDirection(-1);
-    setCurrentIndex((prev) => (prev - 1 + totalImages) % totalImages);
-    setSelectedImage((prev) => (prev - 1 + totalImages) % totalImages);
-  }, [totalImages, setSelectedImage]);
+    const newIndex = (currentIndex - 1 + totalImages) % totalImages;
+    setCurrentIndex(newIndex);
+    setSelectedImage(newIndex);
+  }, [totalImages, currentIndex, setSelectedImage]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
@@ -184,7 +210,9 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     URL.revokeObjectURL(urlBlob);
   }, [images]);
 
-  if (totalImages === 0) {
+  // Only show empty state if BOTH Redux and Context have no images
+  // This prevents flashing empty state during sync
+  if (!hasAnyImages) {
     return (
       <Card className="w-full max-w-[900px] border-border/50 bg-card/50 backdrop-blur-sm">
         <CardContent className="p-6 text-center">
@@ -276,98 +304,85 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 
         {/* Image area */}
         <div className="relative flex flex-1 min-h-0 min-w-0 items-center justify-center overflow-hidden rounded-xl border bg-background">
-          <motion.div {...buttonHover} {...buttonTap}>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={handlePrev}
-              disabled={totalImages === 1}
-              aria-label="Previous"
-              className="absolute left-2 top-1/2 z-10 -translate-y-1/2 bg-background/90 backdrop-blur-sm"
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </Button>
-          </motion.div>
-
-          <AnimatePresence mode="wait" custom={direction}>
-            {current && (
-              <motion.div
-                key={current.id}
-                custom={direction}
-                variants={carouselImage}
-                initial="enter"
-                animate="center"
-                exit="exit"
-                className="h-full w-full min-h-0 min-w-0"
+          {/* Previous button */}
+          <div className="absolute left-2 top-1/2 z-20 -translate-y-1/2">
+            <motion.div {...buttonHover} {...buttonTap}>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={handlePrev}
+                disabled={totalImages <= 1}
+                aria-label="Previous"
+                className="bg-background/90 backdrop-blur-sm shadow-md"
               >
-                <ImageLabeler
-                  imageURL={current.url}
-                  onBoxesChange={(newBoxes) =>
-                    handleUpdateBoxes(current.id, newBoxes)
-                  }
-                  color={color}
-                  opacity={opacity}
-                  mode={isSwitchOn}
-                  toolMode={toolMode}
-                />
-              </motion.div>
-            )}
-          </AnimatePresence>
+                <ChevronLeft className="h-4 w-4" />
+              </Button>
+            </motion.div>
+          </div>
 
-          <motion.div {...buttonHover} {...buttonTap}>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={handleNext}
-              disabled={totalImages === 1}
-              aria-label="Next"
-              className="absolute right-2 top-1/2 z-10 -translate-y-1/2 bg-background/90 backdrop-blur-sm"
-            >
-              <ChevronRight className="h-4 w-4" />
-            </Button>
-          </motion.div>
+          {/* Image display - simple conditional rendering */}
+          {current ? (
+            <div key={current.id} className="h-full w-full min-h-0 min-w-0">
+              <ImageLabeler
+                key={current.id}
+                imageURL={current.url}
+                onBoxesChange={(newBoxes) =>
+                  handleUpdateBoxes(current.id, newBoxes)
+                }
+                color={color}
+                opacity={opacity}
+                mode={isSwitchOn}
+              />
+            </div>
+          ) : (
+            <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+              No image selected
+            </div>
+          )}
+
+          {/* Next button */}
+          <div className="absolute right-2 top-1/2 z-20 -translate-y-1/2">
+            <motion.div {...buttonHover} {...buttonTap}>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={handleNext}
+                disabled={totalImages <= 1}
+                aria-label="Next"
+                className="bg-background/90 backdrop-blur-sm shadow-md"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </motion.div>
+          </div>
         </div>
 
         {/* Delete confirmation dialog */}
         <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-          <DialogContent asChild>
-            <motion.div
-              variants={modalContent}
-              initial="hidden"
-              animate="visible"
-              exit="exit"
-            >
-              <DialogHeader>
-                <DialogTitle className="font-bold">
-                  Delete this image?
-                </DialogTitle>
-                <DialogDescription>
-                  This will remove the current image and its labels from the
-                  session. This cannot be undone.
-                </DialogDescription>
-              </DialogHeader>
-              <DialogFooter className="gap-2 sm:gap-0">
-                <motion.div {...buttonHover} {...buttonTap}>
-                  <Button
-                    variant="outline"
-                    onClick={() => setConfirmOpen(false)}
-                  >
-                    Cancel
-                  </Button>
-                </motion.div>
-                <motion.div {...buttonHover} {...buttonTap}>
-                  <Button
-                    variant="destructive"
-                    onClick={() => {
-                      if (current) handleDeleteImage(current.id);
-                      setConfirmOpen(false);
-                    }}
-                  >
-                    Delete
-                  </Button>
-                </motion.div>
-              </DialogFooter>
-            </motion.div>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle className="font-bold">
+                Delete this image?
+              </DialogTitle>
+              <DialogDescription>
+                This will remove the current image and its labels from the
+                session. This cannot be undone.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter className="gap-2 sm:gap-0">
+              <Button
+                variant="outline"
+                onClick={() => setConfirmOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={handleDeleteImage}
+              >
+                Delete
+              </Button>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
 
@@ -382,7 +397,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
             open={isMagnified}
             onClose={toggleMagnifiedView}
             mode={isSwitchOn}
-            toolMode={toolMode}
           />
         )}
       </Card>

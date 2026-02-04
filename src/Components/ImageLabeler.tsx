@@ -1,22 +1,18 @@
 import React, { useRef, useState, useCallback, useEffect, useContext, useMemo } from "react";
-import { Stage, Layer, Image as KonvaImage, Circle, Text, Rect, Transformer } from "react-konva";
+import { Stage, Layer, Image as KonvaImage, Circle, Text } from "react-konva";
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
-import { ToolMode, BoundingBox } from "../types/Image";
+import { BoundingBox } from "../types/Image";
 import Konva from "konva";
-import { toast } from "sonner";
 
 interface ImageLabelerProps {
   imageURL: string;
   onBoxesChange: (boxes: BoundingBox[]) => void;
   color: string;
   opacity: number;
-  mode: boolean;
-  toolMode: ToolMode;
+  mode: boolean; // View-only mode
 }
-
-const MIN_BOX_SIZE = 10;
 
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
   imageURL,
@@ -24,7 +20,6 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   color,
   opacity,
   mode,
-  toolMode,
 }) => {
   const {
     addLandmark,
@@ -32,14 +27,12 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     selectedBoxId,
     addBox,
     selectBox,
-    updateBox,
     undo,
     redo,
   } = useContext(UndoRedoClearContext);
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<Konva.Stage>(null);
-  const transformerRef = useRef<Konva.Transformer>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [containerSize, setContainerSize] = useState<{ w: number; h: number }>({
@@ -49,10 +42,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   const [scale, setScale] = useState(1);
 
-  // Box drawing state
-  const [isDrawingBox, setIsDrawingBox] = useState(false);
-  const [boxStart, setBoxStart] = useState<{ x: number; y: number } | null>(null);
-  const [boxPreview, setBoxPreview] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  // Track if we just created a box to avoid double-adding landmarks
+  const pendingBoxRef = useRef<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -73,10 +64,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   const baseRadius = 3;
   const getScaledRadius = useCallback(() => {
     if (!imageDimensions) return baseRadius;
-    const imageDiagonal = Math.sqrt(
-      imageDimensions.width ** 2 + imageDimensions.height ** 2
-    );
-    return Math.max(baseRadius, imageDiagonal * 0.003);
+    return Math.max(baseRadius, imageDimensions.width * 0.003);
   }, [imageDimensions]);
 
   const getTextFontSize = useMemo(() => {
@@ -111,25 +99,15 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [undo, redo]);
 
-  // Attach transformer to selected box
+  // When boxes change and we have a pending landmark to add
   useEffect(() => {
-    if (!transformerRef.current || toolMode !== "select") return;
-
-    const stage = stageRef.current;
-    if (!stage) return;
-
-    if (selectedBoxId !== null) {
-      const selectedNode = stage.findOne(`#box-${selectedBoxId}`);
-      if (selectedNode) {
-        transformerRef.current.nodes([selectedNode]);
-        transformerRef.current.getLayer()?.batchDraw();
-      } else {
-        transformerRef.current.nodes([]);
-      }
-    } else {
-      transformerRef.current.nodes([]);
+    if (pendingBoxRef.current && boxes.length > 0) {
+      const pos = pendingBoxRef.current;
+      pendingBoxRef.current = null;
+      const targetBox = boxes[0];
+      addLandmark(targetBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
     }
-  }, [selectedBoxId, boxes, toolMode]);
+  }, [boxes, addLandmark]);
 
   const getPointerPosition = useCallback((e: KonvaEventObject<MouseEvent>) => {
     const stage = e.target.getStage();
@@ -149,130 +127,38 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     [imageDimensions]
   );
 
-  const findBoxContainingPoint = useCallback(
-    (x: number, y: number): BoundingBox | undefined => {
-      return boxes.find(
-        (box) =>
-          x >= box.left &&
-          x <= box.left + box.width &&
-          y >= box.top &&
-          y <= box.top + box.height
-      );
-    },
-    [boxes]
-  );
-
-  const handleMouseDown = useCallback(
-    (e: KonvaEventObject<MouseEvent>) => {
-      if (!image || !imageDimensions || mode) return;
-
-      const pos = getPointerPosition(e);
-      if (!pos || !isPointInBounds(pos.x, pos.y)) return;
-
-      if (toolMode === "box") {
-        // Start drawing a box
-        setIsDrawingBox(true);
-        setBoxStart(pos);
-        setBoxPreview({ left: pos.x, top: pos.y, width: 0, height: 0 });
-      } else if (toolMode === "select") {
-        // Check if we clicked on a box
-        const clickedBox = findBoxContainingPoint(pos.x, pos.y);
-        if (clickedBox) {
-          selectBox(clickedBox.id);
-        } else {
-          selectBox(null);
-        }
-      }
-    },
-    [image, imageDimensions, mode, toolMode, getPointerPosition, isPointInBounds, findBoxContainingPoint, selectBox]
-  );
-
-  const handleMouseMove = useCallback(
-    (e: KonvaEventObject<MouseEvent>) => {
-      if (!isDrawingBox || !boxStart || toolMode !== "box") return;
-
-      const pos = getPointerPosition(e);
-      if (!pos) return;
-
-      // Calculate box dimensions (handle drag in any direction)
-      const left = Math.min(boxStart.x, pos.x);
-      const top = Math.min(boxStart.y, pos.y);
-      const width = Math.abs(pos.x - boxStart.x);
-      const height = Math.abs(pos.y - boxStart.y);
-
-      setBoxPreview({ left, top, width, height });
-    },
-    [isDrawingBox, boxStart, toolMode, getPointerPosition]
-  );
-
-  const handleMouseUp = useCallback(
-    () => {
-      if (toolMode === "box" && isDrawingBox && boxPreview) {
-        // Finalize the box if it meets minimum size
-        if (boxPreview.width >= MIN_BOX_SIZE && boxPreview.height >= MIN_BOX_SIZE) {
-          addBox({
-            left: Math.round(boxPreview.left),
-            top: Math.round(boxPreview.top),
-            width: Math.round(boxPreview.width),
-            height: Math.round(boxPreview.height),
-          });
-        }
-        setIsDrawingBox(false);
-        setBoxStart(null);
-        setBoxPreview(null);
-      }
-    },
-    [toolMode, isDrawingBox, boxPreview, addBox]
-  );
-
+  // Click to add landmark - auto-creates box if needed
   const handleCanvasClick = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
       if (!image || !imageDimensions || mode) return;
 
-      // Only handle landmark mode clicks
-      if (toolMode !== "landmark") return;
-
       const pos = getPointerPosition(e);
       if (!pos || !isPointInBounds(pos.x, pos.y)) return;
 
-      // Find which box contains this click
-      const clickedBox = findBoxContainingPoint(pos.x, pos.y);
-
-      if (!clickedBox) {
-        toast.info("Click inside a bounding box to add a landmark");
+      // Auto-create a default box if none exists
+      if (boxes.length === 0) {
+        // Store the position to add landmark after box is created
+        pendingBoxRef.current = pos;
+        addBox({
+          left: 0,
+          top: 0,
+          width: imageDimensions.width,
+          height: imageDimensions.height,
+        });
         return;
       }
 
-      // Auto-select the box and add landmark
-      addLandmark(clickedBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
+      // Use the first box (we only have one default box now)
+      const targetBox = boxes[0];
+
+      // Auto-select the box if not selected
+      if (selectedBoxId !== targetBox.id) {
+        selectBox(targetBox.id);
+      }
+
+      addLandmark(targetBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
     },
-    [image, imageDimensions, mode, toolMode, getPointerPosition, isPointInBounds, findBoxContainingPoint, addLandmark]
-  );
-
-  const handleTransformEnd = useCallback(
-    (e: Konva.KonvaEventObject<Event>) => {
-      const node = e.target as Konva.Rect;
-      const boxId = parseInt(node.id().replace("box-", ""), 10);
-
-      // Get new dimensions
-      const newLeft = node.x();
-      const newTop = node.y();
-      const newWidth = node.width() * node.scaleX();
-      const newHeight = node.height() * node.scaleY();
-
-      // Reset scale
-      node.scaleX(1);
-      node.scaleY(1);
-
-      // Update box in state
-      updateBox(boxId, {
-        left: Math.round(newLeft),
-        top: Math.round(newTop),
-        width: Math.round(newWidth),
-        height: Math.round(newHeight),
-      });
-    },
-    [updateBox]
+    [image, imageDimensions, mode, getPointerPosition, isPointInBounds, boxes, selectedBoxId, addBox, selectBox, addLandmark]
   );
 
   useEffect(() => {
@@ -285,21 +171,6 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   const stageW = imageDimensions ? imageDimensions.width * scale : 0;
   const stageH = imageDimensions ? imageDimensions.height * scale : 0;
-
-  // Determine cursor based on tool mode
-  const getCursor = () => {
-    if (mode) return "default";
-    switch (toolMode) {
-      case "box":
-        return "crosshair";
-      case "landmark":
-        return "crosshair";
-      case "select":
-        return "pointer";
-      default:
-        return "default";
-    }
-  };
 
   // Track global landmark index for numbering
   let globalLandmarkIndex = 0;
@@ -315,9 +186,6 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
             width={stageW}
             height={stageH}
             onClick={handleCanvasClick}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
             ref={stageRef}
             scaleX={scale}
             scaleY={scale}
@@ -326,7 +194,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
               overflow: "hidden",
               border: "1px solid hsl(var(--border))",
               backgroundColor: "hsl(var(--background))",
-              cursor: getCursor(),
+              cursor: mode ? "default" : "crosshair",
             }}
           >
             <Layer>
@@ -336,91 +204,35 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                 height={imageDimensions.height}
               />
 
-              {/* Render existing boxes */}
-              {boxes.map((box) => {
-                const isSelected = box.id === selectedBoxId;
-                return (
-                  <React.Fragment key={box.id}>
-                    <Rect
-                      id={`box-${box.id}`}
-                      x={box.left}
-                      y={box.top}
-                      width={box.width}
-                      height={box.height}
-                      stroke={isSelected ? "#00ff00" : "#ffffff"}
-                      strokeWidth={isSelected ? 2 : 1}
-                      fill={isSelected ? "rgba(0, 255, 0, 0.1)" : "rgba(255, 255, 255, 0.05)"}
-                      draggable={toolMode === "select" && isSelected}
-                      onDragEnd={(e) => {
-                        updateBox(box.id, {
-                          left: Math.round(e.target.x()),
-                          top: Math.round(e.target.y()),
-                        });
-                      }}
-                      onTransformEnd={handleTransformEnd}
-                      onClick={(e) => {
-                        if (toolMode === "select") {
-                          e.cancelBubble = true;
-                          selectBox(box.id);
-                        }
-                      }}
-                    />
-                    {/* Render landmarks inside this box */}
-                    {box.landmarks.map((point) => {
-                      globalLandmarkIndex++;
-                      return (
-                        <React.Fragment key={point.id}>
-                          <Circle
-                            x={point.x}
-                            y={point.y}
-                            radius={getScaledRadius()}
-                            fill={color}
-                            opacity={opacity / 100}
-                          />
-                          <Text
-                            x={point.x + 4}
-                            y={point.y - 11}
-                            text={globalLandmarkIndex.toString()}
-                            fontSize={getTextFontSize}
-                            fill={color}
-                            opacity={opacity / 100}
-                          />
-                        </React.Fragment>
-                      );
-                    })}
-                  </React.Fragment>
-                );
-              })}
-
-              {/* Render box preview while drawing */}
-              {boxPreview && isDrawingBox && (
-                <Rect
-                  x={boxPreview.left}
-                  y={boxPreview.top}
-                  width={boxPreview.width}
-                  height={boxPreview.height}
-                  stroke="#00ff00"
-                  strokeWidth={2}
-                  dash={[5, 5]}
-                  fill="rgba(0, 255, 0, 0.1)"
-                />
-              )}
-
-              {/* Transformer for resizing selected box */}
-              {toolMode === "select" && (
-                <Transformer
-                  ref={transformerRef}
-                  boundBoxFunc={(oldBox, newBox) => {
-                    // Enforce minimum size
-                    if (newBox.width < MIN_BOX_SIZE || newBox.height < MIN_BOX_SIZE) {
-                      return oldBox;
-                    }
-                    return newBox;
-                  }}
-                  rotateEnabled={false}
-                  keepRatio={false}
-                />
-              )}
+              {/* Render landmarks (box is hidden since it covers full image) */}
+              {boxes.map((box) => (
+                <React.Fragment key={box.id}>
+                  {box.landmarks.map((point) => {
+                    globalLandmarkIndex++;
+                    // Skip rendering for skipped landmarks
+                    if (point.isSkipped) return null;
+                    return (
+                      <React.Fragment key={point.id}>
+                        <Circle
+                          x={point.x}
+                          y={point.y}
+                          radius={getScaledRadius()}
+                          fill={color}
+                          opacity={opacity / 100}
+                        />
+                        <Text
+                          x={point.x + 4}
+                          y={point.y - 11}
+                          text={globalLandmarkIndex.toString()}
+                          fontSize={getTextFontSize}
+                          fill={color}
+                          opacity={opacity / 100}
+                        />
+                      </React.Fragment>
+                    );
+                  })}
+                </React.Fragment>
+              ))}
             </Layer>
           </Stage>
         )}

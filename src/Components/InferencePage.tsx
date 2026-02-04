@@ -13,6 +13,7 @@ import {
   X,
   FileJson,
   FileSpreadsheet,
+  Square,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -27,11 +28,31 @@ import {
   PopoverTrigger,
 } from "@/Components/ui/popover";
 import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
-import { TrainedModel, AppView, BoundingBox } from "@/types/Image";
+import { TrainedModel, AppView } from "@/types/Image";
 
 interface InferencePageProps {
   onNavigate: (view: AppView) => void;
   initialModel?: string;
+}
+
+interface PredictionLandmark {
+  id: number;
+  x: number;
+  y: number;
+}
+
+interface DetectedBox {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+interface ImageDimensions {
+  width: number;
+  height: number;
 }
 
 interface InferenceImage {
@@ -39,7 +60,10 @@ interface InferenceImage {
   name: string;
   url: string;
   results?: {
-    boxes: BoundingBox[];
+    image: string;
+    landmarks: PredictionLandmark[];
+    detected_box?: DetectedBox;
+    image_dimensions?: ImageDimensions;
   };
   error?: string;
 }
@@ -54,6 +78,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isRunning, setIsRunning] = useState(false);
   const [loadingModels, setLoadingModels] = useState(true);
+  const [showBoundingBox, setShowBoundingBox] = useState(true);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
 
@@ -90,11 +115,23 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     try {
       const result = await window.api.selectImages();
       if (!result.canceled && result.files) {
-        const newImages: InferenceImage[] = result.files.map((file) => ({
-          path: file.path,
-          name: file.name,
-          url: `file://${file.path}`,
-        }));
+        const newImages: InferenceImage[] = result.files.map((file) => {
+          // Convert base64 to blob URL for display
+          const byteCharacters = atob(file.data);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+          }
+          const byteArray = new Uint8Array(byteNumbers);
+          const blob = new Blob([byteArray], { type: file.mimeType });
+          const url = URL.createObjectURL(blob);
+
+          return {
+            path: file.path,
+            name: file.name,
+            url,
+          };
+        });
         setImages((prev) => [...prev, ...newImages]);
         toast.success(`Added ${result.files.length} image(s)`);
       }
@@ -177,30 +214,22 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       const data = imagesWithResults.map((img) => ({
         filename: img.name,
         path: img.path,
-        boxes: img.results?.boxes || [],
+        landmarks: img.results?.landmarks || [],
       }));
       content = JSON.stringify(data, null, 2);
       filename = `inference_results_${Date.now()}.json`;
       mimeType = "application/json";
     } else {
-      // CSV format: filename, box_id, left, top, width, height, landmark_id, landmark_x, landmark_y
+      // CSV format: filename, landmark_id, landmark_x, landmark_y
       const rows: string[] = [
-        "filename,box_id,box_left,box_top,box_width,box_height,landmark_id,landmark_x,landmark_y",
+        "filename,landmark_id,landmark_x,landmark_y",
       ];
       imagesWithResults.forEach((img) => {
-        img.results?.boxes.forEach((box, boxIdx) => {
-          if (box.landmarks && box.landmarks.length > 0) {
-            box.landmarks.forEach((lm) => {
-              rows.push(
-                `"${img.name}",${boxIdx},${box.left},${box.top},${box.width},${box.height},${lm.id},${lm.x},${lm.y}`
-              );
-            });
-          } else {
-            rows.push(
-              `"${img.name}",${boxIdx},${box.left},${box.top},${box.width},${box.height},,,`
-            );
-          }
-        });
+        if (img.results?.landmarks && img.results.landmarks.length > 0) {
+          img.results.landmarks.forEach((lm) => {
+            rows.push(`"${img.name}",${lm.id},${lm.x},${lm.y}`);
+          });
+        }
       });
       content = rows.join("\n");
       filename = `inference_results_${Date.now()}.csv`;
@@ -236,37 +265,62 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     imageRef.current = img;
 
     img.onload = () => {
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
+      // Use naturalWidth/naturalHeight for accurate dimensions
+      const imgWidth = img.naturalWidth || img.width;
+      const imgHeight = img.naturalHeight || img.height;
+
+      canvas.width = imgWidth;
+      canvas.height = imgHeight;
+      ctx.drawImage(img, 0, 0, imgWidth, imgHeight);
+
+      // Calculate scaled sizes based on image dimensions
+      const diagonal = Math.sqrt(imgWidth ** 2 + imgHeight ** 2);
+      const pointRadius = Math.max(3, diagonal * 0.005);
+      const fontSize = Math.max(10, diagonal * 0.012);
+      const lineWidth = Math.max(1, diagonal * 0.002);
+
+      // Draw detected bounding box if available and enabled
+      if (showBoundingBox && currentImage.results?.detected_box) {
+        const box = currentImage.results.detected_box;
+        ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
+        ctx.lineWidth = lineWidth * 2;
+        ctx.setLineDash([10, 5]);
+        ctx.strokeRect(box.left, box.top, box.width, box.height);
+        ctx.setLineDash([]);
+
+        // Label the box
+        ctx.fillStyle = "rgba(0, 255, 0, 0.9)";
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        ctx.fillText("Detected Region", box.left + 5, box.top - 5);
+      }
 
       // Draw results if available
-      if (currentImage.results?.boxes) {
-        currentImage.results.boxes.forEach((box) => {
-          // Draw bounding box
-          ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
-          ctx.lineWidth = 2;
-          ctx.strokeRect(box.left, box.top, box.width, box.height);
+      if (currentImage.results?.landmarks) {
+        currentImage.results.landmarks.forEach((lm) => {
+          // Draw point with scaled radius
+          ctx.fillStyle = "rgba(255, 0, 0, 0.9)";
+          ctx.beginPath();
+          ctx.arc(lm.x, lm.y, pointRadius, 0, Math.PI * 2);
+          ctx.fill();
 
-          // Draw landmarks
-          if (box.landmarks) {
-            box.landmarks.forEach((lm, idx) => {
-              // Draw point
-              ctx.fillStyle = "rgba(255, 0, 0, 0.9)";
-              ctx.beginPath();
-              ctx.arc(lm.x, lm.y, 4, 0, Math.PI * 2);
-              ctx.fill();
+          // Draw point outline for visibility
+          ctx.strokeStyle = "white";
+          ctx.lineWidth = lineWidth;
+          ctx.stroke();
 
-              // Draw label
-              ctx.fillStyle = "white";
-              ctx.font = "12px sans-serif";
-              ctx.fillText(String(idx + 1), lm.x + 6, lm.y + 4);
-            });
-          }
+          // Draw label with scaled font
+          ctx.fillStyle = "white";
+          ctx.strokeStyle = "black";
+          ctx.lineWidth = lineWidth * 1.5;
+          ctx.font = `bold ${fontSize}px sans-serif`;
+          const labelX = lm.x + pointRadius + 4;
+          const labelY = lm.y + fontSize / 3;
+          ctx.strokeText(String(lm.id + 1), labelX, labelY);
+          ctx.fillText(String(lm.id + 1), labelX, labelY);
         });
       }
     };
-  }, [currentIndex, images]);
+  }, [currentIndex, images, showBoundingBox]);
 
   const currentImage = images[currentIndex];
 
@@ -292,34 +346,47 @@ export const InferencePage: React.FC<InferencePageProps> = ({
 
         <div className="flex items-center gap-2">
           {images.some((img) => img.results) && (
-            <Popover>
-              <PopoverTrigger asChild>
-                <Button variant="outline" size="sm">
-                  <Download className="mr-2 h-4 w-4" />
-                  Export
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent align="end" className="w-40 p-1">
+            <>
+              <motion.div {...buttonHover} {...buttonTap}>
                 <Button
-                  variant="ghost"
+                  variant={showBoundingBox ? "default" : "outline"}
                   size="sm"
-                  className="w-full justify-start"
-                  onClick={() => handleExport("json")}
+                  onClick={() => setShowBoundingBox(!showBoundingBox)}
+                  title="Toggle detected region box"
                 >
-                  <FileJson className="mr-2 h-4 w-4" />
-                  JSON
+                  <Square className="mr-2 h-4 w-4" />
+                  {showBoundingBox ? "Hide Box" : "Show Box"}
                 </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="w-full justify-start"
-                  onClick={() => handleExport("csv")}
-                >
-                  <FileSpreadsheet className="mr-2 h-4 w-4" />
-                  CSV
-                </Button>
-              </PopoverContent>
-            </Popover>
+              </motion.div>
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" size="sm">
+                    <Download className="mr-2 h-4 w-4" />
+                    Export
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="end" className="w-40 p-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-full justify-start"
+                    onClick={() => handleExport("json")}
+                  >
+                    <FileJson className="mr-2 h-4 w-4" />
+                    JSON
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-full justify-start"
+                    onClick={() => handleExport("csv")}
+                  >
+                    <FileSpreadsheet className="mr-2 h-4 w-4" />
+                    CSV
+                  </Button>
+                </PopoverContent>
+              </Popover>
+            </>
           )}
           <motion.div {...buttonHover} {...buttonTap}>
             <Button
@@ -448,7 +515,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             </div>
                             {img.results && (
                               <span className="shrink-0 text-green-500">
-                                {img.results.boxes.length} box(es)
+                                {img.results.landmarks.length} pts
                               </span>
                             )}
                             {img.error && (
@@ -534,14 +601,22 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                     <p className="text-destructive">{currentImage.error}</p>
                   )}
                   {currentImage.results && (
-                    <p className="text-green-500">
-                      Found {currentImage.results.boxes.length} region(s) with{" "}
-                      {currentImage.results.boxes.reduce(
-                        (sum, box) => sum + (box.landmarks?.length || 0),
-                        0
-                      )}{" "}
-                      total landmarks
-                    </p>
+                    <>
+                      <p className="text-green-500">
+                        Found {currentImage.results.landmarks.length} landmark(s)
+                      </p>
+                      {currentImage.results.image_dimensions && (
+                        <p className="text-muted-foreground/70">
+                          Image: {currentImage.results.image_dimensions.width} × {currentImage.results.image_dimensions.height}px
+                        </p>
+                      )}
+                      {currentImage.results.detected_box && (
+                        <p className="text-muted-foreground/70">
+                          Detection box: ({currentImage.results.detected_box.left}, {currentImage.results.detected_box.top}) →
+                          ({currentImage.results.detected_box.right}, {currentImage.results.detected_box.bottom})
+                        </p>
+                      )}
+                    </>
                   )}
                 </div>
               )}

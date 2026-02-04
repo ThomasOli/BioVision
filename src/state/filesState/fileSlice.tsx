@@ -26,14 +26,15 @@ const fileSlice = createSlice({
         future: [] as BoundingBox[][],
       }));
       state.fileArray = [...state.fileArray, ...newImages];
-      console.log(state.fileArray);
     },
     removeFile: (state, action: PayloadAction<number>) => {
       const imageToRemove = state.fileArray.find(
         (img) => img.id === action.payload
       );
       if (imageToRemove) {
-        URL.revokeObjectURL(imageToRemove.url);
+        // Defer revocation to allow animations and state sync to complete
+        const urlToRevoke = imageToRemove.url;
+        setTimeout(() => URL.revokeObjectURL(urlToRevoke), 1000);
       }
       state.fileArray = state.fileArray.filter(
         (image) => image.id !== action.payload

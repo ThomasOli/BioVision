@@ -97,9 +97,19 @@ function createWindow() {
 
 app.on("ready", createWindow);
 
+function getPythonPath(): string {
+  // Try to use the venv Python if it exists
+  const venvPython = path.join(__dirname, "..", "venv", "bin", "python");
+  if (fs.existsSync(venvPython)) {
+    return venvPython;
+  }
+  // Fall back to system Python
+  return "python";
+}
+
 function runPython(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const pyPath = "python";
+    const pyPath = getPythonPath();
     const proc = spawn(pyPath, args);
 
     let out = "";
@@ -138,23 +148,76 @@ ipcMain.handle("ml:select-project-root", async () => {
   return { canceled: false, projectRoot };
 });
 
-ipcMain.handle("ml:train", async (_event, modelName) => {
+interface TrainOptions {
+  testSplit?: number;  // Fraction for test set (default 0.2)
+  seed?: number;       // Random seed for reproducibility
+  customOptions?: Record<string, number>;  // Custom training parameters
+}
+
+ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOptions) => {
   try {
+    const testSplit = options?.testSplit ?? 0.2;
+    const seed = options?.seed ?? 42;
+
+    // Prepare dataset with train/test split
     await runPython([
       path.join(__dirname, "../backend/prepare_dataset.py"),
       projectRoot,
       modelName,
+      testSplit.toString(),
+      seed.toString(),
     ]);
 
-    const out = await runPython([
+    // Train with optional custom parameters
+    const trainArgs = [
       path.join(__dirname, "../backend/train_shape_model.py"),
+      projectRoot,
+      modelName,
+    ];
+    if (options?.customOptions) {
+      trainArgs.push(JSON.stringify(options.customOptions));
+    }
+
+    const out = await runPython(trainArgs);
+
+    // Parse output for train/test errors
+    const trainErrorMatch = out.match(/TRAIN_ERROR\s+([\d.]+)/);
+    const testErrorMatch = out.match(/TEST_ERROR\s+([\d.]+)/);
+    const modelPathMatch = out.match(/MODEL_PATH\s+(.+)/);
+
+    return {
+      ok: true,
+      output: out,
+      trainError: trainErrorMatch ? parseFloat(trainErrorMatch[1]) : null,
+      testError: testErrorMatch ? parseFloat(testErrorMatch[1]) : null,
+      modelPath: modelPathMatch ? modelPathMatch[1].trim() : null,
+    };
+  } catch (e: any) {
+    console.error("Training failed:", e);
+    return { ok: false, error: e.message };
+  }
+});
+
+// Run detailed model testing
+ipcMain.handle("ml:test-model", async (_event, modelName: string) => {
+  try {
+    const out = await runPython([
+      path.join(__dirname, "../backend/shape_tester.py"),
       projectRoot,
       modelName,
     ]);
 
+    // Parse the JSON summary from output
+    const jsonStart = out.lastIndexOf("{");
+    if (jsonStart >= 0) {
+      const jsonStr = out.substring(jsonStart);
+      const results = JSON.parse(jsonStr);
+      return { ok: true, results };
+    }
+
     return { ok: true, output: out };
   } catch (e: any) {
-    console.error("Training failed:", e);
+    console.error("Model testing failed:", e);
     return { ok: false, error: e.message };
   }
 });
@@ -226,13 +289,30 @@ ipcMain.handle("select-image-folder", async () => {
 
   const folderPath = result.filePaths[0];
 
-  const images = fs
+  const imageFiles = fs
     .readdirSync(folderPath)
-    .filter((f) => /\.(jpg|jpeg|png)$/i.test(f))
-    .map((file) => ({
-      filename: file,
-      path: path.join(folderPath, file),
-    }));
+    .filter((f) => /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(f));
+
+  // Read file contents and return as base64 for conversion to File objects
+  const images = imageFiles.map((filename) => {
+    const filePath = path.join(folderPath, filename);
+    const data = fs.readFileSync(filePath);
+    const ext = path.extname(filename).toLowerCase();
+    const mimeTypes: Record<string, string> = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.gif': 'image/gif',
+      '.bmp': 'image/bmp',
+      '.webp': 'image/webp',
+    };
+    return {
+      filename,
+      path: filePath,
+      data: data.toString('base64'),
+      mimeType: mimeTypes[ext] || 'image/jpeg',
+    };
+  });
 
   return {
     canceled: false,
@@ -251,10 +331,25 @@ ipcMain.handle("select-images", async () => {
     return { canceled: true };
   }
 
-  const files = result.filePaths.map((filePath) => ({
-    path: filePath,
-    name: path.basename(filePath),
-  }));
+  const mimeTypes: Record<string, string> = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.bmp': 'image/bmp',
+    '.tiff': 'image/tiff',
+    '.tif': 'image/tiff',
+  };
+
+  const files = result.filePaths.map((filePath) => {
+    const data = fs.readFileSync(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    return {
+      path: filePath,
+      name: path.basename(filePath),
+      data: data.toString('base64'),
+      mimeType: mimeTypes[ext] || 'image/jpeg',
+    };
+  });
 
   return { canceled: false, files };
 });
@@ -271,12 +366,14 @@ ipcMain.handle("ml:list-models", async () => {
 
     const files = fs.readdirSync(modelsDir);
     const models = files
-      .filter((f) => f.endsWith(".dat"))
+      .filter((f) => f.endsWith(".dat") && f.startsWith("predictor_"))
       .map((file) => {
         const filePath = path.join(modelsDir, file);
         const stats = fs.statSync(filePath);
+        // Strip "predictor_" prefix and ".dat" suffix to get just the tag name
+        const tag = file.replace(/^predictor_/, "").replace(/\.dat$/, "");
         return {
-          name: file.replace(/\.dat$/, ""),
+          name: tag,
           path: filePath,
           size: stats.size,
           createdAt: stats.birthtime,
@@ -294,7 +391,8 @@ ipcMain.handle("ml:list-models", async () => {
 // Delete a trained model
 ipcMain.handle("ml:delete-model", async (_event, modelName: string) => {
   try {
-    const modelPath = path.join(projectRoot, "models", `${modelName}.dat`);
+    // modelName is the tag, file is stored as predictor_{tag}.dat
+    const modelPath = path.join(projectRoot, "models", `predictor_${modelName}.dat`);
 
     if (!fs.existsSync(modelPath)) {
       return { ok: false, error: "Model not found" };
@@ -311,8 +409,9 @@ ipcMain.handle("ml:delete-model", async (_event, modelName: string) => {
 // Rename a trained model
 ipcMain.handle("ml:rename-model", async (_event, oldName: string, newName: string) => {
   try {
-    const oldPath = path.join(projectRoot, "models", `${oldName}.dat`);
-    const newPath = path.join(projectRoot, "models", `${newName}.dat`);
+    // Names are tags, files are stored as predictor_{tag}.dat
+    const oldPath = path.join(projectRoot, "models", `predictor_${oldName}.dat`);
+    const newPath = path.join(projectRoot, "models", `predictor_${newName}.dat`);
 
     if (!fs.existsSync(oldPath)) {
       return { ok: false, error: "Model not found" };
@@ -333,7 +432,8 @@ ipcMain.handle("ml:rename-model", async (_event, oldName: string, newName: strin
 // Get info about a specific model
 ipcMain.handle("ml:get-model-info", async (_event, modelName: string) => {
   try {
-    const modelPath = path.join(projectRoot, "models", `${modelName}.dat`);
+    // modelName is the tag, file is stored as predictor_{tag}.dat
+    const modelPath = path.join(projectRoot, "models", `predictor_${modelName}.dat`);
 
     if (!fs.existsSync(modelPath)) {
       return { ok: false, error: "Model not found" };

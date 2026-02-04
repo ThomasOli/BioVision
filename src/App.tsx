@@ -12,7 +12,7 @@ import { UndoRedoClearContextProvider } from "./Components/UndoRedoClearContext"
 import { LandingPage } from "./Components/LandingPage"
 import { MyModelsPage } from "./Components/MyModelsPage"
 import { InferencePage } from "./Components/InferencePage"
-import { ToolMode, AppView } from "./types/Image"
+import { AppView } from "./types/Image"
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
@@ -31,12 +31,9 @@ const App: React.FC = () => {
     const saved = localStorage.getItem("biovision-default-opacity")
     return saved ? parseInt(saved, 10) : 100
   })
-  const [toolMode, setToolMode] = useState<ToolMode>("box")
-
   const handleColorChange = (selectedColor: string) => setColor(selectedColor)
   const handleSwitchChange = () => setIsSwitchOn((prev) => !prev)
   const handleOpacityChange = (selectedOpacity: number) => setOpacity(selectedOpacity)
-  const handleToolModeChange = (mode: ToolMode) => setToolMode(mode)
 
   // Responsive bounds for menu
   const [isXs, setIsXs] = useState(window.innerWidth < 600)
@@ -136,10 +133,6 @@ const App: React.FC = () => {
     }
   }
 
-  const handleOpenTrainDialog = () => {
-    setOpenTrainDialogOnMount(true)
-  }
-
   const handleSelectModelForInference = (modelName: string) => {
     setSelectedModelForInference(modelName)
   }
@@ -164,8 +157,6 @@ const App: React.FC = () => {
             onOpacityChange={handleOpacityChange}
             onColorChange={handleColorChange}
             onSwitchChange={handleSwitchChange}
-            toolMode={toolMode}
-            onToolModeChange={handleToolModeChange}
             onNavigateToLanding={() => handleNavigate("landing")}
             openTrainDialogOnMount={openTrainDialogOnMount}
             onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
@@ -195,7 +186,6 @@ const App: React.FC = () => {
               color={color}
               opacity={opacity}
               isSwitchOn={isSwitchOn}
-              toolMode={toolMode}
             />
           </div>
         </div>
@@ -210,7 +200,6 @@ const App: React.FC = () => {
         return (
           <LandingPage
             onNavigate={handleNavigate}
-            onOpenTrainDialog={handleOpenTrainDialog}
           />
         )
       case "models":

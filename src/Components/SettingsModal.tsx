@@ -20,7 +20,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/Components/ui/tooltip";
-import { modalContent, buttonHover, buttonTap } from "@/lib/animations";
+import { buttonHover, buttonTap } from "@/lib/animations";
 import { useTheme } from "./theme-provider";
 
 interface SettingsModalProps {
@@ -146,17 +146,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent asChild>
-        <motion.div
-          variants={modalContent}
-          initial="initial"
-          animate="animate"
-          exit="exit"
-          className="max-h-[85vh] overflow-y-auto sm:max-w-lg"
-        >
-          <DialogHeader>
-            <DialogTitle className="text-sm font-bold">Settings</DialogTitle>
-          </DialogHeader>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="text-sm font-bold">Settings</DialogTitle>
+        </DialogHeader>
 
           <div className="space-y-4 py-4">
             {/* Project Settings */}
@@ -283,7 +276,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </p>
             </SettingsSection>
           </div>
-        </motion.div>
       </DialogContent>
     </Dialog>
   );

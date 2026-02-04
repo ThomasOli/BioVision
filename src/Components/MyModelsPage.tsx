@@ -32,7 +32,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/Components/ui/dialog";
-import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover, modalContent } from "@/lib/animations";
+import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
 import { TrainedModel, AppView } from "@/types/Image";
 
 interface MyModelsPageProps {
@@ -342,38 +342,26 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
         open={deleteDialog.open}
         onOpenChange={(open) => setDeleteDialog({ open, model: open ? deleteDialog.model : null })}
       >
-        <DialogContent asChild>
-          <motion.div
-            variants={modalContent}
-            initial="initial"
-            animate="animate"
-            exit="exit"
-            className="sm:max-w-md"
-          >
-            <DialogHeader>
-              <DialogTitle className="text-sm font-bold">Delete Model</DialogTitle>
-              <DialogDescription className="text-xs">
-                Are you sure you want to delete "{deleteDialog.model?.name}"? This action
-                cannot be undone.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter className="gap-2 sm:gap-0">
-              <motion.div {...buttonHover} {...buttonTap}>
-                <Button
-                  variant="outline"
-                  onClick={() => setDeleteDialog({ open: false, model: null })}
-                >
-                  Cancel
-                </Button>
-              </motion.div>
-              <motion.div {...buttonHover} {...buttonTap}>
-                <Button variant="destructive" onClick={handleDeleteModel}>
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  Delete
-                </Button>
-              </motion.div>
-            </DialogFooter>
-          </motion.div>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-sm font-bold">Delete Model</DialogTitle>
+            <DialogDescription className="text-xs">
+              Are you sure you want to delete "{deleteDialog.model?.name}"? This action
+              cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button
+              variant="outline"
+              onClick={() => setDeleteDialog({ open: false, model: null })}
+            >
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteModel}>
+              <Trash2 className="mr-2 h-4 w-4" />
+              Delete
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </>

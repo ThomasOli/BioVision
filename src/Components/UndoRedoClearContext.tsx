@@ -27,6 +27,7 @@ interface UndoRedoClearContextProps {
   // Landmark operations (now takes boxId)
   addLandmark: (boxId: number, point: Omit<Point, "id">) => void;
   deleteLandmark: (boxId: number, pointId: number) => void;
+  skipLandmark: (boxId: number) => void; // Skip the next landmark in sequence
   setSelectedImage: React.Dispatch<React.SetStateAction<number>>;
   // Legacy points (all landmarks from all boxes, for backward compat)
   points: Point[];
@@ -323,19 +324,30 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         const newImages = [...prevImages];
         const activeImage = saveSnapshot(currentImg);
 
+        // Find the box we're adding to
+        const box = activeImage.boxes.find((b) => b.id === boxId);
+        if (!box) return prevImages;
+
+        // Find next sequential index (0, 1, 2...) based on what's already placed
+        const existingIndices = new Set(box.landmarks.map((lm) => lm.id));
+        let nextIndex = 0;
+        while (existingIndices.has(nextIndex)) {
+          nextIndex++;
+        }
+
         const newPoint: Point = {
           ...pointData,
-          id: Date.now(),
+          id: nextIndex, // ✅ Sequential index, not timestamp
         };
 
-        activeImage.boxes = activeImage.boxes.map((box) => {
-          if (box.id === boxId) {
+        activeImage.boxes = activeImage.boxes.map((b) => {
+          if (b.id === boxId) {
             return {
-              ...box,
-              landmarks: [...box.landmarks, newPoint],
+              ...b,
+              landmarks: [...b.landmarks, newPoint],
             };
           }
-          return box;
+          return b;
         });
 
         // Auto-select the box where landmark was added
@@ -377,6 +389,58 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     [selectedImage, saveSnapshot]
   );
 
+  // Skip a landmark (marks it as skipped so it doesn't need to be placed)
+  const skipLandmark = useCallback(
+    (boxId: number) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        // Find the box we're adding to
+        const box = activeImage.boxes.find((b) => b.id === boxId);
+        if (!box) return prevImages;
+
+        // Find next sequential index (0, 1, 2...) based on what's already placed
+        const existingIndices = new Set(box.landmarks.map((lm) => lm.id));
+        let nextIndex = 0;
+        while (existingIndices.has(nextIndex)) {
+          nextIndex++;
+        }
+
+        // Create a skipped landmark placeholder (coordinates don't matter)
+        const skippedPoint: Point = {
+          x: -1,
+          y: -1,
+          id: nextIndex,
+          isSkipped: true,
+        };
+
+        activeImage.boxes = activeImage.boxes.map((b) => {
+          if (b.id === boxId) {
+            return {
+              ...b,
+              landmarks: [...b.landmarks, skippedPoint],
+            };
+          }
+          return b;
+        });
+
+        // Auto-select the box
+        activeImage.selectedBoxId = boxId;
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
   return (
     <UndoRedoClearContext.Provider
       value={{
@@ -393,6 +457,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         updateBox,
         addLandmark,
         deleteLandmark,
+        skipLandmark,
         setSelectedImage,
         points,
       }}

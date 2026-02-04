@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { motion } from "framer-motion";
 import { Info, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
@@ -14,7 +13,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/Components/ui/dialog";
-import { modalContent, buttonHover, buttonTap } from "@/lib/animations";
 
 interface TrainModelDialogProps {
   open: boolean;
@@ -80,96 +78,80 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
 
   return (
     <Dialog open={open} onOpenChange={(value) => !isTraining && setOpen(value)}>
-      <DialogContent asChild>
-        <motion.div
-          variants={modalContent}
-          initial="hidden"
-          animate="visible"
-          exit="exit"
-          className="sm:max-w-md"
-        >
-          <DialogHeader>
-            <DialogTitle className="text-sm font-bold">
-              Train new model
-            </DialogTitle>
-            <DialogDescription className="text-xs">
-              Give your model a clear, versioned name (Ctrl/Cmd+Enter to start).
-            </DialogDescription>
-          </DialogHeader>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="text-sm font-bold">
+            Train new model
+          </DialogTitle>
+          <DialogDescription className="text-xs">
+            Give your model a clear, versioned name (Ctrl/Cmd+Enter to start).
+          </DialogDescription>
+        </DialogHeader>
 
-          <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label htmlFor="model-name" className="text-sm font-medium">
-                Model name
-              </Label>
-              <div className="relative">
-                <Info className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  id="model-name"
-                  autoFocus
-                  value={modelName}
-                  onChange={(e) => setModelName(e.target.value)}
-                  onBlur={() => setTouched(true)}
-                  placeholder="e.g. fossil_landmarks_v1"
-                  disabled={isTraining}
-                  className={cn(
-                    "pl-10",
-                    touched &&
-                      (!trimmed || !nameOk) &&
-                      "border-destructive focus-visible:ring-destructive"
-                  )}
-                />
-              </div>
-              <p
+        <div className="space-y-4 py-4">
+          <div className="space-y-2">
+            <Label htmlFor="model-name" className="text-sm font-medium">
+              Model name
+            </Label>
+            <div className="relative">
+              <Info className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                id="model-name"
+                autoFocus
+                value={modelName}
+                onChange={(e) => setModelName(e.target.value)}
+                onBlur={() => setTouched(true)}
+                placeholder="e.g. fossil_landmarks_v1"
+                disabled={isTraining}
                 className={cn(
-                  "text-xs",
-                  touched && (!trimmed || !nameOk)
-                    ? "text-destructive"
-                    : "text-muted-foreground"
+                  "pl-10",
+                  touched &&
+                    (!trimmed || !nameOk) &&
+                    "border-destructive focus-visible:ring-destructive"
                 )}
-              >
-                {helperText}
-              </p>
+              />
             </div>
-
-            {isTraining && (
-              <motion.div
-                initial={{ opacity: 0, y: -10 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="space-y-2"
-              >
-                <p className="text-xs font-bold text-foreground">
-                  Training in progress...
-                </p>
-                <Progress className="h-2" />
-              </motion.div>
-            )}
+            <p
+              className={cn(
+                "text-xs",
+                touched && (!trimmed || !nameOk)
+                  ? "text-destructive"
+                  : "text-muted-foreground"
+              )}
+            >
+              {helperText}
+            </p>
           </div>
 
-          <DialogFooter className="gap-2 sm:gap-0">
-            <motion.div {...buttonHover} {...buttonTap}>
-              <Button
-                variant="outline"
-                onClick={handleClose}
-                disabled={isTraining}
-              >
-                Cancel
-              </Button>
-            </motion.div>
-            <motion.div {...buttonHover} {...buttonTap}>
-              <Button disabled={!canTrain} onClick={onTrain}>
-                {isTraining ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Training...
-                  </>
-                ) : (
-                  "Train model"
-                )}
-              </Button>
-            </motion.div>
-          </DialogFooter>
-        </motion.div>
+          {isTraining && (
+            <div className="space-y-2">
+              <p className="text-xs font-bold text-foreground">
+                Training in progress...
+              </p>
+              <Progress className="h-2" />
+            </div>
+          )}
+        </div>
+
+        <DialogFooter className="gap-2 sm:gap-0">
+          <Button
+            variant="outline"
+            onClick={handleClose}
+            disabled={isTraining}
+          >
+            Cancel
+          </Button>
+          <Button disabled={!canTrain} onClick={onTrain}>
+            {isTraining ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Training...
+              </>
+            ) : (
+              "Train model"
+            )}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

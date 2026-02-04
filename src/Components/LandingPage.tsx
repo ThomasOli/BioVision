@@ -1,8 +1,8 @@
 import React, { useState } from "react";
 import { motion } from "framer-motion";
+import { useDispatch } from "react-redux";
 import {
   Pencil,
-  Target,
   Microscope,
   Database,
   BookOpen,
@@ -13,13 +13,15 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent } from "@/Components/ui/card";
 import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
-import { AppView } from "@/types/Image";
+import { AppView, Species, LandmarkSchema } from "@/types/Image";
 import { SettingsModal } from "./SettingsModal";
 import { HelpPanel } from "./HelpPanel";
+import { SchemaSelector } from "./SchemaSelector";
+import { CustomSchemaEditor } from "./CustomSchemaEditor";
+import { addSpecies } from "@/state/speciesState/speciesSlice";
 
 interface LandingPageProps {
   onNavigate: (view: AppView) => void;
-  onOpenTrainDialog: () => void;
 }
 
 interface MenuButtonProps {
@@ -62,26 +64,58 @@ const MenuButton: React.FC<MenuButtonProps> = ({ icon, title, description, onCli
 
 export const LandingPage: React.FC<LandingPageProps> = ({
   onNavigate,
-  onOpenTrainDialog,
 }) => {
+  const dispatch = useDispatch();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [schemaDialogOpen, setSchemaDialogOpen] = useState(false);
+  const [customSchemaDialogOpen, setCustomSchemaDialogOpen] = useState(false);
+
+  const handleSchemaSelect = (schema: LandmarkSchema | "custom") => {
+    if (schema === "custom") {
+      setSchemaDialogOpen(false);
+      setCustomSchemaDialogOpen(true);
+    } else {
+      // Create species with selected schema
+      const newSpecies: Species = {
+        id: `species-${Date.now()}`,
+        name: schema.name,
+        landmarkTemplate: schema.landmarks,
+        models: [],
+        imageCount: 0,
+        annotationCount: 0,
+        createdAt: new Date(),
+      };
+
+      dispatch(addSpecies(newSpecies));
+      setSchemaDialogOpen(false);
+      onNavigate("workspace");
+    }
+  };
+
+  const handleCustomSchemaSubmit = (schema: LandmarkSchema) => {
+    // Create species with custom schema
+    const newSpecies: Species = {
+      id: `species-${Date.now()}`,
+      name: schema.name,
+      landmarkTemplate: schema.landmarks,
+      models: [],
+      imageCount: 0,
+      annotationCount: 0,
+      createdAt: new Date(),
+    };
+
+    dispatch(addSpecies(newSpecies));
+    setCustomSchemaDialogOpen(false);
+    onNavigate("workspace");
+  };
 
   const menuItems = [
     {
       icon: <Pencil className="h-6 w-6" />,
       title: "Annotate Images",
       description: "Add landmark points to your images",
-      onClick: () => onNavigate("workspace"),
-    },
-    {
-      icon: <Target className="h-6 w-6" />,
-      title: "Train Model",
-      description: "Train a shape predictor model",
-      onClick: () => {
-        onNavigate("workspace");
-        onOpenTrainDialog();
-      },
+      onClick: () => setSchemaDialogOpen(true), // Show schema selector first
     },
     {
       icon: <Microscope className="h-6 w-6" />,
@@ -169,6 +203,16 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
       <SettingsModal open={settingsOpen} onOpenChange={setSettingsOpen} />
       <HelpPanel open={helpOpen} onOpenChange={setHelpOpen} />
+      <SchemaSelector
+        open={schemaDialogOpen}
+        onSelect={handleSchemaSelect}
+        onCancel={() => setSchemaDialogOpen(false)}
+      />
+      <CustomSchemaEditor
+        open={customSchemaDialogOpen}
+        onSave={handleCustomSchemaSubmit}
+        onCancel={() => setCustomSchemaDialogOpen(false)}
+      />
     </>
   );
 };

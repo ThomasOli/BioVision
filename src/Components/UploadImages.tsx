@@ -48,14 +48,39 @@ const UploadImages: React.FC = () => {
 
   const handleSelectFolder = async () => {
     const result = await window.api.selectImageFolder();
-    if (result.canceled) return;
+    if (result.canceled || !result.images?.length) return;
 
-    const incomingFiles: File[] = result.image ?? [];
-    const incomingPreviews: string[] = (result.images ?? []).map(
-      (img: { path: string }) => `file://${img.path}`
-    );
+    const incomingFiles: File[] = [];
+    const incomingPreviews: string[] = [];
 
-    appendToQueue(incomingFiles, incomingPreviews);
+    // Convert base64 data to File objects
+    for (const img of result.images) {
+      try {
+        // Decode base64 to binary
+        const binaryString = atob(img.data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const blob = new Blob([bytes], { type: img.mimeType });
+
+        // Create File object with the original filename
+        const file = new File([blob], img.filename, { type: img.mimeType });
+        // Attach the original path for later use (e.g., training)
+        Object.defineProperty(file, 'path', { value: img.path, writable: false });
+
+        incomingFiles.push(file);
+        incomingPreviews.push(URL.createObjectURL(blob));
+      } catch (err) {
+        console.error(`Failed to process image: ${img.filename}`, err);
+      }
+    }
+
+    if (incomingFiles.length > 0) {
+      appendToQueue(incomingFiles, incomingPreviews);
+    } else {
+      toast.error("No valid images found in the folder.");
+    }
 
     const fileInput = document.getElementById("btn-upload") as HTMLInputElement;
     if (fileInput) fileInput.value = "";

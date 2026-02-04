@@ -25,9 +25,15 @@ function withPrototype(obj: Record<string, any>) {
 }
 
 
+interface TrainOptions {
+  testSplit?: number;
+  seed?: number;
+  customOptions?: Record<string, number>;
+}
+
 contextBridge.exposeInMainWorld("api", {
   saveLabels: (data : AnnotatedImage []) => ipcRenderer.invoke("ml:save-labels", data),
-  trainModel: (modelName: string) => ipcRenderer.invoke("ml:train", modelName),
+  trainModel: (modelName: string, options?: TrainOptions) => ipcRenderer.invoke("ml:train", modelName, options),
   predictImage: (imagePath: string, tag: string) => ipcRenderer.invoke("ml:predict", imagePath, tag),
   selectImageFolder: () => ipcRenderer.invoke("select-image-folder"),
   getProjectRoot: () => ipcRenderer.invoke("ml:get-project-root"),
@@ -37,6 +43,7 @@ contextBridge.exposeInMainWorld("api", {
   renameModel: (oldName: string, newName: string) => ipcRenderer.invoke("ml:rename-model", oldName, newName),
   getModelInfo: (modelName: string) => ipcRenderer.invoke("ml:get-model-info", modelName),
   selectImages: () => ipcRenderer.invoke("select-images"),
+  testModel: (modelName: string) => ipcRenderer.invoke("ml:test-model", modelName),
 });
 
 // --------- Preload scripts loading ---------
