@@ -1,7 +1,4 @@
-"""
-Image utilities for consistent image loading across training and inference.
-Handles EXIF orientation to match browser display.
-"""
+"""Image utilities with EXIF orientation handling."""
 import cv2
 import numpy as np
 
@@ -14,15 +11,7 @@ except ImportError:
 
 
 def load_image(image_path):
-    """
-    Load an image with EXIF orientation correction.
-
-    Browsers auto-rotate images based on EXIF orientation metadata,
-    but OpenCV doesn't. This function ensures the image is loaded
-    in the same orientation that browsers display.
-
-    Returns: (image, width, height) or (None, 0, 0) if load fails
-    """
+    """Load image with EXIF orientation correction. Returns (image, width, height)."""
     if HAS_PIL:
         return _load_with_pil_exif(image_path)
     else:
@@ -35,7 +24,7 @@ def load_image(image_path):
 
 
 def _load_with_pil_exif(image_path):
-    """Load image using PIL to handle EXIF orientation, then convert to OpenCV format."""
+    """Load with PIL for EXIF handling, convert to OpenCV format."""
     try:
         pil_img = Image.open(image_path)
 

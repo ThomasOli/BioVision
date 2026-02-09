@@ -1,8 +1,5 @@
 # backend/train_shape_model.py
-"""
-Train a dlib shape predictor model with optimized parameters based on ml-morph.
-Supports configurable training parameters for different dataset sizes.
-"""
+"""Train dlib shape predictor with optimized parameters."""
 import os
 import sys
 import json
@@ -10,105 +7,71 @@ import dlib
 
 
 def get_training_options(num_images, num_landmarks):
-    """
-    Get optimized training options based on dataset size.
-    Tuned to reduce overfitting on small datasets while maintaining accuracy.
-
-    Args:
-        num_images: Number of training images
-        num_landmarks: Number of landmarks per image
-
-    Returns:
-        dlib.shape_predictor_training_options
-    """
+    """Get optimized training options based on dataset size."""
     options = dlib.shape_predictor_training_options()
 
-    # For very small datasets (< 10 images), use more conservative parameters
-    # to reduce overfitting
-    is_tiny_dataset = num_images < 10
-    is_small_dataset = num_images < 50
+    is_tiny_dataset = num_images < 30
+    is_small_dataset = num_images < 100
 
-    # Tree depth: Lower depth = less overfitting, but less precision
-    # Use 2-3 for small datasets, 4 for larger ones
+    # Tree depth
     if is_tiny_dataset:
-        options.tree_depth = 2
+        options.tree_depth = 3
     elif is_small_dataset:
         options.tree_depth = 3
     else:
         options.tree_depth = 4
 
-    # Cascade depth: Number of refinement stages
-    # Fewer cascades = faster training and less overfitting
+    # Cascade depth (refinement stages)
     if is_tiny_dataset:
-        options.cascade_depth = 6
+        options.cascade_depth = 12
     elif is_small_dataset:
-        options.cascade_depth = 8
+        options.cascade_depth = 10
     else:
         options.cascade_depth = 12
 
-    # Nu (regularization): Higher = more regularization = less overfitting
-    # Use higher values for small datasets
+    # Nu (regularization)
     if is_tiny_dataset:
-        options.nu = 0.3  # More regularization
+        options.nu = 0.3
     elif is_small_dataset:
         options.nu = 0.2
     else:
         options.nu = 0.1
 
-    # Feature pool size: Number of pixel pairs to sample
-    if is_tiny_dataset:
-        options.feature_pool_size = 200
-    else:
-        options.feature_pool_size = 300
+    # Feature pool size
+    options.feature_pool_size = 400
 
-    # Number of trees per cascade level
-    # Fewer trees = faster training
+    # Trees per cascade level
     if is_tiny_dataset:
-        options.num_trees_per_cascade_level = 50
+        options.num_trees_per_cascade_level = 200
     elif is_small_dataset:
-        options.num_trees_per_cascade_level = 100
+        options.num_trees_per_cascade_level = 150
     else:
         options.num_trees_per_cascade_level = 300
 
-    # Number of test splits for feature selection
-    if is_tiny_dataset:
-        options.num_test_splits = 10
-    else:
-        options.num_test_splits = 15
+    # Test splits
+    options.num_test_splits = 10 if is_tiny_dataset else 15
 
-    # Oversampling: Creates augmented training samples
+    # Oversampling (augmentation)
     if is_tiny_dataset:
-        options.oversampling_amount = 50
+        options.oversampling_amount = 300
     elif is_small_dataset:
-        options.oversampling_amount = 30
+        options.oversampling_amount = 150
     else:
-        options.oversampling_amount = 20
+        options.oversampling_amount = 40
 
-    # Translation jitter: Adds random translation to bounding boxes during training
-    # This is KEY for generalization - helps model learn position-invariant features
+    # Translation jitter
     if is_tiny_dataset:
-        options.oversampling_translation_jitter = 0.1  # 10% of box size
+        options.oversampling_translation_jitter = 0.15
     elif is_small_dataset:
+        options.oversampling_translation_jitter = 0.1
+    else:
         options.oversampling_translation_jitter = 0.05
-    else:
-        options.oversampling_translation_jitter = 0.02
 
-    # Feature pool region padding: Sample features from wider area around landmarks
-    # Helps capture more context
     options.feature_pool_region_padding = 0.1
-
-    # Lambda: Regularization for split feature selection
-    # Higher = more regularization
-    if is_tiny_dataset:
-        options.lambda_param = 0.2
-    else:
-        options.lambda_param = 0.1
-
-    # Random seed for reproducibility (dlib expects a string)
+    options.lambda_param = 0.2 if is_tiny_dataset else 0.1
     options.random_seed = "42"
-
     options.be_verbose = True
-    # Use all available CPU cores for faster training
+
     import multiprocessing
     options.num_threads = multiprocessing.cpu_count()
 
@@ -137,17 +100,7 @@ def count_landmarks_in_xml(xml_path):
 
 
 def train_shape_model(project_root, tag, custom_options=None):
-    """
-    Train a dlib shape predictor model.
-
-    Args:
-        project_root: Root directory of the project
-        tag: Model tag/name
-        custom_options: Optional dict of custom training options to override defaults
-
-    Returns:
-        dict with training results
-    """
+    """Train a dlib shape predictor model."""
     project_root = os.path.abspath(project_root)
     xmldir = os.path.join(project_root, "xml")
     modeldir = os.path.join(project_root, "models")

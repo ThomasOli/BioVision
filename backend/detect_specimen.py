@@ -5,12 +5,7 @@ from image_utils import load_image
 
 
 def detect_specimen(image_path, margin=20):
-    """
-    Fast specimen detection optimized for speed while maintaining accuracy.
-    Uses efficient algorithms that work well for fish/animal specimens.
-
-    Returns: dict with 'left', 'top', 'right', 'bottom', 'width', 'height' keys.
-    """
+    """Detect specimen bounding box. Returns dict with box coordinates."""
     img, w, h = load_image(image_path)
     if img is None:
         return None

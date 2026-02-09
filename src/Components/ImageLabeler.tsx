@@ -31,6 +31,14 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     redo,
   } = useContext(UndoRedoClearContext);
 
+  // Use refs to avoid re-running keyboard effect when undo/redo change
+  const undoRef = useRef(undo);
+  const redoRef = useRef(redo);
+  useEffect(() => {
+    undoRef.current = undo;
+    redoRef.current = redo;
+  }, [undo, redo]);
+
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<Konva.Stage>(null);
 
@@ -87,17 +95,18 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === "z") {
+      const isMod = e.ctrlKey || e.metaKey; // Ctrl on Windows, Cmd on Mac
+      if (isMod && e.key === "z") {
         e.preventDefault();
-        undo();
-      } else if (e.ctrlKey && e.key === "y") {
+        undoRef.current();
+      } else if (isMod && e.key === "y") {
         e.preventDefault();
-        redo();
+        redoRef.current();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [undo, redo]);
+  }, []); // Empty deps - uses refs for stable reference
 
   // When boxes change and we have a pending landmark to add
   useEffect(() => {
