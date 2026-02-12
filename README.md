@@ -9,15 +9,23 @@ npm install
 npm run dev
 ```
 
+Python backend in development runs from source files in `backend/*.py` and uses your local Python.
+
 ## Build
 
-Create production build artifacts:
+Create production frontend/electron build artifacts:
 
 ```bash
 npm run build
 ```
 
 ## Multi-Platform Packaging
+
+Install Python build dependencies once:
+
+```bash
+python -m pip install -r backend/requirements.txt pyinstaller
+```
 
 Generate installers/packages locally:
 
@@ -32,6 +40,8 @@ npm run dist:win
 npm run dist:mac
 npm run dist:linux
 ```
+
+`dist*` commands compile the Python backend into executables and bundle them into the installer under `resources/python`.
 
 ## Releases
 
@@ -54,13 +64,7 @@ git push origin v0.1.0
 
 What happens next:
 - GitHub Actions builds Windows, macOS, and Linux artifacts.
-- `electron-builder` publishes those artifacts to GitHub Releases.
-
-## Required Repository Secret
-
-Set this in GitHub repository settings (`Settings -> Secrets and variables -> Actions`):
-
-- `GH_TOKEN`: GitHub Personal Access Token (classic, `repo` scope recommended)
+- `electron-builder` publishes those artifacts to GitHub Releases using `${{ github.token }}`.
 
 ## Electron Builder Config Notes
 
@@ -68,3 +72,4 @@ The publish target is configured in `electron-builder.json5`:
 - `publish.owner`: your GitHub username or org name
 - `publish.repo`: repository name
 
+Use names only, not full URLs.

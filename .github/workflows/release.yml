@@ -34,12 +34,18 @@ jobs:
           node-version: 20
           cache: npm
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: python -m pip install -r backend/requirements.txt pyinstaller
+
       - name: Install dependencies
         run: npm ci
 
       - name: Build and publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          npm run build
-          npx electron-builder --${{ matrix.target }} --publish always
+        run: npm run publish:${{ matrix.target }}

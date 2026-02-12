@@ -14,6 +14,22 @@
     "dist-electron/**/*",
     "package.json"
   ],
+  "extraResources": [
+    {
+      "from": "backend",
+      "to": "backend",
+      "filter": [
+        "*.py"
+      ]
+    },
+    {
+      "from": "backend/dist",
+      "to": "python",
+      "filter": [
+        "**/*"
+      ]
+    }
+  ],
   "extraMetadata": {
     "main": "dist-electron/main.js"
   },
@@ -29,8 +45,7 @@
       {
         "target": "nsis",
         "arch": [
-          "x64",
-          "arm64"
+          "x64"
         ]
       }
     ],
@@ -47,8 +62,7 @@
       {
         "target": "dmg",
         "arch": [
-          "x64",
-          "arm64"
+          "x64"
         ]
       }
     ],
@@ -60,8 +74,7 @@
       {
         "target": "AppImage",
         "arch": [
-          "x64",
-          "arm64"
+          "x64"
         ]
       }
     ],
