@@ -97,10 +97,34 @@ function createWindow() {
 
 app.on("ready", createWindow);
 
-function runPython(args: string[]): Promise<string> {
+type BackendCommand = {
+  command: string;
+  argsPrefix: string[];
+};
+
+function getBackendCommand(scriptName: string): BackendCommand {
+  const executable = process.platform === "win32" ? `${scriptName}.exe` : scriptName;
+  const packagedExecutable = path.join(process.resourcesPath, "python", executable);
+
+  if (fs.existsSync(packagedExecutable)) {
+    return { command: packagedExecutable, argsPrefix: [] };
+  }
+
+  if (app.isPackaged) {
+    throw new Error(`Bundled backend executable not found: ${packagedExecutable}`);
+  }
+
+  const scriptDir = path.join(__dirname, "../backend");
+  const scriptPath = path.join(scriptDir, `${scriptName}.py`);
+  const pythonPath = process.env.PYTHON_PATH || "python";
+
+  return { command: pythonPath, argsPrefix: [scriptPath] };
+}
+
+function runBackendScript(scriptName: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const pyPath = "python";
-    const proc = spawn(pyPath, args);
+    const backend = getBackendCommand(scriptName);
+    const proc = spawn(backend.command, [...backend.argsPrefix, ...args]);
 
     let out = "";
     let err = "";
@@ -140,17 +164,9 @@ ipcMain.handle("ml:select-project-root", async () => {
 
 ipcMain.handle("ml:train", async (_event, modelName) => {
   try {
-    await runPython([
-      path.join(__dirname, "../backend/prepare_dataset.py"),
-      projectRoot,
-      modelName,
-    ]);
+    await runBackendScript("prepare_dataset", [projectRoot, modelName]);
 
-    const out = await runPython([
-      path.join(__dirname, "../backend/train_shape_model.py"),
-      projectRoot,
-      modelName,
-    ]);
+    const out = await runBackendScript("train_shape_model", [projectRoot, modelName]);
 
     return { ok: true, output: out };
   } catch (e: any) {
@@ -198,12 +214,7 @@ ipcMain.handle("ml:save-labels", async (_event, images) => {
 
 ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string) => {
   try {
-    const out = await runPython([
-      path.join(__dirname, "../backend/predict.py"),
-      projectRoot,
-      tag,
-      imagePath,
-    ]);
+    const out = await runBackendScript("predict", [projectRoot, tag, imagePath]);
 
     const data = JSON.parse(out);
     return { ok: true, data };
