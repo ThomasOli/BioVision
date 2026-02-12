@@ -3,32 +3,38 @@
  */
 {
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
-  "appId": "YourAppID",
+  "appId": "com.biovision.app",
+  "productName": "BioVision",
   "asar": true,
-  "productName": "YourAppName",
   "directories": {
     "output": "release/${version}"
   },
   "files": [
-    "dist",
-    "dist-electron"
+    "dist/**/*",
+    "dist-electron/**/*",
+    "package.json"
   ],
-  "mac": {
-    "target": [
-      "dmg"
-    ],
-    "artifactName": "${productName}-Mac-${version}-Installer.${ext}"
+  "extraMetadata": {
+    "main": "dist-electron/main.js"
   },
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "ThomasOli",
+      "repo": "BioVision"
+    }
+  ],
   "win": {
     "target": [
       {
         "target": "nsis",
         "arch": [
-          "x64"
+          "x64",
+          "arm64"
         ]
       }
     ],
-    "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
+    "artifactName": "${productName}-Windows-${version}-${arch}-Setup.${ext}"
   },
   "nsis": {
     "oneClick": false,
@@ -36,10 +42,30 @@
     "allowToChangeInstallationDirectory": true,
     "deleteAppDataOnUninstall": false
   },
+  "mac": {
+    "target": [
+      {
+        "target": "dmg",
+        "arch": [
+          "x64",
+          "arm64"
+        ]
+      }
+    ],
+    "artifactName": "${productName}-Mac-${version}-${arch}-Installer.${ext}",
+    "category": "public.app-category.productivity"
+  },
   "linux": {
     "target": [
-      "AppImage"
+      {
+        "target": "AppImage",
+        "arch": [
+          "x64",
+          "arm64"
+        ]
+      }
     ],
-    "artifactName": "${productName}-Linux-${version}.${ext}"
+    "category": "Utility",
+    "artifactName": "${productName}-Linux-${version}-${arch}.${ext}"
   }
 }
