@@ -1,10 +1,12 @@
 import React, { useRef, useState, useCallback, useEffect, useContext, useMemo } from "react";
-import { Stage, Layer, Image as KonvaImage, Circle, Text } from "react-konva";
+import { Stage, Layer, Image as KonvaImage, Circle, Text, Rect } from "react-konva";
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 import { BoundingBox } from "../types/Image";
 import Konva from "konva";
+
+export type DetectionMode = "single" | "multi";
 
 interface ImageLabelerProps {
   imageURL: string;
@@ -12,6 +14,7 @@ interface ImageLabelerProps {
   color: string;
   opacity: number;
   mode: boolean; // View-only mode
+  detectionMode?: DetectionMode;
 }
 
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
@@ -20,6 +23,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   color,
   opacity,
   mode,
+  detectionMode = "single",
 }) => {
   const {
     addLandmark,
@@ -83,6 +87,12 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     return Math.max(7, imageDiagonal * 0.01);
   }, [imageDimensions]);
 
+  // Box stroke width based on image size
+  const boxStrokeWidth = useMemo(() => {
+    if (!imageDimensions) return 2;
+    return Math.max(2, imageDimensions.width * 0.002);
+  }, [imageDimensions]);
+
   useEffect(() => {
     if (!imageDimensions) return;
 
@@ -136,7 +146,27 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     [imageDimensions]
   );
 
-  // Click to add landmark - auto-creates box if needed
+  // Check if point is inside a box
+  const findBoxAtPoint = useCallback(
+    (x: number, y: number): BoundingBox | null => {
+      // Check boxes in reverse order (top-most first)
+      for (let i = boxes.length - 1; i >= 0; i--) {
+        const box = boxes[i];
+        if (
+          x >= box.left &&
+          x <= box.left + box.width &&
+          y >= box.top &&
+          y <= box.top + box.height
+        ) {
+          return box;
+        }
+      }
+      return null;
+    },
+    [boxes]
+  );
+
+  // Click to add landmark or select box
   const handleCanvasClick = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
       if (!image || !imageDimensions || mode) return;
@@ -144,7 +174,26 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       const pos = getPointerPosition(e);
       if (!pos || !isPointInBounds(pos.x, pos.y)) return;
 
-      // Auto-create a default box if none exists
+      // In multi-mode, check if clicking on a box to select it
+      if (detectionMode === "multi") {
+        const clickedBox = findBoxAtPoint(pos.x, pos.y);
+
+        if (clickedBox) {
+          // If clicking on a different box, select it
+          if (selectedBoxId !== clickedBox.id) {
+            selectBox(clickedBox.id);
+            return;
+          }
+          // If clicking on already selected box, add landmark
+          addLandmark(clickedBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
+          return;
+        }
+
+        // Clicking outside any box in multi-mode - do nothing
+        return;
+      }
+
+      // Single-specimen mode: auto-create a default box if none exists
       if (boxes.length === 0) {
         // Store the position to add landmark after box is created
         pendingBoxRef.current = pos;
@@ -167,7 +216,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
       addLandmark(targetBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
     },
-    [image, imageDimensions, mode, getPointerPosition, isPointInBounds, boxes, selectedBoxId, addBox, selectBox, addLandmark]
+    [image, imageDimensions, mode, getPointerPosition, isPointInBounds, boxes, selectedBoxId, addBox, selectBox, addLandmark, detectionMode, findBoxAtPoint]
   );
 
   useEffect(() => {
@@ -181,8 +230,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   const stageW = imageDimensions ? imageDimensions.width * scale : 0;
   const stageH = imageDimensions ? imageDimensions.height * scale : 0;
 
-  // Track global landmark index for numbering
-  let globalLandmarkIndex = 0;
+  // Colors for boxes
+  const getBoxColor = (isSelected: boolean) => {
+    if (isSelected) return "#3b82f6"; // blue-500
+    return "#6b7280"; // gray-500
+  };
 
   return (
     <div
@@ -213,35 +265,84 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                 height={imageDimensions.height}
               />
 
-              {/* Render landmarks (box is hidden since it covers full image) */}
-              {boxes.map((box) => (
-                <React.Fragment key={box.id}>
-                  {box.landmarks.map((point) => {
-                    globalLandmarkIndex++;
-                    // Skip rendering for skipped landmarks
-                    if (point.isSkipped) return null;
-                    return (
-                      <React.Fragment key={point.id}>
-                        <Circle
-                          x={point.x}
-                          y={point.y}
-                          radius={getScaledRadius()}
-                          fill={color}
-                          opacity={opacity / 100}
-                        />
-                        <Text
-                          x={point.x + 4}
-                          y={point.y - 11}
-                          text={globalLandmarkIndex.toString()}
-                          fontSize={getTextFontSize}
-                          fill={color}
-                          opacity={opacity / 100}
-                        />
-                      </React.Fragment>
-                    );
-                  })}
-                </React.Fragment>
-              ))}
+              {/* Render bounding boxes in multi-mode */}
+              {detectionMode === "multi" && boxes.map((box, index) => {
+                const isSelected = selectedBoxId === box.id;
+                const boxColor = getBoxColor(isSelected);
+
+                return (
+                  <React.Fragment key={`box-${box.id}`}>
+                    <Rect
+                      x={box.left}
+                      y={box.top}
+                      width={box.width}
+                      height={box.height}
+                      stroke={boxColor}
+                      strokeWidth={boxStrokeWidth}
+                      dash={isSelected ? undefined : [10, 5]}
+                      fill={isSelected ? "rgba(59, 130, 246, 0.1)" : "transparent"}
+                    />
+                    {/* Box number label */}
+                    <Text
+                      x={box.left + 5}
+                      y={box.top + 5}
+                      text={`#${index + 1}`}
+                      fontSize={getTextFontSize * 1.2}
+                      fill={boxColor}
+                      fontStyle="bold"
+                    />
+                    {/* Confidence badge if available */}
+                    {box.confidence !== undefined && (
+                      <Text
+                        x={box.left + 5}
+                        y={box.top + 5 + getTextFontSize * 1.5}
+                        text={`${(box.confidence * 100).toFixed(0)}%`}
+                        fontSize={getTextFontSize * 0.9}
+                        fill={boxColor}
+                      />
+                    )}
+                  </React.Fragment>
+                );
+              })}
+
+              {/* Render landmarks */}
+              {boxes.map((box) => {
+                const isBoxSelected = selectedBoxId === box.id;
+
+                return (
+                  <React.Fragment key={`landmarks-${box.id}`}>
+                    {box.landmarks.map((point, lmIndex) => {
+                      // Skip rendering for skipped landmarks
+                      if (point.isSkipped) return null;
+
+                      // In multi-mode, dim landmarks of non-selected boxes
+                      const landmarkOpacity = detectionMode === "multi" && !isBoxSelected
+                        ? (opacity / 100) * 0.4
+                        : opacity / 100;
+
+                      return (
+                        <React.Fragment key={`lm-${box.id}-${point.id}`}>
+                          <Circle
+                            x={point.x}
+                            y={point.y}
+                            radius={getScaledRadius()}
+                            fill={color}
+                            opacity={landmarkOpacity}
+                          />
+                          <Text
+                            x={point.x + 4}
+                            y={point.y - 11}
+                            text={(lmIndex + 1).toString()}
+                            fontSize={getTextFontSize}
+                            fill={color}
+                            opacity={landmarkOpacity}
+                          />
+                        </React.Fragment>
+                      );
+                    })}
+                  </React.Fragment>
+                );
+              })}
             </Layer>
           </Stage>
         )}

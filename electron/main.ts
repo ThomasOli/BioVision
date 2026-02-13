@@ -152,17 +152,21 @@ interface TrainOptions {
   testSplit?: number;  // Fraction for test set (default 0.2)
   seed?: number;       // Random seed for reproducibility
   customOptions?: Record<string, number>;  // Custom training parameters
+  speciesId?: string;  // Session-scoped training
 }
 
 ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOptions) => {
   try {
     const testSplit = options?.testSplit ?? 0.2;
     const seed = options?.seed ?? 42;
+    const effectiveRoot = options?.speciesId
+      ? path.join(projectRoot, "sessions", options.speciesId)
+      : projectRoot;
 
     // Prepare dataset with train/test split
     await runPython([
       path.join(__dirname, "../backend/prepare_dataset.py"),
-      projectRoot,
+      effectiveRoot,
       modelName,
       testSplit.toString(),
       seed.toString(),
@@ -171,7 +175,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
     // Train with optional custom parameters
     const trainArgs = [
       path.join(__dirname, "../backend/train_shape_model.py"),
-      projectRoot,
+      effectiveRoot,
       modelName,
     ];
     if (options?.customOptions) {
@@ -454,6 +458,376 @@ ipcMain.handle("ml:get-model-info", async (_event, modelName: string) => {
     return { ok: false, error: e.message };
   }
 });
+
+// Multi-specimen detection using OpenCV
+interface DetectionOptions {
+  confThreshold?: number;  // Used as min_area_ratio (0.01-0.2)
+}
+
+ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?: DetectionOptions) => {
+  try {
+    const minAreaRatio = options?.confThreshold ?? 0.02;
+
+    const out = await runPython([
+      path.join(__dirname, "../backend/detect_specimen.py"),
+      imagePath,
+      minAreaRatio.toString(),
+    ]);
+
+    const data = JSON.parse(out.trim());
+    return data;
+  } catch (e: any) {
+    console.error("Specimen detection failed:", e);
+    return { ok: false, error: e.message, boxes: [] };
+  }
+});
+
+// Check detection availability (OpenCV always available)
+ipcMain.handle("ml:check-yolo", async () => {
+  try {
+    const out = await runPython([
+      path.join(__dirname, "../backend/detect_specimen.py"),
+      "--check",
+    ]);
+
+    return JSON.parse(out.trim());
+  } catch (e: any) {
+    return { available: true, primary_method: "opencv" };
+  }
+});
+
+// ── Session management IPC handlers ──
+
+function getSessionDir(speciesId: string): string {
+  return path.join(projectRoot, "sessions", speciesId);
+}
+
+const IMAGE_EXTS = /\.(jpg|jpeg|png|gif|bmp|webp)$/i;
+
+const MIME_TYPES: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".gif": "image/gif",
+  ".bmp": "image/bmp",
+  ".webp": "image/webp",
+};
+
+ipcMain.handle(
+  "session:create",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      name: string;
+      landmarkTemplate: any[];
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      for (const sub of ["images", "labels", "models", "xml", "corrected_images", "debug"]) {
+        fs.mkdirSync(path.join(sessionDir, sub), { recursive: true });
+      }
+      fs.writeFileSync(
+        path.join(sessionDir, "session.json"),
+        JSON.stringify(
+          {
+            speciesId: args.speciesId,
+            name: args.name,
+            landmarkTemplate: args.landmarkTemplate,
+            createdAt: new Date().toISOString(),
+            lastModified: new Date().toISOString(),
+            imageCount: 0,
+          },
+          null,
+          2
+        )
+      );
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:create failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:save-image",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      imageData: string;
+      filename: string;
+      mimeType: string;
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const imagesDir = path.join(sessionDir, "images");
+      fs.mkdirSync(imagesDir, { recursive: true });
+
+      const destPath = path.join(imagesDir, args.filename);
+      const buffer = Buffer.from(args.imageData, "base64");
+      fs.writeFileSync(destPath, buffer);
+
+      // Update or create session.json imageCount
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      try {
+        const imageFiles = fs
+          .readdirSync(imagesDir)
+          .filter((f) => IMAGE_EXTS.test(f));
+        if (fs.existsSync(sessionJsonPath)) {
+          const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+          meta.imageCount = imageFiles.length;
+          meta.lastModified = new Date().toISOString();
+          fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+        } else {
+          // Fallback: create session.json if it was never created
+          fs.writeFileSync(
+            sessionJsonPath,
+            JSON.stringify(
+              {
+                speciesId: args.speciesId,
+                name: args.speciesId,
+                landmarkTemplate: [],
+                createdAt: new Date().toISOString(),
+                lastModified: new Date().toISOString(),
+                imageCount: imageFiles.length,
+              },
+              null,
+              2
+            )
+          );
+        }
+      } catch (_) {
+        // non-critical
+      }
+
+      return { ok: true, diskPath: destPath };
+    } catch (e: any) {
+      console.error("session:save-image failed:", e);
+      return { ok: false, error: e.message, diskPath: "" };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:save-annotations",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      filename: string;
+      boxes: any[];
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const labelsDir = path.join(sessionDir, "labels");
+      fs.mkdirSync(labelsDir, { recursive: true });
+
+      const basename = args.filename.replace(/\.\w+$/, ".json");
+      const boxes = (args.boxes || []).map((box: any) => ({
+        id: box.id,
+        left: box.left,
+        top: box.top,
+        width: box.width,
+        height: box.height,
+        confidence: box.confidence,
+        source: box.source,
+        landmarks: (box.landmarks || []).map((lm: any) => ({
+          x: lm.x,
+          y: lm.y,
+          id: lm.id,
+          isSkipped: lm.isSkipped,
+          label: lm.label,
+        })),
+      }));
+
+      fs.writeFileSync(
+        path.join(labelsDir, basename),
+        JSON.stringify(
+          {
+            imageFilename: args.filename,
+            speciesId: args.speciesId,
+            boxes,
+          },
+          null,
+          2
+        )
+      );
+
+      // Update lastModified
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      if (fs.existsSync(sessionJsonPath)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+          meta.lastModified = new Date().toISOString();
+          fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+        } catch (_) {
+          // non-critical
+        }
+      }
+
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:save-annotations failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:load",
+  async (_event, args: { speciesId: string }) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const imagesDir = path.join(sessionDir, "images");
+      const labelsDir = path.join(sessionDir, "labels");
+
+      // Load session metadata from session.json
+      let meta: any = null;
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      if (fs.existsSync(sessionJsonPath)) {
+        try {
+          meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+        } catch (_) {
+          // skip bad session.json
+        }
+      }
+
+      if (!fs.existsSync(imagesDir)) {
+        return { ok: true, images: [], meta };
+      }
+
+      const imageFiles = fs
+        .readdirSync(imagesDir)
+        .filter((f) => IMAGE_EXTS.test(f));
+
+      const images = imageFiles.map((filename) => {
+        const filePath = path.join(imagesDir, filename);
+        const data = fs.readFileSync(filePath);
+        const ext = path.extname(filename).toLowerCase();
+
+        // Load annotations if they exist
+        let boxes: any[] = [];
+        const labelPath = path.join(
+          labelsDir,
+          filename.replace(/\.\w+$/, ".json")
+        );
+        if (fs.existsSync(labelPath)) {
+          try {
+            const labelData = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+            boxes = labelData.boxes || [];
+          } catch (_) {
+            // skip bad label files
+          }
+        }
+
+        return {
+          filename,
+          diskPath: filePath,
+          data: data.toString("base64"),
+          mimeType: MIME_TYPES[ext] || "image/jpeg",
+          boxes,
+        };
+      });
+
+      return { ok: true, images, meta };
+    } catch (e: any) {
+      console.error("session:load failed:", e);
+      return { ok: false, error: e.message, images: [] };
+    }
+  }
+);
+
+ipcMain.handle("session:list", async () => {
+  try {
+    const sessionsDir = path.join(projectRoot, "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      return { ok: true, sessions: [] };
+    }
+
+    const entries = fs
+      .readdirSync(sessionsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory());
+
+    const sessions = [];
+    for (const entry of entries) {
+      const sessionJsonPath = path.join(
+        sessionsDir,
+        entry.name,
+        "session.json"
+      );
+      if (!fs.existsSync(sessionJsonPath)) continue;
+      try {
+        const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+        sessions.push({
+          speciesId: meta.speciesId || entry.name,
+          name: meta.name || entry.name,
+          imageCount: meta.imageCount || 0,
+          lastModified: meta.lastModified || meta.createdAt || "",
+          landmarkCount: (meta.landmarkTemplate || []).length,
+        });
+      } catch (_) {
+        // skip bad session.json
+      }
+    }
+
+    // Sort by lastModified descending
+    sessions.sort(
+      (a, b) =>
+        new Date(b.lastModified).getTime() -
+        new Date(a.lastModified).getTime()
+    );
+
+    return { ok: true, sessions };
+  } catch (e: any) {
+    console.error("session:list failed:", e);
+    return { ok: false, error: e.message, sessions: [] };
+  }
+});
+
+ipcMain.handle(
+  "session:delete-image",
+  async (_event, args: { speciesId: string; filename: string }) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const imagePath = path.join(sessionDir, "images", args.filename);
+      const labelPath = path.join(
+        sessionDir,
+        "labels",
+        args.filename.replace(/\.\w+$/, ".json")
+      );
+
+      if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
+      if (fs.existsSync(labelPath)) fs.unlinkSync(labelPath);
+
+      // Update session.json imageCount
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      if (fs.existsSync(sessionJsonPath)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+          const imagesDir = path.join(sessionDir, "images");
+          const imageFiles = fs.existsSync(imagesDir)
+            ? fs.readdirSync(imagesDir).filter((f) => IMAGE_EXTS.test(f))
+            : [];
+          meta.imageCount = imageFiles.length;
+          meta.lastModified = new Date().toISOString();
+          fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+        } catch (_) {
+          // non-critical
+        }
+      }
+
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:delete-image failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {

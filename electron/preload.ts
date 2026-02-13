@@ -29,6 +29,11 @@ interface TrainOptions {
   testSplit?: number;
   seed?: number;
   customOptions?: Record<string, number>;
+  speciesId?: string;
+}
+
+interface DetectionOptions {
+  confThreshold?: number;
 }
 
 contextBridge.exposeInMainWorld("api", {
@@ -44,6 +49,22 @@ contextBridge.exposeInMainWorld("api", {
   getModelInfo: (modelName: string) => ipcRenderer.invoke("ml:get-model-info", modelName),
   selectImages: () => ipcRenderer.invoke("select-images"),
   testModel: (modelName: string) => ipcRenderer.invoke("ml:test-model", modelName),
+  // Multi-specimen detection
+  detectSpecimens: (imagePath: string, options?: DetectionOptions) => ipcRenderer.invoke("ml:detect-specimens", imagePath, options),
+  checkYolo: () => ipcRenderer.invoke("ml:check-yolo"),
+  // Session management
+  sessionCreate: (speciesId: string, name: string, landmarkTemplate: any[]) =>
+    ipcRenderer.invoke("session:create", { speciesId, name, landmarkTemplate }),
+  sessionSaveImage: (speciesId: string, imageData: string, filename: string, mimeType: string) =>
+    ipcRenderer.invoke("session:save-image", { speciesId, imageData, filename, mimeType }),
+  sessionSaveAnnotations: (speciesId: string, filename: string, boxes: any[]) =>
+    ipcRenderer.invoke("session:save-annotations", { speciesId, filename, boxes }),
+  sessionLoad: (speciesId: string) =>
+    ipcRenderer.invoke("session:load", { speciesId }),
+  sessionList: () =>
+    ipcRenderer.invoke("session:list"),
+  sessionDeleteImage: (speciesId: string, filename: string) =>
+    ipcRenderer.invoke("session:delete-image", { speciesId, filename }),
 });
 
 // --------- Preload scripts loading ---------

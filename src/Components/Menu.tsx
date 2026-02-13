@@ -7,8 +7,8 @@ import { toast } from "sonner";
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
 import Landmark from "./Landmark";
-import { AnnotatedImage } from "../types/Image";
 import { TrainModelDialog } from "./PopUp";
+import { DetectionModeSelector, DetectionMode } from "./DetectionModeSelector";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
@@ -30,10 +30,11 @@ interface MenuProps {
   onNavigateToLanding?: () => void;
   openTrainDialogOnMount?: boolean;
   onTrainDialogOpened?: () => void;
-}
-
-async function saveLabels(fileArray: AnnotatedImage[]) {
-  await window.api.saveLabels(fileArray);
+  // Multi-specimen detection
+  detectionMode?: DetectionMode;
+  onDetectionModeChange?: (mode: DetectionMode) => void;
+  confThreshold?: number;
+  onConfThresholdChange?: (value: number) => void;
 }
 
 const Menu: React.FC<MenuProps> = ({
@@ -43,6 +44,10 @@ const Menu: React.FC<MenuProps> = ({
   onNavigateToLanding,
   openTrainDialogOnMount,
   onTrainDialogOpened,
+  detectionMode = "single",
+  onDetectionModeChange,
+  confThreshold = 0.25,
+  onConfThresholdChange,
 }) => {
   const [openTrainDialog, setOpenTrainDialog] = useState(false);
 
@@ -58,6 +63,7 @@ const Menu: React.FC<MenuProps> = ({
   const [modelPath, setModelPath] = useState("");
 
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
   const canTrain = useMemo(
     () => (fileArray?.length ?? 0) > 0 && !isTraining,
     [fileArray, isTraining]
@@ -118,16 +124,22 @@ const Menu: React.FC<MenuProps> = ({
 
     try {
       setIsTraining(true);
-      toast.info("Saving labels...");
 
-      await saveLabels(fileArray);
-
-      toast.info("Training model...");
-      const result = await window.api.trainModel(name);
-
-      if (!result.ok) throw new Error(result.error);
-
-      console.log("Training output:", result.output);
+      if (activeSpeciesId) {
+        // Session-scoped: auto-save already persisted annotations to session dir
+        toast.info("Training model from session...");
+        const result = await window.api.trainModel(name, { speciesId: activeSpeciesId });
+        if (!result.ok) throw new Error(result.error);
+        console.log("Training output:", result.output);
+      } else {
+        // Legacy fallback: save labels to flat directory and train
+        toast.info("Saving labels...");
+        await window.api.saveLabels(fileArray);
+        toast.info("Training model...");
+        const result = await window.api.trainModel(name);
+        if (!result.ok) throw new Error(result.error);
+        console.log("Training output:", result.output);
+      }
 
       setOpenTrainDialog(false);
       setModelName("");
@@ -312,6 +324,29 @@ const Menu: React.FC<MenuProps> = ({
                 onSwitchChange={onSwitchChange}
               />
             </motion.div>
+
+            {/* Detection Mode */}
+            {onDetectionModeChange && onConfThresholdChange && (
+              <motion.div variants={sidebarItem}>
+                <motion.div variants={cardHover} initial="initial" whileHover="hover">
+                  <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
+                    <CardHeader className="pb-3">
+                      <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                        Detection Mode
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <DetectionModeSelector
+                        mode={detectionMode}
+                        onModeChange={onDetectionModeChange}
+                        confThreshold={confThreshold}
+                        onConfThresholdChange={onConfThresholdChange}
+                      />
+                    </CardContent>
+                  </Card>
+                </motion.div>
+              </motion.div>
+            )}
 
             {/* Training Card */}
             <motion.div variants={sidebarItem}>

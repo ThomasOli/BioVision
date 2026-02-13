@@ -13,6 +13,7 @@ import { LandingPage } from "./Components/LandingPage"
 import { MyModelsPage } from "./Components/MyModelsPage"
 import { InferencePage } from "./Components/InferencePage"
 import { AppView } from "./types/Image"
+import { DetectionMode } from "./Components/ImageLabeler"
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
@@ -31,6 +32,10 @@ const App: React.FC = () => {
     const saved = localStorage.getItem("biovision-default-opacity")
     return saved ? parseInt(saved, 10) : 100
   })
+  // Multi-specimen detection state
+  const [detectionMode, setDetectionMode] = useState<DetectionMode>("single")
+  const [confThreshold, setConfThreshold] = useState(0.02)
+
   const handleColorChange = (selectedColor: string) => setColor(selectedColor)
   const handleSwitchChange = () => setIsSwitchOn((prev) => !prev)
   const handleOpacityChange = (selectedOpacity: number) => setOpacity(selectedOpacity)
@@ -160,6 +165,10 @@ const App: React.FC = () => {
             onNavigateToLanding={() => handleNavigate("landing")}
             openTrainDialogOnMount={openTrainDialogOnMount}
             onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
+            detectionMode={detectionMode}
+            onDetectionModeChange={setDetectionMode}
+            confThreshold={confThreshold}
+            onConfThresholdChange={setConfThreshold}
           />
         </div>
       </motion.div>
@@ -186,6 +195,8 @@ const App: React.FC = () => {
               color={color}
               opacity={opacity}
               isSwitchOn={isSwitchOn}
+              detectionMode={detectionMode}
+              confThreshold={confThreshold}
             />
           </div>
         </div>

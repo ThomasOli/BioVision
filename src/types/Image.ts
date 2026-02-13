@@ -38,8 +38,11 @@ export interface AnnotatedImage {
   history: BoundingBox[][];
   future: BoundingBox[][];
 
-  // Agentic metadata (optional)
+  // Session context
   speciesId?: string;
+  diskPath?: string; // Persisted path in session directory (survives restarts)
+
+  // Agentic metadata (optional)
   processingStatus?: "pending" | "predicted" | "review" | "approved";
   qualityScore?: number; // 0-1
 }

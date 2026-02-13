@@ -1,19 +1,37 @@
 import React, { ChangeEvent, useState, DragEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Upload, Folder, Trash2, X, ImageIcon, Loader2 } from "lucide-react";
-import { useDispatch } from "react-redux";
+import { useDispatch, useSelector } from "react-redux";
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Progress } from "@/Components/ui/progress";
 import { ScrollArea } from "@/Components/ui/scroll-area";
-import { addFiles } from "../state/filesState/fileSlice";
+import { addFilesWithSpecies } from "../state/filesState/fileSlice";
+import type { RootState } from "../state/store";
+import type { AnnotatedImage, BoundingBox } from "../types/Image";
 import { staggerContainer, staggerItem, dropzoneActive, buttonHover, buttonTap } from "@/lib/animations";
 import { toast } from "sonner";
 
 const fileKey = (f: File) => `${f.name}__${f.size}__${f.lastModified}`;
 
+// Convert a File to base64 string
+async function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Strip the data URL prefix (e.g. "data:image/jpeg;base64,")
+      const base64 = result.split(",")[1];
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 const UploadImages: React.FC = () => {
   const dispatch = useDispatch();
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
 
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
@@ -98,33 +116,73 @@ const UploadImages: React.FC = () => {
     }
   };
 
-  const handleUpload = () => {
+  const handleUpload = async () => {
     if (selectedFiles.length === 0) {
       toast.error("No files to upload.");
       return;
     }
+    if (!activeSpeciesId) {
+      toast.error("No active session. Please select a schema first.");
+      return;
+    }
 
     setIsUploading(true);
-    dispatch(addFiles(selectedFiles));
+    setProgress(0);
 
-    let currentProgress = 0;
-    const interval = setInterval(() => {
-      currentProgress += 50;
-      setProgress(currentProgress);
+    try {
+      const newImages: AnnotatedImage[] = [];
+      const total = selectedFiles.length;
 
-      if (currentProgress >= 100) {
-        clearInterval(interval);
+      for (let i = 0; i < total; i++) {
+        const file = selectedFiles[i];
+        const base64 = await fileToBase64(file);
+        const result = await window.api.sessionSaveImage(
+          activeSpeciesId,
+          base64,
+          file.name,
+          file.type || "image/jpeg"
+        );
 
-        previews.forEach((p) => {
-          if (p.startsWith("blob:")) URL.revokeObjectURL(p);
+        if (!result.ok) {
+          console.error(`Failed to save image ${file.name}:`, result.error);
+          toast.error(`Failed to save ${file.name}: ${result.error || "unknown error"}`);
+          continue;
+        }
+
+        const url = URL.createObjectURL(file);
+        // Electron attaches `path` to File objects via Object.defineProperty
+        const filePath = (file as File & { path?: string }).path || file.name;
+        newImages.push({
+          id: Date.now() + Math.random(),
+          path: filePath,
+          diskPath: result.diskPath,
+          url,
+          filename: file.name,
+          boxes: [] as BoundingBox[],
+          selectedBoxId: null,
+          history: [] as BoundingBox[][],
+          future: [] as BoundingBox[][],
+          speciesId: activeSpeciesId,
         });
 
-        setSelectedFiles([]);
-        setPreviews([]);
-        setIsUploading(false);
-        toast.success("Upload completed!");
+        setProgress(Math.round(((i + 1) / total) * 100));
       }
-    }, 500);
+
+      dispatch(addFilesWithSpecies({ files: newImages, speciesId: activeSpeciesId }));
+
+      previews.forEach((p) => {
+        if (p.startsWith("blob:")) URL.revokeObjectURL(p);
+      });
+
+      setSelectedFiles([]);
+      setPreviews([]);
+      toast.success("Upload completed!");
+    } catch (err) {
+      console.error("Upload failed:", err);
+      toast.error("Upload failed. Please try again.");
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   const handleRemoveImage = (index: number) => {

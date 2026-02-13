@@ -97,53 +97,117 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                                     "height": int(h / scale) if scale != 1.0 else h}
         })
 
-        # Get landmarks from JSON
-        if "boxes" in data and data["boxes"]:
-            all_lm = [lm for box in data["boxes"] for lm in box.get("landmarks", [])]
+        # Get boxes from JSON - support both multi-box and legacy single-box format
+        json_boxes = data.get("boxes", [])
+
+        # Multi-specimen mode: each box has its own bounding region and landmarks
+        if json_boxes and any(box.get("left", 0) != 0 or box.get("top", 0) != 0 for box in json_boxes):
+            # Multi-specimen: boxes have specific regions
+            image_boxes = []
+            for box_data in json_boxes:
+                box_lm = box_data.get("landmarks", [])
+                valid_lm = [lm for lm in box_lm if not lm.get("isSkipped") and lm.get("x", -1) >= 0 and lm.get("y", -1) >= 0]
+                if not valid_lm:
+                    continue
+
+                # Scale landmarks and box coordinates if image was resized
+                if scale != 1.0:
+                    valid_lm = [{**lm, "x": lm["x"] * scale, "y": lm["y"] * scale} for lm in valid_lm]
+                    box_coords = {
+                        "left": int(box_data.get("left", 0) * scale),
+                        "top": int(box_data.get("top", 0) * scale),
+                        "width": int(box_data.get("width", w) * scale),
+                        "height": int(box_data.get("height", h) * scale)
+                    }
+                else:
+                    box_coords = {
+                        "left": box_data.get("left", 0),
+                        "top": box_data.get("top", 0),
+                        "width": box_data.get("width", w),
+                        "height": box_data.get("height", h)
+                    }
+
+                # Detect and normalize orientation per box
+                orig_orientation = detect_orientation(valid_lm)
+                was_mirrored = False
+                if orig_orientation and orig_orientation != target_orientation:
+                    valid_lm = mirror_landmarks(valid_lm, w)
+                    # Also mirror the box
+                    box_coords["left"] = w - box_coords["left"] - box_coords["width"]
+                    was_mirrored = True
+
+                image_boxes.append({
+                    "box": box_coords,
+                    "landmarks": valid_lm,
+                    "orientation": orig_orientation,
+                    "mirrored": was_mirrored
+                })
+
+            if image_boxes:
+                orientation_log.append({
+                    "filename": img_filename,
+                    "mode": "multi-specimen",
+                    "num_boxes": len(image_boxes),
+                    "boxes": [{"orientation": b["orientation"], "mirrored": b["mirrored"]} for b in image_boxes]
+                })
+                processed.append({
+                    "path": corrected_path,
+                    "boxes": image_boxes,
+                    "scale": scale,
+                    "filename": img_filename,
+                    "multi_specimen": True
+                })
         else:
-            all_lm = data.get("landmarks", [])
-        if not all_lm:
-            continue
+            # Single-specimen mode: flatten all landmarks, use auto-detected box
+            if json_boxes:
+                all_lm = [lm for box in json_boxes for lm in box.get("landmarks", [])]
+            else:
+                all_lm = data.get("landmarks", [])
+            if not all_lm:
+                continue
 
-        # Filter valid landmarks (not skipped, has valid coordinates)
-        valid_lm = [lm for lm in all_lm if not lm.get("isSkipped") and lm.get("x", -1) >= 0 and lm.get("y", -1) >= 0]
-        if not valid_lm:
-            continue
+            # Filter valid landmarks (not skipped, has valid coordinates)
+            valid_lm = [lm for lm in all_lm if not lm.get("isSkipped") and lm.get("x", -1) >= 0 and lm.get("y", -1) >= 0]
+            if not valid_lm:
+                continue
 
-        # Scale landmarks if image was resized
-        if scale != 1.0:
-            valid_lm = [{**lm, "x": lm["x"] * scale, "y": lm["y"] * scale} for lm in valid_lm]
+            # Scale landmarks if image was resized
+            if scale != 1.0:
+                valid_lm = [{**lm, "x": lm["x"] * scale, "y": lm["y"] * scale} for lm in valid_lm]
 
-        # Detect and normalize orientation
-        orig_orientation = detect_orientation(valid_lm)
-        was_mirrored = False
+            # Detect and normalize orientation
+            orig_orientation = detect_orientation(valid_lm)
+            was_mirrored = False
 
-        if orig_orientation and orig_orientation != target_orientation:
-            valid_lm = mirror_landmarks(valid_lm, w)
-            was_mirrored = True
+            if orig_orientation and orig_orientation != target_orientation:
+                valid_lm = mirror_landmarks(valid_lm, w)
+                was_mirrored = True
 
-        orientation_log.append({
-            "filename": img_filename,
-            "original_orientation": orig_orientation,
-            "target_orientation": target_orientation,
-            "was_mirrored": was_mirrored
-        })
+            orientation_log.append({
+                "filename": img_filename,
+                "mode": "single-specimen",
+                "original_orientation": orig_orientation,
+                "target_orientation": target_orientation,
+                "was_mirrored": was_mirrored
+            })
 
-        processed.append({
-            "path": corrected_path,
-            "box": detected,
-            "landmarks": valid_lm,
-            "scale": scale,
-            "filename": img_filename,
-            "orientation": orig_orientation,
-            "mirrored": was_mirrored
-        })
+            processed.append({
+                "path": corrected_path,
+                "boxes": [{"box": detected, "landmarks": valid_lm, "orientation": orig_orientation, "mirrored": was_mirrored}],
+                "scale": scale,
+                "filename": img_filename,
+                "multi_specimen": False
+            })
 
     if not processed:
         raise RuntimeError("No valid images with landmarks found")
 
-    # Find common landmarks across all images
-    id_sets = [set(lm.get("id", 0) for lm in p["landmarks"]) for p in processed]
+    # Find common landmarks across all boxes in all images
+    id_sets = []
+    for p in processed:
+        for box_data in p["boxes"]:
+            id_sets.append(set(lm.get("id", 0) for lm in box_data["landmarks"]))
+
     common = id_sets[0]
     for s in id_sets[1:]:
         common &= s
@@ -152,13 +216,14 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     if excluded:
         print(f"Excluding landmark IDs {sorted(excluded)}, using {len(common)} common landmarks: {sorted(common)}", file=sys.stderr)
     if not common:
-        raise RuntimeError("No common landmarks across all images")
+        raise RuntimeError("No common landmarks across all images/boxes")
 
-    # Filter to only common landmarks
+    # Filter to only common landmarks in each box
     for p in processed:
-        p["landmarks"] = [lm for lm in p["landmarks"] if lm.get("id", 0) in common]
+        for box_data in p["boxes"]:
+            box_data["landmarks"] = [lm for lm in box_data["landmarks"] if lm.get("id", 0) in common]
 
-    # Split into train/test sets
+    # Split into train/test sets (at image level, not box level)
     random.seed(seed)
     random.shuffle(processed)
     n_test = max(1, int(len(processed) * test_split))
@@ -178,11 +243,13 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         images = ET.SubElement(root, "images")
         for p in imgs:
             img_el = ET.SubElement(images, "image", file=p["path"])
-            box = p["box"]
-            box_el = ET.SubElement(img_el, "box", top=str(box['top']), left=str(box['left']),
-                                   width=str(box['width']), height=str(box['height']))
-            for lm in sorted(p["landmarks"], key=lambda x: x.get("id", 0)):
-                ET.SubElement(box_el, "part", name=str(rev_map[lm["id"]]), x=str(int(lm["x"])), y=str(int(lm["y"])))
+            # Write each box with its landmarks
+            for box_data in p["boxes"]:
+                box = box_data["box"]
+                box_el = ET.SubElement(img_el, "box", top=str(box['top']), left=str(box['left']),
+                                       width=str(box['width']), height=str(box['height']))
+                for lm in sorted(box_data["landmarks"], key=lambda x: x.get("id", 0)):
+                    ET.SubElement(box_el, "part", name=str(rev_map[lm["id"]]), x=str(int(lm["x"])), y=str(int(lm["y"])))
         ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
     train_path = os.path.join(xml_dir, f"train_{tag}.xml")
@@ -222,9 +289,13 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         json.dump(debug_log, f, indent=2)
 
     with open(os.path.join(debug_dir, f"split_info_{tag}.json"), "w") as f:
+        train_boxes = sum(len(p["boxes"]) for p in train_imgs)
+        test_boxes = sum(len(p["boxes"]) for p in test_imgs)
         json.dump({
-            "train": len(train_imgs),
-            "test": len(test_imgs),
+            "train_images": len(train_imgs),
+            "test_images": len(test_imgs),
+            "train_boxes": train_boxes,
+            "test_boxes": test_boxes,
             "train_files": [p["path"] for p in train_imgs],
             "test_files": [p["path"] for p in test_imgs]
         }, f, indent=2)

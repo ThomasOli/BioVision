@@ -56,10 +56,28 @@ const fileSlice = createSlice({
       });
       state.fileArray = [];
     },
+    // Replace entire fileArray when loading a session from disk
+    setSessionImages: (state, action: PayloadAction<AnnotatedImage[]>) => {
+      state.fileArray.forEach((image) => {
+        URL.revokeObjectURL(image.url);
+      });
+      state.fileArray = action.payload;
+    },
+    // Add files tagged with a speciesId
+    addFilesWithSpecies: (
+      state,
+      action: PayloadAction<{ files: AnnotatedImage[]; speciesId: string }>
+    ) => {
+      const tagged = action.payload.files.map((f) => ({
+        ...f,
+        speciesId: action.payload.speciesId,
+      }));
+      state.fileArray = [...state.fileArray, ...tagged];
+    },
   },
 });
 
-export const { addFiles, removeFile, updateBoxes, clearFiles } =
+export const { addFiles, removeFile, updateBoxes, clearFiles, setSessionImages, addFilesWithSpecies } =
   fileSlice.actions;
 
 export default fileSlice.reducer;

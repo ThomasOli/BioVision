@@ -1,9 +1,9 @@
 import React, { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { motion } from "framer-motion";
-import { ChevronLeft, ChevronRight, Trash2, ZoomIn } from "lucide-react";
+import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Scan, Loader2 } from "lucide-react";
 
-import ImageLabeler from "./ImageLabeler";
+import ImageLabeler, { DetectionMode } from "./ImageLabeler";
 import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
@@ -33,14 +33,18 @@ interface ImageLabelerCarouselProps {
   color: string;
   opacity: number;
   isSwitchOn: boolean;
+  detectionMode?: DetectionMode;
+  confThreshold?: number;
 }
 
 const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   color,
   opacity,
   isSwitchOn,
+  detectionMode = "single",
+  confThreshold = 0.25,
 }) => {
-  const { images, setSelectedImage } = useContext(UndoRedoClearContext);
+  const { images, setSelectedImage, setBoxesFromDetection } = useContext(UndoRedoClearContext);
   const dispatch = useDispatch<AppDispatch>();
 
   // Get Redux state directly to avoid sync issues during deletion
@@ -49,6 +53,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [isMagnified, setIsMagnified] = useState<boolean>(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [isDetecting, setIsDetecting] = useState(false);
 
   // Use Context images for display, but check Redux for "has images" to avoid race conditions
   const totalImages = images.length;
@@ -88,9 +93,18 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     if (!current) return;
 
     const idToDelete = current.id;
+    const filenameToDelete = current.filename;
+    const speciesId = current.speciesId;
 
     // Close dialog first
     setConfirmOpen(false);
+
+    // Delete from session on disk if in a session
+    if (speciesId && filenameToDelete) {
+      window.api.sessionDeleteImage(speciesId, filenameToDelete).catch((err) =>
+        console.error("Failed to delete image from session:", err)
+      );
+    }
 
     // Use Redux state for accurate index calculation (it updates synchronously)
     const reduxIndex = reduxFileArray.findIndex(img => img.id === idToDelete);
@@ -140,6 +154,40 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   }, [handleKeyDown]);
 
   const toggleMagnifiedView = () => setIsMagnified((prev) => !prev);
+
+  // Handle multi-specimen detection with OpenCV
+  const handleDetectSpecimens = useCallback(async () => {
+    if (!current || !current.path) return;
+
+    setIsDetecting(true);
+    try {
+      const result = await window.api.detectSpecimens(current.path, {
+        confThreshold,
+      });
+
+      if (result.ok && result.boxes.length > 0) {
+        // Convert detected boxes to the format expected by context
+        const detectedBoxes = result.boxes.map((box) => ({
+          left: box.left,
+          top: box.top,
+          width: box.width,
+          height: box.height,
+          confidence: box.confidence,
+          class_name: box.class_name,
+        }));
+        setBoxesFromDetection(detectedBoxes);
+      } else if (result.ok && result.boxes.length === 0) {
+        // No specimens detected - could show a toast or message
+        console.log("No specimens detected in this image");
+      } else if (result.error) {
+        console.error("Detection error:", result.error);
+      }
+    } catch (err) {
+      console.error("Failed to detect specimens:", err);
+    } finally {
+      setIsDetecting(false);
+    }
+  }, [current, confThreshold, setBoxesFromDetection]);
 
   const exportCurrent = useCallback(async () => {
     if (!current || !current.boxes?.length) return;
@@ -243,6 +291,31 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
+            {/* Detect Specimens button - only in multi-mode */}
+            {detectionMode === "multi" && (
+              <motion.div {...buttonHover} {...buttonTap}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDetectSpecimens}
+                  disabled={isDetecting || !current}
+                  className="font-bold"
+                >
+                  {isDetecting ? (
+                    <>
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      Detecting...
+                    </>
+                  ) : (
+                    <>
+                      <Scan className="mr-1.5 h-3.5 w-3.5" />
+                      Detect Specimens
+                    </>
+                  )}
+                </Button>
+              </motion.div>
+            )}
+
             {hasAnnotations && (
               <motion.div {...buttonHover} {...buttonTap}>
                 <Button
@@ -332,6 +405,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 color={color}
                 opacity={opacity}
                 mode={isSwitchOn}
+                detectionMode={detectionMode}
               />
             </div>
           ) : (

@@ -1,5 +1,5 @@
 // src/Components/UndoRedoClearContext.tsx
-import React, { createContext, useCallback, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSelector } from "react-redux";
 import { RootState } from "../state/store";
 import { Point, BoundingBox, AnnotatedImage } from "../types/Image";
@@ -10,6 +10,16 @@ const cloneBoxes = (boxes: BoundingBox[]): BoundingBox[] =>
     ...box,
     landmarks: box.landmarks.map((lm) => ({ ...lm })),
   }));
+
+// Detected box from multi-specimen detection
+interface DetectedBoxData {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  confidence?: number;
+  class_name?: string;
+}
 
 interface UndoRedoClearContextProps {
   images: AnnotatedImage[];
@@ -24,6 +34,7 @@ interface UndoRedoClearContextProps {
   deleteBox: (boxId: number) => void;
   selectBox: (boxId: number | null) => void;
   updateBox: (boxId: number, updates: Partial<Omit<BoundingBox, "id" | "landmarks">>) => void;
+  setBoxesFromDetection: (detectedBoxes: DetectedBoxData[]) => void; // Bulk set from detection
   // Landmark operations (now takes boxId)
   addLandmark: (boxId: number, point: Omit<Point, "id">) => void;
   deleteLandmark: (boxId: number, pointId: number) => void;
@@ -37,30 +48,38 @@ export const UndoRedoClearContext = createContext<UndoRedoClearContextProps>({} 
 
 export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildren<object>) => {
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
 
   const [images, setImages] = useState<AnnotatedImage[]>([]);
   const [selectedImage, setSelectedImage] = useState<number>(0);
+  const dirtyImageIds = useRef<Set<number>>(new Set());
+  const autoSaveTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
 
-  // Keep images in sync with Redux fileArray
+  // Keep images in sync with Redux fileArray, filtered by activeSpeciesId
   useEffect(() => {
     setImages((prevImages) => {
+      const relevantFiles = activeSpeciesId
+        ? fileArray.filter((f) => f.speciesId === activeSpeciesId)
+        : fileArray;
+
       const existingIds = new Set(prevImages.map((img) => img.id));
 
-      const newImages: AnnotatedImage[] = fileArray
+      const newImages: AnnotatedImage[] = relevantFiles
         .filter((file) => !existingIds.has(file.id))
         .map((file) => ({
           ...file,
-          boxes: [],
+          boxes: file.boxes?.length ? file.boxes : [],
           selectedBoxId: null,
           history: [],
           future: [],
         }));
 
-      const updatedImages = prevImages.filter((img) => fileArray.some((file) => file.id === img.id));
+      const relevantIds = new Set(relevantFiles.map((f) => f.id));
+      const updatedImages = prevImages.filter((img) => relevantIds.has(img.id));
 
       return [...updatedImages, ...newImages];
     });
-  }, [fileArray]);
+  }, [fileArray, activeSpeciesId]);
 
   // Clamp selectedImage whenever images length changes
   useEffect(() => {
@@ -75,6 +94,38 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     if (images.length === 0) return 0;
     return Math.min(Math.max(selectedImage, 0), images.length - 1);
   }, [selectedImage, images.length]);
+
+  // Mark the current image as dirty (needs auto-save)
+  const markDirty = useCallback((imageId: number) => {
+    dirtyImageIds.current.add(imageId);
+  }, []);
+
+  // Debounced auto-save: persist dirty images' annotations to disk
+  useEffect(() => {
+    if (!activeSpeciesId || images.length === 0 || dirtyImageIds.current.size === 0) return;
+
+    clearTimeout(autoSaveTimeoutRef.current);
+    autoSaveTimeoutRef.current = setTimeout(async () => {
+      const idsToSave = new Set(dirtyImageIds.current);
+      dirtyImageIds.current.clear();
+
+      for (const img of images) {
+        if (!idsToSave.has(img.id)) continue;
+        if (!img.speciesId) continue;
+        try {
+          await window.api.sessionSaveAnnotations(
+            img.speciesId,
+            img.filename,
+            img.boxes
+          );
+        } catch (err) {
+          console.error(`Auto-save failed for ${img.filename}:`, err);
+        }
+      }
+    }, 1000);
+
+    return () => clearTimeout(autoSaveTimeoutRef.current);
+  }, [images, activeSpeciesId]);
 
   // Current boxes for the active image
   const boxes = useMemo<BoundingBox[]>(() => {
@@ -95,16 +146,17 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     return boxes.flatMap((box) => box.landmarks);
   }, [boxes]);
 
-  // Helper to save snapshot before change
+  // Helper to save snapshot before change (also marks image dirty for auto-save)
   const saveSnapshot = useCallback(
     (activeImage: AnnotatedImage): AnnotatedImage => {
+      markDirty(activeImage.id);
       return {
         ...activeImage,
         history: [...(activeImage.history ?? []), cloneBoxes(activeImage.boxes)],
         future: [],
       };
     },
-    []
+    [markDirty]
   );
 
   const undo = useCallback(() => {
@@ -117,6 +169,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
 
       if (!currentImg.history || currentImg.history.length === 0) return prevImages;
 
+      markDirty(currentImg.id);
       const newImages = [...prevImages];
       const activeImage = { ...currentImg };
 
@@ -145,7 +198,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       newImages[idx] = activeImage;
       return newImages;
     });
-  }, [selectedImage]);
+  }, [selectedImage, markDirty]);
 
   const redo = useCallback(() => {
     setImages((prevImages) => {
@@ -157,6 +210,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
 
       if (!currentImg.future || currentImg.future.length === 0) return prevImages;
 
+      markDirty(currentImg.id);
       const newImages = [...prevImages];
       const activeImage = { ...currentImg };
 
@@ -184,7 +238,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       newImages[idx] = activeImage;
       return newImages;
     });
-  }, [selectedImage]);
+  }, [selectedImage, markDirty]);
 
   const clear = useCallback(() => {
     setImages((prevImages) => {
@@ -194,6 +248,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       const currentImg = prevImages[idx];
       if (!currentImg) return prevImages;
 
+      markDirty(currentImg.id);
       const newImages = [...prevImages];
       const activeImage = { ...currentImg };
 
@@ -209,7 +264,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       newImages[idx] = activeImage;
       return newImages;
     });
-  }, [selectedImage]);
+  }, [selectedImage, markDirty]);
 
   const addBox = useCallback(
     (boxData: Omit<BoundingBox, "id" | "landmarks">) => {
@@ -441,6 +496,41 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     [selectedImage, saveSnapshot]
   );
 
+  // Bulk set boxes from detection
+  const setBoxesFromDetection = useCallback(
+    (detectedBoxes: DetectedBoxData[]) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        // Convert detected boxes to BoundingBox format
+        const newBoxes: BoundingBox[] = detectedBoxes.map((det, i) => ({
+          id: Date.now() + i,
+          left: det.left,
+          top: det.top,
+          width: det.width,
+          height: det.height,
+          landmarks: [],
+          confidence: det.confidence,
+          source: "predicted" as const,
+        }));
+
+        activeImage.boxes = newBoxes;
+        activeImage.selectedBoxId = newBoxes.length > 0 ? newBoxes[0].id : null;
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
   return (
     <UndoRedoClearContext.Provider
       value={{
@@ -455,6 +545,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         deleteBox,
         selectBox,
         updateBox,
+        setBoxesFromDetection,
         addLandmark,
         deleteLandmark,
         skipLandmark,
