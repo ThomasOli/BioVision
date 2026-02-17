@@ -8,6 +8,58 @@ import cv2
 from detect_specimen import detect_specimen
 from image_utils import load_image
 
+STANDARD_SIZE = 512
+
+
+def standardize_crop(image, box, landmarks, pad_ratio=0.20):
+    """
+    Crop image to bounding box + padding, resize to STANDARD_SIZE x STANDARD_SIZE,
+    and remap landmarks to the new coordinate space.
+    Returns (cropped_image, remapped_landmarks, crop_metadata).
+    """
+    h, w = image.shape[:2]
+    bx, by = int(box['left']), int(box['top'])
+    bw, bh = int(box['width']), int(box['height'])
+
+    # Pad around bounding box
+    pad_x = int(bw * pad_ratio)
+    pad_y = int(bh * pad_ratio)
+    cx1 = max(0, bx - pad_x)
+    cy1 = max(0, by - pad_y)
+    cx2 = min(w, bx + bw + pad_x)
+    cy2 = min(h, by + bh + pad_y)
+
+    crop = image[cy1:cy2, cx1:cx2]
+    crop_h, crop_w = crop.shape[:2]
+
+    if crop_h == 0 or crop_w == 0:
+        # Fallback: use full image
+        crop = image
+        cx1, cy1 = 0, 0
+        crop_w, crop_h = w, h
+
+    # Scale to STANDARD_SIZE
+    scale_x = STANDARD_SIZE / crop_w
+    scale_y = STANDARD_SIZE / crop_h
+    standardized = cv2.resize(crop, (STANDARD_SIZE, STANDARD_SIZE), interpolation=cv2.INTER_LINEAR)
+
+    # Remap landmarks to cropped+resized coordinates
+    remapped = []
+    for lm in landmarks:
+        nx = (lm['x'] - cx1) * scale_x
+        ny = (lm['y'] - cy1) * scale_y
+        remapped.append({**lm, 'x': nx, 'y': ny})
+
+    metadata = {
+        "crop_origin": [cx1, cy1],
+        "crop_size": [crop_w, crop_h],
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        "original_box": {"left": bx, "top": by, "width": bw, "height": bh},
+    }
+
+    return standardized, remapped, metadata
+
 
 def detect_orientation(landmarks, head_id=0):
     """
@@ -223,39 +275,78 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         for box_data in p["boxes"]:
             box_data["landmarks"] = [lm for lm in box_data["landmarks"] if lm.get("id", 0) in common]
 
-    # Split into train/test sets (at image level, not box level)
+    # Standardize: crop each box to tight crop + padding, resize to 512x512
+    # Each box becomes its own image entry in the XML
+    crop_metadata_log = []
+    standardized_entries = []  # list of {"path": ..., "landmarks": [...], "source": ...}
+
+    for p in processed:
+        # Re-load the corrected (full) image for cropping
+        full_img = cv2.imread(p["path"])
+        if full_img is None:
+            continue
+        base = os.path.splitext(os.path.basename(p["path"]))[0]
+
+        for bi, box_data in enumerate(p["boxes"]):
+            box = box_data["box"]
+            landmarks = box_data["landmarks"]
+
+            cropped_img, remapped_lm, meta = standardize_crop(full_img, box, landmarks)
+
+            # Save cropped image — one per box
+            suffix = f"_box{bi}" if len(p["boxes"]) > 1 else ""
+            crop_path = os.path.join(corrected_dir, f"{base}{suffix}_crop.png")
+            cv2.imwrite(crop_path, cropped_img)
+
+            standardized_entries.append({
+                "path": crop_path,
+                "landmarks": remapped_lm,
+                "source_image": p["filename"],
+                "box_index": bi,
+            })
+
+            crop_metadata_log.append({
+                "source_image": p["filename"],
+                "box_index": bi,
+                "crop_path": crop_path,
+                **meta,
+            })
+
+    if not standardized_entries:
+        raise RuntimeError("No valid standardized crops produced")
+
+    # Split into train/test sets (at crop level)
     random.seed(seed)
-    random.shuffle(processed)
-    n_test = max(1, int(len(processed) * test_split))
-    if len(processed) - n_test < 1:
-        n_test = len(processed) - 1
-    test_imgs, train_imgs = processed[:n_test], processed[n_test:]
-    if len(processed) == 1:
-        train_imgs = test_imgs = processed
+    random.shuffle(standardized_entries)
+    n_test = max(1, int(len(standardized_entries) * test_split))
+    if len(standardized_entries) - n_test < 1:
+        n_test = len(standardized_entries) - 1
+    test_entries, train_entries = standardized_entries[:n_test], standardized_entries[n_test:]
+    if len(standardized_entries) == 1:
+        train_entries = test_entries = standardized_entries
 
     # Create ID mapping (dlib requires sequential 0-based IDs)
     sorted_ids = sorted(common)
     id_map = {i: orig for i, orig in enumerate(sorted_ids)}
     rev_map = {orig: i for i, orig in enumerate(sorted_ids)}
 
-    def write_xml(imgs, path):
+    def write_xml(entries, path):
         root = ET.Element("dataset")
         images = ET.SubElement(root, "images")
-        for p in imgs:
-            img_el = ET.SubElement(images, "image", file=p["path"])
-            # Write each box with its landmarks
-            for box_data in p["boxes"]:
-                box = box_data["box"]
-                box_el = ET.SubElement(img_el, "box", top=str(box['top']), left=str(box['left']),
-                                       width=str(box['width']), height=str(box['height']))
-                for lm in sorted(box_data["landmarks"], key=lambda x: x.get("id", 0)):
-                    ET.SubElement(box_el, "part", name=str(rev_map[lm["id"]]), x=str(int(lm["x"])), y=str(int(lm["y"])))
+        for entry in entries:
+            img_el = ET.SubElement(images, "image", file=entry["path"])
+            # Full-image box since the crop IS the specimen
+            box_el = ET.SubElement(img_el, "box", top="0", left="0",
+                                   width=str(STANDARD_SIZE), height=str(STANDARD_SIZE))
+            for lm in sorted(entry["landmarks"], key=lambda x: x.get("id", 0)):
+                ET.SubElement(box_el, "part", name=str(rev_map[lm["id"]]),
+                              x=str(int(lm["x"])), y=str(int(lm["y"])))
         ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
     train_path = os.path.join(xml_dir, f"train_{tag}.xml")
     test_path = os.path.join(xml_dir, f"test_{tag}.xml")
-    write_xml(train_imgs, train_path)
-    write_xml(test_imgs, test_path)
+    write_xml(train_entries, train_path)
+    write_xml(test_entries, test_path)
 
     # Save debug files
     with open(os.path.join(debug_dir, f"id_mapping_{tag}.json"), "w") as f:
@@ -265,6 +356,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             "original_ids": sorted_ids,
             "excluded_ids": sorted(excluded) if excluded else [],
             "num_landmarks": len(sorted_ids),
+            "standard_size": STANDARD_SIZE,
             "training_config": {
                 "max_dim": max_dim,
                 "test_split": test_split,
@@ -272,6 +364,9 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "target_orientation": target_orientation
             }
         }, f, indent=2)
+
+    with open(os.path.join(debug_dir, f"crop_metadata_{tag}.json"), "w") as f:
+        json.dump(crop_metadata_log, f, indent=2)
 
     with open(os.path.join(debug_dir, f"orientation_{tag}.json"), "w") as f:
         json.dump({
@@ -289,15 +384,13 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         json.dump(debug_log, f, indent=2)
 
     with open(os.path.join(debug_dir, f"split_info_{tag}.json"), "w") as f:
-        train_boxes = sum(len(p["boxes"]) for p in train_imgs)
-        test_boxes = sum(len(p["boxes"]) for p in test_imgs)
         json.dump({
-            "train_images": len(train_imgs),
-            "test_images": len(test_imgs),
-            "train_boxes": train_boxes,
-            "test_boxes": test_boxes,
-            "train_files": [p["path"] for p in train_imgs],
-            "test_files": [p["path"] for p in test_imgs]
+            "train_crops": len(train_entries),
+            "test_crops": len(test_entries),
+            "total_crops": len(standardized_entries),
+            "standard_size": STANDARD_SIZE,
+            "train_files": [e["path"] for e in train_entries],
+            "test_files": [e["path"] for e in test_entries]
         }, f, indent=2)
 
     print(train_path)

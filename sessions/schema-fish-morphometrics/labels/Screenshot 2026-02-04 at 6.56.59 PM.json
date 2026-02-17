@@ -1,0 +1,56 @@
+{
+  "imageFilename": "Screenshot 2026-02-04 at 6.56.59 PM.png",
+  "speciesId": "schema-fish-morphometrics",
+  "boxes": [
+    {
+      "id": 1771367462758,
+      "left": 320,
+      "top": 108,
+      "width": 601,
+      "height": 340,
+      "confidence": 0.943,
+      "source": "predicted",
+      "landmarks": []
+    },
+    {
+      "id": 1771367462759,
+      "left": 474,
+      "top": 132,
+      "width": 471,
+      "height": 312,
+      "confidence": 0.907,
+      "source": "predicted",
+      "landmarks": []
+    },
+    {
+      "id": 1771367462760,
+      "left": 225,
+      "top": 47,
+      "width": 592,
+      "height": 406,
+      "confidence": 0.754,
+      "source": "predicted",
+      "landmarks": []
+    },
+    {
+      "id": 1771367462761,
+      "left": 246,
+      "top": 127,
+      "width": 592,
+      "height": 378,
+      "confidence": 0.376,
+      "source": "predicted",
+      "landmarks": []
+    },
+    {
+      "id": 1771367462762,
+      "left": 141,
+      "top": 194,
+      "width": 599,
+      "height": 231,
+      "confidence": 0.317,
+      "source": "predicted",
+      "landmarks": []
+    }
+  ]
+}

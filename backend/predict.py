@@ -9,6 +9,67 @@ import cv2
 from detect_specimen import detect_specimen
 from image_utils import load_image
 
+STANDARD_SIZE = 512
+
+
+def standardize_crop(image, box, pad_ratio=0.20):
+    """
+    Crop image to bounding box + padding and resize to STANDARD_SIZE x STANDARD_SIZE.
+    Returns (cropped_image, crop_metadata) for inverse mapping.
+    """
+    h, w = image.shape[:2]
+    bx, by = int(box['left']), int(box['top'])
+    bw, bh = int(box['width']), int(box['height'])
+
+    pad_x = int(bw * pad_ratio)
+    pad_y = int(bh * pad_ratio)
+    cx1 = max(0, bx - pad_x)
+    cy1 = max(0, by - pad_y)
+    cx2 = min(w, bx + bw + pad_x)
+    cy2 = min(h, by + bh + pad_y)
+
+    crop = image[cy1:cy2, cx1:cx2]
+    crop_h, crop_w = crop.shape[:2]
+
+    if crop_h == 0 or crop_w == 0:
+        crop = image
+        cx1, cy1 = 0, 0
+        crop_w, crop_h = w, h
+
+    scale_x = STANDARD_SIZE / crop_w
+    scale_y = STANDARD_SIZE / crop_h
+    standardized = cv2.resize(crop, (STANDARD_SIZE, STANDARD_SIZE), interpolation=cv2.INTER_LINEAR)
+
+    metadata = {
+        "crop_origin": (cx1, cy1),
+        "crop_size": (crop_w, crop_h),
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+    }
+
+    return standardized, metadata
+
+
+def map_landmarks_to_original(landmarks_512, crop_meta, image_scale=1.0):
+    """Map landmarks from 512x512 crop space back to original image coordinates."""
+    cx1, cy1 = crop_meta["crop_origin"]
+    sx, sy = crop_meta["scale_x"], crop_meta["scale_y"]
+
+    mapped = []
+    for lm in landmarks_512:
+        # Un-resize: 512 -> crop coordinates
+        x_crop = lm["x"] / sx
+        y_crop = lm["y"] / sy
+        # Offset by crop origin
+        x_img = x_crop + cx1
+        y_img = y_crop + cy1
+        # Scale back to original image size if image was downscaled
+        if image_scale != 1.0:
+            x_img = x_img / image_scale
+            y_img = y_img / image_scale
+        mapped.append({"id": lm["id"], "x": int(round(x_img)), "y": int(round(y_img))})
+    return mapped
+
 
 def save_prediction_log(debug_dir, tag, log_entry):
     """Append prediction to log file."""
@@ -28,6 +89,7 @@ def save_prediction_log(debug_dir, tag, log_entry):
 def predict_image(project_root, tag, image_path):
     """
     Predict landmarks using trained dlib shape predictor.
+    Uses tight-crop standardization (crop + pad + resize to 512x512) to match training.
     Returns landmarks with original IDs from the annotation schema.
     """
     modeldir = os.path.join(project_root, "models")
@@ -79,20 +141,23 @@ def predict_image(project_root, tag, image_path):
     if detected is None:
         detected = {'left': 0, 'top': 0, 'right': w, 'bottom': h, 'width': w, 'height': h}
 
-    # Run dlib shape predictor
-    rect = dlib.rectangle(detected['left'], detected['top'], detected['right'], detected['bottom'])
-    predictor = dlib.shape_predictor(predictor_path)
-    shape = predictor(img, rect)
+    # Standardize: crop to bounding box + padding, resize to 512x512
+    cropped, crop_meta = standardize_crop(img, detected)
 
-    # Extract landmarks with ID mapping back to original schema
-    landmarks = []
+    # Run dlib on the standardized 512x512 image (full-image rect)
+    rect = dlib.rectangle(0, 0, STANDARD_SIZE, STANDARD_SIZE)
+    predictor = dlib.shape_predictor(predictor_path)
+    shape = predictor(cropped, rect)
+
+    # Extract landmarks in 512x512 space
+    landmarks_512 = []
     for i in range(shape.num_parts):
         part = shape.part(i)
         orig_id = id_mapping.get(i, i) if id_mapping else i
-        # Scale coordinates back to original image size
-        x = int(part.x / scale) if scale != 1.0 else int(part.x)
-        y = int(part.y / scale) if scale != 1.0 else int(part.y)
-        landmarks.append({"id": orig_id, "x": x, "y": y})
+        landmarks_512.append({"id": orig_id, "x": part.x, "y": part.y})
+
+    # Map back to original image coordinates
+    landmarks = map_landmarks_to_original(landmarks_512, crop_meta, scale)
 
     # Scale bounding box to original size
     if scale != 1.0:
@@ -127,6 +192,7 @@ def predict_image(project_root, tag, image_path):
 def predict_multi_specimen(project_root, tag, image_path, min_area_ratio=0.02):
     """
     Predict landmarks for multiple specimens using OpenCV detection + dlib.
+    Uses tight-crop standardization per specimen to match training.
     Returns list of {box, landmarks} for each detected specimen.
     """
     from detect_specimen import detect_multiple_specimens
@@ -160,7 +226,6 @@ def predict_multi_specimen(project_root, tag, image_path, min_area_ratio=0.02):
         img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
 
     # Save temp image for detection if scaled
-    import tempfile
     temp_path = None
     if scale != 1.0:
         temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
@@ -187,24 +252,25 @@ def predict_multi_specimen(project_root, tag, image_path, min_area_ratio=0.02):
 
     # Load dlib predictor
     predictor = dlib.shape_predictor(predictor_path)
+    rect = dlib.rectangle(0, 0, STANDARD_SIZE, STANDARD_SIZE)
 
     specimens = []
     for box in detected_boxes:
-        # Create dlib rectangle (use scaled coordinates)
-        rect = dlib.rectangle(box['left'], box['top'], box['right'], box['bottom'])
+        # Standardize: crop to bounding box + padding, resize to 512x512
+        cropped, crop_meta = standardize_crop(img, box)
 
-        # Run shape predictor
-        shape = predictor(img, rect)
+        # Run shape predictor on standardized image
+        shape = predictor(cropped, rect)
 
-        # Extract landmarks with ID mapping
-        landmarks = []
+        # Extract landmarks in 512x512 space
+        landmarks_512 = []
         for i in range(shape.num_parts):
             part = shape.part(i)
             orig_id = id_mapping.get(i, i) if id_mapping else i
-            # Scale coordinates back to original image size
-            x = int(part.x / scale) if scale != 1.0 else int(part.x)
-            y = int(part.y / scale) if scale != 1.0 else int(part.y)
-            landmarks.append({"id": orig_id, "x": x, "y": y})
+            landmarks_512.append({"id": orig_id, "x": part.x, "y": part.y})
+
+        # Map back to original image coordinates
+        landmarks = map_landmarks_to_original(landmarks_512, crop_meta, scale)
 
         # Scale bounding box back to original size
         scaled_box = {k: int(v / scale) if scale != 1.0 else v for k, v in box.items() if isinstance(v, (int, float))}

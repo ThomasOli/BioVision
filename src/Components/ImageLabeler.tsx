@@ -1,12 +1,11 @@
 import React, { useRef, useState, useCallback, useEffect, useContext, useMemo } from "react";
-import { Stage, Layer, Image as KonvaImage, Circle, Text, Rect } from "react-konva";
+import { Stage, Layer, Image as KonvaImage, Circle, Text, Rect, Line, Transformer } from "react-konva";
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 import { BoundingBox } from "../types/Image";
+import { DetectionMode } from "./DetectionModeSelector";
 import Konva from "konva";
-
-export type DetectionMode = "single" | "multi";
 
 interface ImageLabelerProps {
   imageURL: string;
@@ -15,6 +14,7 @@ interface ImageLabelerProps {
   opacity: number;
   mode: boolean; // View-only mode
   detectionMode?: DetectionMode;
+  autoCorrectionMode?: boolean;
 }
 
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
@@ -23,7 +23,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   color,
   opacity,
   mode,
-  detectionMode = "single",
+  detectionMode = "manual",
+  autoCorrectionMode = false,
 }) => {
   const {
     addLandmark,
@@ -31,6 +32,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     selectedBoxId,
     addBox,
     selectBox,
+    updateBox,
     undo,
     redo,
   } = useContext(UndoRedoClearContext);
@@ -45,6 +47,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<Konva.Stage>(null);
+  const selectedRectRef = useRef<Konva.Rect>(null);
+  const transformerRef = useRef<Konva.Transformer>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [containerSize, setContainerSize] = useState<{ w: number; h: number }>({
@@ -53,6 +57,12 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   });
 
   const [scale, setScale] = useState(1);
+
+  // Drag-to-draw bounding box state
+  const [isDrawingBox, setIsDrawingBox] = useState(false);
+  const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(null);
+  const [drawCurrent, setDrawCurrent] = useState<{ x: number; y: number } | null>(null);
+  const [isRedrawingSelected, setIsRedrawingSelected] = useState(false);
 
   // Track if we just created a box to avoid double-adding landmarks
   const pendingBoxRef = useRef<{ x: number; y: number } | null>(null);
@@ -146,12 +156,18 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     [imageDimensions]
   );
 
+  // In manual mode, hide predicted boxes until user manually draws/edits boxes.
+  const visibleBoxes = useMemo<BoundingBox[]>(() => {
+    if (detectionMode !== "manual") return boxes;
+    return boxes.filter((box) => box.source !== "predicted");
+  }, [boxes, detectionMode]);
+
   // Check if point is inside a box
   const findBoxAtPoint = useCallback(
     (x: number, y: number): BoundingBox | null => {
       // Check boxes in reverse order (top-most first)
-      for (let i = boxes.length - 1; i >= 0; i--) {
-        const box = boxes[i];
+      for (let i = visibleBoxes.length - 1; i >= 0; i--) {
+        const box = visibleBoxes[i];
         if (
           x >= box.left &&
           x <= box.left + box.width &&
@@ -163,8 +179,117 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       }
       return null;
     },
-    [boxes]
+    [visibleBoxes]
   );
+
+  // Drag-to-draw handlers for manual mode
+  const handleMouseDown = useCallback(
+    (e: KonvaEventObject<MouseEvent>) => {
+      if (mode) return;
+      const pos = getPointerPosition(e);
+      if (!pos || !isPointInBounds(pos.x, pos.y)) return;
+
+      // Don't start drawing if clicking inside an existing visible box
+      const clickedBox = findBoxAtPoint(pos.x, pos.y);
+      if (detectionMode === "manual") {
+        if (clickedBox) return;
+        setIsDrawingBox(true);
+        setIsRedrawingSelected(false);
+        setDrawStart(pos);
+        setDrawCurrent(pos);
+        return;
+      }
+
+      // Auto mode correction: redraw selected box by dragging in empty area
+      if (detectionMode === "auto" && autoCorrectionMode) {
+        if (clickedBox) return;
+        if (selectedBoxId === null) return;
+        setIsDrawingBox(true);
+        setIsRedrawingSelected(true);
+        setDrawStart(pos);
+        setDrawCurrent(pos);
+      }
+    },
+    [mode, detectionMode, autoCorrectionMode, selectedBoxId, getPointerPosition, isPointInBounds, findBoxAtPoint]
+  );
+
+  const handleMouseMove = useCallback(
+    (e: KonvaEventObject<MouseEvent>) => {
+      if (!isDrawingBox || !drawStart) return;
+      const pos = getPointerPosition(e);
+      if (!pos) return;
+
+      // Clamp to image bounds
+      const x = imageDimensions ? Math.max(0, Math.min(pos.x, imageDimensions.width)) : pos.x;
+      const y = imageDimensions ? Math.max(0, Math.min(pos.y, imageDimensions.height)) : pos.y;
+      setDrawCurrent({ x, y });
+    },
+    [isDrawingBox, drawStart, getPointerPosition, imageDimensions]
+  );
+
+  const handleMouseUp = useCallback(
+    () => {
+      if (!isDrawingBox || !drawStart || !drawCurrent) {
+        setIsDrawingBox(false);
+        setIsRedrawingSelected(false);
+        setDrawStart(null);
+        setDrawCurrent(null);
+        return;
+      }
+
+      const left = Math.min(drawStart.x, drawCurrent.x);
+      const top = Math.min(drawStart.y, drawCurrent.y);
+      const width = Math.abs(drawCurrent.x - drawStart.x);
+      const height = Math.abs(drawCurrent.y - drawStart.y);
+
+      // Minimum size threshold to avoid accidental micro-boxes
+      const minSize = imageDimensions ? Math.max(20, imageDimensions.width * 0.02) : 20;
+      if (width >= minSize && height >= minSize) {
+        if (detectionMode === "manual") {
+          addBox({
+            left: Math.round(left),
+            top: Math.round(top),
+            width: Math.round(width),
+            height: Math.round(height),
+            source: "manual",
+          });
+        } else if (
+          detectionMode === "auto" &&
+          autoCorrectionMode &&
+          isRedrawingSelected &&
+          selectedBoxId !== null
+        ) {
+          updateBox(selectedBoxId, {
+            left: Math.round(left),
+            top: Math.round(top),
+            width: Math.round(width),
+            height: Math.round(height),
+            source: "corrected",
+            confidence: undefined,
+            maskOutline: undefined,
+            detectionMethod: "human_corrected",
+          });
+        }
+      }
+
+      setIsDrawingBox(false);
+      setIsRedrawingSelected(false);
+      setDrawStart(null);
+      setDrawCurrent(null);
+    },
+    [isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox]
+  );
+
+  // Preview rectangle for drag-to-draw
+  const drawPreview = useMemo(() => {
+    if (!isDrawingBox || !drawStart || !drawCurrent) return null;
+    return {
+      x: Math.min(drawStart.x, drawCurrent.x),
+      y: Math.min(drawStart.y, drawCurrent.y),
+      width: Math.abs(drawCurrent.x - drawStart.x),
+      height: Math.abs(drawCurrent.y - drawStart.y),
+    };
+  }, [isDrawingBox, drawStart, drawCurrent]);
 
   // Click to add landmark or select box
   const handleCanvasClick = useCallback(
@@ -174,8 +299,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       const pos = getPointerPosition(e);
       if (!pos || !isPointInBounds(pos.x, pos.y)) return;
 
-      // In multi-mode, check if clicking on a box to select it
-      if (detectionMode === "multi") {
+      // In auto mode, check if clicking on a box to select it
+      if (detectionMode === "auto") {
         const clickedBox = findBoxAtPoint(pos.x, pos.y);
 
         if (clickedBox) {
@@ -184,40 +309,49 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
             selectBox(clickedBox.id);
             return;
           }
-          // If clicking on already selected box, add landmark
-          addLandmark(clickedBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
+          // In correction mode, keep click for selection only.
+          if (!autoCorrectionMode) {
+            // If clicking on already selected box, add landmark
+            addLandmark(clickedBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
+          }
           return;
         }
 
-        // Clicking outside any box in multi-mode - do nothing
+        // Clicking outside any box in auto mode - do nothing
         return;
       }
 
-      // Single-specimen mode: auto-create a default box if none exists
-      if (boxes.length === 0) {
-        // Store the position to add landmark after box is created
-        pendingBoxRef.current = pos;
-        addBox({
-          left: 0,
-          top: 0,
-          width: imageDimensions.width,
-          height: imageDimensions.height,
-        });
+      // Manual mode: clicking inside an existing box adds a landmark to it
+      if (detectionMode === "manual") {
+        const clickedBox = findBoxAtPoint(pos.x, pos.y);
+        if (clickedBox) {
+          if (selectedBoxId !== clickedBox.id) {
+            selectBox(clickedBox.id);
+            return;
+          }
+          addLandmark(clickedBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
+        }
+        // Clicking outside boxes in manual mode does nothing (drag to draw a new box)
         return;
       }
-
-      // Use the first box (we only have one default box now)
-      const targetBox = boxes[0];
-
-      // Auto-select the box if not selected
-      if (selectedBoxId !== targetBox.id) {
-        selectBox(targetBox.id);
-      }
-
-      addLandmark(targetBox.id, { x: Math.round(pos.x), y: Math.round(pos.y) });
     },
-    [image, imageDimensions, mode, getPointerPosition, isPointInBounds, boxes, selectedBoxId, addBox, selectBox, addLandmark, detectionMode, findBoxAtPoint]
+    [image, imageDimensions, mode, getPointerPosition, isPointInBounds, selectedBoxId, selectBox, addLandmark, detectionMode, findBoxAtPoint, autoCorrectionMode]
   );
+
+  useEffect(() => {
+    const tr = transformerRef.current;
+    const node = selectedRectRef.current;
+    if (!tr) return;
+
+    if (detectionMode === "auto" && autoCorrectionMode && node) {
+      tr.nodes([node]);
+      tr.getLayer()?.batchDraw();
+      return;
+    }
+
+    tr.nodes([]);
+    tr.getLayer()?.batchDraw();
+  }, [detectionMode, autoCorrectionMode, selectedBoxId, visibleBoxes]);
 
   useEffect(() => {
     onBoxesChange(boxes);
@@ -247,6 +381,9 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
             width={stageW}
             height={stageH}
             onClick={handleCanvasClick}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
             ref={stageRef}
             scaleX={scale}
             scaleY={scale}
@@ -255,7 +392,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
               overflow: "hidden",
               border: "1px solid hsl(var(--border))",
               backgroundColor: "hsl(var(--background))",
-              cursor: mode ? "default" : "crosshair",
+              cursor: mode ? "default" : isDrawingBox ? "crosshair" : "crosshair",
             }}
           >
             <Layer>
@@ -265,14 +402,40 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                 height={imageDimensions.height}
               />
 
-              {/* Render bounding boxes in multi-mode */}
-              {detectionMode === "multi" && boxes.map((box, index) => {
+              {/* Draw preview rectangle during drag */}
+              {drawPreview && (
+                <Rect
+                  x={drawPreview.x}
+                  y={drawPreview.y}
+                  width={drawPreview.width}
+                  height={drawPreview.height}
+                  stroke="#3b82f6"
+                  strokeWidth={boxStrokeWidth}
+                  dash={[8, 4]}
+                  fill="rgba(59, 130, 246, 0.08)"
+                />
+              )}
+
+              {/* Render bounding boxes */}
+              {visibleBoxes.map((box, index) => {
                 const isSelected = selectedBoxId === box.id;
                 const boxColor = getBoxColor(isSelected);
+                const isEditableSelected = detectionMode === "auto" && autoCorrectionMode && isSelected;
 
                 return (
                   <React.Fragment key={`box-${box.id}`}>
+                    {/* SAM2 mask polygon overlay */}
+                    {box.maskOutline && box.maskOutline.length > 0 && (
+                      <Line
+                        points={box.maskOutline.flat()}
+                        closed={true}
+                        fill={isSelected ? "rgba(59, 130, 246, 0.15)" : "rgba(100, 100, 100, 0.1)"}
+                        stroke={isSelected ? "#3b82f6" : "#6b7280"}
+                        strokeWidth={boxStrokeWidth * 0.5}
+                      />
+                    )}
                     <Rect
+                      ref={isEditableSelected ? selectedRectRef : undefined}
                       x={box.left}
                       y={box.top}
                       width={box.width}
@@ -281,6 +444,51 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                       strokeWidth={boxStrokeWidth}
                       dash={isSelected ? undefined : [10, 5]}
                       fill={isSelected ? "rgba(59, 130, 246, 0.1)" : "transparent"}
+                      draggable={isEditableSelected}
+                      onDragEnd={(e) => {
+                        if (!isEditableSelected || !imageDimensions) return;
+                        const node = e.target;
+                        const nextLeft = Math.max(0, Math.min(node.x(), imageDimensions.width - box.width));
+                        const nextTop = Math.max(0, Math.min(node.y(), imageDimensions.height - box.height));
+                        updateBox(box.id, {
+                          left: Math.round(nextLeft),
+                          top: Math.round(nextTop),
+                          source: "corrected",
+                          confidence: undefined,
+                          maskOutline: undefined,
+                          detectionMethod: "human_corrected",
+                        });
+                      }}
+                      onTransformEnd={() => {
+                        if (!isEditableSelected || !imageDimensions || !selectedRectRef.current) return;
+                        const node = selectedRectRef.current;
+                        const scaleX = node.scaleX();
+                        const scaleY = node.scaleY();
+
+                        const rawLeft = node.x();
+                        const rawTop = node.y();
+                        const rawWidth = Math.max(12, node.width() * scaleX);
+                        const rawHeight = Math.max(12, node.height() * scaleY);
+
+                        node.scaleX(1);
+                        node.scaleY(1);
+
+                        const left = Math.max(0, Math.min(rawLeft, imageDimensions.width - rawWidth));
+                        const top = Math.max(0, Math.min(rawTop, imageDimensions.height - rawHeight));
+                        const width = Math.max(12, Math.min(rawWidth, imageDimensions.width - left));
+                        const height = Math.max(12, Math.min(rawHeight, imageDimensions.height - top));
+
+                        updateBox(box.id, {
+                          left: Math.round(left),
+                          top: Math.round(top),
+                          width: Math.round(width),
+                          height: Math.round(height),
+                          source: "corrected",
+                          confidence: undefined,
+                          maskOutline: undefined,
+                          detectionMethod: "human_corrected",
+                        });
+                      }}
                     />
                     {/* Box number label */}
                     <Text
@@ -305,8 +513,33 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                 );
               })}
 
+              {detectionMode === "auto" && autoCorrectionMode && (
+                <Transformer
+                  ref={transformerRef}
+                  rotateEnabled={false}
+                  enabledAnchors={[
+                    "top-left",
+                    "top-center",
+                    "top-right",
+                    "middle-right",
+                    "bottom-right",
+                    "bottom-center",
+                    "bottom-left",
+                    "middle-left",
+                  ]}
+                  boundBoxFunc={(oldBox, newBox) => {
+                    if (!imageDimensions) return oldBox;
+                    if (newBox.width < 12 || newBox.height < 12) return oldBox;
+                    if (newBox.x < 0 || newBox.y < 0) return oldBox;
+                    if (newBox.x + newBox.width > imageDimensions.width) return oldBox;
+                    if (newBox.y + newBox.height > imageDimensions.height) return oldBox;
+                    return newBox;
+                  }}
+                />
+              )}
+
               {/* Render landmarks */}
-              {boxes.map((box) => {
+              {visibleBoxes.map((box) => {
                 const isBoxSelected = selectedBoxId === box.id;
 
                 return (
@@ -315,8 +548,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                       // Skip rendering for skipped landmarks
                       if (point.isSkipped) return null;
 
-                      // In multi-mode, dim landmarks of non-selected boxes
-                      const landmarkOpacity = detectionMode === "multi" && !isBoxSelected
+                      // Dim landmarks of non-selected boxes
+                      const landmarkOpacity = !isBoxSelected && visibleBoxes.length > 1
                         ? (opacity / 100) * 0.4
                         : opacity / 100;
 

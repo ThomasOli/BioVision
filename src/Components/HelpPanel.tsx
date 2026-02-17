@@ -9,6 +9,8 @@ import {
   Keyboard,
   Lightbulb,
   Rocket,
+  ListChecks,
+  Database,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -141,17 +143,17 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      BioVision helps you train machine learning models to automatically
-                      detect landmarks on biological images.
+                      BioVision supports a full annotation loop:
+                      detection (YOLO/CV), user correction, landmarking, and model training.
                     </p>
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Quick Start:</p>
                       <ol className="ml-4 list-decimal space-y-1">
-                        <li>Import your images using "Annotate Images"</li>
-                        <li>Draw bounding boxes around regions of interest</li>
-                        <li>Add landmark points within each box</li>
-                        <li>Train a model when you have enough annotations</li>
-                        <li>Use your model to predict landmarks on new images</li>
+                        <li>Create or resume a session from Annotate Images</li>
+                        <li>Upload images and optionally import pre-annotated labels/XML</li>
+                        <li>Choose Manual or Auto detection and annotate landmarks</li>
+                        <li>Train landmark model (dlib) and optionally fine-tune session detector (YOLO)</li>
+                        <li>Run inference on unseen images and export CSV/JSON results</li>
                       </ol>
                     </div>
                   </div>
@@ -166,25 +168,46 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Bounding Boxes</p>
                       <p>
-                        Use the Box tool to draw rectangles around regions you want to
-                        annotate. Each box represents one instance of your subject.
+                        Manual mode: no auto boxes are shown; draw boxes yourself.
+                        Auto mode: click Auto-detect, then accept/correct/delete detected boxes.
                       </p>
                     </div>
                     <Separator />
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Landmarks</p>
                       <p>
-                        Switch to the Landmark tool to place points within a selected box.
-                        Consistent landmark ordering across all images is important for
-                        training quality.
+                        Place landmarks consistently inside each accepted box.
+                        Landmark order/ID consistency is critical for reliable dlib training.
                       </p>
                     </div>
                     <Separator />
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Selection & Editing</p>
+                      <p className="font-medium text-foreground">Correction Loop</p>
                       <p>
-                        Use the Select tool to move boxes or landmarks. Click on a box to
-                        select it, then drag to reposition.
+                        In Auto mode, correction mode lets you redraw/resize selected boxes.
+                        Deleting bad auto boxes records hard negatives for future YOLO fine-tuning.
+                      </p>
+                    </div>
+                  </div>
+                </AccordionItem>
+
+                <AccordionItem
+                  title="Pre-Annotated Import"
+                  icon={<Database className="h-4 w-4" />}
+                >
+                  <div className="space-y-3 text-sm text-muted-foreground">
+                    <p>
+                      You can import pre-annotated datasets into a session before continuing annotation.
+                    </p>
+                    <ul className="ml-4 list-disc space-y-1">
+                      <li>Supported: JSON with boxes + landmarks</li>
+                      <li>Supported: landmarks-only JSON (box is auto-derived and validated)</li>
+                      <li>Advanced: import dlib XML for direct XML-based training</li>
+                    </ul>
+                    <div className="rounded-md bg-muted/50 p-3">
+                      <p className="text-xs">
+                        Imported labels and in-app edits are merged in the same session labels.
+                        For dlib, training consumes XML; for YOLO detection, training consumes session label JSON.
                       </p>
                     </div>
                   </div>
@@ -197,8 +220,8 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      BioVision uses dlib's shape predictor to train landmark detection
-                      models.
+                      Landmark training uses dlib shape predictor. Detection fine-tuning
+                      uses session YOLO checkpoints with versioning and promotion.
                     </p>
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Best Practices:</p>
@@ -206,13 +229,13 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                         <li>Annotate at least 20-30 images for basic training</li>
                         <li>Include diverse examples (angles, lighting, sizes)</li>
                         <li>Be consistent with landmark placement order</li>
-                        <li>Use clear, versioned model names (e.g., "model_v1")</li>
+                        <li>Use detection presets based on goal: Precision/Recall/Single Object</li>
                       </ul>
                     </div>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
-                        Training time varies based on the number of images and landmarks.
-                        Larger datasets produce more accurate models.
+                        YOLO training keeps versioned candidates and promotes only if validation
+                        quality is not worse than the active detector.
                       </p>
                     </div>
                   </div>
@@ -225,8 +248,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      Once you have a trained model, use it to automatically detect
-                      landmarks on new images.
+                      Run inference with your trained dlib model to predict landmarks on new images.
                     </p>
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Steps:</p>
@@ -234,9 +256,36 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                         <li>Go to "Run Inference" from the landing page</li>
                         <li>Select your trained model</li>
                         <li>Upload images to analyze</li>
-                        <li>Review the predicted landmarks</li>
+                        <li>Review predicted landmarks and confidence</li>
                         <li>Export results as CSV or JSON</li>
                       </ol>
+                    </div>
+                  </div>
+                </AccordionItem>
+
+                <AccordionItem
+                  title="End-to-End Test Pipeline"
+                  icon={<ListChecks className="h-4 w-4" />}
+                >
+                  <div className="space-y-3 text-sm text-muted-foreground">
+                    <p className="font-medium text-foreground">Session QA Checklist</p>
+                    <ol className="ml-4 list-decimal space-y-1">
+                      <li>Create a fresh session and upload 10-20 images</li>
+                      <li>Import pre-annotated JSON (include one landmarks-only sample)</li>
+                      <li>Verify imported images/boxes/landmarks appear in workspace</li>
+                      <li>Auto-detect on 3-5 images using each preset (Balanced/Precision/Recall/Single)</li>
+                      <li>Correct and delete some auto boxes, then annotate landmarks</li>
+                      <li>Train YOLO detection once, then annotate more images and train again</li>
+                      <li>Confirm second YOLO run creates a new version and reports promoted/not promoted</li>
+                      <li>Run dlib train preflight, then train dlib model</li>
+                      <li>Open Inference page, run model on unseen images, export CSV and JSON</li>
+                      <li>Spot-check outputs: landmark IDs, coordinates, and image filenames</li>
+                    </ol>
+                    <div className="rounded-md bg-muted/50 p-3">
+                      <p className="text-xs">
+                        Minimum acceptance: no import validation errors, no training crash,
+                        inference exports complete, and qualitative landmark placement is stable.
+                      </p>
                     </div>
                   </div>
                 </AccordionItem>

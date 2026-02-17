@@ -30,15 +30,25 @@ interface TrainOptions {
   seed?: number;
   customOptions?: Record<string, number>;
   speciesId?: string;
+  useImportedXml?: boolean;
 }
 
-interface DetectionOptions {
-  confThreshold?: number;
-}
+interface DetectionOptions {}
 
 contextBridge.exposeInMainWorld("api", {
   saveLabels: (data : AnnotatedImage []) => ipcRenderer.invoke("ml:save-labels", data),
   trainModel: (modelName: string, options?: TrainOptions) => ipcRenderer.invoke("ml:train", modelName, options),
+  importPreAnnotatedDataset: (options?: { speciesId?: string }) =>
+    ipcRenderer.invoke("ml:import-preannotated-dataset", options),
+  importDlibXml: (args: { modelName: string; speciesId?: string }) =>
+    ipcRenderer.invoke("ml:import-dlib-xml", args),
+  trainingPreflight: (args: {
+    speciesId?: string;
+    modelName: string;
+    useImportedXml?: boolean;
+    workspaceImages?: number;
+    importedImagesHint?: number;
+  }) => ipcRenderer.invoke("ml:training-preflight", args),
   predictImage: (imagePath: string, tag: string) => ipcRenderer.invoke("ml:predict", imagePath, tag),
   selectImageFolder: () => ipcRenderer.invoke("select-image-folder"),
   getProjectRoot: () => ipcRenderer.invoke("ml:get-project-root"),
@@ -59,12 +69,38 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.invoke("session:save-image", { speciesId, imageData, filename, mimeType }),
   sessionSaveAnnotations: (speciesId: string, filename: string, boxes: any[]) =>
     ipcRenderer.invoke("session:save-annotations", { speciesId, filename, boxes }),
+  sessionAddRejectedDetection: (
+    speciesId: string,
+    filename: string,
+    rejectedDetection: {
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+      confidence?: number;
+      className?: string;
+      detectionMethod?: string;
+    }
+  ) => ipcRenderer.invoke("session:add-rejected-detection", { speciesId, filename, rejectedDetection }),
   sessionLoad: (speciesId: string) =>
     ipcRenderer.invoke("session:load", { speciesId }),
   sessionList: () =>
     ipcRenderer.invoke("session:list"),
   sessionDeleteImage: (speciesId: string, filename: string) =>
     ipcRenderer.invoke("session:delete-image", { speciesId, filename }),
+  // SuperAnnotator pipeline
+  superAnnotate: (imagePath: string, className: string, modelTag?: string, options?: { confThreshold?: number; samEnabled?: boolean; maxObjects?: number; detectionMode?: string; detectionPreset?: string }, speciesId?: string) =>
+    ipcRenderer.invoke("ml:super-annotate", { imagePath, className, modelTag, options, speciesId }),
+  checkSuperAnnotator: () => ipcRenderer.invoke("ml:check-super-annotator"),
+  initSuperAnnotator: () => ipcRenderer.invoke("ml:init-super-annotator"),
+  refineSam: (imagePath: string, objectIndex: number, clickPoint: [number, number], clickLabel: number) =>
+    ipcRenderer.invoke("ml:refine-sam", { imagePath, objectIndex, clickPoint, clickLabel }),
+  trainYolo: (speciesId: string, className: string, epochs?: number, detectionPreset?: string) =>
+    ipcRenderer.invoke("ml:train-yolo", { speciesId, className, epochs, detectionPreset }),
+  onSuperAnnotateProgress: (callback: (data: any) => void) => {
+    ipcRenderer.on("ml:super-annotate-progress", (_event: any, data: any) => callback(data));
+    return () => { ipcRenderer.removeAllListeners("ml:super-annotate-progress"); };
+  },
 });
 
 // --------- Preload scripts loading ---------

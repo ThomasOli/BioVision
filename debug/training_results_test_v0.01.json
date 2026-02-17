@@ -1,0 +1,7 @@
+{
+  "model_path": "/Users/juntianzhong/BioVision/models/predictor_test_v0.01.dat",
+  "train_error": 0.32686175174885057,
+  "test_error": 39.51317778553929,
+  "num_images": 18,
+  "num_landmarks": 11
+}

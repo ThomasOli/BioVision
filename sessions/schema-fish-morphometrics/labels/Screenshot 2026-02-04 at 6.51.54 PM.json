@@ -1,0 +1,15 @@
+{
+  "imageFilename": "Screenshot 2026-02-04 at 6.51.54 PM.png",
+  "speciesId": "schema-fish-morphometrics",
+  "boxes": [
+    {
+      "id": 1771367102785,
+      "left": 27,
+      "top": 13,
+      "width": 1022,
+      "height": 445,
+      "source": "corrected",
+      "landmarks": []
+    }
+  ]
+}

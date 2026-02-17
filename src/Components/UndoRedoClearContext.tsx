@@ -21,6 +21,32 @@ interface DetectedBoxData {
   class_name?: string;
 }
 
+// SuperAnnotator result object (from pipeline)
+interface SuperAnnotateObjectData {
+  box: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+    width: number;
+    height: number;
+    confidence: number;
+    class_name: string;
+  };
+  mask_outline: [number, number][];
+  landmarks: { id: number; x: number; y: number }[];
+  confidence: number;
+  class_name: string;
+  instance_metadata: {
+    center: [number, number];
+    crop_origin: [number, number];
+    crop_size: [number, number];
+    rotation: number;
+    scale: number;
+  };
+  detection_method: string;
+}
+
 interface UndoRedoClearContextProps {
   images: AnnotatedImage[];
   setImages: React.Dispatch<React.SetStateAction<AnnotatedImage[]>>;
@@ -34,7 +60,8 @@ interface UndoRedoClearContextProps {
   deleteBox: (boxId: number) => void;
   selectBox: (boxId: number | null) => void;
   updateBox: (boxId: number, updates: Partial<Omit<BoundingBox, "id" | "landmarks">>) => void;
-  setBoxesFromDetection: (detectedBoxes: DetectedBoxData[]) => void; // Bulk set from detection
+  setBoxesFromDetection: (detectedBoxes: DetectedBoxData[]) => void;
+  setBoxesFromSuperAnnotation: (objects: SuperAnnotateObjectData[]) => void;
   // Landmark operations (now takes boxId)
   addLandmark: (boxId: number, point: Omit<Point, "id">) => void;
   deleteLandmark: (boxId: number, pointId: number) => void;
@@ -531,6 +558,49 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     [selectedImage, saveSnapshot]
   );
 
+  // Bulk set boxes from SuperAnnotator pipeline (with landmarks, masks, metadata)
+  const setBoxesFromSuperAnnotation = useCallback(
+    (objects: SuperAnnotateObjectData[]) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        const newBoxes: BoundingBox[] = objects.map((obj, i) => ({
+          id: Date.now() + i,
+          left: obj.box.left,
+          top: obj.box.top,
+          width: obj.box.width,
+          height: obj.box.height,
+          landmarks: obj.landmarks.map((lm) => ({
+            x: lm.x,
+            y: lm.y,
+            id: lm.id,
+            isPredicted: true,
+          })),
+          confidence: obj.confidence,
+          source: "predicted" as const,
+          maskOutline: obj.mask_outline,
+          className: obj.class_name,
+          instanceMetadata: obj.instance_metadata,
+          detectionMethod: obj.detection_method,
+        }));
+
+        activeImage.boxes = newBoxes;
+        activeImage.selectedBoxId = newBoxes.length > 0 ? newBoxes[0].id : null;
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
   return (
     <UndoRedoClearContext.Provider
       value={{
@@ -546,6 +616,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         selectBox,
         updateBox,
         setBoxesFromDetection,
+        setBoxesFromSuperAnnotation,
         addLandmark,
         deleteLandmark,
         skipLandmark,

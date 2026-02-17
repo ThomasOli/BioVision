@@ -1,0 +1,14 @@
+{
+  "num_images": 18,
+  "num_landmarks": 11,
+  "tree_depth": 3,
+  "cascade_depth": 12,
+  "nu": 0.3,
+  "feature_pool_size": 400,
+  "num_trees_per_cascade_level": 200,
+  "num_test_splits": 10,
+  "oversampling_amount": 300,
+  "oversampling_translation_jitter": 0.15,
+  "feature_pool_region_padding": 0.1,
+  "lambda_param": 0.2
+}

@@ -21,6 +21,8 @@ interface TrainModelDialogProps {
   setModelName: (name: string) => void;
   isTraining?: boolean;
   modelName: string;
+  preflightSummary?: string;
+  preflightWarning?: string;
 }
 
 export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
@@ -30,6 +32,8 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   modelName,
   setModelName,
   isTraining = false,
+  preflightSummary,
+  preflightWarning,
 }) => {
   const [touched, setTouched] = useState(false);
 
@@ -74,7 +78,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, canTrain, isTraining, trimmed, nameOk]);
+  }, [open, canTrain, isTraining, handleTrainConfirm]);
 
   return (
     <Dialog open={open} onOpenChange={(value) => !isTraining && setOpen(value)}>
@@ -122,6 +126,21 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
               {helperText}
             </p>
           </div>
+
+          {(preflightSummary || preflightWarning) && (
+            <div className="rounded-md border border-border/70 bg-muted/30 p-3">
+              {preflightSummary && (
+                <p className="text-[11px] text-muted-foreground">
+                  {preflightSummary}
+                </p>
+              )}
+              {preflightWarning && (
+                <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                  {preflightWarning}
+                </p>
+              )}
+            </div>
+          )}
 
           {isTraining && (
             <div className="space-y-2">

@@ -26,6 +26,18 @@ export interface BoundingBox {
   confidence?: number; // Overall box confidence
   source?: "manual" | "predicted" | "corrected";
   predictedBy?: string; // Model name
+
+  // SuperAnnotator fields
+  maskOutline?: [number, number][]; // SAM2 polygon for canvas overlay
+  className?: string; // Detected class (user's prompt text)
+  instanceMetadata?: {
+    center: [number, number];
+    crop_origin: [number, number];
+    crop_size: [number, number];
+    rotation: number;
+    scale: number;
+  };
+  detectionMethod?: string; // "yolo_world+sam2", "opencv", etc.
 }
 
 export interface AnnotatedImage {

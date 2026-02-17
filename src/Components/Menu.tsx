@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { useSelector } from "react-redux";
 import { Copy, FolderOpen, Loader2, Home } from "lucide-react";
@@ -8,13 +8,15 @@ import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
 import Landmark from "./Landmark";
 import { TrainModelDialog } from "./PopUp";
-import { DetectionModeSelector, DetectionMode } from "./DetectionModeSelector";
+import { DetectionModeSelector, DetectionMode, DetectionPreset } from "./DetectionModeSelector";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
+import { Input } from "@/Components/ui/input";
 import { Separator } from "@/Components/ui/separator";
 import { ScrollArea } from "@/Components/ui/scroll-area";
+import { Switch } from "@/Components/ui/switch";
 import {
   Tooltip,
   TooltipContent,
@@ -30,11 +32,19 @@ interface MenuProps {
   onNavigateToLanding?: () => void;
   openTrainDialogOnMount?: boolean;
   onTrainDialogOpened?: () => void;
-  // Multi-specimen detection
+  // Detection mode
   detectionMode?: DetectionMode;
   onDetectionModeChange?: (mode: DetectionMode) => void;
-  confThreshold?: number;
-  onConfThresholdChange?: (value: number) => void;
+  autoConfidence?: number;
+  onAutoConfidenceChange?: (value: number) => void;
+  detectionPreset?: DetectionPreset;
+  onDetectionPresetChange?: (preset: DetectionPreset) => void;
+  // Auto mode class name
+  className?: string;
+  onClassNameChange?: (name: string) => void;
+  // SAM2 refinement toggle
+  samEnabled?: boolean;
+  onSamEnabledChange?: (enabled: boolean) => void;
 }
 
 const Menu: React.FC<MenuProps> = ({
@@ -44,10 +54,16 @@ const Menu: React.FC<MenuProps> = ({
   onNavigateToLanding,
   openTrainDialogOnMount,
   onTrainDialogOpened,
-  detectionMode = "single",
+  detectionMode = "manual",
   onDetectionModeChange,
-  confThreshold = 0.25,
-  onConfThresholdChange,
+  autoConfidence = 0.5,
+  onAutoConfidenceChange,
+  detectionPreset = "balanced",
+  onDetectionPresetChange,
+  className = "",
+  onClassNameChange,
+  samEnabled = false,
+  onSamEnabledChange,
 }) => {
   const [openTrainDialog, setOpenTrainDialog] = useState(false);
 
@@ -59,15 +75,26 @@ const Menu: React.FC<MenuProps> = ({
     }
   }, [openTrainDialogOnMount, onTrainDialogOpened]);
   const [modelName, setModelName] = useState("");
+  const [xmlImportModelName, setXmlImportModelName] = useState("");
   const [isTraining, setIsTraining] = useState(false);
   const [modelPath, setModelPath] = useState("");
+  const [showAdvancedImport, setShowAdvancedImport] = useState(false);
+  const [useImportedXmlForTraining, setUseImportedXmlForTraining] = useState(false);
+  const [hasImportedPreAnnotated, setHasImportedPreAnnotated] = useState(false);
+  const [importedPreAnnotatedCount, setImportedPreAnnotatedCount] = useState(0);
+  const [importedXmlModelName, setImportedXmlModelName] = useState<string | null>(null);
+  const [preAnnotatedStatus, setPreAnnotatedStatus] = useState("");
+  const [dlibXmlStatus, setDlibXmlStatus] = useState("");
+  const [preflightSummary, setPreflightSummary] = useState("");
+  const [preflightWarning, setPreflightWarning] = useState("");
 
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
-  const canTrain = useMemo(
-    () => (fileArray?.length ?? 0) > 0 && !isTraining,
-    [fileArray, isTraining]
-  );
+  const hasWorkspaceData = (fileArray?.length ?? 0) > 0;
+  const hasImportedXml = Boolean(importedXmlModelName);
+  const canUseImportedXml =
+    hasImportedXml && modelName.trim().length > 0 && importedXmlModelName === modelName.trim();
+  const canTrain = (useImportedXmlForTraining ? canUseImportedXml : (hasWorkspaceData || hasImportedPreAnnotated)) && !isTraining;
 
   useEffect(() => {
     const fetchProjectRoot = async () => {
@@ -118,31 +145,146 @@ const Menu: React.FC<MenuProps> = ({
     }
   };
 
+  const handleImportPreAnnotated = async () => {
+    try {
+      const result = await window.api.importPreAnnotatedDataset({
+        speciesId: activeSpeciesId ?? undefined,
+      });
+      if (result.canceled) return;
+      if (!result.ok) throw new Error(result.error || "Import failed.");
+
+      const warningSuffix = result.warnings?.length
+        ? ` Warnings: ${result.warnings.join(" | ")}`
+        : "";
+      const status = `Imported ${result.importedImages ?? 0} image(s), ${result.importedLabels ?? 0} label file(s).${warningSuffix}`;
+      setHasImportedPreAnnotated(true);
+      setImportedPreAnnotatedCount(result.importedImages ?? 0);
+      setPreAnnotatedStatus(status);
+
+      if (result.warnings && result.warnings.length > 0) {
+        toast.warning(status);
+      } else {
+        toast.success(status);
+      }
+    } catch (err) {
+      console.error(err);
+      toast.error(`Pre-annotated import failed. ${String(err)}`);
+    }
+  };
+
+  const handleImportDlibXml = async (currentModelName: string) => {
+    try {
+      const name = currentModelName.trim();
+      if (!name) {
+        toast.error("Enter a model name before importing dlib XML.");
+        return;
+      }
+
+      const result = await window.api.importDlibXml({
+        modelName: name,
+        speciesId: activeSpeciesId ?? undefined,
+      });
+      if (result.canceled) return;
+      if (!result.ok) throw new Error(result.error || "dlib XML import failed.");
+
+      const trainStats = result.trainStats
+        ? `${result.trainStats.num_images} images, ${result.trainStats.num_boxes} boxes`
+        : "train XML imported";
+      const testStats = result.testStats
+        ? ` Test: ${result.testStats.num_images} images, ${result.testStats.num_boxes} boxes.`
+        : " No test XML provided.";
+      const warningSuffix = result.warnings?.length
+        ? ` Warnings: ${result.warnings.join(" | ")}`
+        : "";
+
+      const status = `XML imported for "${name}". Train: ${trainStats}.${testStats}${warningSuffix}`;
+      setImportedXmlModelName(name);
+      setModelName(name);
+      setShowAdvancedImport(true);
+      setDlibXmlStatus(status);
+
+      if (result.warnings && result.warnings.length > 0) {
+        toast.warning(status);
+      } else {
+        toast.success(status);
+      }
+    } catch (err) {
+      console.error(err);
+      toast.error(`dlib XML import failed. ${String(err)}`);
+    }
+  };
+
+  const runPreflight = async (autosaveWorkspace: boolean) => {
+    const name = modelName.trim();
+    if (!name) {
+      setPreflightSummary("Enter a model name to run preflight.");
+      setPreflightWarning("");
+      return null;
+    }
+
+    if (autosaveWorkspace && !useImportedXmlForTraining && !activeSpeciesId && hasWorkspaceData) {
+      await window.api.saveLabels(fileArray);
+    }
+
+    const preflight = await window.api.trainingPreflight({
+      speciesId: activeSpeciesId ?? undefined,
+      modelName: name,
+      useImportedXml: useImportedXmlForTraining,
+      workspaceImages: fileArray.length,
+      importedImagesHint: importedPreAnnotatedCount,
+    });
+
+    if (!preflight.ok) {
+      throw new Error(preflight.error || "Preflight failed.");
+    }
+
+    if (preflight.useImportedXml) {
+      setPreflightSummary(
+        `Preflight: Train XML ${preflight.trainXmlImages ?? 0} image(s)` +
+        `${preflight.testXmlImages !== undefined ? ` • Test XML ${preflight.testXmlImages} image(s)` : ""}` +
+        ` • Landmark IDs: ${preflight.landmarkMessage}`
+      );
+    } else {
+      setPreflightSummary(
+        `Preflight: Workspace ${preflight.workspaceImages ?? fileArray.length} • Imported ${preflight.importedImages ?? importedPreAnnotatedCount} • Total trainable ${preflight.totalTrainableImages ?? 0} • Landmark IDs: ${preflight.landmarkMessage}`
+      );
+    }
+
+    const warningText = (preflight.warnings || []).join(" | ");
+    setPreflightWarning(warningText);
+    return preflight;
+  };
+
   const handleTrainConfirm = async () => {
     const name = modelName.trim();
     if (!name) return;
 
     try {
       setIsTraining(true);
+      const preflight = await runPreflight(true);
+      if (!preflight) return;
 
-      if (activeSpeciesId) {
-        // Session-scoped: auto-save already persisted annotations to session dir
-        toast.info("Training model from session...");
-        const result = await window.api.trainModel(name, { speciesId: activeSpeciesId });
+      if (useImportedXmlForTraining) {
+        if (!canUseImportedXml) {
+          throw new Error("Import dlib XML for this exact model name before training.");
+        }
+        toast.info("Training from imported dlib XML...");
+        const result = await window.api.trainModel(name, {
+          speciesId: activeSpeciesId ?? undefined,
+          useImportedXml: true,
+        });
         if (!result.ok) throw new Error(result.error);
         console.log("Training output:", result.output);
       } else {
-        // Legacy fallback: save labels to flat directory and train
-        toast.info("Saving labels...");
-        await window.api.saveLabels(fileArray);
-        toast.info("Training model...");
-        const result = await window.api.trainModel(name);
+        toast.info("Training from combined app data...");
+        const result = await window.api.trainModel(name, {
+          speciesId: activeSpeciesId ?? undefined,
+        });
         if (!result.ok) throw new Error(result.error);
         console.log("Training output:", result.output);
       }
 
       setOpenTrainDialog(false);
-      setModelName("");
       toast.success("Training complete.");
     } catch (err) {
       console.error(err);
@@ -151,6 +293,13 @@ const Menu: React.FC<MenuProps> = ({
       setIsTraining(false);
     }
   };
+
+  useEffect(() => {
+    if (!openTrainDialog) return;
+    runPreflight(false).catch((err) => {
+      setPreflightWarning(String(err));
+    });
+  }, [openTrainDialog, modelName, useImportedXmlForTraining, activeSpeciesId, importedPreAnnotatedCount, hasWorkspaceData]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -183,6 +332,8 @@ const Menu: React.FC<MenuProps> = ({
           modelName={modelName}
           isTraining={isTraining}
           setModelName={setModelName}
+          preflightSummary={preflightSummary}
+          preflightWarning={preflightWarning}
         />
 
         <ScrollArea className="flex-1">
@@ -311,6 +462,75 @@ const Menu: React.FC<MenuProps> = ({
                         ? `${fileArray.length} image(s) loaded`
                         : "No images loaded"}
                     </p>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-xs"
+                        onClick={handleImportPreAnnotated}
+                        disabled={isTraining}
+                      >
+                        Import pre-annotated
+                      </Button>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">
+                      {preAnnotatedStatus || "Pre-annotated import: not imported."}
+                    </p>
+                    <div className="rounded-md border border-border/70 p-2">
+                      <div className="flex items-center justify-between">
+                        <p className="text-[11px] font-medium text-foreground">
+                          Advanced
+                        </p>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-2 text-[11px]"
+                          onClick={() => setShowAdvancedImport((v) => !v)}
+                          disabled={isTraining}
+                        >
+                          {showAdvancedImport ? "Hide" : "Show"}
+                        </Button>
+                      </div>
+                      {showAdvancedImport && (
+                        <div className="mt-2 space-y-2">
+                          <Input
+                            value={xmlImportModelName}
+                            onChange={(e) => setXmlImportModelName(e.target.value)}
+                            placeholder="Model name for XML import"
+                            disabled={isTraining}
+                            className="h-8 text-xs"
+                          />
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="text-xs"
+                            onClick={() => handleImportDlibXml(xmlImportModelName)}
+                            disabled={isTraining}
+                          >
+                            Import dlib XML (Advanced)
+                          </Button>
+                          <p className="text-[11px] text-muted-foreground">
+                            {dlibXmlStatus || "Import dlib XML only if you already have train/test XML ready."}
+                          </p>
+                          <div className="flex items-center justify-between">
+                            <p className="text-[11px] text-muted-foreground">
+                              Train directly from imported XML
+                            </p>
+                            <Switch
+                              checked={useImportedXmlForTraining}
+                              onCheckedChange={setUseImportedXmlForTraining}
+                              disabled={isTraining || !canUseImportedXml}
+                            />
+                          </div>
+                          {!canUseImportedXml && (
+                            <p className="text-[11px] text-muted-foreground">
+                              Import XML for this exact model name to enable XML training.
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </CardContent>
                 </Card>
               </motion.div>
@@ -326,7 +546,7 @@ const Menu: React.FC<MenuProps> = ({
             </motion.div>
 
             {/* Detection Mode */}
-            {onDetectionModeChange && onConfThresholdChange && (
+            {onDetectionModeChange && onAutoConfidenceChange && (
               <motion.div variants={sidebarItem}>
                 <motion.div variants={cardHover} initial="initial" whileHover="hover">
                   <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
@@ -339,8 +559,14 @@ const Menu: React.FC<MenuProps> = ({
                       <DetectionModeSelector
                         mode={detectionMode}
                         onModeChange={onDetectionModeChange}
-                        confThreshold={confThreshold}
-                        onConfThresholdChange={onConfThresholdChange}
+                        autoConfidence={autoConfidence}
+                        onAutoConfidenceChange={onAutoConfidenceChange}
+                        detectionPreset={detectionPreset}
+                        onDetectionPresetChange={onDetectionPresetChange}
+                        className={className}
+                        onClassNameChange={onClassNameChange}
+                        samEnabled={samEnabled}
+                        onSamEnabledChange={onSamEnabledChange}
                       />
                     </CardContent>
                   </Card>
@@ -361,12 +587,14 @@ const Menu: React.FC<MenuProps> = ({
                     <p
                       className={cn(
                         "text-xs",
-                        canTrain ? "text-muted-foreground" : "text-destructive"
+                        "text-muted-foreground"
                       )}
                     >
                       {canTrain
-                        ? "Ready to train."
-                        : "Add images to enable training."}
+                        ? `Ready to train (${useImportedXmlForTraining ? "imported XML (advanced)" : "combined app data"}).`
+                        : useImportedXmlForTraining
+                          ? "XML mode selected: import dlib XML for this model name first."
+                          : "Import pre-annotated data and/or annotate images in app to train."}
                     </p>
                   </CardContent>
                 </Card>

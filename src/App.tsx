@@ -13,7 +13,7 @@ import { LandingPage } from "./Components/LandingPage"
 import { MyModelsPage } from "./Components/MyModelsPage"
 import { InferencePage } from "./Components/InferencePage"
 import { AppView } from "./types/Image"
-import { DetectionMode } from "./Components/ImageLabeler"
+import { DetectionMode, DetectionPreset } from "./Components/DetectionModeSelector"
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
@@ -32,21 +32,25 @@ const App: React.FC = () => {
     const saved = localStorage.getItem("biovision-default-opacity")
     return saved ? parseInt(saved, 10) : 100
   })
-  // Multi-specimen detection state
-  const [detectionMode, setDetectionMode] = useState<DetectionMode>("single")
-  const [confThreshold, setConfThreshold] = useState(0.02)
+  // Detection state
+  const [detectionMode, setDetectionMode] = useState<DetectionMode>("manual")
+  const [autoConfidence, setAutoConfidence] = useState(0.3)
+  const [detectionPreset, setDetectionPreset] = useState<DetectionPreset>("balanced")
+  const [objectClassName, setObjectClassName] = useState("")
+  const [samEnabled, setSamEnabled] = useState(false)
 
   const handleColorChange = (selectedColor: string) => setColor(selectedColor)
   const handleSwitchChange = () => setIsSwitchOn((prev) => !prev)
   const handleOpacityChange = (selectedOpacity: number) => setOpacity(selectedOpacity)
 
   // Responsive bounds for menu
-  const [isXs, setIsXs] = useState(window.innerWidth < 600)
-  const MIN_MENU = isXs ? 200 : 305
-  const MAX_MENU = isXs ? 360 : 680
+  const [isXs, setIsXs] = useState(window.innerWidth < 900)
+  // Hard clamp: users cannot drag sidebar below 375px.
+  const MIN_MENU = 375
+  const MAX_MENU = isXs ? 440 : 680
 
   useEffect(() => {
-    const handleResize = () => setIsXs(window.innerWidth < 600)
+    const handleResize = () => setIsXs(window.innerWidth < 900)
     window.addEventListener("resize", handleResize)
     return () => window.removeEventListener("resize", handleResize)
   }, [])
@@ -120,6 +124,20 @@ const App: React.FC = () => {
     }
   }, [MIN_MENU, MAX_MENU])
 
+  useLayoutEffect(() => {
+    if (!menuWrapRef.current) return
+
+    const el = menuWrapRef.current
+    const overflowX = el.scrollWidth - el.clientWidth
+
+    if (overflowX > 0) {
+      const requiredWidth = clamp(Math.ceil(menuWidth + overflowX), MIN_MENU, MAX_MENU)
+      if (requiredWidth > menuWidth) {
+        setMenuWidth(requiredWidth)
+      }
+    }
+  }, [menuWidth, MIN_MENU, MAX_MENU])
+
   const startDrag = () => {
     userResizedRef.current = true
     draggingRef.current = true
@@ -146,13 +164,13 @@ const App: React.FC = () => {
   const renderWorkspace = () => (
     <div
       ref={pageRef}
-      className="w-screen h-screen min-w-[880px] min-h-[500px] bg-background flex overflow-auto"
+      className="w-screen h-screen min-w-0 min-h-0 bg-background flex overflow-hidden"
     >
       {/* Left: menu container */}
       <motion.div
         animate={{ width: menuWidth }}
         transition={{ duration: 0.15, ease: "easeOut" }}
-        className="shrink-0 h-full overflow-hidden border-r bg-card"
+        className="shrink-0 h-full min-w-[375px] overflow-hidden border-r bg-card"
       >
         <div
           ref={menuWrapRef}
@@ -167,8 +185,14 @@ const App: React.FC = () => {
             onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
             detectionMode={detectionMode}
             onDetectionModeChange={setDetectionMode}
-            confThreshold={confThreshold}
-            onConfThresholdChange={setConfThreshold}
+            autoConfidence={autoConfidence}
+            onAutoConfidenceChange={setAutoConfidence}
+            detectionPreset={detectionPreset}
+            onDetectionPresetChange={setDetectionPreset}
+            className={objectClassName}
+            onClassNameChange={setObjectClassName}
+            samEnabled={samEnabled}
+            onSamEnabledChange={setSamEnabled}
           />
         </div>
       </motion.div>
@@ -196,7 +220,10 @@ const App: React.FC = () => {
               opacity={opacity}
               isSwitchOn={isSwitchOn}
               detectionMode={detectionMode}
-              confThreshold={confThreshold}
+              confThreshold={autoConfidence}
+              detectionPreset={detectionPreset}
+              className={objectClassName}
+              samEnabled={samEnabled}
             />
           </div>
         </div>

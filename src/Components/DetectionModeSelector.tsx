@@ -1,82 +1,274 @@
-import { useEffect, useState } from "react";
-import { Switch } from "./ui/switch";
+import { useCallback, useEffect, useState } from "react";
 import { Label } from "./ui/label";
 import { Slider } from "./ui/slider";
+import { Input } from "./ui/input";
+import { Switch } from "./ui/switch";
 
-export type DetectionMode = "single" | "multi";
+export type DetectionMode = "manual" | "auto";
+export type DetectionPreset = "balanced" | "precision" | "recall" | "single_object";
 
 interface DetectionModeSelectorProps {
   mode: DetectionMode;
   onModeChange: (mode: DetectionMode) => void;
-  confThreshold: number;
-  onConfThresholdChange: (value: number) => void;
+  autoConfidence: number;
+  onAutoConfidenceChange: (value: number) => void;
+  detectionPreset?: DetectionPreset;
+  onDetectionPresetChange?: (preset: DetectionPreset) => void;
   disabled?: boolean;
+  className?: string;
+  onClassNameChange?: (name: string) => void;
+  samEnabled?: boolean;
+  onSamEnabledChange?: (enabled: boolean) => void;
 }
 
 export function DetectionModeSelector({
   mode,
   onModeChange,
-  confThreshold,
-  onConfThresholdChange,
+  autoConfidence,
+  onAutoConfidenceChange,
+  detectionPreset = "balanced",
+  onDetectionPresetChange,
   disabled = false,
+  className = "",
+  onClassNameChange,
+  samEnabled = false,
+  onSamEnabledChange,
 }: DetectionModeSelectorProps) {
-  const [detectionInfo, setDetectionInfo] = useState<{
-    available: boolean;
-    primary_method?: string;
+  const [capabilityInfo, setCapabilityInfo] = useState<{
+    mode: string;
+    gpu: boolean;
+    yolo_ready: boolean;
+    sam2_ready: boolean;
+    yolo_failed: boolean;
+    sam2_failed: boolean;
+    yolo_error?: string | null;
   } | null>(null);
+  const [isInitializing, setIsInitializing] = useState(false);
 
-  useEffect(() => {
-    // Check detection availability (OpenCV is always available)
-    window.api.checkYolo().then((result) => {
-      setDetectionInfo({
-        available: result.available,
-        primary_method: result.primary_method || "opencv",
+  const refreshCapabilities = useCallback(() => {
+    window.api.checkSuperAnnotator().then((result) => {
+      setCapabilityInfo({
+        mode: result.mode,
+        gpu: result.gpu,
+        yolo_ready: result.yolo_ready,
+        sam2_ready: result.sam2_ready,
+        yolo_failed: !!result.yolo_failed,
+        sam2_failed: !!result.sam2_failed,
+        yolo_error: result.yolo_error,
       });
     }).catch(() => {
-      // OpenCV detection is always available
-      setDetectionInfo({ available: true, primary_method: "opencv" });
+      setCapabilityInfo({
+        mode: "classic_fallback",
+        gpu: false,
+        yolo_ready: false,
+        sam2_ready: false,
+        yolo_failed: false,
+        sam2_failed: false,
+      });
     });
   }, []);
 
-  const isMultiMode = mode === "multi";
-  const isAvailable = detectionInfo?.available ?? true; // OpenCV always available
+  useEffect(() => {
+    refreshCapabilities();
+  }, [refreshCapabilities]);
+
+  // Re-check capabilities after models load (triggered by first auto-detect)
+  useEffect(() => {
+    const recheck = () => {
+      refreshCapabilities();
+    };
+    window.addEventListener("super-annotator-ready", recheck);
+    return () => window.removeEventListener("super-annotator-ready", recheck);
+  }, [refreshCapabilities]);
+
+  const modeOptions: { value: DetectionMode; label: string; desc: string }[] = [
+    { value: "manual", label: "Manual", desc: "Draw bounding boxes manually" },
+    { value: "auto", label: "Auto (AI)", desc: "YOLO-World multi-object detection" },
+  ];
+
+  const sam2Available = capabilityInfo?.mode === "auto_high_performance";
+
+  const yoloStatusHint = capabilityInfo
+    ? capabilityInfo.yolo_ready
+      ? "YOLO ready."
+      : capabilityInfo.yolo_failed
+        ? `YOLO unavailable: ${capabilityInfo.yolo_error ?? "initialization failed"}`
+        : capabilityInfo.mode === "classic_fallback"
+          ? "YOLO not attempted: requires more free RAM (>2GB) or GPU."
+          : "YOLO pending: click Initialize models."
+    : null;
+
+  const canInitializeModels = capabilityInfo ? capabilityInfo.mode !== "classic_fallback" : false;
+
+  const handleInitializeModels = async () => {
+    setIsInitializing(true);
+    try {
+      await window.api.initSuperAnnotator();
+    } finally {
+      refreshCapabilities();
+      window.dispatchEvent(new CustomEvent("super-annotator-ready"));
+      setIsInitializing(false);
+    }
+  };
 
   return (
     <div className="flex flex-col gap-3 p-3 bg-zinc-800 rounded-lg">
-      <div className="flex items-center justify-between">
-        <Label htmlFor="detection-mode" className="text-sm font-medium text-zinc-200">
-          Multi-Specimen Mode
-        </Label>
-        <Switch
-          id="detection-mode"
-          checked={isMultiMode}
-          onCheckedChange={(checked) => onModeChange(checked ? "multi" : "single")}
-          disabled={disabled || !isAvailable}
-        />
+      {/* 2-option segmented control */}
+      <div className="flex rounded-lg bg-zinc-900 p-0.5">
+        {modeOptions.map((opt) => (
+          <button
+            key={opt.value}
+            onClick={() => onModeChange(opt.value)}
+            disabled={disabled}
+            className={`flex-1 px-2 py-1.5 text-xs font-medium rounded-md transition-all ${
+              mode === opt.value
+                ? "bg-zinc-700 text-zinc-100 shadow-sm"
+                : "text-zinc-400 hover:text-zinc-200"
+            } ${disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
+          >
+            {opt.label}
+          </button>
+        ))}
       </div>
 
-      {isMultiMode && (
+      <p className="text-xs text-zinc-500">
+        {modeOptions.find((o) => o.value === mode)?.desc}
+      </p>
+
+      {/* Manual mode controls */}
+      {mode === "manual" && (
         <div className="flex flex-col gap-2 pt-2 border-t border-zinc-700">
-          <p className="text-xs text-zinc-400">
-            Uses contour detection to find multiple specimens
-          </p>
-          <div className="flex items-center justify-between">
-            <Label className="text-xs text-zinc-400">
-              Min Area: {(confThreshold * 100).toFixed(0)}%
-            </Label>
-          </div>
-          <Slider
-            value={[confThreshold]}
-            onValueChange={([value]) => onConfThresholdChange(value)}
-            min={0.01}
-            max={0.2}
-            step={0.01}
-            disabled={disabled}
-            className="w-full"
-          />
           <p className="text-xs text-zinc-500">
-            Minimum specimen size as % of image area
+            Click and drag on the canvas to draw bounding boxes.
           </p>
+        </div>
+      )}
+
+      {/* Auto (AI) mode controls */}
+      {mode === "auto" && (
+        <div className="flex flex-col gap-3 pt-2 border-t border-zinc-700">
+          <div className="flex flex-col gap-1.5">
+            <Label className="text-xs text-zinc-400">
+              Detection goal
+            </Label>
+            <select
+              value={detectionPreset}
+              onChange={(e) => onDetectionPresetChange?.(e.target.value as DetectionPreset)}
+              disabled={disabled}
+              className="h-8 rounded-md border border-zinc-700 bg-zinc-900 px-2 text-xs text-white"
+            >
+              <option value="balanced">Balanced</option>
+              <option value="precision">Precision (fewer false positives)</option>
+              <option value="recall">Recall (find more objects)</option>
+              <option value="single_object">Single object focus</option>
+            </select>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <Label className="text-xs text-zinc-400">
+              Object class / prompt
+            </Label>
+            <Input
+              value={className}
+              onChange={(e) => onClassNameChange?.(e.target.value)}
+              placeholder="e.g. Fish, Butterfly, Leaf..."
+              className="h-8 text-xs text-white placeholder:text-zinc-400 bg-zinc-900 border-zinc-700"
+              disabled={disabled}
+            />
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <Label className="text-xs text-zinc-400">
+                Confidence: {(autoConfidence * 100).toFixed(0)}%
+              </Label>
+            </div>
+            <Slider
+              value={[autoConfidence]}
+              onValueChange={([value]) => onAutoConfidenceChange(value)}
+              min={0.2}
+              max={0.9}
+              step={0.05}
+              disabled={disabled}
+              className="w-full"
+            />
+          </div>
+
+          {/* SAM2 refinement toggle */}
+          <div className="flex items-center justify-between pt-1">
+            <div className="flex flex-col gap-0.5">
+              <Label className="text-xs text-zinc-400">
+                SAM2 mask refinement
+              </Label>
+              <p className="text-[10px] text-zinc-500">
+                {sam2Available
+                  ? "Precise pixel masks for crowded scenes"
+                  : "Requires GPU + SAM2 model"}
+              </p>
+            </div>
+            <Switch
+              checked={samEnabled}
+              onCheckedChange={(checked) => onSamEnabledChange?.(checked)}
+              disabled={disabled || !sam2Available}
+            />
+          </div>
+
+          {/* Capability badges */}
+          {capabilityInfo && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-1">
+              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                capabilityInfo.yolo_ready
+                  ? "bg-green-500/20 text-green-400"
+                  : capabilityInfo.yolo_failed
+                    ? "bg-red-500/20 text-red-400"
+                  : capabilityInfo.mode !== "classic_fallback"
+                    ? "bg-yellow-500/20 text-yellow-400"
+                    : "bg-zinc-500/20 text-zinc-400"
+              }`}>
+                YOLO {capabilityInfo.yolo_ready ? "ready" : capabilityInfo.yolo_failed ? "unavailable" : "pending"}
+              </span>
+              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                capabilityInfo.sam2_ready
+                  ? "bg-green-500/20 text-green-400"
+                  : sam2Available
+                    ? "bg-yellow-500/20 text-yellow-400"
+                    : "bg-zinc-500/20 text-zinc-400"
+              }`}>
+                SAM2 {capabilityInfo.sam2_ready ? "ready" : sam2Available ? "pending" : "N/A"}
+              </span>
+              {capabilityInfo.gpu && (
+                <span className="text-[10px] text-zinc-500">GPU</span>
+              )}
+            </div>
+          )}
+
+          {/* Small status hint */}
+          {yoloStatusHint && (
+            <p className={`text-[10px] ${
+              capabilityInfo?.yolo_failed ? "text-red-400/90" : "text-zinc-500"
+            }`}>
+              Status: {yoloStatusHint}
+            </p>
+          )}
+
+          {canInitializeModels && (
+            <button
+              type="button"
+              onClick={handleInitializeModels}
+              disabled={disabled || isInitializing || !!capabilityInfo?.yolo_ready}
+              className={`h-8 px-3 rounded-md text-xs font-medium text-white border border-zinc-600 ${
+                disabled || isInitializing || !!capabilityInfo?.yolo_ready
+                  ? "bg-zinc-800/60 opacity-60 cursor-not-allowed"
+                  : "bg-zinc-700 hover:bg-zinc-600"
+              }`}
+            >
+              {capabilityInfo?.yolo_ready
+                ? "Models initialized"
+                : isInitializing
+                  ? "Initializing models..."
+                  : "Initialize models"}
+            </button>
+          )}
         </div>
       )}
     </div>
