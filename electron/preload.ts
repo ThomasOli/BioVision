@@ -150,6 +150,8 @@ contextBridge.exposeInMainWorld("api", {
   ) => ipcRenderer.invoke("session:add-rejected-detection", { speciesId, filename, rejectedDetection }),
   sessionLoad: (speciesId: string) =>
     ipcRenderer.invoke("session:load", { speciesId }),
+  sessionLoadAnnotation: (speciesId: string, filename: string) =>
+    ipcRenderer.invoke("session:load-annotation", { speciesId, filename }),
   sessionList: () =>
     ipcRenderer.invoke("session:list"),
   sessionDeleteImage: (speciesId: string, filename: string) =>

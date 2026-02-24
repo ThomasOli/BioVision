@@ -1,4 +1,4 @@
-import React, { useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Loader2, Sparkles, Crosshair, PencilRuler, XCircle, Save, CheckCircle2 } from "lucide-react";
@@ -90,6 +90,8 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const [finalizedBoxSignatureByImageId, setFinalizedBoxSignatureByImageId] = useState<Record<number, string>>({});
   // Tracks which image IDs have been explicitly finalized by the user
   const [finalizedImageIds, setFinalizedImageIds] = useState<Set<number>>(new Set());
+  const [annotationHydratedIds, setAnnotationHydratedIds] = useState<Set<number>>(new Set());
+  const annotationLoadInFlight = useRef<Set<number>>(new Set());
 
   // Use Context images for display, but check Redux for "has images" to avoid race conditions
   const totalImages = images.length;
@@ -222,6 +224,46 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     }
   }, [detectionMode, current?.id]);
 
+  // Lazy-load heavy box/landmark payload only for the active image.
+  useEffect(() => {
+    if (!current?.speciesId || !current?.filename) return;
+    if (current.boxes?.length) {
+      if (!annotationHydratedIds.has(current.id)) {
+        setAnnotationHydratedIds((prev) => new Set([...prev, current.id]));
+      }
+      return;
+    }
+    if (annotationHydratedIds.has(current.id)) return;
+    if (annotationLoadInFlight.current.has(current.id)) return;
+
+    let cancelled = false;
+    annotationLoadInFlight.current.add(current.id);
+
+    void window.api
+      .sessionLoadAnnotation(current.speciesId, current.filename)
+      .then((result) => {
+        if (cancelled || !result.ok) return;
+        dispatch(updateBoxes({ id: current.id, boxes: result.boxes || [] }));
+        if (result.finalized) {
+          dispatch(setImageFinalized({ id: current.id }));
+          setFinalizedImageIds((prev) => new Set([...prev, current.id]));
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to load session annotation:", err);
+      })
+      .finally(() => {
+        annotationLoadInFlight.current.delete(current.id);
+        if (!cancelled) {
+          setAnnotationHydratedIds((prev) => new Set([...prev, current.id]));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [current, annotationHydratedIds, dispatch]);
+
   const handleUpdateBoxes = useCallback(
     (id: number, boxes: BoundingBox[]) => {
       dispatch(updateBoxes({ id, boxes }));
@@ -264,9 +306,38 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     dispatch(removeFile(idToDelete));
   }, [current, reduxFileArray, dispatch, setSelectedImage]);
 
+  const ensureImageBoxesLoaded = useCallback(
+    async (image: (typeof images)[number] | null): Promise<BoundingBox[]> => {
+      if (!image?.speciesId || !image?.filename) return image?.boxes || [];
+      if ((image.boxes || []).length > 0) return image.boxes || [];
+      if (annotationLoadInFlight.current.has(image.id)) return image.boxes || [];
+
+      annotationLoadInFlight.current.add(image.id);
+      try {
+        const result = await window.api.sessionLoadAnnotation(image.speciesId, image.filename);
+        if (!result.ok) return image.boxes || [];
+        const loadedBoxes = result.boxes || [];
+        dispatch(updateBoxes({ id: image.id, boxes: loadedBoxes }));
+        if (result.finalized) {
+          dispatch(setImageFinalized({ id: image.id }));
+          setFinalizedImageIds((prev) => new Set([...prev, image.id]));
+        }
+        setAnnotationHydratedIds((prev) => new Set([...prev, image.id]));
+        return loadedBoxes;
+      } catch (err) {
+        console.error("Failed to load session annotation:", err);
+        return image.boxes || [];
+      } finally {
+        annotationLoadInFlight.current.delete(image.id);
+      }
+    },
+    [dispatch, images]
+  );
+
   const finalizeImageSegments = useCallback(async (image: (typeof images)[number] | null): Promise<boolean> => {
     if (!image?.speciesId || !image?.filename) return false;
-    const acceptedBoxes = (image.boxes || [])
+    const sourceBoxes = await ensureImageBoxesLoaded(image);
+    const acceptedBoxes = (sourceBoxes || [])
       .filter((b) => b.width > 0 && b.height > 0)
       .map((b) => ({
         left: Math.round(b.left),
@@ -319,7 +390,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       console.error("Failed to finalize accepted boxes:", err);
       return false;
     }
-  }, [dispatch]);
+  }, [dispatch, ensureImageBoxesLoaded]);
 
   const finalizeCurrentImageSegments = useCallback(async (): Promise<boolean> => {
     return finalizeImageSegments(current);
@@ -327,7 +398,9 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 
   const finalizableImages = useMemo(() => {
     return images.filter((img) => {
-      const hasValidBoxes = (img.boxes || []).some((b) => b.width > 0 && b.height > 0);
+      const hasValidBoxes =
+        (img.boxes || []).some((b) => b.width > 0 && b.height > 0) ||
+        Boolean(img.hasBoxes);
       if (!hasValidBoxes || !img.speciesId || !img.filename) return false;
       const finalized = Boolean(img.isFinalized) || finalizedImageIds.has(img.id);
       return !finalized;
@@ -338,7 +411,9 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const segmentableImageCount = useMemo(() => {
     return images.filter((img) => {
       const imgPath = img.path || img.diskPath;
-      const hasValidBoxes = (img.boxes || []).some((b) => b.width > 0 && b.height > 0);
+      const hasValidBoxes =
+        (img.boxes || []).some((b) => b.width > 0 && b.height > 0) ||
+        Boolean(img.hasBoxes);
       return Boolean(imgPath) && hasValidBoxes;
     }).length;
   }, [images]);

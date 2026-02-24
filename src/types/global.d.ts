@@ -590,9 +590,9 @@ declare global {
   interface SessionImage {
     filename: string;
     diskPath: string;
-    data: string;
     mimeType: string;
-    boxes: import("./Image").BoundingBox[];
+    hasBoxes?: boolean;
+    boxes?: import("./Image").BoundingBox[];
     finalized?: boolean;
   }
 
@@ -716,6 +716,15 @@ interface SessionMeta {
           orientationPolicy?: OrientationPolicy;
           orientationPolicyConfigured?: boolean;
         };
+        error?: string;
+      }>;
+      sessionLoadAnnotation: (
+        speciesId: string,
+        filename: string
+      ) => Promise<{
+        ok: boolean;
+        boxes: import("./Image").BoundingBox[];
+        finalized?: boolean;
         error?: string;
       }>;
       sessionList: () => Promise<{ ok: boolean; sessions: SessionMeta[]; error?: string }>;

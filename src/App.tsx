@@ -31,11 +31,8 @@ function SessionRestorer() {
       if (cancelled || !result.ok || !result.images?.length) return
 
       const restored: AnnotatedImage[] = result.images.map((img, i) => {
-        // Convert base64 → blob URL so Konva/img tags can render it
-        const binary = atob(img.data)
-        const bytes = new Uint8Array(binary.length)
-        for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j)
-        const url = URL.createObjectURL(new Blob([bytes], { type: img.mimeType }))
+        const safePath = img.diskPath.replace(/\\/g, "/")
+        const url = `localfile:///${safePath.replace(/^\//, "")}`
 
         return {
           id: Date.now() + i,
@@ -49,6 +46,7 @@ function SessionRestorer() {
           speciesId: activeSpeciesId,
           diskPath: img.diskPath,
           isFinalized: img.finalized ?? false,
+          hasBoxes: img.hasBoxes ?? false,
         }
       })
 

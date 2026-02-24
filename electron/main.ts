@@ -984,6 +984,60 @@ type AnnotationEntry = {
   landmarks: Array<{ id: number; x: number; y: number }>;
 };
 
+const MATCHABLE_IMAGE_EXTS = new Set([
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".gif",
+  ".bmp",
+  ".webp",
+  ".tiff",
+  ".tif",
+]);
+
+function pushUniqueKey(out: string[], key: string): void {
+  const normalized = key.trim().toLowerCase();
+  if (!normalized) return;
+  if (!out.includes(normalized)) out.push(normalized);
+}
+
+/**
+ * Build matchable keys from an annotation file path token.
+ * Examples:
+ * - "in/example.png" -> ["example.png", "example"]
+ * - "xxx/something.png.yy" -> ["something.png.yy", "something.png", "something"]
+ * - "in/example.jpeg.in" -> ["example.jpeg.in", "example.jpeg", "example"]
+ */
+function buildMatchableKeys(fileToken: string): string[] {
+  const out: string[] = [];
+  const raw = String(fileToken ?? "").trim();
+  if (!raw) return out;
+
+  // Normalize separators so basename extraction works across OS-exported paths.
+  const normalizedPath = raw.replace(/\\/g, "/");
+  const base = path.posix.basename(normalizedPath);
+  if (!base) return out;
+
+  pushUniqueKey(out, base);
+
+  let candidate = base;
+  let parsed = path.parse(candidate);
+  pushUniqueKey(out, parsed.name);
+
+  // Strip trailing non-image extensions until known image extension appears.
+  while (parsed.ext) {
+    if (MATCHABLE_IMAGE_EXTS.has(parsed.ext.toLowerCase())) {
+      break;
+    }
+    candidate = parsed.name;
+    parsed = path.parse(candidate);
+    pushUniqueKey(out, candidate);
+    pushUniqueKey(out, parsed.name);
+  }
+
+  return out;
+}
+
 function parseXmlAttrs(str: string): Record<string, string> {
   const attrs: Record<string, string> = {};
   // Handle quoted values (single or double quotes) — paths may contain slashes
@@ -1011,7 +1065,8 @@ function parseImglabXml(filePath: string): Map<string, AnnotationEntry> {
     const imgAttrs = parseXmlAttrs(imgMatch[1]);
     const fileAttr = imgAttrs["file"];
     if (!fileAttr) continue;
-    const filename = path.basename(fileAttr);
+    const keys = buildMatchableKeys(fileAttr);
+    if (keys.length === 0) continue;
     const body = imgMatch[2];
 
     // Parse <box ...>
@@ -1040,8 +1095,10 @@ function parseImglabXml(filePath: string): Map<string, AnnotationEntry> {
       }
     }
     landmarks.sort((a, b) => a.id - b.id);
-
-    result.set(filename, { box, landmarks });
+    const entry = { box, landmarks };
+    for (const key of keys) {
+      result.set(key, entry);
+    }
   }
 
   return result;
@@ -1082,9 +1139,12 @@ function parseBioVisionJson(filePath: string): Map<string, AnnotationEntry> {
         y: Number(lm?.y ?? 0),
       }));
 
-    // Always key by bare filename — ignore any path prefix baked into the annotation file
-    // (e.g. "in/image.jpg", "/old/system/path/image.jpg" → "image.jpg")
-    result.set(path.basename(imageFilename), { box, landmarks });
+    const entry = { box, landmarks };
+    const keys = buildMatchableKeys(imageFilename);
+    if (keys.length === 0) continue;
+    for (const key of keys) {
+      result.set(key, entry);
+    }
   }
 
   return result;
@@ -2330,10 +2390,10 @@ ipcMain.handle(
         // Copy image into session (no base64 read — renderer uses localfile:// URLs)
         fs.copyFileSync(srcPath, diskPath);
 
-        // Match annotation by full filename, then by stem (name without ext)
-        const annotation =
-          annotationMap.get(filename) ??
-          annotationMap.get(path.parse(filename).name);
+        const annotationKeys = buildMatchableKeys(filename);
+        const annotation = annotationKeys
+          .map((key) => annotationMap.get(key))
+          .find((entry) => Boolean(entry));
 
         let boxes: any[] = [];
         if (annotation) {
@@ -2766,7 +2826,10 @@ ipcMain.handle("ml:check-yolo", async () => {
 // ── Session management IPC handlers ──
 
 function getSessionDir(speciesId: string): string {
-  return path.join(projectRoot, "sessions", speciesId);
+  const safeSpeciesId = String(speciesId || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "_");
+  return path.join(projectRoot, "sessions", safeSpeciesId || "default");
 }
 
 const INFERENCE_REVIEW_DRAFTS_FILE = "inference_review_drafts.json";
@@ -3651,21 +3714,19 @@ ipcMain.handle(
 
       const images = imageFiles.map((filename) => {
         const filePath = path.join(imagesDir, filename);
-        const data = fs.readFileSync(filePath);
         const ext = path.extname(filename).toLowerCase();
-
-        // Load annotations if they exist
-        let boxes: any[] = [];
         let isFinalizedFromLabel = false;
-        const labelPath = path.join(
-          labelsDir,
-          filename.replace(/\.\w+$/, ".json")
-        );
+        let hasBoxes = false;
+        let boxes: any[] = [];
+        const labelPath = path.join(labelsDir, filename.replace(/\.\w+$/, ".json"));
         if (fs.existsSync(labelPath)) {
           try {
             const labelData = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
-            boxes = labelData.boxes || [];
             isFinalizedFromLabel = Boolean(labelData?.finalizedDetection?.isFinalized);
+            if (Array.isArray(labelData?.boxes)) {
+              boxes = labelData.boxes;
+              hasBoxes = boxes.some((b: any) => Number(b?.width) > 0 && Number(b?.height) > 0);
+            }
           } catch (_) {
             // skip bad label files
           }
@@ -3674,8 +3735,8 @@ ipcMain.handle(
         return {
           filename,
           diskPath: filePath,
-          data: data.toString("base64"),
           mimeType: MIME_TYPES[ext] || "image/jpeg",
+          hasBoxes,
           boxes,
           finalized: finalizedSet.has(filename) || isFinalizedFromLabel,
         };
@@ -3685,6 +3746,35 @@ ipcMain.handle(
     } catch (e: any) {
       console.error("session:load failed:", e);
       return { ok: false, error: e.message, images: [] };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:load-annotation",
+  async (_event, args: { speciesId: string; filename: string }) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const labelsDir = path.join(sessionDir, "labels");
+      const safeFilename = path.basename(String(args.filename || "").trim());
+      if (!safeFilename) {
+        return { ok: false, error: "Invalid filename", boxes: [] };
+      }
+      const labelPath = path.join(labelsDir, safeFilename.replace(/\.\w+$/, ".json"));
+
+      if (!fs.existsSync(labelPath)) {
+        return { ok: true, boxes: [], finalized: false };
+      }
+
+      const labelData = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+      return {
+        ok: true,
+        boxes: Array.isArray(labelData?.boxes) ? labelData.boxes : [],
+        finalized: Boolean(labelData?.finalizedDetection?.isFinalized),
+      };
+    } catch (e: any) {
+      console.error("session:load-annotation failed:", e);
+      return { ok: false, error: e.message, boxes: [] };
     }
   }
 );

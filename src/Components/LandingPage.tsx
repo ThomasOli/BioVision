@@ -376,9 +376,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       }
 
       const loadedImages = result.images.map((img) => {
-        const bytes = Uint8Array.from(atob(img.data), (c) => c.charCodeAt(0));
-        const blob = new Blob([bytes], { type: img.mimeType });
-        const url = URL.createObjectURL(blob);
+        const safePath = img.diskPath.replace(/\\/g, "/");
+        const url = `localfile:///${safePath.replace(/^\//, "")}`;
 
         return {
           id: Date.now() + Math.random(),
@@ -391,6 +390,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           history: [] as BoundingBox[][],
           future: [] as BoundingBox[][],
           speciesId,
+          hasBoxes: img.hasBoxes ?? false,
         };
       });
 

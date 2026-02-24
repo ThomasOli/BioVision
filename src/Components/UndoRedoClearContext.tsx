@@ -121,10 +121,31 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         .filter((img) => relevantIds.has(img.id))
         .map((img) => {
           const fromRedux = relevantFiles.find((f) => f.id === img.id);
-          if (fromRedux?.isFinalized && !img.isFinalized) {
-            return { ...img, isFinalized: true };
+          if (!fromRedux) return img;
+
+          const next = { ...img };
+          let changed = false;
+
+          if (fromRedux.isFinalized && !img.isFinalized) {
+            next.isFinalized = true;
+            changed = true;
           }
-          return img;
+          if (fromRedux.hasBoxes && !img.hasBoxes) {
+            next.hasBoxes = true;
+            changed = true;
+          }
+
+          // Sync lazy-loaded annotations from Redux into context images.
+          // Limit this to empty-context -> populated-redux to avoid clobbering
+          // in-context edits that have not been persisted yet.
+          const reduxBoxes = fromRedux.boxes || [];
+          const contextBoxes = img.boxes || [];
+          if (contextBoxes.length === 0 && reduxBoxes.length > 0) {
+            next.boxes = reduxBoxes;
+            changed = true;
+          }
+
+          return changed ? next : img;
         });
 
       return [...updatedImages, ...newImages];

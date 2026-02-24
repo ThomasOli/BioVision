@@ -54,6 +54,7 @@ export interface AnnotatedImage {
   speciesId?: string;
   diskPath?: string;    // Persisted path in session directory (survives restarts)
   isFinalized?: boolean; // True once the user has clicked "Finalize This Image"
+  hasBoxes?: boolean; // Lightweight metadata from session restore for lazy box hydration
 
   // Agentic metadata (optional)
   processingStatus?: "pending" | "predicted" | "review" | "approved";
