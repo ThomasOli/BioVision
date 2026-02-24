@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, nativeImage } from "electron";
+import { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol } from "electron";
 import fs from "fs";
 import * as path from "path";
 import { spawn, ChildProcess } from "child_process";
@@ -31,6 +31,14 @@ function persistProjectRoot(root: string) {
 
 let projectRoot = loadProjectRoot();
 fs.mkdirSync(projectRoot, { recursive: true });
+const finalizedSegmentSignatureCache = new Map<string, string>();
+let sam2CompatibilityCache:
+  | {
+      ok: boolean;
+      error?: string;
+      checkedAtMs: number;
+    }
+  | null = null;
 
 const template = [
   { label: "Minimize", click: () => mainWindow?.minimize() },
@@ -96,14 +104,31 @@ function createWindow() {
   });
 }
 
-app.on("ready", createWindow);
+app.on("ready", () => {
+  // Register a safe local-file protocol so the renderer can load session images
+  // directly from disk paths without base64 encoding through IPC.
+  protocol.registerFileProtocol("localfile", (request, callback) => {
+    // URL format: localfile:///C:/path/to/file  (triple-slash absolute path)
+    const rawPath = decodeURIComponent(request.url.replace(/^localfile:\/\//, ""));
+    // On Windows the pathname begins with a leading slash before the drive letter; strip it.
+    const filePath =
+      process.platform === "win32" && /^\/[A-Za-z]:/.test(rawPath)
+        ? rawPath.slice(1)
+        : rawPath;
+    callback({ path: filePath });
+  });
+  createWindow();
+});
 
 function getPythonPath(): string {
-  // Try to use the venv Python if it exists
-  const venvPython = path.join(__dirname, "..", "venv", "bin", "python");
-  if (fs.existsSync(venvPython)) {
-    return venvPython;
-  }
+  // Windows: venv\Scripts\python.exe
+  const venvWin = path.join(__dirname, "..", "venv", "Scripts", "python.exe");
+  if (fs.existsSync(venvWin)) return venvWin;
+
+  // Unix/macOS: venv/bin/python
+  const venvUnix = path.join(__dirname, "..", "venv", "bin", "python");
+  if (fs.existsSync(venvUnix)) return venvUnix;
+
   // Fall back to system Python
   return "python";
 }
@@ -118,6 +143,57 @@ function runPython(args: string[]): Promise<string> {
 
     proc.stdout.on("data", (d) => (out += d.toString()));
     proc.stderr.on("data", (d) => (err += d.toString()));
+
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(err || `Python exited with code ${code}`));
+      }
+      resolve(out.trim());
+    });
+  });
+}
+
+function runPythonWithProgress(
+  args: string[],
+  onProgress?: (percent: number, stage: string, details?: Record<string, unknown>) => void
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const pyPath = getPythonPath();
+    const proc = spawn(pyPath, args);
+    let out = "";
+    let err = "";
+
+    proc.stdout.on("data", (d) => (out += d.toString()));
+    proc.stderr.on("data", (d) => {
+      const chunk = d.toString();
+      err += chunk;
+      if (onProgress) {
+        for (const line of chunk.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+
+          const jsonMatch = trimmed.match(/^PROGRESS_JSON\s+(.+)$/);
+          if (jsonMatch) {
+            try {
+              const payload = JSON.parse(jsonMatch[1]) as Record<string, unknown>;
+              const rawPercent = Number(payload.percent);
+              const percent = Number.isFinite(rawPercent) ? rawPercent : 0;
+              const stage =
+                typeof payload.message === "string" && payload.message.trim().length > 0
+                  ? payload.message.trim()
+                  : (typeof payload.stage === "string" ? payload.stage : "progress");
+              onProgress(percent, stage, payload);
+              continue;
+            } catch {
+              // fall through to legacy parser
+            }
+          }
+
+          const m = trimmed.match(/^PROGRESS\s+(\d+)\s+(.+)$/);
+          if (m) onProgress(parseInt(m[1], 10), m[2].trim());
+        }
+      }
+    });
 
     proc.on("close", (code) => {
       if (code !== 0) {
@@ -164,6 +240,659 @@ function ensureTrainingLayout(root: string): void {
 
 function isFiniteNumber(value: unknown): boolean {
   return Number.isFinite(Number(value));
+}
+
+type OrientationMode = "directional" | "bilateral" | "axial" | "invariant";
+type PcaLevelingMode = "off" | "on" | "auto";
+
+type NormalizedOrientationPolicy = {
+  mode: OrientationMode;
+  targetOrientation?: "left" | "right";
+  headCategories: string[];
+  tailCategories: string[];
+  bilateralPairs: [number, number][];
+  pcaLevelingMode: PcaLevelingMode;
+};
+
+type ModelTrainingProfile = {
+  modelName: string;
+  predictorType: "dlib" | "cnn";
+  orientationMode: OrientationMode;
+  orientationPolicy: NormalizedOrientationPolicy;
+  canonicalTrainingEnabled: boolean;
+  trainedWithSam2Segments: boolean;
+  canonicalMaskSource: "none" | "segments" | "rough_otsu" | "mixed" | "unknown";
+  canonicalMaskStats: {
+    total: number;
+    segments: number;
+    roughOtsu: number;
+    unknown: number;
+  };
+  pcaLevelingMode: PcaLevelingMode;
+  targetOrientation?: "left" | "right";
+  headCategories: string[];
+  tailCategories: string[];
+  bilateralPairs: [number, number][];
+  metadataSources: string[];
+};
+
+type ModelCompatibilityIssue = {
+  code: string;
+  severity: "error" | "warning";
+  message: string;
+};
+
+type ModelCompatibilityResult = {
+  ok: boolean;
+  compatible: boolean;
+  blocking: boolean;
+  requiresOverride: boolean;
+  issues: ModelCompatibilityIssue[];
+  sessionPolicy?: NormalizedOrientationPolicy;
+  modelProfile?: ModelTrainingProfile;
+  runtime?: {
+    sam2Ready: boolean;
+    sam2Required: boolean;
+    requirementSource?: string;
+    trainedMaskSource?: "none" | "segments" | "rough_otsu" | "mixed" | "unknown";
+    checkedAt: string;
+    error?: string;
+  };
+  error?: string;
+};
+
+const COMPAT_ORIENTATION_MODES = new Set<OrientationMode>([
+  "directional",
+  "bilateral",
+  "axial",
+  "invariant",
+]);
+const COMPAT_PCA_MODES = new Set<PcaLevelingMode>(["off", "on", "auto"]);
+const SAM2_COMPATIBILITY_CACHE_TTL_MS = 2 * 60 * 1000;
+
+function safeReadJson(filePath: string): any | null {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function summarizeCanonicalMaskUsageFromCropMetadata(
+  effectiveRoot: string,
+  modelName: string
+): {
+  source: "none" | "segments" | "rough_otsu" | "mixed" | "unknown";
+  total: number;
+  segments: number;
+  roughOtsu: number;
+  unknown: number;
+} {
+  const cropMetaPath = path.join(effectiveRoot, "debug", `crop_metadata_${modelName}.json`);
+  const raw = safeReadJson(cropMetaPath);
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return {
+      source: "unknown",
+      total: 0,
+      segments: 0,
+      roughOtsu: 0,
+      unknown: 0,
+    };
+  }
+
+  let total = 0;
+  let segments = 0;
+  let roughOtsu = 0;
+  let unknown = 0;
+
+  raw.forEach((entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const canonicalEnabled = Boolean((entry as any).canonical_training_enabled);
+    const canonicalMeta = (entry as any).canonicalization;
+    if (!canonicalEnabled && (!canonicalMeta || typeof canonicalMeta !== "object")) {
+      return;
+    }
+    total += 1;
+    const source = String((entry as any).canonical_mask_source || "")
+      .trim()
+      .toLowerCase();
+    if (source === "segments") {
+      segments += 1;
+    } else if (source === "rough_otsu") {
+      roughOtsu += 1;
+    } else {
+      unknown += 1;
+    }
+  });
+
+  let resolved: "none" | "segments" | "rough_otsu" | "mixed" | "unknown" = "unknown";
+  if (total === 0) {
+    resolved = "none";
+  } else if (segments > 0 && roughOtsu > 0) {
+    resolved = "mixed";
+  } else if (segments > 0) {
+    resolved = "segments";
+  } else if (roughOtsu > 0) {
+    resolved = "rough_otsu";
+  }
+
+  return {
+    source: resolved,
+    total,
+    segments,
+    roughOtsu,
+    unknown,
+  };
+}
+
+function normalizeCategoryList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const out = new Set<string>();
+  value.forEach((item) => {
+    const normalized = String(item || "").trim().toLowerCase();
+    if (normalized) out.add(normalized);
+  });
+  return [...out];
+}
+
+function normalizeOrientationMode(value: unknown): OrientationMode {
+  const mode = String(value || "").trim().toLowerCase();
+  if (COMPAT_ORIENTATION_MODES.has(mode as OrientationMode)) {
+    return mode as OrientationMode;
+  }
+  return "invariant";
+}
+
+function normalizePcaLevelingMode(value: unknown): PcaLevelingMode {
+  const mode = String(value || "").trim().toLowerCase();
+  if (COMPAT_PCA_MODES.has(mode as PcaLevelingMode)) {
+    return mode as PcaLevelingMode;
+  }
+  return "off";
+}
+
+function inferOrientationPolicyFromTemplate(landmarkTemplate: unknown): NormalizedOrientationPolicy {
+  const categories = new Set<string>();
+  if (Array.isArray(landmarkTemplate)) {
+    landmarkTemplate.forEach((lm: any) => {
+      const cat = String(lm?.category || "").trim().toLowerCase();
+      if (cat) categories.add(cat);
+    });
+  }
+  const hasHead = categories.has("head");
+  const inferredTail = ["tail", "caudal-fin"].filter((cat) => categories.has(cat));
+  const tailCategories = inferredTail.length > 0 ? inferredTail : ["tail", "caudal-fin"];
+  if (hasHead || inferredTail.length > 0) {
+    return {
+      mode: "directional",
+      targetOrientation: "left",
+      headCategories: hasHead ? ["head"] : [],
+      tailCategories,
+      bilateralPairs: [],
+      pcaLevelingMode: "auto",
+    };
+  }
+  return {
+    mode: "invariant",
+    headCategories: [],
+    tailCategories: [],
+    bilateralPairs: [],
+    pcaLevelingMode: "off",
+  };
+}
+
+function normalizeOrientationPolicy(
+  rawPolicy: unknown,
+  landmarkTemplate: unknown
+): NormalizedOrientationPolicy {
+  const inferred = inferOrientationPolicyFromTemplate(landmarkTemplate);
+  const raw = rawPolicy && typeof rawPolicy === "object" ? (rawPolicy as Record<string, unknown>) : {};
+
+  const mode = normalizeOrientationMode(raw.mode ?? inferred.mode);
+  const pcaLevelingMode = normalizePcaLevelingMode(raw.pcaLevelingMode ?? inferred.pcaLevelingMode);
+  const rawTarget = String(raw.targetOrientation || inferred.targetOrientation || "left").trim().toLowerCase();
+  const targetOrientation = rawTarget === "right" ? "right" : "left";
+
+  const headFallback = inferred.headCategories.length > 0 ? inferred.headCategories : ["head"];
+  const tailFallback =
+    inferred.tailCategories.length > 0 ? inferred.tailCategories : ["tail", "caudal-fin"];
+  const headCategories = normalizeCategoryList(raw.headCategories);
+  const tailCategories = normalizeCategoryList(raw.tailCategories);
+
+  const normalizedPairs: [number, number][] = [];
+  if (Array.isArray(raw.bilateralPairs)) {
+    const seen = new Set<string>();
+    raw.bilateralPairs.forEach((pair: any) => {
+      if (!Array.isArray(pair) || pair.length !== 2) return;
+      const a = Number(pair[0]);
+      const b = Number(pair[1]);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) return;
+      const key = `${Math.min(a, b)}:${Math.max(a, b)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      normalizedPairs.push([Math.round(a), Math.round(b)]);
+    });
+  }
+
+  const policy: NormalizedOrientationPolicy = {
+    mode,
+    pcaLevelingMode,
+    headCategories: mode === "directional" ? (headCategories.length > 0 ? headCategories : headFallback) : [],
+    tailCategories: mode === "directional" ? (tailCategories.length > 0 ? tailCategories : tailFallback) : [],
+    bilateralPairs: mode === "bilateral" ? normalizedPairs : [],
+  };
+  if (mode === "directional") {
+    policy.targetOrientation = targetOrientation;
+  }
+  return policy;
+}
+
+function loadSessionOrientationPolicyForCompatibility(
+  speciesId: string
+): { policy: NormalizedOrientationPolicy; landmarkTemplate: any[] } {
+  const sessionPath = path.join(getEffectiveRoot(speciesId), "session.json");
+  const sessionRaw = safeReadJson(sessionPath) || {};
+  const template = Array.isArray(sessionRaw.landmarkTemplate) ? sessionRaw.landmarkTemplate : [];
+  return {
+    policy: normalizeOrientationPolicy(sessionRaw.orientationPolicy, template),
+    landmarkTemplate: template,
+  };
+}
+
+function loadModelTrainingProfileForCompatibility(
+  speciesId: string,
+  modelName: string,
+  predictorType: "dlib" | "cnn"
+): ModelTrainingProfile {
+  const effectiveRoot = getEffectiveRoot(speciesId);
+  const metadataSources: string[] = [];
+  const fallbackSession = loadSessionOrientationPolicyForCompatibility(speciesId);
+
+  let rawTrainingConfig: Record<string, any> = {};
+  if (predictorType === "dlib") {
+    const idMappingPath = path.join(effectiveRoot, "debug", `id_mapping_${modelName}.json`);
+    const idMappingRaw = safeReadJson(idMappingPath);
+    if (idMappingRaw && typeof idMappingRaw === "object") {
+      rawTrainingConfig = (idMappingRaw.training_config || {}) as Record<string, any>;
+      metadataSources.push(idMappingPath);
+    }
+  } else {
+    const cnnTrainParamsPath = path.join(effectiveRoot, "debug", `training_params_${modelName}_cnn.json`);
+    const cnnTrainParamsRaw = safeReadJson(cnnTrainParamsPath);
+    if (cnnTrainParamsRaw && typeof cnnTrainParamsRaw === "object") {
+      rawTrainingConfig = {
+        orientation_mode: cnnTrainParamsRaw.orientation_mode,
+        orientation_policy: cnnTrainParamsRaw.orientation_policy,
+        canonical_training_enabled: cnnTrainParamsRaw.canonical_training_enabled,
+        pca_leveling_mode: cnnTrainParamsRaw.pca_leveling_mode,
+        target_orientation: cnnTrainParamsRaw.target_orientation,
+      };
+      metadataSources.push(cnnTrainParamsPath);
+    }
+
+    const cnnConfigPath = path.join(effectiveRoot, "models", `cnn_${modelName}_config.json`);
+    const cnnConfigRaw = safeReadJson(cnnConfigPath);
+    if (cnnConfigRaw && typeof cnnConfigRaw === "object") {
+      metadataSources.push(cnnConfigPath);
+    }
+  }
+
+  const trainingPolicy = normalizeOrientationPolicy(
+    rawTrainingConfig.orientation_policy,
+    fallbackSession.landmarkTemplate
+  );
+  const orientationMode = normalizeOrientationMode(
+    rawTrainingConfig.orientation_mode ?? trainingPolicy.mode
+  );
+  const pcaLevelingMode = normalizePcaLevelingMode(
+    rawTrainingConfig.pca_leveling_mode ?? trainingPolicy.pcaLevelingMode
+  );
+  const rawTarget = String(
+    rawTrainingConfig.target_orientation ??
+      trainingPolicy.targetOrientation ??
+      fallbackSession.policy.targetOrientation ??
+      "left"
+  )
+    .trim()
+    .toLowerCase();
+  const targetOrientation: "left" | "right" = rawTarget === "right" ? "right" : "left";
+  const canonicalTrainingEnabled =
+    typeof rawTrainingConfig.canonical_training_enabled === "boolean"
+      ? rawTrainingConfig.canonical_training_enabled
+      : orientationMode !== "invariant" && pcaLevelingMode !== "off";
+  const maskUsage = summarizeCanonicalMaskUsageFromCropMetadata(effectiveRoot, modelName);
+  const trainedWithSam2Segments =
+    Boolean(canonicalTrainingEnabled) && maskUsage.segments > 0;
+
+  return {
+    modelName,
+    predictorType,
+    orientationMode,
+    orientationPolicy: {
+      ...trainingPolicy,
+      mode: orientationMode,
+      pcaLevelingMode,
+      ...(orientationMode === "directional" ? { targetOrientation } : {}),
+    },
+    canonicalTrainingEnabled: Boolean(canonicalTrainingEnabled),
+    trainedWithSam2Segments,
+    canonicalMaskSource: maskUsage.source,
+    canonicalMaskStats: {
+      total: maskUsage.total,
+      segments: maskUsage.segments,
+      roughOtsu: maskUsage.roughOtsu,
+      unknown: maskUsage.unknown,
+    },
+    pcaLevelingMode,
+    targetOrientation: orientationMode === "directional" ? targetOrientation : undefined,
+    headCategories:
+      orientationMode === "directional"
+        ? normalizeCategoryList(trainingPolicy.headCategories)
+        : [],
+    tailCategories:
+      orientationMode === "directional"
+        ? normalizeCategoryList(trainingPolicy.tailCategories)
+        : [],
+    bilateralPairs:
+      orientationMode === "bilateral"
+        ? (trainingPolicy.bilateralPairs || []).map((pair) => [pair[0], pair[1]] as [number, number])
+        : [],
+    metadataSources,
+  };
+}
+
+function hasCategoryOverlap(left: string[], right: string[]): boolean {
+  if (left.length === 0 || right.length === 0) return false;
+  const rightSet = new Set(right);
+  return left.some((item) => rightSet.has(item));
+}
+
+function formatCompatibilityErrorSummary(issues: ModelCompatibilityIssue[]): string {
+  const blocking = issues
+    .filter((issue) => issue.severity === "error")
+    .map((issue) => issue.message);
+  if (blocking.length === 0) return "No blocking compatibility issues.";
+  return blocking.join(" ");
+}
+
+async function resolveSam2CompatibilityReadiness(force = false): Promise<{ ok: boolean; error?: string }> {
+  const now = Date.now();
+  if (
+    !force &&
+    sam2CompatibilityCache &&
+    now - sam2CompatibilityCache.checkedAtMs <= SAM2_COMPATIBILITY_CACHE_TTL_MS
+  ) {
+    return { ok: sam2CompatibilityCache.ok, error: sam2CompatibilityCache.error };
+  }
+
+  const ready = await ensureSam2Ready();
+  sam2CompatibilityCache = {
+    ok: ready.ok,
+    error: ready.error,
+    checkedAtMs: now,
+  };
+  return { ok: ready.ok, error: ready.error };
+}
+
+async function evaluateModelCompatibility(args: {
+  speciesId?: string;
+  modelName: string;
+  predictorType: "dlib" | "cnn";
+  includeRuntime?: boolean;
+}): Promise<ModelCompatibilityResult> {
+  if (!args.speciesId) {
+    return {
+      ok: true,
+      compatible: true,
+      blocking: false,
+      requiresOverride: false,
+      issues: [],
+    };
+  }
+
+  try {
+    const session = loadSessionOrientationPolicyForCompatibility(args.speciesId);
+    const profile = loadModelTrainingProfileForCompatibility(
+      args.speciesId,
+      args.modelName,
+      args.predictorType
+    );
+    const issues: ModelCompatibilityIssue[] = [];
+
+    if (profile.orientationMode !== session.policy.mode) {
+      issues.push({
+        code: "orientation_mode_mismatch",
+        severity: "error",
+        message: `Model trained for "${profile.orientationMode}" orientation schema but session is "${session.policy.mode}".`,
+      });
+    }
+
+    if (profile.orientationMode === "directional" && session.policy.mode === "directional") {
+      const modelTarget = profile.targetOrientation || "left";
+      const sessionTarget = session.policy.targetOrientation || "left";
+      if (modelTarget !== sessionTarget) {
+        issues.push({
+          code: "target_orientation_mismatch",
+          severity: "error",
+          message: `Model canonical target is "${modelTarget}" but session target is "${sessionTarget}".`,
+        });
+      }
+
+      if (profile.headCategories.length > 0 && session.policy.headCategories.length > 0) {
+        if (!hasCategoryOverlap(profile.headCategories, session.policy.headCategories)) {
+          issues.push({
+            code: "head_category_mismatch",
+            severity: "warning",
+            message: "Model and session head categories do not overlap; orientation hints may degrade.",
+          });
+        }
+      }
+
+      if (profile.tailCategories.length > 0 && session.policy.tailCategories.length > 0) {
+        if (!hasCategoryOverlap(profile.tailCategories, session.policy.tailCategories)) {
+          issues.push({
+            code: "tail_category_mismatch",
+            severity: "error",
+            message: "Model and session tail categories do not overlap (for fish include caudal-fin as tail).",
+          });
+        }
+      }
+    }
+
+    if (profile.orientationMode === "bilateral" && session.policy.mode === "bilateral") {
+      if (profile.bilateralPairs.length > 0 && session.policy.bilateralPairs.length === 0) {
+        issues.push({
+          code: "bilateral_pairs_missing",
+          severity: "error",
+          message: "Model was trained with bilateral pair swaps but session has no bilateral pairs configured.",
+        });
+      }
+    }
+
+    if (profile.canonicalTrainingEnabled) {
+      if (session.policy.mode === "invariant") {
+        issues.push({
+          code: "canonical_vs_invariant_mismatch",
+          severity: "error",
+          message: "Model expects canonicalized orientation flow but session is configured as invariant.",
+        });
+      }
+      if (session.policy.pcaLevelingMode === "off") {
+        issues.push({
+          code: "pca_disabled_mismatch",
+          severity: "error",
+          message: "Model was trained with PCA/canonicalization enabled but session PCA leveling is OFF.",
+        });
+      }
+      if (profile.canonicalMaskSource === "unknown" || profile.canonicalMaskSource === "none") {
+        issues.push({
+          code: "canonical_mask_source_unknown",
+          severity: "warning",
+          message:
+            "Training mask source metadata is missing/unknown; SAM2 parity requirements cannot be fully verified.",
+        });
+      }
+    } else if (session.policy.mode !== "invariant" && session.policy.pcaLevelingMode === "on") {
+      issues.push({
+        code: "canonicalization_training_gap",
+        severity: "warning",
+        message: "Session requests forced PCA leveling, but model metadata indicates non-canonical training.",
+      });
+    }
+
+    let runtime: ModelCompatibilityResult["runtime"] | undefined;
+    const sam2Required = Boolean(profile.trainedWithSam2Segments);
+    const shouldCheckSam2Runtime =
+      Boolean(args.includeRuntime) &&
+      (sam2Required || profile.canonicalTrainingEnabled);
+    if (shouldCheckSam2Runtime) {
+      const sam2 = await resolveSam2CompatibilityReadiness(false);
+      runtime = {
+        sam2Ready: sam2.ok,
+        sam2Required,
+        requirementSource: sam2Required ? "trained_with_sam2_segments" : "advisory_only",
+        trainedMaskSource: profile.canonicalMaskSource,
+        checkedAt: new Date().toISOString(),
+        ...(sam2.error ? { error: sam2.error } : {}),
+      };
+      if (sam2Required && !sam2.ok) {
+        issues.push({
+          code: "sam2_training_mismatch",
+          severity: "error",
+          message:
+            "Model was trained with SAM2-derived segment masks, but SAM2 is unavailable at inference. This is blocked by default to preserve train/inference parity. Override only if you accept reduced orientation accuracy.",
+        });
+      } else if (!sam2.ok && profile.canonicalTrainingEnabled) {
+        issues.push({
+          code: "sam2_unavailable_using_rough_mask_fallback",
+          severity: "warning",
+          message:
+            "SAM2 is unavailable; inference will use rough-mask PCA fallback instead of SAM2 masks.",
+        });
+      }
+    }
+
+    const blocking = issues.some((issue) => issue.severity === "error");
+    return {
+      ok: true,
+      compatible: !blocking && issues.length === 0,
+      blocking,
+      requiresOverride: blocking,
+      issues,
+      sessionPolicy: session.policy,
+      modelProfile: profile,
+      runtime,
+    };
+  } catch (error: any) {
+    return {
+      ok: false,
+      compatible: false,
+      blocking: true,
+      requiresOverride: true,
+      issues: [
+        {
+          code: "compatibility_check_failed",
+          severity: "error",
+          message: error?.message || "Compatibility check failed.",
+        },
+      ],
+      error: error?.message || "Compatibility check failed.",
+    };
+  }
+}
+
+type FinalizedAcceptedLandmark = {
+  id: number;
+  x: number;
+  y: number;
+  isSkipped?: boolean;
+};
+
+type FinalizedAcceptedBox = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  orientation_override?: "left" | "right" | "uncertain";
+  landmarks?: FinalizedAcceptedLandmark[];
+};
+
+function normalizeFinalizedAcceptedBoxes(
+  rawBoxes: Array<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    orientation_override?: "left" | "right" | "uncertain";
+    landmarks?: Array<{ id: number; x: number; y: number; isSkipped?: boolean }>;
+  }>
+): FinalizedAcceptedBox[] {
+  const accepted: FinalizedAcceptedBox[] = [];
+  (rawBoxes || []).forEach((raw, idx) => {
+    const left = Math.round(Number(raw?.left));
+    const top = Math.round(Number(raw?.top));
+    const width = Math.round(Number(raw?.width));
+    const height = Math.round(Number(raw?.height));
+    if (!isFiniteNumber(left) || !isFiniteNumber(top) || width <= 0 || height <= 0) {
+      return;
+    }
+    const box: FinalizedAcceptedBox = { left, top, width, height };
+    if (
+      raw?.orientation_override === "left" ||
+      raw?.orientation_override === "right" ||
+      raw?.orientation_override === "uncertain"
+    ) {
+      box.orientation_override = raw.orientation_override;
+    }
+    if (Array.isArray(raw?.landmarks) && raw.landmarks.length > 0) {
+      try {
+        const normalizedLandmarks = normalizeLandmarks(
+          raw.landmarks as any[],
+          `acceptedBoxes[${idx}]`
+        );
+        if (normalizedLandmarks.length > 0) {
+          box.landmarks = normalizedLandmarks.map((lm) => ({
+            id: Number(lm.id),
+            x: Number(lm.x),
+            y: Number(lm.y),
+            ...(lm.isSkipped ? { isSkipped: true } : {}),
+          }));
+        }
+      } catch (_) {
+        // Keep box geometry even if a subset of landmarks are malformed.
+      }
+    }
+    accepted.push(box);
+  });
+
+  accepted.sort(
+    (a, b) =>
+      a.left - b.left ||
+      a.top - b.top ||
+      a.width - b.width ||
+      a.height - b.height
+  );
+  return accepted;
+}
+
+function buildAcceptedBoxesSignature(boxes: Array<{ left: number; top: number; width: number; height: number }>): string {
+  const reduced = (boxes || [])
+    .map((b) => ({
+      left: Math.round(Number(b.left) || 0),
+      top: Math.round(Number(b.top) || 0),
+      width: Math.round(Number(b.width) || 0),
+      height: Math.round(Number(b.height) || 0),
+    }))
+    .filter((b) => b.width > 0 && b.height > 0)
+    .sort(
+      (a, b) =>
+        a.left - b.left ||
+        a.top - b.top ||
+        a.width - b.width ||
+        a.height - b.height
+    );
+  return JSON.stringify(reduced);
 }
 
 function getImageDimensions(imagePath: string): { width: number; height: number } | null {
@@ -246,6 +975,119 @@ function deriveBoxFromLandmarks(
   }
 
   return { left: minX, top: minY, width, height };
+}
+
+// ── Annotation file parsers ──
+
+type AnnotationEntry = {
+  box: { left: number; top: number; width: number; height: number };
+  landmarks: Array<{ id: number; x: number; y: number }>;
+};
+
+function parseXmlAttrs(str: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  // Handle quoted values (single or double quotes) — paths may contain slashes
+  const re = /(\w+)=(?:'([^']*)'|"([^"]*)")/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(str)) !== null) {
+    attrs[m[1]] = m[2] ?? m[3] ?? "";
+  }
+  return attrs;
+}
+
+/**
+ * Parse an imglab-format dlib XML annotation file.
+ * Returns a Map keyed by image basename → { box, landmarks[] }.
+ */
+function parseImglabXml(filePath: string): Map<string, AnnotationEntry> {
+  const content = fs.readFileSync(filePath, "utf-8");
+  const result = new Map<string, AnnotationEntry>();
+
+  // Match each <image ...> block
+  const imageRe = /<image\s([^>]+)>([\s\S]*?)<\/image>/g;
+  let imgMatch: RegExpExecArray | null;
+
+  while ((imgMatch = imageRe.exec(content)) !== null) {
+    const imgAttrs = parseXmlAttrs(imgMatch[1]);
+    const fileAttr = imgAttrs["file"];
+    if (!fileAttr) continue;
+    const filename = path.basename(fileAttr);
+    const body = imgMatch[2];
+
+    // Parse <box ...>
+    const boxTagMatch = body.match(/<box\s([^>]+)>/);
+    if (!boxTagMatch) continue;
+    const boxAttrs = parseXmlAttrs(boxTagMatch[1]);
+    const box = {
+      left: parseFloat(boxAttrs["left"] ?? "0"),
+      top: parseFloat(boxAttrs["top"] ?? "0"),
+      width: parseFloat(boxAttrs["width"] ?? "0"),
+      height: parseFloat(boxAttrs["height"] ?? "0"),
+    };
+
+    // Parse all <part name=N x=X y=Y/>
+    const landmarks: Array<{ id: number; x: number; y: number }> = [];
+    const partRe = /<part\s([^>]+?)\/>/g;
+    let partMatch: RegExpExecArray | null;
+    while ((partMatch = partRe.exec(body)) !== null) {
+      const pa = parseXmlAttrs(partMatch[1]);
+      if (pa["name"] !== undefined && pa["x"] !== undefined && pa["y"] !== undefined) {
+        landmarks.push({
+          id: parseInt(pa["name"], 10),
+          x: parseFloat(pa["x"]),
+          y: parseFloat(pa["y"]),
+        });
+      }
+    }
+    landmarks.sort((a, b) => a.id - b.id);
+
+    result.set(filename, { box, landmarks });
+  }
+
+  return result;
+}
+
+/**
+ * Parse a BioVision JSON annotation file.
+ * Accepts a single object { imageFilename, boxes[] } or an array of such objects.
+ * Returns a Map keyed by image filename → { box, landmarks[] }.
+ */
+function parseBioVisionJson(filePath: string): Map<string, AnnotationEntry> {
+  const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  const records: any[] = Array.isArray(raw) ? raw : [raw];
+  const result = new Map<string, AnnotationEntry>();
+
+  for (const record of records) {
+    const imageFilename: string = record?.imageFilename;
+    if (!imageFilename) continue;
+
+    const boxes: any[] = record?.boxes ?? [];
+    if (!boxes.length) continue;
+
+    // Use the first box
+    const firstBox = boxes[0];
+    const box = {
+      left: Number(firstBox.left ?? 0),
+      top: Number(firstBox.top ?? 0),
+      width: Number(firstBox.width ?? 0),
+      height: Number(firstBox.height ?? 0),
+    };
+
+    const rawLandmarks: any[] = firstBox?.landmarks ?? [];
+    const landmarks = rawLandmarks
+      .filter((lm: any) => !lm?.isSkipped)
+      .map((lm: any, i: number) => ({
+        id: Number(lm?.id ?? i),
+        x: Number(lm?.x ?? 0),
+        y: Number(lm?.y ?? 0),
+      }));
+
+    // Always key by bare filename — ignore any path prefix baked into the annotation file
+    // (e.g. "in/image.jpg", "/old/system/path/image.jpg" → "image.jpg")
+    result.set(path.basename(imageFilename), { box, landmarks });
+  }
+
+  return result;
 }
 
 interface PreAnnotatedRecord {
@@ -573,7 +1415,97 @@ interface TrainOptions {
   customOptions?: Record<string, number>;  // Custom training parameters
   speciesId?: string;  // Session-scoped training
   useImportedXml?: boolean; // Train directly from existing xml/train_{tag}.xml
+  predictorType?: "dlib" | "cnn"; // Predictor backend (default: "dlib")
+  cnnVariant?: string; // CNN backbone id (e.g. simplebaseline, mobilenet_v3_large)
 }
+
+const FALLBACK_CNN_VARIANTS = [
+  {
+    id: "simplebaseline",
+    label: "SimpleBaseline (ResNet-50)",
+    description: "Balanced accuracy/speed baseline for most datasets.",
+    selectable: true,
+    recommended: true,
+    reason: null as string | null,
+  },
+  {
+    id: "mobilenet_v3_large",
+    label: "MobileNetV3 Large",
+    description: "Fastest option; useful on CPU or lower-memory systems.",
+    selectable: true,
+    recommended: false,
+    reason: null as string | null,
+  },
+  {
+    id: "efficientnet_b0",
+    label: "EfficientNet-B0",
+    description: "Compact backbone with strong generalization on medium datasets.",
+    selectable: true,
+    recommended: false,
+    reason: null as string | null,
+  },
+  {
+    id: "hrnet_w32",
+    label: "HRNet-W32",
+    description: "Highest-capacity option; best with stronger GPU resources.",
+    selectable: false,
+    recommended: false,
+    reason: "Capability probe unavailable. Use simplebaseline by default.",
+  },
+];
+
+async function resolveCnnVariantCapabilities(): Promise<{
+  ok: boolean;
+  torchAvailable: boolean;
+  torchvisionAvailable: boolean;
+  device: string;
+  gpuName: string | null;
+  gpuMemoryGb: number | null;
+  defaultVariant: string;
+  variants: Array<{
+    id: string;
+    label: string;
+    description: string;
+    selectable: boolean;
+    recommended?: boolean;
+    reason?: string | null;
+  }>;
+  warning?: string;
+}> {
+  try {
+    const out = await runPython([path.join(__dirname, "../backend/list_cnn_variants.py")]);
+    const parsed = JSON.parse(out || "{}");
+    if (!parsed || !Array.isArray(parsed.variants)) {
+      throw new Error("Invalid CNN variant response payload.");
+    }
+    return {
+      ok: true,
+      torchAvailable: !!parsed.torch_available,
+      torchvisionAvailable: !!parsed.torchvision_available,
+      device: String(parsed.device || "cpu"),
+      gpuName: parsed.gpu_name ?? null,
+      gpuMemoryGb: parsed.gpu_memory_gb ?? null,
+      defaultVariant: String(parsed.default_variant || "simplebaseline"),
+      variants: parsed.variants,
+    };
+  } catch (e: any) {
+    return {
+      ok: true,
+      torchAvailable: false,
+      torchvisionAvailable: false,
+      device: "cpu",
+      gpuName: null,
+      gpuMemoryGb: null,
+      defaultVariant: "simplebaseline",
+      variants: FALLBACK_CNN_VARIANTS,
+      warning: e?.message || "Capability probe failed; using safe defaults.",
+    };
+  }
+}
+
+ipcMain.handle("ml:get-cnn-variants", async () => {
+  return resolveCnnVariantCapabilities();
+});
 
 ipcMain.handle(
   "ml:training-preflight",
@@ -657,6 +1589,55 @@ ipcMain.handle(
 );
 
 ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOptions) => {
+  const predictorTypeRaw = (options as any)?.predictorType ?? "dlib";
+  if (predictorTypeRaw !== "dlib" && predictorTypeRaw !== "cnn") {
+    return { ok: false, error: "Unsupported predictor type. Use dlib or cnn." };
+  }
+  const predictorType: "dlib" | "cnn" = predictorTypeRaw;
+  let lastTrainProgressPercent = 0;
+  const emitTrainProgress = (
+    percent: number,
+    stage: string,
+    message: string,
+    details?: Record<string, unknown>
+  ) => {
+    const rawPct = Math.max(0, Math.min(100, Math.round(percent)));
+    // Keep train progress monotonic across nested evaluation/parity subloops
+    // (some backend phases restart local progress counters).
+    const pct = Math.max(lastTrainProgressPercent, rawPct);
+    lastTrainProgressPercent = pct;
+    const detailPayload =
+      details && typeof details === "object"
+        ? {
+            ...details,
+            raw_percent: rawPct,
+            monotonic_percent: pct,
+          }
+        : details;
+    mainWindow?.webContents.send("ml:train-progress", {
+      percent: pct,
+      stage,
+      message,
+      predictorType,
+      modelName,
+      details: detailPayload,
+    });
+  };
+  const resolveProgressStage = (fallback: string, details?: Record<string, unknown>) => {
+    const raw = details?.["stage"];
+    if (typeof raw === "string" && raw.trim().length > 0) {
+      return raw.trim();
+    }
+    return fallback;
+  };
+  const resolveProgressMessage = (fallback: string, details?: Record<string, unknown>) => {
+    const raw = details?.["message"];
+    if (typeof raw === "string" && raw.trim().length > 0) {
+      return raw.trim();
+    }
+    return fallback;
+  };
+
   try {
     if (!MODEL_NAME_RE.test(modelName)) {
       throw new Error("Invalid model name. Use letters, numbers, dot, underscore, or hyphen.");
@@ -666,6 +1647,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
     const seed = options?.seed ?? 42;
     const effectiveRoot = getEffectiveRoot(options?.speciesId);
     ensureTrainingLayout(effectiveRoot);
+    emitTrainProgress(3, "preflight", "Validating training inputs...");
 
     if (options?.useImportedXml) {
       const xmlValidator = path.join(__dirname, "../backend/validate_dlib_xml.py");
@@ -686,33 +1668,159 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
           throw new Error(`Test XML validation failed: ${summarizeValidationErrors(testValidation)}`);
         }
       }
+      emitTrainProgress(20, "preflight", "Imported XML validated.");
     } else {
       // Prepare dataset with train/test split
-      await runPython([
+      emitTrainProgress(12, "prepare_dataset", "Preparing dataset...");
+      await runPythonWithProgress([
         path.join(__dirname, "../backend/prepare_dataset.py"),
         effectiveRoot,
         modelName,
         testSplit.toString(),
         seed.toString(),
-      ]);
+      ], (pct, stage, details) => {
+        const scaled = 12 + Math.round((Math.max(0, Math.min(100, pct)) / 100) * 18);
+        const uiStage = resolveProgressStage("prepare_dataset", details);
+        const uiMessage = resolveProgressMessage(stage, details);
+        emitTrainProgress(scaled, uiStage, uiMessage, details);
+      });
+      emitTrainProgress(30, "prepare_dataset", "Dataset preparation complete.");
     }
 
-    // Train with optional custom parameters
-    const trainArgs = [
-      path.join(__dirname, "../backend/train_shape_model.py"),
-      effectiveRoot,
-      modelName,
-    ];
-    if (options?.customOptions) {
-      trainArgs.push(JSON.stringify(options.customOptions));
+    // Run dataset audit (non-blocking: surface warnings but don't abort)
+    let auditReport: Record<string, unknown> | null = null;
+    emitTrainProgress(35, "evaluation", "Auditing dataset...");
+    try {
+      const auditScript = path.join(__dirname, "../backend/audit_dataset.py");
+      if (fs.existsSync(auditScript)) {
+        const auditOut = await runPython([
+          auditScript,
+          "--project-root", effectiveRoot,
+          "--tag", modelName,
+        ]).catch(() => null);
+        if (auditOut) {
+          const debugDir = path.join(effectiveRoot, "debug");
+          const auditPath = path.join(debugDir, `audit_${modelName}.json`);
+          if (fs.existsSync(auditPath)) {
+            try { auditReport = JSON.parse(fs.readFileSync(auditPath, "utf-8")); } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Train with selected predictor type
+    let out: string;
+    if (predictorType === "cnn") {
+      const cnnCapabilities = await resolveCnnVariantCapabilities();
+      const selectableVariants = (cnnCapabilities.variants || []).filter(
+        (v) => v && v.selectable
+      );
+      if (selectableVariants.length === 0) {
+        const reasonBits: string[] = [];
+        if (!cnnCapabilities.torchAvailable) {
+          reasonBits.push("PyTorch is not available");
+        }
+        if (!cnnCapabilities.torchvisionAvailable) {
+          reasonBits.push("torchvision is not available");
+        }
+        if (cnnCapabilities.warning) {
+          reasonBits.push(cnnCapabilities.warning);
+        }
+        const suffix =
+          reasonBits.length > 0 ? ` (${reasonBits.join("; ")})` : "";
+        throw new Error(
+          `CNN training is unavailable on this system${suffix}.`
+        );
+      }
+
+      const cnnVariantRaw = (options as any)?.cnnVariant;
+      const requestedVariant =
+        typeof cnnVariantRaw === "string" && cnnVariantRaw.trim().length > 0
+          ? cnnVariantRaw.trim()
+          : "";
+      let cnnVariant = requestedVariant;
+      if (requestedVariant) {
+        const requested = cnnCapabilities.variants.find(
+          (v) => v.id === requestedVariant
+        );
+        if (requested && !requested.selectable) {
+          throw new Error(
+            `CNN variant "${requestedVariant}" is not available on this system${
+              requested.reason ? `: ${requested.reason}` : "."
+            }`
+          );
+        }
+      }
+      if (!cnnVariant || !selectableVariants.some((v) => v.id === cnnVariant)) {
+        const fallbackVariant =
+          selectableVariants.find(
+            (v) => v.id === cnnCapabilities.defaultVariant
+          )?.id ?? selectableVariants[0].id;
+        cnnVariant = fallbackVariant;
+      }
+      const epochsRaw = Number(options?.customOptions?.epochs);
+      const lrRaw = Number((options as any)?.customOptions?.lr);
+      const batchRaw = Number((options as any)?.customOptions?.batch ?? (options as any)?.customOptions?.batch_size);
+      const cnnArgs = [
+        path.join(__dirname, "../backend/train_cnn_model.py"),
+        effectiveRoot,
+        modelName,
+        "--model-variant", cnnVariant,
+      ];
+      emitTrainProgress(
+        40,
+        "preflight",
+        `CNN system gate: device=${cnnCapabilities.device}, variant=${cnnVariant}.`,
+        {
+          stage: "preflight",
+          device: cnnCapabilities.device,
+          gpu_name: cnnCapabilities.gpuName ?? undefined,
+          gpu_memory_gb: cnnCapabilities.gpuMemoryGb ?? undefined,
+          model_variant: cnnVariant,
+        }
+      );
+      if (Number.isFinite(epochsRaw) && epochsRaw > 0) {
+        cnnArgs.push("--epochs", String(Math.round(epochsRaw)));
+      }
+      if (Number.isFinite(lrRaw) && lrRaw > 0) {
+        cnnArgs.push("--lr", String(lrRaw));
+      }
+      if (Number.isFinite(batchRaw) && batchRaw > 0) {
+        cnnArgs.push("--batch-size", String(Math.round(batchRaw)));
+      }
+      emitTrainProgress(42, "training", "Training CNN model...");
+      out = await runPythonWithProgress(cnnArgs, (pct, stage, details) => {
+        const scaled = 42 + Math.round((Math.max(0, Math.min(100, pct)) / 100) * 50);
+        const uiStage = resolveProgressStage("training", details);
+        const uiMessage = resolveProgressMessage(stage, details);
+        emitTrainProgress(scaled, uiStage, uiMessage, details);
+      });
+    } else {
+      const trainArgs = [
+        path.join(__dirname, "../backend/train_shape_model.py"),
+        effectiveRoot,
+        modelName,
+      ];
+      if (options?.customOptions) {
+        trainArgs.push(JSON.stringify(options.customOptions));
+      }
+      emitTrainProgress(42, "training", "Training dlib shape predictor...");
+      out = await runPythonWithProgress(trainArgs, (pct, stage, details) => {
+        const scaled = 42 + Math.round((Math.max(0, Math.min(100, pct)) / 100) * 50);
+        const uiStage = resolveProgressStage("training", details);
+        const uiMessage = resolveProgressMessage(stage, details);
+        emitTrainProgress(scaled, uiStage, uiMessage, details);
+      });
     }
 
-    const out = await runPython(trainArgs);
+    emitTrainProgress(95, "evaluation", "Evaluating trained model...");
 
     // Parse output for train/test errors
     const trainErrorMatch = out.match(/TRAIN_ERROR\s+([\d.]+)/);
     const testErrorMatch = out.match(/TEST_ERROR\s+([\d.]+)/);
     const modelPathMatch = out.match(/MODEL_PATH\s+(.+)/);
+
+    emitTrainProgress(100, "done", "Training complete.");
 
     return {
       ok: true,
@@ -720,8 +1828,10 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       trainError: trainErrorMatch ? parseFloat(trainErrorMatch[1]) : null,
       testError: testErrorMatch ? parseFloat(testErrorMatch[1]) : null,
       modelPath: modelPathMatch ? modelPathMatch[1].trim() : null,
+      auditReport: auditReport ?? undefined,
     };
   } catch (e: any) {
+    emitTrainProgress(100, "error", `Training failed: ${e.message}`);
     console.error("Training failed:", e);
     return { ok: false, error: e.message };
   }
@@ -881,11 +1991,16 @@ ipcMain.handle("ml:import-dlib-xml", async (_event, args: { modelName: string; s
 });
 
 // Run detailed model testing
-ipcMain.handle("ml:test-model", async (_event, modelName: string) => {
+ipcMain.handle("ml:test-model", async (_event, args: string | { modelName: string; speciesId?: string }) => {
   try {
+    // Accept either legacy string arg or new object with speciesId
+    const modelName = typeof args === "string" ? args : args.modelName;
+    const speciesId = typeof args === "object" ? args.speciesId : undefined;
+    const effectiveRoot = getEffectiveRoot(speciesId);
+
     const out = await runPython([
       path.join(__dirname, "../backend/shape_tester.py"),
-      projectRoot,
+      effectiveRoot,
       modelName,
     ]);
 
@@ -941,20 +2056,125 @@ ipcMain.handle("ml:save-labels", async (_event, images) => {
   return { ok: true };
 });
 
-ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string) => {
+interface PredictOptions {
+  multiSpecimen?: boolean;
+  predictorType?: "dlib" | "cnn";
+  allowIncompatible?: boolean;
+  boxes?: Array<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    right?: number;
+    bottom?: number;
+    orientation_hint?: {
+      orientation?: "left" | "right";
+      confidence?: number;
+      source?: string;
+      head_point?: [number, number];
+      tail_point?: [number, number];
+    };
+  }>;
+}
+
+ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string, speciesId?: string, options?: PredictOptions) => {
+  let tempFile: string | null = null;
+  let tempBoxesFile: string | null = null;
   try {
-    const out = await runPython([
+    const modelRoot = getEffectiveRoot(speciesId);
+
+    // Paths containing non-ASCII characters (e.g. macOS narrow no-break space U+202F
+    // in screenshot names) can get corrupted when passed as spawn() argv on Windows.
+    // Copy to a temp file with an ASCII-safe name to avoid the encoding issue.
+    let effectivePath = imagePath;
+    if (/[^\x00-\x7F]/.test(imagePath)) {
+      const ext = path.extname(imagePath);
+      tempFile = path.join(app.getPath("temp"), `bv_infer_${Date.now()}${ext}`);
+      fs.copyFileSync(imagePath, tempFile);
+      effectivePath = tempFile;
+    }
+
+    // Wire in session YOLO detection model so inference uses the same detector
+    // that was trained for this session (falls back to OpenCV if none found).
+    const yoloModel = getSessionYoloModel(speciesId);
+
+    // Respect explicit predictor choice, otherwise auto-detect.
+    const cnnModelPath = path.join(modelRoot, "models", `cnn_${tag}.pth`);
+    const dlibModelPath = path.join(modelRoot, "models", `predictor_${tag}.dat`);
+    const requestedPredictor = options?.predictorType;
+    let predictorType: "dlib" | "cnn";
+    if (requestedPredictor === "cnn") {
+      if (!fs.existsSync(cnnModelPath)) {
+        throw new Error(`CNN model not found for "${tag}".`);
+      }
+      predictorType = "cnn";
+    } else if (requestedPredictor === "dlib") {
+      if (!fs.existsSync(dlibModelPath)) {
+        throw new Error(`dlib model not found for "${tag}".`);
+      }
+      predictorType = "dlib";
+    } else {
+      predictorType = fs.existsSync(cnnModelPath) ? "cnn" : "dlib";
+    }
+
+    const compatibility = await evaluateModelCompatibility({
+      speciesId,
+      modelName: tag,
+      predictorType,
+      includeRuntime: true,
+    });
+    if (!compatibility.ok) {
+      throw new Error(
+        compatibility.error ||
+          "Model/session compatibility check failed."
+      );
+    }
+    if (compatibility.blocking && !options?.allowIncompatible) {
+      throw new Error(
+        `Inference blocked by compatibility checks. ${formatCompatibilityErrorSummary(
+          compatibility.issues
+        )} Use override to continue.`
+      );
+    }
+
+    const pythonArgs = [
       path.join(__dirname, "../backend/predict.py"),
-      projectRoot,
+      modelRoot,
       tag,
-      imagePath,
-    ]);
+      effectivePath,
+      "--predictor-type", predictorType,
+    ];
+    if (options?.multiSpecimen) {
+      pythonArgs.push("--multi");
+    }
+    if (yoloModel) {
+      pythonArgs.push("--yolo-model", yoloModel);
+    }
+    let boxesForInference: PredictOptions["boxes"] =
+      Array.isArray(options?.boxes) && options!.boxes.length > 0 ? options!.boxes : undefined;
+
+    if (Array.isArray(boxesForInference) && boxesForInference.length > 0) {
+      tempBoxesFile = path.join(app.getPath("temp"), `bv_boxes_${Date.now()}_${Math.random().toString(16).slice(2)}.json`);
+      fs.writeFileSync(tempBoxesFile, JSON.stringify(boxesForInference));
+      pythonArgs.push("--boxes-json", tempBoxesFile);
+    }
+
+    const out = await runPythonWithProgress(pythonArgs, (percent, stage) => {
+      mainWindow?.webContents.send("ml:predict-progress", { percent, stage });
+    });
 
     const data = JSON.parse(out);
     return { ok: true, data };
   } catch (e: any) {
     console.error("Prediction failed:", e);
     return { ok: false, error: e.message };
+  } finally {
+    if (tempFile) {
+      try { fs.unlinkSync(tempFile); } catch {}
+    }
+    if (tempBoxesFile) {
+      try { fs.unlinkSync(tempBoxesFile); } catch {}
+    }
   }
 });
 
@@ -1036,10 +2256,146 @@ ipcMain.handle("select-images", async () => {
   return { canceled: false, files };
 });
 
-// List trained models in the models directory
-ipcMain.handle("ml:list-models", async () => {
+// Open a folder-picker dialog and return only the selected path (no file reading)
+ipcMain.handle("select-folder-path", async () => {
+  const result = await dialog.showOpenDialog({ properties: ["openDirectory"] });
+  if (result.canceled || !result.filePaths.length) return { canceled: true };
+  return { canceled: false, folderPath: result.filePaths[0] };
+});
+
+// Open a file-picker dialog filtered to annotation formats (.xml, .json)
+ipcMain.handle("select-annotation-file", async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ["openFile"],
+    filters: [{ name: "Annotation files", extensions: ["xml", "json"] }],
+  });
+  if (result.canceled || !result.filePaths.length) return { canceled: true };
+  return { canceled: false, filePath: result.filePaths[0] };
+});
+
+// Load a folder of images and an annotation file (XML or JSON) into a session,
+// returning images as base64 with pre-populated BoundingBox arrays so the
+// frontend can display them in the carousel with landmarks already drawn.
+ipcMain.handle(
+  "ml:load-annotated-folder",
+  async (
+    _event,
+    args: { imageFolderPath: string; annotationFilePath: string; speciesId: string }
+  ) => {
+    try {
+      const { imageFolderPath, annotationFilePath, speciesId } = args;
+
+      // 1. Parse annotation file based on extension
+      const annExt = path.extname(annotationFilePath).toLowerCase();
+      let annotationMap: Map<string, AnnotationEntry>;
+
+      if (annExt === ".xml") {
+        annotationMap = parseImglabXml(annotationFilePath);
+      } else if (annExt === ".json") {
+        annotationMap = parseBioVisionJson(annotationFilePath);
+      } else {
+        return { ok: false, error: `Unsupported annotation format: ${annExt}` };
+      }
+
+      // 2. List image files in the folder
+      const imageFiles = fs
+        .readdirSync(imageFolderPath)
+        .filter((f) => IMAGE_EXTS.test(f));
+
+      if (imageFiles.length === 0) {
+        return { ok: false, error: "No images found in the selected folder." };
+      }
+
+      // 3. Ensure session directories exist
+      const sessionDir = getSessionDir(speciesId);
+      const imagesDir = path.join(sessionDir, "images");
+      const labelsDir = path.join(sessionDir, "labels");
+      fs.mkdirSync(imagesDir, { recursive: true });
+      fs.mkdirSync(labelsDir, { recursive: true });
+
+      const images: Array<{
+        filename: string;
+        mimeType: string;
+        diskPath: string;
+        boxes: any[];
+      }> = [];
+      const unmatched: string[] = [];
+
+      for (const filename of imageFiles) {
+        const srcPath = path.join(imageFolderPath, filename);
+        const diskPath = path.join(imagesDir, filename);
+        const imgExt = path.extname(filename).toLowerCase();
+        const mimeType = MIME_TYPES[imgExt] || "image/jpeg";
+
+        // Copy image into session (no base64 read — renderer uses localfile:// URLs)
+        fs.copyFileSync(srcPath, diskPath);
+
+        // Match annotation by full filename, then by stem (name without ext)
+        const annotation =
+          annotationMap.get(filename) ??
+          annotationMap.get(path.parse(filename).name);
+
+        let boxes: any[] = [];
+        if (annotation) {
+          const box = {
+            id: 0,
+            left: annotation.box.left,
+            top: annotation.box.top,
+            width: annotation.box.width,
+            height: annotation.box.height,
+            landmarks: annotation.landmarks,
+            source: "manual" as const,
+          };
+          boxes = [box];
+
+          // Persist labels JSON to session so training can read them later
+          const labelPath = path.join(
+            labelsDir,
+            `${path.parse(filename).name}.json`
+          );
+          fs.writeFileSync(
+            labelPath,
+            JSON.stringify({ imageFilename: filename, boxes }, null, 2)
+          );
+        } else {
+          unmatched.push(filename);
+        }
+
+        images.push({ filename, mimeType, diskPath, boxes });
+      }
+
+      // Update session.json image count (non-critical)
+      try {
+        const sessionJsonPath = path.join(sessionDir, "session.json");
+        if (fs.existsSync(sessionJsonPath)) {
+          const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+          meta.imageCount = fs
+            .readdirSync(imagesDir)
+            .filter((f) => IMAGE_EXTS.test(f)).length;
+          meta.lastModified = new Date().toISOString();
+          fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+        }
+      } catch (_) {
+        // non-critical
+      }
+
+      const warnings: string[] =
+        unmatched.length > 0
+          ? [`${unmatched.length} image(s) had no matching annotation.`]
+          : [];
+
+      return { ok: true, images, unmatched, warnings };
+    } catch (e: any) {
+      console.error("ml:load-annotated-folder failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+// List trained models in the session (or global) models directory
+ipcMain.handle("ml:list-models", async (_event, speciesId?: string) => {
   try {
-    const modelsDir = path.join(projectRoot, "models");
+    const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
 
     if (!fs.existsSync(modelsDir)) {
       fs.mkdirSync(modelsDir, { recursive: true });
@@ -1047,20 +2403,38 @@ ipcMain.handle("ml:list-models", async () => {
     }
 
     const files = fs.readdirSync(modelsDir);
-    const models = files
+
+    const dlibModels = files
       .filter((f) => f.endsWith(".dat") && f.startsWith("predictor_"))
       .map((file) => {
         const filePath = path.join(modelsDir, file);
         const stats = fs.statSync(filePath);
-        // Strip "predictor_" prefix and ".dat" suffix to get just the tag name
         const tag = file.replace(/^predictor_/, "").replace(/\.dat$/, "");
         return {
           name: tag,
           path: filePath,
           size: stats.size,
           createdAt: stats.birthtime,
+          predictorType: "dlib" as const,
         };
-      })
+      });
+
+    const cnnModels = files
+      .filter((f) => f.endsWith(".pth") && f.startsWith("cnn_"))
+      .map((file) => {
+        const filePath = path.join(modelsDir, file);
+        const stats = fs.statSync(filePath);
+        const tag = file.replace(/^cnn_/, "").replace(/\.pth$/, "");
+        return {
+          name: tag,
+          path: filePath,
+          size: stats.size,
+          createdAt: stats.birthtime,
+          predictorType: "cnn" as const,
+        };
+      });
+
+    const models = [...dlibModels, ...cnnModels]
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
     return { ok: true, models };
@@ -1071,16 +2445,80 @@ ipcMain.handle("ml:list-models", async () => {
 });
 
 // Delete a trained model
-ipcMain.handle("ml:delete-model", async (_event, modelName: string) => {
+ipcMain.handle(
+  "ml:delete-model",
+  async (
+    _event,
+    modelName: string,
+    speciesId?: string,
+    predictorType?: "dlib" | "cnn" | "yolo_pose"
+  ) => {
   try {
-    // modelName is the tag, file is stored as predictor_{tag}.dat
-    const modelPath = path.join(projectRoot, "models", `predictor_${modelName}.dat`);
+    const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
+    const dlibPath = path.join(modelsDir, `predictor_${modelName}.dat`);
+    const cnnPath = path.join(modelsDir, `cnn_${modelName}.pth`);
+    const cnnConfigPath = path.join(modelsDir, `cnn_${modelName}_config.json`);
+    const posePath = path.join(modelsDir, `pose_${modelName}.pt`);
+    const yoloPosePath = path.join(modelsDir, `yolo_pose_${modelName}.pt`);
+    const yoloAliasPath = path.join(modelsDir, `yolo_${modelName}.pt`);
 
-    if (!fs.existsSync(modelPath)) {
-      return { ok: false, error: "Model not found" };
+    const dlibExists = fs.existsSync(dlibPath);
+    const cnnExists = fs.existsSync(cnnPath);
+    const poseExists = fs.existsSync(posePath);
+    const yoloPoseExists = fs.existsSync(yoloPosePath);
+    const yoloAliasExists = fs.existsSync(yoloAliasPath);
+
+    if (predictorType === "dlib") {
+      if (!dlibExists) return { ok: false, error: "dlib model not found" };
+      fs.unlinkSync(dlibPath);
+      return { ok: true };
+    }
+    if (predictorType === "cnn") {
+      if (!cnnExists) return { ok: false, error: "CNN model not found" };
+      fs.unlinkSync(cnnPath);
+      if (fs.existsSync(cnnConfigPath)) fs.unlinkSync(cnnConfigPath);
+      return { ok: true };
+    }
+    if (predictorType === "yolo_pose") {
+      let removed = false;
+      if (poseExists) {
+        fs.unlinkSync(posePath);
+        removed = true;
+      }
+      if (yoloPoseExists) {
+        fs.unlinkSync(yoloPosePath);
+        removed = true;
+      }
+      if (yoloAliasExists) {
+        fs.unlinkSync(yoloAliasPath);
+        removed = true;
+      }
+      // Remove versioned checkpoints for this class/tag.
+      fs.readdirSync(modelsDir)
+        .filter((f) => {
+          const lower = f.toLowerCase();
+          const prefix = `yolo_${modelName.toLowerCase()}_v`;
+          return lower.startsWith(prefix) && lower.endsWith(".pt");
+        })
+        .forEach((f) => {
+          fs.unlinkSync(path.join(modelsDir, f));
+          removed = true;
+        });
+      if (!removed) return { ok: false, error: "YOLO-pose model not found" };
+      return { ok: true };
     }
 
-    fs.unlinkSync(modelPath);
+    // Backward-compatible behavior: if predictor type is not specified,
+    // delete both variants for this model tag.
+    if (!dlibExists && !cnnExists && !poseExists && !yoloPoseExists && !yoloAliasExists) return { ok: false, error: "Model not found" };
+    if (dlibExists) fs.unlinkSync(dlibPath);
+    if (cnnExists) {
+      fs.unlinkSync(cnnPath);
+      if (fs.existsSync(cnnConfigPath)) fs.unlinkSync(cnnConfigPath);
+    }
+    if (poseExists) fs.unlinkSync(posePath);
+    if (yoloPoseExists) fs.unlinkSync(yoloPosePath);
+    if (yoloAliasExists) fs.unlinkSync(yoloAliasPath);
     return { ok: true };
   } catch (e: any) {
     console.error("Failed to delete model:", e);
@@ -1089,21 +2527,66 @@ ipcMain.handle("ml:delete-model", async (_event, modelName: string) => {
 });
 
 // Rename a trained model
-ipcMain.handle("ml:rename-model", async (_event, oldName: string, newName: string) => {
+ipcMain.handle(
+  "ml:rename-model",
+  async (
+    _event,
+    oldName: string,
+    newName: string,
+    speciesId?: string,
+    predictorType?: "dlib" | "cnn" | "yolo_pose"
+  ) => {
   try {
-    // Names are tags, files are stored as predictor_{tag}.dat
-    const oldPath = path.join(projectRoot, "models", `predictor_${oldName}.dat`);
-    const newPath = path.join(projectRoot, "models", `predictor_${newName}.dat`);
+    const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
+    const oldDlib = path.join(modelsDir, `predictor_${oldName}.dat`);
+    const newDlib = path.join(modelsDir, `predictor_${newName}.dat`);
+    const oldCnn = path.join(modelsDir, `cnn_${oldName}.pth`);
+    const newCnn = path.join(modelsDir, `cnn_${newName}.pth`);
+    const oldCnnCfg = path.join(modelsDir, `cnn_${oldName}_config.json`);
+    const newCnnCfg = path.join(modelsDir, `cnn_${newName}_config.json`);
+    const oldPose = path.join(modelsDir, `pose_${oldName}.pt`);
+    const newPose = path.join(modelsDir, `pose_${newName}.pt`);
+    const oldYoloPose = path.join(modelsDir, `yolo_pose_${oldName}.pt`);
+    const newYoloPose = path.join(modelsDir, `yolo_pose_${newName}.pt`);
 
-    if (!fs.existsSync(oldPath)) {
-      return { ok: false, error: "Model not found" };
+    const isDlib = fs.existsSync(oldDlib);
+    const isCnn = fs.existsSync(oldCnn);
+    const isPose = fs.existsSync(oldPose) || fs.existsSync(oldYoloPose);
+
+    if (predictorType === "dlib") {
+      if (!isDlib) return { ok: false, error: "dlib model not found" };
+      if (fs.existsSync(newDlib)) return { ok: false, error: "A dlib model with that name already exists" };
+      fs.renameSync(oldDlib, newDlib);
+      return { ok: true };
+    }
+    if (predictorType === "cnn") {
+      if (!isCnn) return { ok: false, error: "CNN model not found" };
+      if (fs.existsSync(newCnn)) return { ok: false, error: "A CNN model with that name already exists" };
+      fs.renameSync(oldCnn, newCnn);
+      if (fs.existsSync(oldCnnCfg)) fs.renameSync(oldCnnCfg, newCnnCfg);
+      return { ok: true };
+    }
+    if (predictorType === "yolo_pose") {
+      if (!isPose) return { ok: false, error: "YOLO-pose model not found" };
+      if (fs.existsSync(newPose) || fs.existsSync(newYoloPose)) {
+        return { ok: false, error: "A YOLO-pose model with that name already exists" };
+      }
+      if (fs.existsSync(oldPose)) fs.renameSync(oldPose, newPose);
+      if (fs.existsSync(oldYoloPose)) fs.renameSync(oldYoloPose, newYoloPose);
+      return { ok: true };
     }
 
-    if (fs.existsSync(newPath)) {
-      return { ok: false, error: "A model with that name already exists" };
-    }
+    if (!isDlib && !isCnn && !isPose) return { ok: false, error: "Model not found" };
+    if (isDlib && fs.existsSync(newDlib)) return { ok: false, error: "A model with that name already exists" };
+    if (isCnn && fs.existsSync(newCnn)) return { ok: false, error: "A model with that name already exists" };
 
-    fs.renameSync(oldPath, newPath);
+    if (isDlib) fs.renameSync(oldDlib, newDlib);
+    if (isCnn) {
+      fs.renameSync(oldCnn, newCnn);
+      if (fs.existsSync(oldCnnCfg)) fs.renameSync(oldCnnCfg, newCnnCfg);
+    }
+    if (fs.existsSync(oldPose)) fs.renameSync(oldPose, newPose);
+    if (fs.existsSync(oldYoloPose)) fs.renameSync(oldYoloPose, newYoloPose);
     return { ok: true };
   } catch (e: any) {
     console.error("Failed to rename model:", e);
@@ -1112,39 +2595,122 @@ ipcMain.handle("ml:rename-model", async (_event, oldName: string, newName: strin
 });
 
 // Get info about a specific model
-ipcMain.handle("ml:get-model-info", async (_event, modelName: string) => {
+ipcMain.handle("ml:get-model-info", async (_event, modelName: string, speciesId?: string) => {
   try {
-    // modelName is the tag, file is stored as predictor_{tag}.dat
-    const modelPath = path.join(projectRoot, "models", `predictor_${modelName}.dat`);
+    const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
+    const dlibPath = path.join(modelsDir, `predictor_${modelName}.dat`);
+    const cnnPath = path.join(modelsDir, `cnn_${modelName}.pth`);
+    const posePath = path.join(modelsDir, `pose_${modelName}.pt`);
+    const yoloPosePath = path.join(modelsDir, `yolo_pose_${modelName}.pt`);
 
-    if (!fs.existsSync(modelPath)) {
-      return { ok: false, error: "Model not found" };
+    if (fs.existsSync(dlibPath)) {
+      const stats = fs.statSync(dlibPath);
+      return {
+        ok: true,
+        model: { name: modelName, path: dlibPath, size: stats.size, createdAt: stats.birthtime, predictorType: "dlib" },
+      };
     }
-
-    const stats = fs.statSync(modelPath);
-    return {
-      ok: true,
-      model: {
-        name: modelName,
-        path: modelPath,
-        size: stats.size,
-        createdAt: stats.birthtime,
-      },
-    };
+    if (fs.existsSync(cnnPath)) {
+      const stats = fs.statSync(cnnPath);
+      return {
+        ok: true,
+        model: { name: modelName, path: cnnPath, size: stats.size, createdAt: stats.birthtime, predictorType: "cnn" },
+      };
+    }
+    if (fs.existsSync(posePath)) {
+      const stats = fs.statSync(posePath);
+      return {
+        ok: true,
+        model: { name: modelName, path: posePath, size: stats.size, createdAt: stats.birthtime, predictorType: "yolo_pose" },
+      };
+    }
+    if (fs.existsSync(yoloPosePath)) {
+      const stats = fs.statSync(yoloPosePath);
+      return {
+        ok: true,
+        model: { name: modelName, path: yoloPosePath, size: stats.size, createdAt: stats.birthtime, predictorType: "yolo_pose" },
+      };
+    }
+    return { ok: false, error: "Model not found" };
   } catch (e: any) {
     console.error("Failed to get model info:", e);
     return { ok: false, error: e.message };
   }
 });
 
-interface DetectionOptions {}
+ipcMain.handle(
+  "ml:check-model-compatibility",
+  async (
+    _event,
+    args: {
+      speciesId?: string;
+      modelName: string;
+      predictorType?: "dlib" | "cnn";
+      includeRuntime?: boolean;
+    }
+  ) => {
+    try {
+      if (!args?.modelName) {
+        return {
+          ok: false,
+          compatible: false,
+          blocking: true,
+          requiresOverride: true,
+          issues: [
+            {
+              code: "missing_model_name",
+              severity: "error",
+              message: "modelName is required.",
+            },
+          ],
+          error: "modelName is required.",
+        } as ModelCompatibilityResult;
+      }
+      const predictorType = args.predictorType === "cnn" ? "cnn" : "dlib";
+      return await evaluateModelCompatibility({
+        speciesId: args.speciesId,
+        modelName: args.modelName,
+        predictorType,
+        includeRuntime: args.includeRuntime ?? true,
+      });
+    } catch (e: any) {
+      return {
+        ok: false,
+        compatible: false,
+        blocking: true,
+        requiresOverride: true,
+        issues: [
+          {
+            code: "compatibility_check_failed",
+            severity: "error",
+            message: e?.message || "Compatibility check failed.",
+          },
+        ],
+        error: e?.message || "Compatibility check failed.",
+      } as ModelCompatibilityResult;
+    }
+  }
+);
 
-ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, _options?: DetectionOptions) => {
+interface DetectionOptions {
+  speciesId?: string;
+}
+
+ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?: DetectionOptions) => {
   try {
-    const out = await runPython([
+    const speciesId = options?.speciesId;
+    const yoloModel = getSessionYoloModel(speciesId);
+
+    const pythonArgs = [
       path.join(__dirname, "../backend/detect_specimen.py"),
       imagePath,
-    ]);
+      "--multi",
+    ];
+    if (yoloModel) {
+      pythonArgs.push("--yolo-model", yoloModel);
+    }
+
+    const out = await runPython(pythonArgs);
 
     const data = JSON.parse(out.trim());
     if (!data) {
@@ -1203,12 +2769,455 @@ function getSessionDir(speciesId: string): string {
   return path.join(projectRoot, "sessions", speciesId);
 }
 
+const INFERENCE_REVIEW_DRAFTS_FILE = "inference_review_drafts.json";
+const RETRAIN_QUEUE_FILE = "retrain_queue.json";
+const INFERENCE_SESSIONS_DIR = "inference_sessions";
+const INFERENCE_SESSION_MANIFEST_FILE = "manifest.json";
+
+type InferenceDraftSpecimen = {
+  box: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    confidence?: number;
+    class_id?: number;
+    class_name?: string;
+    orientation_override?: "left" | "right" | "uncertain";
+    orientation_hint?: {
+      orientation?: "left" | "right";
+      confidence?: number;
+      source?: string;
+      head_point?: [number, number];
+      tail_point?: [number, number];
+    };
+  };
+  landmarks: { id: number; x: number; y: number }[];
+};
+
+type InferenceReviewDraftItem = {
+  key: string;
+  imagePath: string;
+  filename: string;
+  specimens: InferenceDraftSpecimen[];
+  edited: boolean;
+  saved: boolean;
+  updatedAt: string;
+};
+
+type InferenceReviewDraftsPayload = {
+  version: 1;
+  updatedAt: string;
+  items: Record<string, InferenceReviewDraftItem>;
+};
+
+type RetrainQueueItem = {
+  key: string;
+  speciesId: string;
+  inferenceSessionId?: string;
+  landmarkModelKey?: string;
+  landmarkModelName?: string;
+  landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
+  detectionModelKey?: string;
+  detectionModelName?: string;
+  filename: string;
+  imagePath?: string;
+  source: string;
+  boxesCount: number;
+  landmarksCount: number;
+  queuedAt: string;
+  updatedAt: string;
+};
+
+type RetrainQueuePayload = {
+  version: 1;
+  updatedAt: string;
+  items: Record<string, RetrainQueueItem>;
+};
+
+type InferenceSessionManifest = {
+  version: 1;
+  sessionId: string;
+  speciesId: string;
+  models: {
+    landmark: {
+      key: string;
+      name?: string;
+      predictorType?: "dlib" | "cnn" | "yolo_pose";
+    };
+    detection: {
+      key: string;
+      name?: string;
+    };
+  };
+  createdAt: string;
+  updatedAt: string;
+};
+
+function sanitizeInferenceSessionId(raw: string): string {
+  return String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120);
+}
+
+function buildInferenceSessionId(
+  speciesId: string,
+  landmarkModelKey: string,
+  detectionModelKey?: string
+): string {
+  const schema = sanitizeInferenceSessionId(speciesId) || "schema";
+  const landmark = sanitizeInferenceSessionId(landmarkModelKey) || "landmark_default";
+  const detection = sanitizeInferenceSessionId(detectionModelKey || "session_detection_default");
+  return `${schema}__lm_${landmark}__det_${detection}`;
+}
+
+function getInferenceSessionDir(speciesId: string, inferenceSessionId: string): string {
+  return path.join(
+    getSessionDir(speciesId),
+    INFERENCE_SESSIONS_DIR,
+    sanitizeInferenceSessionId(inferenceSessionId)
+  );
+}
+
+function getInferenceSessionManifestPath(speciesId: string, inferenceSessionId: string): string {
+  return path.join(
+    getInferenceSessionDir(speciesId, inferenceSessionId),
+    INFERENCE_SESSION_MANIFEST_FILE
+  );
+}
+
+function getInferenceReviewDraftsPath(speciesId: string, inferenceSessionId?: string): string {
+  if (inferenceSessionId) {
+    return path.join(getInferenceSessionDir(speciesId, inferenceSessionId), INFERENCE_REVIEW_DRAFTS_FILE);
+  }
+  return path.join(getSessionDir(speciesId), INFERENCE_REVIEW_DRAFTS_FILE);
+}
+
+function getRetrainQueuePath(speciesId: string, inferenceSessionId?: string): string {
+  if (inferenceSessionId) {
+    return path.join(getInferenceSessionDir(speciesId, inferenceSessionId), RETRAIN_QUEUE_FILE);
+  }
+  return path.join(getSessionDir(speciesId), RETRAIN_QUEUE_FILE);
+}
+
+function ensureInferenceSessionManifest(args: {
+  speciesId: string;
+  inferenceSessionId: string;
+  landmarkModelKey?: string;
+  landmarkModelName?: string;
+  landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
+  detectionModelKey?: string;
+  detectionModelName?: string;
+}): InferenceSessionManifest {
+  const sessionDir = getInferenceSessionDir(args.speciesId, args.inferenceSessionId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const manifestPath = getInferenceSessionManifestPath(args.speciesId, args.inferenceSessionId);
+  const now = new Date().toISOString();
+  let existing: InferenceSessionManifest | null = null;
+  if (fs.existsSync(manifestPath)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+    } catch {
+      existing = null;
+    }
+  }
+
+  const manifest: InferenceSessionManifest = {
+    version: 1,
+    sessionId: args.inferenceSessionId,
+    speciesId: args.speciesId,
+    models: {
+      landmark: {
+        key: args.landmarkModelKey || existing?.models?.landmark?.key || "unknown_landmark",
+        name: args.landmarkModelName || existing?.models?.landmark?.name,
+        predictorType:
+          args.landmarkPredictorType ||
+          existing?.models?.landmark?.predictorType,
+      },
+      detection: {
+        key: args.detectionModelKey || existing?.models?.detection?.key || "session_detection_default",
+        name: args.detectionModelName || existing?.models?.detection?.name,
+      },
+    },
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  };
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  return manifest;
+}
+
+function migrateLegacyInferenceArtifactsToSession(speciesId: string, inferenceSessionId: string): void {
+  const legacyDraftPath = getInferenceReviewDraftsPath(speciesId);
+  const legacyQueuePath = getRetrainQueuePath(speciesId);
+  const sessionDraftPath = getInferenceReviewDraftsPath(speciesId, inferenceSessionId);
+  const sessionQueuePath = getRetrainQueuePath(speciesId, inferenceSessionId);
+  const sessionDir = getInferenceSessionDir(speciesId, inferenceSessionId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+
+  if (!fs.existsSync(sessionDraftPath) && fs.existsSync(legacyDraftPath)) {
+    try {
+      fs.copyFileSync(legacyDraftPath, sessionDraftPath);
+    } catch (_) {}
+  }
+  if (!fs.existsSync(sessionQueuePath) && fs.existsSync(legacyQueuePath)) {
+    try {
+      fs.copyFileSync(legacyQueuePath, sessionQueuePath);
+    } catch (_) {}
+  }
+}
+
+function normalizeDraftPath(value: string): string {
+  return (value || "").replace(/\\/g, "/").toLowerCase();
+}
+
+function buildInferenceReviewDraftKey(imagePath: string, filename?: string): string {
+  const safeFilename = (filename || path.basename(imagePath || "") || "").toLowerCase();
+  const normalizedPath = normalizeDraftPath(path.resolve(imagePath || filename || safeFilename));
+  return `${safeFilename}::${normalizedPath}`;
+}
+
+function readInferenceReviewDrafts(speciesId: string, inferenceSessionId?: string): InferenceReviewDraftsPayload {
+  const draftPath = getInferenceReviewDraftsPath(speciesId, inferenceSessionId);
+  if (!fs.existsSync(draftPath)) {
+    return { version: 1, updatedAt: new Date().toISOString(), items: {} };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(draftPath, "utf-8"));
+    const items = parsed?.items && typeof parsed.items === "object" ? parsed.items : {};
+    return {
+      version: 1,
+      updatedAt: String(parsed?.updatedAt || new Date().toISOString()),
+      items,
+    };
+  } catch {
+    return { version: 1, updatedAt: new Date().toISOString(), items: {} };
+  }
+}
+
+function writeInferenceReviewDrafts(
+  speciesId: string,
+  payload: InferenceReviewDraftsPayload,
+  inferenceSessionId?: string
+): void {
+  const sessionDir = inferenceSessionId
+    ? getInferenceSessionDir(speciesId, inferenceSessionId)
+    : getSessionDir(speciesId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const draftPath = getInferenceReviewDraftsPath(speciesId, inferenceSessionId);
+  fs.writeFileSync(draftPath, JSON.stringify(payload, null, 2));
+}
+
+function buildRetrainQueueKey(filename: string): string {
+  return (filename || "").trim().toLowerCase();
+}
+
+function readRetrainQueue(speciesId: string, inferenceSessionId?: string): RetrainQueuePayload {
+  const queuePath = getRetrainQueuePath(speciesId, inferenceSessionId);
+  if (!fs.existsSync(queuePath)) {
+    return { version: 1, updatedAt: new Date().toISOString(), items: {} };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(queuePath, "utf-8"));
+    const items = parsed?.items && typeof parsed.items === "object" ? parsed.items : {};
+    return {
+      version: 1,
+      updatedAt: String(parsed?.updatedAt || new Date().toISOString()),
+      items,
+    };
+  } catch {
+    return { version: 1, updatedAt: new Date().toISOString(), items: {} };
+  }
+}
+
+function writeRetrainQueue(
+  speciesId: string,
+  payload: RetrainQueuePayload,
+  inferenceSessionId?: string
+): void {
+  const sessionDir = inferenceSessionId
+    ? getInferenceSessionDir(speciesId, inferenceSessionId)
+    : getSessionDir(speciesId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const queuePath = getRetrainQueuePath(speciesId, inferenceSessionId);
+  fs.writeFileSync(queuePath, JSON.stringify(payload, null, 2));
+}
+
+function sanitizeDraftSpecimens(specimens: unknown): InferenceDraftSpecimen[] {
+  if (!Array.isArray(specimens)) return [];
+  return specimens
+    .filter((s: any) => s?.box && Number(s.box.width) > 0 && Number(s.box.height) > 0)
+    .map((s: any) => ({
+      box: {
+        left: Math.round(Number(s.box.left) || 0),
+        top: Math.round(Number(s.box.top) || 0),
+        width: Math.round(Number(s.box.width) || 0),
+        height: Math.round(Number(s.box.height) || 0),
+        confidence: Number.isFinite(Number(s.box.confidence))
+          ? Number(s.box.confidence)
+          : undefined,
+        class_id: Number.isFinite(Number(s.box.class_id))
+          ? Number(s.box.class_id)
+          : undefined,
+        class_name:
+          typeof s.box.class_name === "string" && s.box.class_name.trim()
+            ? s.box.class_name.trim()
+            : undefined,
+        orientation_override:
+          s.box.orientation_override === "left" ||
+          s.box.orientation_override === "right" ||
+          s.box.orientation_override === "uncertain"
+            ? s.box.orientation_override
+            : undefined,
+        orientation_hint: s.box.orientation_hint
+          ? {
+              orientation:
+                s.box.orientation_hint.orientation === "left" || s.box.orientation_hint.orientation === "right"
+                  ? s.box.orientation_hint.orientation
+                  : undefined,
+              confidence: Number.isFinite(Number(s.box.orientation_hint.confidence))
+                ? Number(s.box.orientation_hint.confidence)
+                : undefined,
+              source:
+                typeof s.box.orientation_hint.source === "string" && s.box.orientation_hint.source.trim()
+                  ? s.box.orientation_hint.source.trim()
+                  : undefined,
+              head_point:
+                Array.isArray(s.box.orientation_hint.head_point) && s.box.orientation_hint.head_point.length === 2
+                  ? [Number(s.box.orientation_hint.head_point[0]), Number(s.box.orientation_hint.head_point[1])]
+                  : undefined,
+              tail_point:
+                Array.isArray(s.box.orientation_hint.tail_point) && s.box.orientation_hint.tail_point.length === 2
+                  ? [Number(s.box.orientation_hint.tail_point[0]), Number(s.box.orientation_hint.tail_point[1])]
+                  : undefined,
+            }
+          : undefined,
+      },
+      landmarks: Array.isArray(s.landmarks)
+        ? s.landmarks.map((lm: any) => ({
+            id: Number(lm?.id) || 0,
+            x: Math.round(Number(lm?.x) || 0),
+            y: Math.round(Number(lm?.y) || 0),
+          }))
+        : [],
+    }));
+}
+
 function safeClassName(className: string): string {
   return (className || "object").toLowerCase().trim().replace(/\s+/g, "_");
 }
 
 function getSessionYoloAliasPath(speciesId: string, className: string): string {
   return path.join(getSessionDir(speciesId), "models", `yolo_${safeClassName(className)}.pt`);
+}
+
+/**
+ * Find the best YOLO detection model for a session.
+ * Selection order:
+ * 1) class-specific promoted alias (if className provided)
+ * 2) active_model.path from any YOLO registry in models/
+ * 3) single promoted alias yolo_<class>.pt (non-versioned) if exactly one exists
+ * 4) fallback: most recently modified yolo_*.pt
+ */
+function getSessionYoloModel(speciesId?: string, className?: string): string | undefined {
+  const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
+  if (!fs.existsSync(modelsDir)) return undefined;
+
+  if (speciesId && className) {
+    const aliasPath = getSessionYoloAliasPath(speciesId, className);
+    if (fs.existsSync(aliasPath)) return aliasPath;
+  }
+
+  const registryCandidates: { full: string; updatedMs: number }[] = [];
+  const registryFiles = fs
+    .readdirSync(modelsDir)
+    .filter((f) => /^yolo_.+_registry\.json$/i.test(f));
+  for (const registryFile of registryFiles) {
+    try {
+      const registryPath = path.join(modelsDir, registryFile);
+      const raw = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
+      const active = raw?.active_model;
+      if (!active || typeof active.path !== "string") continue;
+      if (Boolean(active?.use_pose)) continue;
+      const activePath = path.isAbsolute(active.path)
+        ? active.path
+        : path.join(modelsDir, active.path);
+      if (!fs.existsSync(activePath)) continue;
+      let updatedMs = 0;
+      if (typeof active.updated_at === "string") {
+        const parsed = Date.parse(active.updated_at);
+        if (Number.isFinite(parsed)) updatedMs = parsed;
+      }
+      if (!updatedMs) {
+        updatedMs = fs.statSync(activePath).mtimeMs;
+      }
+      registryCandidates.push({ full: activePath, updatedMs });
+    } catch (_) {
+      // Ignore malformed registry and continue fallback resolution.
+    }
+  }
+  if (registryCandidates.length > 0) {
+    registryCandidates.sort((a, b) => b.updatedMs - a.updatedMs);
+    return registryCandidates[0].full;
+  }
+
+  const promotedAliases = fs
+    .readdirSync(modelsDir)
+    .filter((f) => /^yolo_.+\.pt$/i.test(f))
+    .filter((f) => !/_v\d+\.pt$/i.test(f))
+    .filter((f) => {
+      const clsTag = f.replace(/^yolo_/, "").replace(/\.pt$/i, "");
+      const registryPath = path.join(modelsDir, `yolo_${clsTag}_registry.json`);
+      if (!fs.existsSync(registryPath)) return true;
+      try {
+        const raw = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
+        const active = raw?.active_model;
+        if (!active) return true;
+        return !Boolean(active.use_pose);
+      } catch {
+        return true;
+      }
+    });
+  if (promotedAliases.length === 1) {
+    return path.join(modelsDir, promotedAliases[0]);
+  }
+
+  const candidates = fs
+    .readdirSync(modelsDir)
+    .filter((f) => f.startsWith("yolo_") && f.endsWith(".pt"))
+    .filter((f) => {
+      const clsTag = f
+        .replace(/^yolo_/, "")
+        .replace(/_v\d+\.pt$/i, "")
+        .replace(/\.pt$/i, "");
+      const registryPath = path.join(modelsDir, `yolo_${clsTag}_registry.json`);
+      if (!fs.existsSync(registryPath)) return true;
+      try {
+        const raw = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
+        const runs = Array.isArray(raw?.training_runs) ? raw.training_runs : [];
+        const fullPath = path.join(modelsDir, f);
+        const matched = runs.find((r: any) => {
+          const p = typeof r?.path === "string" ? r.path : "";
+          if (!p) return false;
+          const resolved = path.isAbsolute(p) ? p : path.join(modelsDir, p);
+          return path.resolve(resolved) === path.resolve(fullPath);
+        });
+        if (!matched) return true;
+        return !Boolean(matched.use_pose);
+      } catch {
+        return true;
+      }
+    })
+    .map((f) => {
+      const full = path.join(modelsDir, f);
+      return { full, mtime: fs.statSync(full).mtimeMs };
+    });
+
+  if (candidates.length === 0) return undefined;
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  return candidates[0].full;
 }
 
 const IMAGE_EXTS = /\.(jpg|jpeg|png|gif|bmp|webp)$/i;
@@ -1222,6 +3231,16 @@ const MIME_TYPES: Record<string, string> = {
   ".webp": "image/webp",
 };
 
+const ORIENTATION_MODES = new Set(["directional", "bilateral", "axial", "invariant"]);
+
+function hasConfiguredOrientationPolicy(meta: any): boolean {
+  if (!meta || typeof meta !== "object") return false;
+  if (!meta.orientationPolicy || typeof meta.orientationPolicy !== "object") return false;
+  const mode = String(meta.orientationPolicy.mode || "").trim().toLowerCase();
+  if (!ORIENTATION_MODES.has(mode)) return false;
+  return Boolean(meta.orientationPolicyConfigured);
+}
+
 ipcMain.handle(
   "session:create",
   async (
@@ -1230,6 +3249,14 @@ ipcMain.handle(
       speciesId: string;
       name: string;
       landmarkTemplate: any[];
+      orientationPolicy?: {
+        mode?: "directional" | "bilateral" | "axial" | "invariant";
+        targetOrientation?: "left" | "right";
+        headCategories?: string[];
+        tailCategories?: string[];
+        bilateralPairs?: [number, number][];
+        pcaLevelingMode?: "off" | "on" | "auto";
+      };
     }
   ) => {
     try {
@@ -1244,6 +3271,11 @@ ipcMain.handle(
             speciesId: args.speciesId,
             name: args.name,
             landmarkTemplate: args.landmarkTemplate,
+            orientationPolicy: args.orientationPolicy || undefined,
+            orientationPolicyConfigured: Boolean(args.orientationPolicy),
+            orientationPolicyConfiguredAt: args.orientationPolicy
+              ? new Date().toISOString()
+              : undefined,
             createdAt: new Date().toISOString(),
             lastModified: new Date().toISOString(),
             imageCount: 0,
@@ -1333,7 +3365,9 @@ ipcMain.handle(
   ) => {
     try {
       const sessionDir = getSessionDir(args.speciesId);
+      const imagesDir = path.join(sessionDir, "images");
       const labelsDir = path.join(sessionDir, "labels");
+      fs.mkdirSync(imagesDir, { recursive: true });
       fs.mkdirSync(labelsDir, { recursive: true });
 
       const basename = args.filename.replace(/\.\w+$/, ".json");
@@ -1356,30 +3390,33 @@ ipcMain.handle(
       }));
 
       let rejectedDetections: any[] = [];
+      let finalizedDetection: any = undefined;
       if (fs.existsSync(labelPath)) {
         try {
           const previous = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
           if (Array.isArray(previous?.rejectedDetections)) {
             rejectedDetections = previous.rejectedDetections;
           }
+          if (previous?.finalizedDetection && typeof previous.finalizedDetection === "object") {
+            finalizedDetection = previous.finalizedDetection;
+          }
         } catch (_) {
           // ignore malformed previous JSON
         }
       }
 
-      fs.writeFileSync(
-        labelPath,
-        JSON.stringify(
-          {
-            imageFilename: args.filename,
-            speciesId: args.speciesId,
-            boxes,
-            rejectedDetections,
-          },
-          null,
-          2
-        )
-      );
+      const payload: any = {
+        imageFilename: args.filename,
+        speciesId: args.speciesId,
+        boxes,
+        rejectedDetections,
+      };
+      // Preserve finalized detection snapshot across autosaves.
+      if (finalizedDetection) {
+        payload.finalizedDetection = finalizedDetection;
+      }
+
+      fs.writeFileSync(labelPath, JSON.stringify(payload, null, 2));
 
       // Update lastModified
       const sessionJsonPath = path.join(sessionDir, "session.json");
@@ -1396,6 +3433,118 @@ ipcMain.handle(
       return { ok: true };
     } catch (e: any) {
       console.error("session:save-annotations failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:finalize-accepted-boxes",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      filename: string;
+      boxes: {
+        left: number;
+        top: number;
+        width: number;
+        height: number;
+        landmarks?: { id: number; x: number; y: number; isSkipped?: boolean }[];
+      }[];
+      imagePath?: string;
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const sessionImagePath = path.join(sessionDir, "images", args.filename);
+      const resolvedImagePath = fs.existsSync(sessionImagePath) ? sessionImagePath : args.imagePath;
+
+      const acceptedBoxes = normalizeFinalizedAcceptedBoxes(args.boxes || []);
+
+      const xyxyBoxes = acceptedBoxes.map((b) => [
+        b.left,
+        b.top,
+        b.left + b.width,
+        b.top + b.height,
+      ]);
+
+      const cacheKey = `${args.speciesId}::${args.filename}`;
+      const signature = buildAcceptedBoxesSignature(acceptedBoxes);
+      const cacheHit = finalizedSegmentSignatureCache.get(cacheKey) === signature;
+      let segmentSaveAttempted = false;
+      let segmentSaveSkipped = false;
+
+      // Only save segments if SAM2 is already warm — avoids blocking model load on finalize
+      if (superAnnotator.isRunning && resolvedImagePath && xyxyBoxes.length > 0 && !cacheHit) {
+        segmentSaveAttempted = true;
+        try {
+          await superAnnotator.send({
+            cmd: "save_segments_for_boxes",
+            image_path: resolvedImagePath,
+            boxes: xyxyBoxes,
+            session_dir: sessionDir,
+          });
+        } catch (_) {
+          // non-fatal
+        }
+      } else {
+        segmentSaveSkipped = true;
+      }
+      // Always mark as finalized (UI lock) regardless of whether SAM2 was available
+      finalizedSegmentSignatureCache.set(cacheKey, signature);
+
+      // Persist finalized box snapshot into label JSON.
+      const labelsDir = path.join(sessionDir, "labels");
+      fs.mkdirSync(labelsDir, { recursive: true });
+      const labelPath = path.join(labelsDir, args.filename.replace(/\.\w+$/, ".json"));
+      let payload: any = {
+        imageFilename: args.filename,
+        speciesId: args.speciesId,
+        boxes: [],
+        rejectedDetections: [],
+      };
+      if (fs.existsSync(labelPath)) {
+        try {
+          payload = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+        } catch (_) {
+          // keep default payload
+        }
+      }
+      payload.imageFilename = payload.imageFilename || args.filename;
+      payload.speciesId = payload.speciesId || args.speciesId;
+      payload.boxes = Array.isArray(payload.boxes) ? payload.boxes : [];
+      payload.rejectedDetections = Array.isArray(payload.rejectedDetections) ? payload.rejectedDetections : [];
+      payload.finalizedDetection = {
+        isFinalized: true,
+        finalizedAt: new Date().toISOString(),
+        acceptedBoxes,
+        boxSignature: signature,
+      };
+      fs.writeFileSync(labelPath, JSON.stringify(payload, null, 2));
+
+      // Persist finalized filename to disk so it survives app restart
+      const finalizedListPath = path.join(sessionDir, "finalized_images.json");
+      try {
+        const existing: string[] = fs.existsSync(finalizedListPath)
+          ? JSON.parse(fs.readFileSync(finalizedListPath, "utf-8"))
+          : [];
+        if (!existing.includes(args.filename)) {
+          existing.push(args.filename);
+          fs.writeFileSync(finalizedListPath, JSON.stringify(existing));
+        }
+      } catch (_) { /* non-fatal */ }
+
+      return {
+        ok: true,
+        finalized: true,
+        acceptedCount: acceptedBoxes.length,
+        signature,
+        skipped: cacheHit && segmentSaveSkipped,
+        segmentSaveAttempted,
+      };
+    } catch (e: any) {
+      console.error("session:finalize-accepted-boxes failed:", e);
       return { ok: false, error: e.message };
     }
   }
@@ -1474,6 +3623,9 @@ ipcMain.handle(
       if (fs.existsSync(sessionJsonPath)) {
         try {
           meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+          if (meta && typeof meta === "object") {
+            meta.orientationPolicyConfigured = hasConfiguredOrientationPolicy(meta);
+          }
         } catch (_) {
           // skip bad session.json
         }
@@ -1481,6 +3633,16 @@ ipcMain.handle(
 
       if (!fs.existsSync(imagesDir)) {
         return { ok: true, images: [], meta };
+      }
+
+      // Load finalized filenames
+      const finalizedListPath = path.join(sessionDir, "finalized_images.json");
+      let finalizedSet = new Set<string>();
+      if (fs.existsSync(finalizedListPath)) {
+        try {
+          const list = JSON.parse(fs.readFileSync(finalizedListPath, "utf-8")) as string[];
+          finalizedSet = new Set(list);
+        } catch (_) { /* ignore bad file */ }
       }
 
       const imageFiles = fs
@@ -1494,6 +3656,7 @@ ipcMain.handle(
 
         // Load annotations if they exist
         let boxes: any[] = [];
+        let isFinalizedFromLabel = false;
         const labelPath = path.join(
           labelsDir,
           filename.replace(/\.\w+$/, ".json")
@@ -1502,6 +3665,7 @@ ipcMain.handle(
           try {
             const labelData = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
             boxes = labelData.boxes || [];
+            isFinalizedFromLabel = Boolean(labelData?.finalizedDetection?.isFinalized);
           } catch (_) {
             // skip bad label files
           }
@@ -1513,6 +3677,7 @@ ipcMain.handle(
           data: data.toString("base64"),
           mimeType: MIME_TYPES[ext] || "image/jpeg",
           boxes,
+          finalized: finalizedSet.has(filename) || isFinalizedFromLabel,
         };
       });
 
@@ -1551,6 +3716,8 @@ ipcMain.handle("session:list", async () => {
           imageCount: meta.imageCount || 0,
           lastModified: meta.lastModified || meta.createdAt || "",
           landmarkCount: (meta.landmarkTemplate || []).length,
+          orientationPolicy: meta.orientationPolicy || undefined,
+          orientationPolicyConfigured: hasConfiguredOrientationPolicy(meta),
         });
       } catch (_) {
         // skip bad session.json
@@ -1572,6 +3739,604 @@ ipcMain.handle("session:list", async () => {
 });
 
 ipcMain.handle(
+  "session:delete-all-images",
+  async (_event, args: { speciesId: string }) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const imagesDir = path.join(sessionDir, "images");
+      const labelsDir = path.join(sessionDir, "labels");
+
+      // Delete all image files
+      if (fs.existsSync(imagesDir)) {
+        for (const file of fs.readdirSync(imagesDir)) {
+          try { fs.unlinkSync(path.join(imagesDir, file)); } catch {}
+        }
+      }
+      // Delete all label files
+      if (fs.existsSync(labelsDir)) {
+        for (const file of fs.readdirSync(labelsDir)) {
+          try { fs.unlinkSync(path.join(labelsDir, file)); } catch {}
+        }
+      }
+      // Delete persisted inference-review drafts
+      try {
+        const draftPath = getInferenceReviewDraftsPath(args.speciesId);
+        if (fs.existsSync(draftPath)) {
+          fs.unlinkSync(draftPath);
+        }
+      } catch (_) {
+        // non-critical
+      }
+      // Delete persisted retrain queue
+      try {
+        const queuePath = getRetrainQueuePath(args.speciesId);
+        if (fs.existsSync(queuePath)) {
+          fs.unlinkSync(queuePath);
+        }
+      } catch (_) {
+        // non-critical
+      }
+
+      // Update session.json imageCount to 0
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      if (fs.existsSync(sessionJsonPath)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+          meta.imageCount = 0;
+          meta.lastModified = new Date().toISOString();
+          fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+        } catch (_) {}
+      }
+
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:delete-all-images failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:save-inference-correction",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      imagePath: string;
+      box?: { left: number; top: number; width: number; height: number };
+      landmarks?: { id: number; x: number; y: number }[];
+      specimens?: {
+        box: {
+          left: number;
+          top: number;
+          width: number;
+          height: number;
+          orientation_override?: "left" | "right" | "uncertain";
+        };
+        landmarks: { id: number; x: number; y: number }[];
+      }[];
+      rejectedDetections?: {
+        left: number;
+        top: number;
+        width: number;
+        height: number;
+        confidence?: number;
+        className?: string;
+        detectionMethod?: string;
+      }[];
+      allowEmpty?: boolean;
+      filename?: string;
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const imagesDir = path.join(sessionDir, "images");
+      const labelsDir = path.join(sessionDir, "labels");
+      fs.mkdirSync(imagesDir, { recursive: true });
+      fs.mkdirSync(labelsDir, { recursive: true });
+
+      const imgName = args.filename ?? path.basename(args.imagePath);
+      const imgDest = path.join(imagesDir, imgName);
+      const lblDest = path.join(labelsDir, imgName.replace(/\.\w+$/, ".json"));
+
+      // Copy image into session if not already there
+      if (!fs.existsSync(imgDest)) {
+        fs.copyFileSync(args.imagePath, imgDest);
+      }
+
+      let boxesPayload: any[] = [];
+      if (Array.isArray(args.specimens) && args.specimens.length > 0) {
+        boxesPayload = args.specimens
+          .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0)
+          .map((s) => ({
+            left: Math.round(s.box.left),
+            top: Math.round(s.box.top),
+            width: Math.round(s.box.width),
+            height: Math.round(s.box.height),
+            ...(s.box.orientation_override === "left" ||
+            s.box.orientation_override === "right" ||
+            s.box.orientation_override === "uncertain"
+              ? { orientation_override: s.box.orientation_override }
+              : {}),
+            landmarks: (s.landmarks || []).map((lm) => ({
+              id: Number(lm.id),
+              x: Number(lm.x),
+              y: Number(lm.y),
+              isSkipped: false,
+            })),
+          }));
+      } else if (args.box && Array.isArray(args.landmarks)) {
+        boxesPayload = [
+          {
+            left: Math.round(args.box.left),
+            top: Math.round(args.box.top),
+            width: Math.round(args.box.width),
+            height: Math.round(args.box.height),
+            landmarks: args.landmarks.map((lm) => ({
+              id: Number(lm.id),
+              x: Number(lm.x),
+              y: Number(lm.y),
+              isSkipped: false,
+            })),
+          },
+        ];
+      }
+
+      if (boxesPayload.length === 0 && !args.allowEmpty) {
+        return { ok: false, error: "No valid corrected specimens to save." };
+      }
+
+      let existingRejectedDetections: any[] = [];
+      if (fs.existsSync(lblDest)) {
+        try {
+          const prev = JSON.parse(fs.readFileSync(lblDest, "utf-8"));
+          if (Array.isArray(prev?.rejectedDetections)) {
+            existingRejectedDetections = prev.rejectedDetections;
+          }
+        } catch (_) {
+          // ignore malformed existing file
+        }
+      }
+      const incomingRejectedDetections = Array.isArray(args.rejectedDetections)
+        ? args.rejectedDetections
+            .filter((d) => d && Number(d.width) > 0 && Number(d.height) > 0)
+            .map((d) => ({
+              left: Math.round(Number(d.left) || 0),
+              top: Math.round(Number(d.top) || 0),
+              width: Math.round(Number(d.width) || 0),
+              height: Math.round(Number(d.height) || 0),
+              ...(Number.isFinite(Number(d.confidence))
+                ? { confidence: Number(d.confidence) }
+                : {}),
+              ...(d.className ? { className: String(d.className) } : {}),
+              ...(d.detectionMethod ? { detectionMethod: String(d.detectionMethod) } : {}),
+              rejectedAt: new Date().toISOString(),
+            }))
+        : [];
+      const mergedRejectedMap = new Map<string, any>();
+      [...existingRejectedDetections, ...incomingRejectedDetections].forEach((d) => {
+        const left = Math.round(Number(d?.left) || 0);
+        const top = Math.round(Number(d?.top) || 0);
+        const width = Math.round(Number(d?.width) || 0);
+        const height = Math.round(Number(d?.height) || 0);
+        if (width <= 0 || height <= 0) return;
+        const key = `${left}:${top}:${width}:${height}`;
+        if (!mergedRejectedMap.has(key)) {
+          mergedRejectedMap.set(key, {
+            ...d,
+            left,
+            top,
+            width,
+            height,
+          });
+        }
+      });
+      const mergedRejectedDetections = Array.from(mergedRejectedMap.values());
+
+      const acceptedBoxes = normalizeFinalizedAcceptedBoxes(
+        boxesPayload.map((b) => ({
+          left: b.left,
+          top: b.top,
+          width: b.width,
+          height: b.height,
+          orientation_override:
+            b.orientation_override === "left" ||
+            b.orientation_override === "right" ||
+            b.orientation_override === "uncertain"
+              ? b.orientation_override
+              : undefined,
+          landmarks: b.landmarks,
+        }))
+      );
+      const boxSignature = buildAcceptedBoxesSignature(acceptedBoxes);
+
+      // Write label JSON in BioVision format (+ finalized snapshot for YOLO export)
+      const label: any = {
+        imageFilename: imgName,
+        speciesId: args.speciesId,
+        boxes: boxesPayload,
+        rejectedDetections: mergedRejectedDetections,
+        finalizedDetection: {
+          isFinalized: true,
+          finalizedAt: new Date().toISOString(),
+          acceptedBoxes,
+          boxSignature,
+        },
+      };
+      fs.writeFileSync(lblDest, JSON.stringify(label, null, 2));
+
+      // Persist finalized filename for finalized-only YOLO export.
+      const finalizedListPath = path.join(sessionDir, "finalized_images.json");
+      try {
+        const existing: string[] = fs.existsSync(finalizedListPath)
+          ? JSON.parse(fs.readFileSync(finalizedListPath, "utf-8"))
+          : [];
+        if (!existing.includes(imgName)) {
+          existing.push(imgName);
+          fs.writeFileSync(finalizedListPath, JSON.stringify(existing));
+        }
+      } catch (_) {
+        // non-fatal
+      }
+
+      // Update session.json imageCount
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      if (fs.existsSync(sessionJsonPath)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+          meta.imageCount = fs.readdirSync(imagesDir).filter((f) => IMAGE_EXTS.test(f)).length;
+          meta.lastModified = new Date().toISOString();
+          fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+        } catch (_) {}
+      }
+
+      return { ok: true, savedPath: lblDest };
+    } catch (e: any) {
+      console.error("session:save-inference-correction failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:open-inference-session",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      landmarkModelKey: string;
+      landmarkModelName?: string;
+      landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
+      detectionModelKey?: string;
+      detectionModelName?: string;
+    }
+  ) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required." };
+      }
+      if (!args.landmarkModelKey) {
+        return { ok: false, error: "landmarkModelKey is required." };
+      }
+      const inferenceSessionId = buildInferenceSessionId(
+        args.speciesId,
+        args.landmarkModelKey,
+        args.detectionModelKey
+      );
+      const manifest = ensureInferenceSessionManifest({
+        speciesId: args.speciesId,
+        inferenceSessionId,
+        landmarkModelKey: args.landmarkModelKey,
+        landmarkModelName: args.landmarkModelName,
+        landmarkPredictorType: args.landmarkPredictorType,
+        detectionModelKey: args.detectionModelKey,
+        detectionModelName: args.detectionModelName,
+      });
+      migrateLegacyInferenceArtifactsToSession(args.speciesId, inferenceSessionId);
+      return { ok: true, inferenceSessionId, manifest };
+    } catch (e: any) {
+      console.error("session:open-inference-session failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:save-inference-review-draft",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      inferenceSessionId?: string;
+      imagePath: string;
+      filename?: string;
+      specimens?: InferenceDraftSpecimen[];
+      edited?: boolean;
+      saved?: boolean;
+      clear?: boolean;
+    }
+  ) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required." };
+      }
+      if (!args.imagePath && !args.filename) {
+        return { ok: false, error: "imagePath or filename is required." };
+      }
+      if (args.inferenceSessionId) {
+        ensureInferenceSessionManifest({
+          speciesId: args.speciesId,
+          inferenceSessionId: args.inferenceSessionId,
+        });
+      }
+      const drafts = readInferenceReviewDrafts(args.speciesId, args.inferenceSessionId);
+      const filename = args.filename ?? path.basename(args.imagePath);
+      const key = buildInferenceReviewDraftKey(args.imagePath || filename, filename);
+
+      if (args.clear) {
+        delete drafts.items[key];
+      } else {
+        drafts.items[key] = {
+          key,
+          imagePath: args.imagePath || "",
+          filename,
+          specimens: sanitizeDraftSpecimens(args.specimens),
+          edited: Boolean(args.edited),
+          saved: Boolean(args.saved),
+          updatedAt: new Date().toISOString(),
+        };
+      }
+      drafts.updatedAt = new Date().toISOString();
+      writeInferenceReviewDrafts(args.speciesId, drafts, args.inferenceSessionId);
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:save-inference-review-draft failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:update-orientation-policy",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      orientationPolicy: {
+        mode?: "directional" | "bilateral" | "axial" | "invariant";
+        targetOrientation?: "left" | "right";
+        headCategories?: string[];
+        tailCategories?: string[];
+        bilateralPairs?: [number, number][];
+        pcaLevelingMode?: "off" | "on" | "auto";
+      };
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      if (!fs.existsSync(sessionJsonPath)) {
+        return { ok: false, error: `Session not found: ${args.speciesId}` };
+      }
+      const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+      meta.orientationPolicy = args.orientationPolicy || undefined;
+      meta.orientationPolicyConfigured = true;
+      meta.orientationPolicyConfiguredAt = new Date().toISOString();
+      meta.lastModified = new Date().toISOString();
+      fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:update-orientation-policy failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:load-inference-review-drafts",
+  async (_event, args: { speciesId: string; inferenceSessionId?: string }) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required.", drafts: [] };
+      }
+      if (args.inferenceSessionId) {
+        ensureInferenceSessionManifest({
+          speciesId: args.speciesId,
+          inferenceSessionId: args.inferenceSessionId,
+        });
+        migrateLegacyInferenceArtifactsToSession(args.speciesId, args.inferenceSessionId);
+      }
+      const drafts = readInferenceReviewDrafts(args.speciesId, args.inferenceSessionId);
+      return { ok: true, drafts: Object.values(drafts.items) };
+    } catch (e: any) {
+      console.error("session:load-inference-review-drafts failed:", e);
+      return { ok: false, error: e.message, drafts: [] };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:queue-retrain-item",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      inferenceSessionId?: string;
+      landmarkModelKey?: string;
+      landmarkModelName?: string;
+      landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
+      detectionModelKey?: string;
+      detectionModelName?: string;
+      filename: string;
+      imagePath?: string;
+      source?: string;
+      boxesCount?: number;
+      landmarksCount?: number;
+    }
+  ) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required." };
+      }
+      if (!args.filename) {
+        return { ok: false, error: "filename is required." };
+      }
+      if (args.inferenceSessionId) {
+        ensureInferenceSessionManifest({
+          speciesId: args.speciesId,
+          inferenceSessionId: args.inferenceSessionId,
+          landmarkModelKey: args.landmarkModelKey,
+          landmarkModelName: args.landmarkModelName,
+          landmarkPredictorType: args.landmarkPredictorType,
+          detectionModelKey: args.detectionModelKey,
+          detectionModelName: args.detectionModelName,
+        });
+      }
+      const queue = readRetrainQueue(args.speciesId, args.inferenceSessionId);
+      const now = new Date().toISOString();
+      const key = buildRetrainQueueKey(args.filename);
+      const existing = queue.items[key];
+      queue.items[key] = {
+        key,
+        speciesId: args.speciesId,
+        inferenceSessionId: args.inferenceSessionId,
+        landmarkModelKey: args.landmarkModelKey || existing?.landmarkModelKey,
+        landmarkModelName: args.landmarkModelName || existing?.landmarkModelName,
+        landmarkPredictorType:
+          args.landmarkPredictorType || existing?.landmarkPredictorType,
+        detectionModelKey: args.detectionModelKey || existing?.detectionModelKey,
+        detectionModelName: args.detectionModelName || existing?.detectionModelName,
+        filename: args.filename,
+        imagePath: args.imagePath || existing?.imagePath || "",
+        source: args.source || existing?.source || "inference_review",
+        boxesCount: Math.max(0, Math.round(Number(args.boxesCount) || existing?.boxesCount || 0)),
+        landmarksCount: Math.max(0, Math.round(Number(args.landmarksCount) || existing?.landmarksCount || 0)),
+        queuedAt: existing?.queuedAt || now,
+        updatedAt: now,
+      };
+      queue.updatedAt = now;
+      writeRetrainQueue(args.speciesId, queue, args.inferenceSessionId);
+
+      return {
+        ok: true,
+        item: queue.items[key],
+        queuedCount: Object.keys(queue.items).length,
+      };
+    } catch (e: any) {
+      console.error("session:queue-retrain-item failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:get-retrain-queue",
+  async (_event, args: { speciesId: string; inferenceSessionId?: string }) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required.", items: [], count: 0 };
+      }
+      if (args.inferenceSessionId) {
+        ensureInferenceSessionManifest({
+          speciesId: args.speciesId,
+          inferenceSessionId: args.inferenceSessionId,
+        });
+        migrateLegacyInferenceArtifactsToSession(args.speciesId, args.inferenceSessionId);
+      }
+      const queue = readRetrainQueue(args.speciesId, args.inferenceSessionId);
+      return { ok: true, items: Object.values(queue.items), count: Object.keys(queue.items).length };
+    } catch (e: any) {
+      console.error("session:get-retrain-queue failed:", e);
+      return { ok: false, error: e.message, items: [], count: 0 };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:clear-retrain-queue",
+  async (_event, args: { speciesId: string; inferenceSessionId?: string; filenames?: string[] }) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required.", count: 0 };
+      }
+      if (args.inferenceSessionId) {
+        ensureInferenceSessionManifest({
+          speciesId: args.speciesId,
+          inferenceSessionId: args.inferenceSessionId,
+        });
+      }
+      const queue = readRetrainQueue(args.speciesId, args.inferenceSessionId);
+      if (Array.isArray(args.filenames) && args.filenames.length > 0) {
+        const keys = new Set(args.filenames.map((name) => buildRetrainQueueKey(name)));
+        for (const key of keys) {
+          delete queue.items[key];
+        }
+      } else {
+        queue.items = {};
+      }
+      queue.updatedAt = new Date().toISOString();
+      writeRetrainQueue(args.speciesId, queue, args.inferenceSessionId);
+      return { ok: true, count: Object.keys(queue.items).length };
+    } catch (e: any) {
+      console.error("session:clear-retrain-queue failed:", e);
+      return { ok: false, error: e.message, count: 0 };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:save-detection-correction",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      imagePath: string;
+      boxes: { left: number; top: number; width: number; height: number }[];
+      imageWidth: number;
+      imageHeight: number;
+      filename?: string;
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const imagesDir = path.join(sessionDir, "images");
+      const detLblDir = path.join(sessionDir, "detection_labels");
+      fs.mkdirSync(imagesDir, { recursive: true });
+      fs.mkdirSync(detLblDir, { recursive: true });
+
+      const imgName = args.filename ?? path.basename(args.imagePath);
+      const imgDest = path.join(imagesDir, imgName);
+
+      // Copy image into session if not already there
+      if (!fs.existsSync(imgDest)) {
+        fs.copyFileSync(args.imagePath, imgDest);
+      }
+
+      // Write YOLO-format detection label (normalized coords)
+      const iw = Math.max(args.imageWidth, 1);
+      const ih = Math.max(args.imageHeight, 1);
+      const lines = args.boxes
+        .filter((b) => b.width > 0 && b.height > 0)
+        .map((b) => {
+          const cx = ((b.left + b.width / 2) / iw).toFixed(6);
+          const cy = ((b.top + b.height / 2) / ih).toFixed(6);
+          const w  = (b.width  / iw).toFixed(6);
+          const h  = (b.height / ih).toFixed(6);
+          return `0 ${cx} ${cy} ${w} ${h}`;
+        });
+
+      const lblDest = path.join(detLblDir, imgName.replace(/\.\w+$/, ".txt"));
+      fs.writeFileSync(lblDest, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
+
+      return { ok: true, savedPath: lblDest };
+    } catch (e: any) {
+      console.error("session:save-detection-correction failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
   "session:delete-image",
   async (_event, args: { speciesId: string; filename: string }) => {
     try {
@@ -1585,6 +4350,31 @@ ipcMain.handle(
 
       if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
       if (fs.existsSync(labelPath)) fs.unlinkSync(labelPath);
+
+      // Remove persisted inference-review drafts for this image.
+      try {
+        const drafts = readInferenceReviewDrafts(args.speciesId);
+        const lowerName = (args.filename || "").toLowerCase();
+        for (const [key, item] of Object.entries(drafts.items)) {
+          if ((item?.filename || "").toLowerCase() === lowerName) {
+            delete drafts.items[key];
+          }
+        }
+        drafts.updatedAt = new Date().toISOString();
+        writeInferenceReviewDrafts(args.speciesId, drafts);
+      } catch (_) {
+        // non-critical cleanup
+      }
+
+      // Remove retrain queue entry for this image.
+      try {
+        const queue = readRetrainQueue(args.speciesId);
+        delete queue.items[buildRetrainQueueKey(args.filename)];
+        queue.updatedAt = new Date().toISOString();
+        writeRetrainQueue(args.speciesId, queue);
+      } catch (_) {
+        // non-critical cleanup
+      }
 
       // Update session.json imageCount
       const sessionJsonPath = path.join(sessionDir, "session.json");
@@ -1616,10 +4406,22 @@ ipcMain.handle(
 class SuperAnnotatorProcess {
   private process: ChildProcess | null = null;
   private rl: ReadlineInterface | null = null;
-  private pending: Map<string, { resolve: (v: any) => void; reject: (e: Error) => void }> = new Map();
+  private pending: Map<
+    string,
+    {
+      resolve: (v: any) => void;
+      reject: (e: Error) => void;
+      cmdName: string;
+      startedAt: number;
+      timeoutMs: number;
+      timeout: ReturnType<typeof setTimeout>;
+    }
+  > = new Map();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private requestId = 0;
   private readonly IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+  private stderrTail: string[] = [];
+  private readonly MAX_STDERR_TAIL_LINES = 60;
 
   async start(): Promise<void> {
     if (this.process) return; // already running
@@ -1630,10 +4432,16 @@ class SuperAnnotatorProcess {
     this.process = spawn(pyPath, [scriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: path.join(__dirname, ".."),
+      // Force UTF-8 for stdin/stdout so non-ASCII paths (e.g. macOS narrow
+      // no-break space U+202F in screenshot filenames) survive the JSON pipe.
+      // Without this, Windows Python defaults to CP1252 and mangles the path.
+      env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
     });
 
     this.process.stderr?.on("data", (d: Buffer) => {
-      console.log("[SuperAnnotator]", d.toString().trim());
+      const text = d.toString();
+      this.pushStderr(text);
+      console.log("[SuperAnnotator]", text.trim());
     });
 
     this.rl = createInterface({ input: this.process.stdout! });
@@ -1643,24 +4451,39 @@ class SuperAnnotatorProcess {
 
         // Forward progress events to renderer
         if (msg.status === "progress") {
+          if (msg._request_id) {
+            this.refreshRequestTimeout(String(msg._request_id));
+          }
+          this.resetIdleTimer();
           mainWindow?.webContents.send("ml:super-annotate-progress", msg);
           return;
         }
 
-        // Match response to pending request
-        if (msg._request_id && this.pending.has(msg._request_id)) {
-          const { resolve } = this.pending.get(msg._request_id)!;
-          this.pending.delete(msg._request_id);
-          resolve(msg);
+        // Match response to pending request by explicit request id.
+        if (msg._request_id) {
+          const requestId = String(msg._request_id);
+          const entry = this.pending.get(requestId);
+          if (!entry) {
+            console.warn(`[SuperAnnotator] Unmatched response for request ${requestId}; ignoring stale message.`);
+            return;
+          }
+          clearTimeout(entry.timeout);
+          this.pending.delete(requestId);
+          entry.resolve(msg);
+          this.resetIdleTimer();
           return;
         }
 
-        // Unmatched response — resolve oldest pending request
-        if (this.pending.size > 0) {
+        // Backward-compatible fallback for responses without _request_id.
+        if (this.pending.size === 1) {
           const [firstId, handler] = this.pending.entries().next().value!;
+          clearTimeout(handler.timeout);
           this.pending.delete(firstId);
           handler.resolve(msg);
+          this.resetIdleTimer();
+          return;
         }
+        console.warn("[SuperAnnotator] Received response without _request_id while multiple requests are pending; ignoring.");
       } catch (e) {
         const trimmed = line.trim();
         if (!trimmed) return;
@@ -1670,15 +4493,26 @@ class SuperAnnotatorProcess {
       }
     });
 
-    this.process.on("close", (code: number | null) => {
-      console.log(`[SuperAnnotator] Process exited with code ${code}`);
+    this.process.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      const stderrTail = this.getLastStderrTail();
+      const suffix = stderrTail ? `\nRecent stderr:\n${stderrTail}` : "";
+      console.log(`[SuperAnnotator] Process exited with code ${code}, signal ${signal}`);
       // Reject all pending
       for (const [, handler] of this.pending) {
-        handler.reject(new Error(`SuperAnnotator process exited with code ${code}`));
+        clearTimeout(handler.timeout);
+        handler.reject(
+          new Error(
+            `SuperAnnotator process exited (code=${code}, signal=${signal}) while handling "${handler.cmdName}" after ${Math.round((Date.now() - handler.startedAt) / 1000)}s.${suffix}`
+          )
+        );
       }
       this.pending.clear();
       this.process = null;
       this.rl = null;
+    });
+
+    this.process.on("error", (err: Error) => {
+      console.error("[SuperAnnotator] Child process error:", err);
     });
 
     this.resetIdleTimer();
@@ -1693,10 +4527,38 @@ class SuperAnnotatorProcess {
 
     const id = `req_${++this.requestId}`;
     const payload = { ...cmd, _request_id: id };
+    const cmdName = String(cmd?.cmd ?? "unknown");
+    const timeoutMs = this.getRequestTimeoutMs(cmdName);
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.process!.stdin!.write(JSON.stringify(payload) + "\n");
+      const timeout = setTimeout(() => {
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        this.pending.delete(id);
+        entry.reject(
+          new Error(
+            `SuperAnnotator request timed out after ${Math.round(timeoutMs / 1000)}s (cmd="${cmdName}").`
+          )
+        );
+        this.resetIdleTimer();
+      }, timeoutMs);
+
+      this.pending.set(id, {
+        resolve,
+        reject,
+        cmdName,
+        startedAt: Date.now(),
+        timeoutMs,
+        timeout,
+      });
+
+      try {
+        this.process!.stdin!.write(JSON.stringify(payload) + "\n");
+      } catch (err: any) {
+        clearTimeout(timeout);
+        this.pending.delete(id);
+        reject(new Error(`Failed to write SuperAnnotator command "${cmdName}": ${err?.message || err}`));
+      }
     });
   }
 
@@ -1729,9 +4591,56 @@ class SuperAnnotatorProcess {
   private resetIdleTimer(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
+      if (this.pending.size > 0) {
+        console.log(`[SuperAnnotator] Idle timeout deferred: ${this.pending.size} request(s) still pending`);
+        this.resetIdleTimer();
+        return;
+      }
       console.log("[SuperAnnotator] Idle timeout, shutting down process");
       this.stop();
     }, this.IDLE_TIMEOUT_MS);
+  }
+
+  private pushStderr(text: string): void {
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    for (const line of lines) {
+      this.stderrTail.push(line);
+      if (this.stderrTail.length > this.MAX_STDERR_TAIL_LINES) {
+        this.stderrTail.shift();
+      }
+    }
+  }
+
+  private getLastStderrTail(maxLines = 25): string {
+    if (this.stderrTail.length === 0) return "";
+    return this.stderrTail.slice(-maxLines).join("\n");
+  }
+
+  private getRequestTimeoutMs(cmdName: string): number {
+    if (cmdName === "train_yolo") return 4 * 60 * 60 * 1000;
+    if (cmdName === "annotate") return 15 * 60 * 1000;
+    if (cmdName === "init" || cmdName === "check") return 2 * 60 * 1000;
+    return 5 * 60 * 1000;
+  }
+
+  private refreshRequestTimeout(requestId: string): void {
+    const entry = this.pending.get(requestId);
+    if (!entry) return;
+    clearTimeout(entry.timeout);
+    entry.timeout = setTimeout(() => {
+      const active = this.pending.get(requestId);
+      if (!active) return;
+      this.pending.delete(requestId);
+      active.reject(
+        new Error(
+          `SuperAnnotator request timed out after ${Math.round(active.timeoutMs / 1000)}s (cmd="${active.cmdName}").`
+        )
+      );
+      this.resetIdleTimer();
+    }, entry.timeoutMs);
   }
 
   get isRunning(): boolean {
@@ -1740,6 +4649,33 @@ class SuperAnnotatorProcess {
 }
 
 const superAnnotator = new SuperAnnotatorProcess();
+
+async function ensureSam2Ready(): Promise<{ ok: boolean; error?: string }> {
+  try {
+    if (!superAnnotator.isRunning) {
+      const initRes = await superAnnotator.send({ cmd: "init" });
+      if (initRes?.sam2_loaded) {
+        return { ok: true };
+      }
+      const checkRes = await superAnnotator.send({ cmd: "check" });
+      return { ok: false, error: checkRes?.sam2_error || "SAM2 is not available." };
+    }
+
+    const checkRes = await superAnnotator.send({ cmd: "check" });
+    if (checkRes?.sam2_ready) {
+      return { ok: true };
+    }
+
+    const initRes = await superAnnotator.send({ cmd: "init" });
+    if (initRes?.sam2_loaded) {
+      return { ok: true };
+    }
+    const recheck = await superAnnotator.send({ cmd: "check" });
+    return { ok: false, error: recheck?.sam2_error || "SAM2 is not available." };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || "Failed to initialize SAM2." };
+  }
+}
 
 // ── SuperAnnotator IPC handlers ──
 
@@ -1785,6 +4721,8 @@ ipcMain.handle(
         maxObjects?: number;
         detectionMode?: string;
         detectionPreset?: string;
+        pcaMode?: "off" | "on" | "auto";
+        useOrientationHint?: boolean;
       };
     }
   ) => {
@@ -1819,6 +4757,7 @@ ipcMain.handle(
         : path.join(effectiveRoot, "models", `yolo_${safeClassName(args.className)}.pt`);
       const finetunedModel = fs.existsSync(ftModelPath) ? ftModelPath : undefined;
 
+      const samEnabled = args.options?.samEnabled ?? true;
       const result = await superAnnotator.send({
         cmd: "annotate",
         image_path: args.imagePath,
@@ -1827,11 +4766,15 @@ ipcMain.handle(
         id_mapping_path: idMappingPath,
         options: {
           conf_threshold: args.options?.confThreshold ?? 0.3,
-          sam_enabled: args.options?.samEnabled ?? true,
+          sam_enabled: samEnabled,
           max_objects: args.options?.maxObjects ?? 20,
           detection_mode: args.options?.detectionMode ?? "auto",
           detection_preset: args.options?.detectionPreset ?? "balanced",
+          pca_mode: args.options?.pcaMode ?? "auto",
+          use_orientation_hint: args.options?.useOrientationHint ?? true,
           finetuned_model: finetunedModel,
+          // Pass session_dir so SAM2 segments are auto-saved for synthetic augmentation
+          session_dir: samEnabled ? effectiveRoot : undefined,
         },
       });
 
@@ -1859,6 +4802,11 @@ ipcMain.handle(
     }
   ) => {
     try {
+      const ready = await ensureSam2Ready();
+      if (!ready.ok) {
+        return { ok: false, error: ready.error || "SAM2 is not ready." };
+      }
+
       const result = await superAnnotator.send({
         cmd: "refine_sam",
         image_path: args.imagePath,
@@ -1876,6 +4824,93 @@ ipcMain.handle(
 );
 
 ipcMain.handle(
+  "ml:resegment-box",
+  async (
+    _event,
+    args: {
+      imagePath: string;
+      boxXyxy: [number, number, number, number];
+    }
+  ) => {
+    try {
+      const ready = await ensureSam2Ready();
+      if (!ready.ok) {
+        return { ok: false, error: ready.error || "SAM2 is not ready." };
+      }
+
+      const result = await superAnnotator.send({
+        cmd: "resegment_box",
+        image_path: args.imagePath,
+        box_xyxy: args.boxXyxy,
+      });
+      if (result.ok) {
+        return { ok: true, maskOutline: result.mask_outline as [number, number][], score: result.score };
+      }
+      return { ok: false, error: result.error };
+    } catch (e: any) {
+      console.error("SAM re-segmentation failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "ml:get-yolo-train-plan",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      className: string;
+      epochs?: number;
+      detectionPreset?: string;
+      datasetSize?: number;
+      autoTune?: boolean;
+    }
+  ) => {
+    try {
+      const sessionDir = path.join(projectRoot, "sessions", args.speciesId);
+      if (!fs.existsSync(sessionDir)) {
+        return { ok: false, error: `Session directory not found: ${sessionDir}` };
+      }
+
+      // Ensure process is running and initialized
+      if (!superAnnotator.isRunning) {
+        await superAnnotator.send({ cmd: "init" });
+      }
+
+      const result = await superAnnotator.send({
+        cmd: "preview_yolo_train_plan",
+        session_dir: sessionDir,
+        class_name: args.className,
+        epochs: args.epochs,
+        detection_preset: args.detectionPreset ?? "balanced",
+        dataset_size: args.datasetSize,
+        auto_tune: args.autoTune ?? true,
+      });
+
+      if (result?.status === "error") {
+        return { ok: false, error: result.error ?? "YOLO training plan preview failed" };
+      }
+
+      return {
+        ok: true,
+        dataset: result?.dataset,
+        usePose: result?.use_pose,
+        detectionPreset: result?.detection_preset,
+        autoTune: result?.auto_tune,
+        datasetSizeEffective: result?.dataset_size_effective,
+        datasetSizeSource: result?.dataset_size_source,
+        resolvedTrainParams: result?.resolved_train_params,
+        preflightWarnings: result?.preflight_warnings,
+      };
+    } catch (e: any) {
+      console.error("YOLO train plan preview failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
   "ml:train-yolo",
   async (
     _event,
@@ -1884,6 +4919,8 @@ ipcMain.handle(
       className: string;
       epochs?: number;
       detectionPreset?: string;
+      datasetSize?: number;
+      autoTune?: boolean;
     }
   ) => {
     try {
@@ -1901,8 +4938,10 @@ ipcMain.handle(
         cmd: "train_yolo",
         session_dir: sessionDir,
         class_name: args.className,
-        epochs: args.epochs ?? 25,
+        epochs: args.epochs,
         detection_preset: args.detectionPreset ?? "balanced",
+        dataset_size: args.datasetSize,
+        auto_tune: args.autoTune ?? true,
       });
 
       if (result?.status === "error") {
@@ -1915,10 +4954,29 @@ ipcMain.handle(
         candidateModelPath: result?.candidate_model_path,
         version: result?.version,
         promoted: result?.promoted,
+        evaluationMetricType: result?.evaluation_metric_type,
         candidateMap50: result?.candidate_map50,
+        candidateMap50_95: result?.candidate_map50_95,
         incumbentMap50: result?.incumbent_map50,
+        incumbentMap50_95: result?.incumbent_map50_95,
+        candidatePoseMap50: result?.candidate_pose_map50,
+        candidatePoseMap50_95: result?.candidate_pose_map50_95,
+        candidateBoxMap50: result?.candidate_box_map50,
+        candidateBoxMap50_95: result?.candidate_box_map50_95,
+        incumbentPoseMap50: result?.incumbent_pose_map50,
+        incumbentPoseMap50_95: result?.incumbent_pose_map50_95,
+        incumbentBoxMap50: result?.incumbent_box_map50,
+        incumbentBoxMap50_95: result?.incumbent_box_map50_95,
+        candidateMetrics: result?.candidate_metrics,
+        incumbentMetrics: result?.incumbent_metrics,
         dataset: result?.dataset,
         registryPath: result?.registry_path,
+        detectionPreset: result?.detection_preset,
+        autoTune: result?.auto_tune,
+        datasetSizeEffective: result?.dataset_size_effective,
+        datasetSizeSource: result?.dataset_size_source,
+        resolvedTrainParams: result?.resolved_train_params,
+        preflightWarnings: result?.preflight_warnings,
       };
     } catch (e: any) {
       console.error("YOLO training failed:", e);

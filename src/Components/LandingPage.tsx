@@ -15,14 +15,29 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent } from "@/Components/ui/card";
 import { Separator } from "@/Components/ui/separator";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/Components/ui/dialog";
 import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
-import { AppView, Species, LandmarkSchema, BoundingBox, LandmarkDefinition } from "@/types/Image";
+import {
+  AppView,
+  Species,
+  LandmarkSchema,
+  BoundingBox,
+  LandmarkDefinition,
+  OrientationPolicy,
+} from "@/types/Image";
 import type { RootState } from "@/state/store";
 import { SettingsModal } from "./SettingsModal";
 import { HelpPanel } from "./HelpPanel";
 import { SchemaSelector } from "./SchemaSelector";
 import { CustomSchemaEditor } from "./CustomSchemaEditor";
-import { addSpecies, setActiveSpecies } from "@/state/speciesState/speciesSlice";
+import { addSpecies, setActiveSpecies, updateSpecies } from "@/state/speciesState/speciesSlice";
 import { clearFiles, setSessionImages } from "@/state/filesState/fileSlice";
 import { toast } from "sonner";
 
@@ -95,6 +110,110 @@ function customSchemaToSessionId(name: string): string {
   return `schema-custom-${normalized || Date.now()}`;
 }
 
+function inferDefaultOrientationPolicy(
+  landmarkTemplate: LandmarkDefinition[]
+): OrientationPolicy {
+  const categories = new Set(
+    (landmarkTemplate || [])
+      .map((lm) => (lm.category || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const hasHead = categories.has("head");
+  const hasTail = categories.has("tail");
+  const hasCaudalTail = categories.has("caudal-fin");
+  const tailCategories = ["tail", "caudal-fin"].filter((cat) => categories.has(cat));
+  if (hasHead || hasTail || hasCaudalTail) {
+    return {
+      mode: "directional",
+      targetOrientation: "left",
+      headCategories: ["head"],
+      tailCategories: tailCategories.length > 0 ? tailCategories : ["tail", "caudal-fin"],
+      pcaLevelingMode: "auto",
+    };
+  }
+  return {
+    mode: "invariant",
+    pcaLevelingMode: "off",
+  };
+}
+
+type PendingSessionLaunch =
+  | {
+      type: "create";
+      speciesId: string;
+      name: string;
+      landmarkTemplate: LandmarkDefinition[];
+    }
+  | {
+      type: "resume";
+      speciesId: string;
+      name: string;
+      landmarkTemplate: LandmarkDefinition[];
+    };
+
+const ORIENTATION_MODE_LABELS: Record<OrientationPolicy["mode"], { title: string; description: string }> = {
+  directional: {
+    title: "Directional (Head/Tail)",
+    description: "Use for strict head/tail objects (for example side-view fish or isolated single wings).",
+  },
+  bilateral: {
+    title: "Mirrored / Bilateral",
+    description: "Use when left/right pairs exist on the same specimen (for example full fly with both wings).",
+  },
+  axial: {
+    title: "Axial",
+    description: "Use for elongated specimens that rotate around a dominant axis (for example worms/diatoms).",
+  },
+  invariant: {
+    title: "Invariant",
+    description: "Use for radial/non-directional objects where no stable head/tail axis exists.",
+  },
+};
+
+const ORIENTATION_MODE_DETAILS: Record<OrientationPolicy["mode"], string> = {
+  directional:
+    "Backend goal: align the major axis, then force a canonical facing direction (for example head-left). Best for side-view organisms.",
+  bilateral:
+    "Backend goal: align symmetry axis and allow mirrored augmentation for paired structures (left/right sides).",
+  axial:
+    "Backend goal: align long axis while keeping stronger rotational augmentation for elongated specimens with variable pose.",
+  invariant:
+    "Backend goal: avoid forced PCA direction when no stable axis exists; rely on broad rotational augmentation.",
+};
+
+function buildOrientationPolicy(
+  mode: OrientationPolicy["mode"],
+  landmarkTemplate: LandmarkDefinition[]
+): OrientationPolicy {
+  const categories = new Set(
+    (landmarkTemplate || [])
+      .map((lm) => (lm.category || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const hasHead = categories.has("head");
+  const hasTail = categories.has("tail");
+  const hasCaudalTail = categories.has("caudal-fin");
+  const tailCategories = ["tail", "caudal-fin"].filter((cat) => categories.has(cat));
+
+  if (mode === "directional") {
+    return {
+      mode,
+      targetOrientation: "left",
+      headCategories: hasHead ? ["head"] : [],
+      tailCategories:
+        hasTail || hasCaudalTail ? (tailCategories.length > 0 ? tailCategories : ["tail", "caudal-fin"]) : [],
+      pcaLevelingMode: "auto",
+    };
+  }
+  if (mode === "bilateral") {
+    return { mode, pcaLevelingMode: "auto" };
+  }
+  if (mode === "axial") {
+    return { mode, pcaLevelingMode: "auto" };
+  }
+  return { mode: "invariant", pcaLevelingMode: "off" };
+}
+
 export const LandingPage: React.FC<LandingPageProps> = ({
   onNavigate,
 }) => {
@@ -107,6 +226,9 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [resumingSessionId, setResumingSessionId] = useState<string | null>(null);
+  const [orientationDialogOpen, setOrientationDialogOpen] = useState(false);
+  const [pendingSessionLaunch, setPendingSessionLaunch] = useState<PendingSessionLaunch | null>(null);
+  const [selectedOrientationMode, setSelectedOrientationMode] = useState<OrientationPolicy["mode"]>("invariant");
 
   // Load existing sessions on mount
   useEffect(() => {
@@ -125,6 +247,80 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     loadSessions();
   }, []);
 
+  const openOrientationDialogForLaunch = (launch: PendingSessionLaunch) => {
+    const suggested = inferDefaultOrientationPolicy(launch.landmarkTemplate).mode;
+    setPendingSessionLaunch(launch);
+    setSelectedOrientationMode(suggested);
+    setOrientationDialogOpen(true);
+  };
+
+  const beginResumeWithOrientationCheck = async (
+    speciesId: string,
+    sessionName: string,
+    fallbackTemplate: LandmarkDefinition[] = []
+  ) => {
+    const existingSession = sessions.find((s) => s.speciesId === speciesId);
+    const hasConfiguredFromList = Boolean(
+      existingSession?.orientationPolicyConfigured &&
+      existingSession?.orientationPolicy?.mode
+    );
+    if (hasConfiguredFromList) {
+      await resumeSession(speciesId, sessionName);
+      return;
+    }
+
+    let template = fallbackTemplate;
+    let hasConfiguredFromLoad = false;
+    try {
+      const loaded = await window.api.sessionLoad(speciesId);
+      if (loaded.ok && loaded.meta?.landmarkTemplate?.length) {
+        template = loaded.meta.landmarkTemplate;
+      }
+      hasConfiguredFromLoad = Boolean(
+        loaded.ok &&
+        loaded.meta?.orientationPolicyConfigured &&
+        loaded.meta?.orientationPolicy?.mode
+      );
+    } catch {
+      // Fallback template is good enough for policy prompt.
+    }
+
+    if (hasConfiguredFromLoad) {
+      await resumeSession(speciesId, sessionName);
+      return;
+    }
+
+    openOrientationDialogForLaunch({
+      type: "resume",
+      speciesId,
+      name: sessionName,
+      landmarkTemplate: template,
+    });
+  };
+
+  const confirmOrientationSelection = async () => {
+    if (!pendingSessionLaunch) return;
+    const launch = pendingSessionLaunch;
+    const policy = buildOrientationPolicy(
+      selectedOrientationMode,
+      launch.landmarkTemplate
+    );
+    setOrientationDialogOpen(false);
+    setPendingSessionLaunch(null);
+
+    if (launch.type === "create") {
+      await createNewSession(launch.speciesId, launch.name, launch.landmarkTemplate, policy);
+      return;
+    }
+
+    try {
+      await window.api.sessionUpdateOrientationPolicy(launch.speciesId, policy);
+    } catch (err) {
+      console.warn("Failed to persist selected orientation policy:", err);
+    }
+    await resumeSession(launch.speciesId, launch.name);
+  };
+
   /** Resume an existing session by loading its images from disk */
   const resumeSession = async (speciesId: string, sessionName: string) => {
     setResumingSessionId(speciesId);
@@ -137,10 +333,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       const existingSpecies = speciesList.find((s) => s.id === speciesId);
       if (!existingSpecies) {
         const landmarkTemplate: LandmarkDefinition[] = result.meta?.landmarkTemplate || [];
+        const orientationPolicy =
+          result.meta?.orientationPolicy ||
+          inferDefaultOrientationPolicy(landmarkTemplate);
         const reconstructed: Species = {
           id: speciesId,
           name: result.meta?.name || sessionName,
           landmarkTemplate,
+          orientationPolicy,
           models: [],
           imageCount: 0,
           annotationCount: 0,
@@ -149,6 +349,25 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         dispatch(addSpecies(reconstructed));
       } else {
         dispatch(setActiveSpecies(speciesId));
+        // Always sync the landmark template from disk — session.json may have been
+        // updated (e.g. index renumbering) since the species was last persisted in Redux.
+        const syncedTemplate =
+          result.meta?.landmarkTemplate?.length
+            ? result.meta.landmarkTemplate
+            : existingSpecies.landmarkTemplate;
+        const syncedPolicy =
+          result.meta?.orientationPolicy ||
+          existingSpecies.orientationPolicy ||
+          inferDefaultOrientationPolicy(syncedTemplate || []);
+        dispatch(
+          updateSpecies({
+            id: speciesId,
+            updates: {
+              landmarkTemplate: syncedTemplate,
+              orientationPolicy: syncedPolicy,
+            },
+          })
+        );
       }
 
       if (!result.ok || !result.images?.length) {
@@ -186,11 +405,19 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   };
 
   /** Create a brand-new session on disk + Redux, then navigate */
-  const createNewSession = async (speciesId: string, name: string, landmarkTemplate: LandmarkDefinition[]) => {
+  const createNewSession = async (
+    speciesId: string,
+    name: string,
+    landmarkTemplate: LandmarkDefinition[],
+    orientationPolicyOverride?: OrientationPolicy
+  ) => {
+    const orientationPolicy =
+      orientationPolicyOverride || inferDefaultOrientationPolicy(landmarkTemplate);
     const newSpecies: Species = {
       id: speciesId,
       name,
       landmarkTemplate,
+      orientationPolicy,
       models: [],
       imageCount: 0,
       annotationCount: 0,
@@ -201,7 +428,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     dispatch(clearFiles());
 
     try {
-      await window.api.sessionCreate(speciesId, name, landmarkTemplate);
+      await window.api.sessionCreate(
+        speciesId,
+        name,
+        landmarkTemplate,
+        orientationPolicy
+      );
     } catch (err) {
       console.error("Failed to create session on disk:", err);
       toast.error("Failed to create session directory.");
@@ -224,9 +456,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     const existingSession = sessions.find((s) => s.speciesId === sessionId);
 
     if (existingSession) {
-      await resumeSession(sessionId, schema.name);
+      await beginResumeWithOrientationCheck(sessionId, schema.name, schema.landmarks);
     } else {
-      await createNewSession(sessionId, schema.name, schema.landmarks);
+      openOrientationDialogForLaunch({
+        type: "create",
+        speciesId: sessionId,
+        name: schema.name,
+        landmarkTemplate: schema.landmarks,
+      });
     }
   };
 
@@ -238,9 +475,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     const existingSession = sessions.find((s) => s.speciesId === sessionId);
 
     if (existingSession) {
-      await resumeSession(sessionId, schema.name);
+      await beginResumeWithOrientationCheck(sessionId, schema.name, schema.landmarks);
     } else {
-      await createNewSession(sessionId, schema.name, schema.landmarks);
+      openOrientationDialogForLaunch({
+        type: "create",
+        speciesId: sessionId,
+        name: schema.name,
+        landmarkTemplate: schema.landmarks,
+      });
     }
   };
 
@@ -357,7 +599,9 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                       "transition-colors hover:border-primary/30 hover:bg-card/80",
                       resumingSessionId === session.speciesId && "opacity-60 pointer-events-none"
                     )}
-                    onClick={() => resumeSession(session.speciesId, session.name)}
+                    onClick={() =>
+                      beginResumeWithOrientationCheck(session.speciesId, session.name)
+                    }
                   >
                     <CardContent className="p-3">
                       <h3 className="text-xs font-bold text-foreground truncate">
@@ -393,6 +637,69 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           Press <kbd className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">?</kbd> for keyboard shortcuts
         </motion.p>
       </div>
+
+      <Dialog
+        open={orientationDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            setOrientationDialogOpen(false);
+            setPendingSessionLaunch(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Choose Orientation Schema</DialogTitle>
+            <DialogDescription>
+              Select how this session should handle orientation normalization during training and inference.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-2">
+            {(Object.keys(ORIENTATION_MODE_LABELS) as OrientationPolicy["mode"][]).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setSelectedOrientationMode(mode)}
+                className={cn(
+                  "rounded-md border px-3 py-2 text-left transition-colors",
+                  selectedOrientationMode === mode
+                    ? "border-primary bg-primary/10"
+                    : "border-border hover:border-primary/40"
+                )}
+              >
+                <p className="text-sm font-semibold">{ORIENTATION_MODE_LABELS[mode].title}</p>
+                <p className="text-xs text-muted-foreground">
+                  {ORIENTATION_MODE_LABELS[mode].description}
+                </p>
+              </button>
+            ))}
+          </div>
+          <div className="rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-foreground">
+            {ORIENTATION_MODE_DETAILS[selectedOrientationMode]}
+          </div>
+          <div className="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            <p>
+              SAM2 + PCA (when available) will level specimens before landmark prediction.
+              Directional schemas then enforce a canonical facing direction; bilateral and axial
+              schemas keep symmetry-aware augmentation; invariant schemas avoid unstable forced leveling.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setOrientationDialogOpen(false);
+                setPendingSessionLaunch(null);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button onClick={confirmOrientationSelection}>
+              Continue
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <SettingsModal open={settingsOpen} onOpenChange={setSettingsOpen} />
       <HelpPanel open={helpOpen} onOpenChange={setHelpOpen} />

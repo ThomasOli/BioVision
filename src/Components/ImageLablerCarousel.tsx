@@ -1,7 +1,7 @@
 import React, { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { motion } from "framer-motion";
-import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Loader2, Sparkles, Crosshair, PencilRuler, XCircle } from "lucide-react";
+import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Loader2, Sparkles, Crosshair, PencilRuler, XCircle, Save, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
 
 import ImageLabeler from "./ImageLabeler";
@@ -10,7 +10,7 @@ import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 import { AppDispatch, RootState } from "../state/store";
-import { removeFile, updateBoxes } from "../state/filesState/fileSlice";
+import { removeFile, updateBoxes, setImageFinalized } from "../state/filesState/fileSlice";
 import { BoundingBox } from "../types/Image";
 
 import { Button } from "@/Components/ui/button";
@@ -54,6 +54,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 }) => {
   const {
     images,
+    setImages,
     boxes,
     selectedBoxId,
     setSelectedImage,
@@ -73,7 +74,22 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const [autoDetectProgress, setAutoDetectProgress] = useState<{ message: string; percent: number } | null>(null);
   const [isTrainingDetection, setIsTrainingDetection] = useState(false);
   const [trainingProgress, setTrainingProgress] = useState<{ message: string; percent: number } | null>(null);
+  const [trainDialogOpen, setTrainDialogOpen] = useState(false);
+  const [trainPlanLoading, setTrainPlanLoading] = useState(false);
+  const [trainPlanError, setTrainPlanError] = useState<string | null>(null);
+  const [trainPlanPreview, setTrainPlanPreview] = useState<
+    Awaited<ReturnType<typeof window.api.getYoloTrainPlan>> | null
+  >(null);
+  const [trainEpochsInput, setTrainEpochsInput] = useState("");
+  const [trainAutoTune, setTrainAutoTune] = useState(true);
+  const [trainDatasetSizeInput, setTrainDatasetSizeInput] = useState("");
   const [isAutoBoxCorrection, setIsAutoBoxCorrection] = useState(false);
+  const [isSegmentingBoxes, setIsSegmentingBoxes] = useState(false);
+  const [segmentProgress, setSegmentProgress] = useState<{ current: number; total: number } | null>(null);
+  const [isBulkFinalizing, setIsBulkFinalizing] = useState(false);
+  const [finalizedBoxSignatureByImageId, setFinalizedBoxSignatureByImageId] = useState<Record<number, string>>({});
+  // Tracks which image IDs have been explicitly finalized by the user
+  const [finalizedImageIds, setFinalizedImageIds] = useState<Set<number>>(new Set());
 
   // Use Context images for display, but check Redux for "has images" to avoid race conditions
   const totalImages = images.length;
@@ -101,6 +117,104 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   }, [images, currentIndex, totalImages]);
 
   const hasAnnotations = Boolean(current?.boxes?.length);
+  const hasFinalizableBoxes = Boolean(
+    current?.boxes?.some((b) => b.width > 0 && b.height > 0)
+  );
+  // Get speciesId from current image
+  const activeSpeciesId = current?.speciesId;
+
+  const currentBoxSignature = useMemo(() => {
+    const curBoxes = current?.boxes ?? [];
+    const reduced = curBoxes
+      .filter((b) => b.width > 0 && b.height > 0)
+      .map((b) => ({
+        left: Math.round(b.left),
+        top: Math.round(b.top),
+        width: Math.round(b.width),
+        height: Math.round(b.height),
+      }))
+      .sort((a, b) =>
+        a.left - b.left ||
+        a.top - b.top ||
+        a.width - b.width ||
+        a.height - b.height
+      );
+    return JSON.stringify(reduced);
+  }, [current?.boxes]);
+
+  // isCurrentFinalized: true if the user finalized this session OR the session was restored from disk as finalized.
+  // Belt-and-suspenders: also check Redux directly by filename in case the context sync missed the update.
+  const isCurrentFinalizedInRedux = useMemo(() => {
+    if (!current?.filename || !current?.speciesId) return false;
+    return reduxFileArray.some(
+      (f) => f.filename === current.filename && f.speciesId === current.speciesId && Boolean(f.isFinalized)
+    );
+  }, [reduxFileArray, current?.filename, current?.speciesId]);
+
+  const isCurrentFinalized = current
+    ? (finalizedImageIds.has(current.id) || Boolean(current.isFinalized) || isCurrentFinalizedInRedux)
+    : false;
+
+  const isFinalizePending = Boolean(
+    current &&
+    !isCurrentFinalized &&
+    hasFinalizableBoxes &&
+    finalizedBoxSignatureByImageId[current.id] !== currentBoxSignature
+  );
+
+  const finalizationCandidates = useMemo(
+    () =>
+      images.map((img) => ({
+        id: img.id,
+        filename: img.filename,
+        isFinalized: Boolean(img.isFinalized),
+      })),
+    [images]
+  );
+
+  // Re-hydrate finalized status from persisted session labels whenever this view mounts.
+  // This keeps "Detection Finalized" state stable after leaving/re-entering workspace.
+  useEffect(() => {
+    if (!activeSpeciesId) return;
+    let cancelled = false;
+
+    const hydrateFinalized = async () => {
+      try {
+        const result = await window.api.sessionLoad(activeSpeciesId);
+        if (cancelled || !result.ok || !result.images) return;
+
+        const finalizedNames = new Set(
+          result.images
+            .filter((img) => Boolean(img.finalized))
+            .map((img) => img.filename)
+        );
+        if (finalizedNames.size === 0) return;
+
+        setFinalizedImageIds((prev) => {
+          const next = new Set(prev);
+          finalizationCandidates.forEach((img) => {
+            if (finalizedNames.has(img.filename)) {
+              next.add(img.id);
+            }
+          });
+          return next;
+        });
+
+        finalizationCandidates.forEach((img) => {
+          if (finalizedNames.has(img.filename) && !img.isFinalized) {
+            dispatch(setImageFinalized({ id: img.id }));
+          }
+        });
+      } catch (err) {
+        console.error("Failed to hydrate finalized image state:", err);
+      }
+    };
+
+    void hydrateFinalized();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSpeciesId, finalizationCandidates, dispatch]);
 
   useEffect(() => {
     if (detectionMode !== "auto") {
@@ -149,6 +263,85 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     // Dispatch the deletion
     dispatch(removeFile(idToDelete));
   }, [current, reduxFileArray, dispatch, setSelectedImage]);
+
+  const finalizeImageSegments = useCallback(async (image: (typeof images)[number] | null): Promise<boolean> => {
+    if (!image?.speciesId || !image?.filename) return false;
+    const acceptedBoxes = (image.boxes || [])
+      .filter((b) => b.width > 0 && b.height > 0)
+      .map((b) => ({
+        left: Math.round(b.left),
+        top: Math.round(b.top),
+        width: Math.round(b.width),
+        height: Math.round(b.height),
+        landmarks: (b.landmarks || [])
+          .filter((lm) => Number.isFinite(Number(lm?.id)))
+          .map((lm) => ({
+            id: Number(lm.id),
+            x: Number(lm.x),
+            y: Number(lm.y),
+            ...(lm.isSkipped ? { isSkipped: true } : {}),
+          })),
+      }));
+
+    const imageId = image.id;
+    const sig = JSON.stringify(
+      acceptedBoxes
+        .map((b) => ({
+          left: b.left,
+          top: b.top,
+          width: b.width,
+          height: b.height,
+        }))
+        .slice()
+        .sort((a, b) =>
+          a.left - b.left ||
+          a.top - b.top ||
+          a.width - b.width ||
+          a.height - b.height
+        )
+    );
+
+    try {
+      const result = await window.api.sessionFinalizeAcceptedBoxes(
+        image.speciesId,
+        image.filename,
+        acceptedBoxes,
+        image.path
+      );
+      if (result.ok) {
+        setFinalizedBoxSignatureByImageId((prev) => ({ ...prev, [imageId]: sig }));
+        setFinalizedImageIds((prev) => new Set([...prev, imageId]));
+        dispatch(setImageFinalized({ id: imageId }));
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error("Failed to finalize accepted boxes:", err);
+      return false;
+    }
+  }, [dispatch]);
+
+  const finalizeCurrentImageSegments = useCallback(async (): Promise<boolean> => {
+    return finalizeImageSegments(current);
+  }, [current, finalizeImageSegments]);
+
+  const finalizableImages = useMemo(() => {
+    return images.filter((img) => {
+      const hasValidBoxes = (img.boxes || []).some((b) => b.width > 0 && b.height > 0);
+      if (!hasValidBoxes || !img.speciesId || !img.filename) return false;
+      const finalized = Boolean(img.isFinalized) || finalizedImageIds.has(img.id);
+      return !finalized;
+    });
+  }, [images, finalizedImageIds]);
+
+  const finalizableImageCount = finalizableImages.length;
+  const segmentableImageCount = useMemo(() => {
+    return images.filter((img) => {
+      const imgPath = img.path || img.diskPath;
+      const hasValidBoxes = (img.boxes || []).some((b) => b.width > 0 && b.height > 0);
+      return Boolean(imgPath) && hasValidBoxes;
+    }).length;
+  }, [images]);
 
   const handleNext = useCallback(() => {
     if (totalImages <= 1) return;
@@ -203,6 +396,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         maxObjects: 25,
         detectionMode: "auto",
         detectionPreset,
+        useOrientationHint: true,
       }, current.speciesId);
 
       if (result.ok && Array.isArray(result.objects) && result.objects.length > 0) {
@@ -226,6 +420,47 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       setAutoDetectProgress(null);
     }
   }, [current, className, confThreshold, samEnabled, detectionPreset, setBoxesFromSuperAnnotation]);
+
+  const handleAutoDetectOrFinalize = useCallback(async () => {
+    if (isFinalizePending) {
+      const ok = await finalizeCurrentImageSegments();
+      if (ok) {
+        toast.success("Finalized accepted boxes for this image.");
+      } else {
+        toast.error("Failed to finalize accepted boxes.");
+      }
+      return;
+    }
+    await handleAutoDetect();
+  }, [isFinalizePending, finalizeCurrentImageSegments, handleAutoDetect]);
+
+  const handleFinalizeAllWithBoxes = useCallback(async () => {
+    if (finalizableImageCount === 0) {
+      toast.info("No remaining images with boxes to finalize.");
+      return;
+    }
+
+    setIsBulkFinalizing(true);
+    let successCount = 0;
+    let failCount = 0;
+    try {
+      for (const image of finalizableImages) {
+        const ok = await finalizeImageSegments(image);
+        if (ok) successCount += 1;
+        else failCount += 1;
+      }
+    } finally {
+      setIsBulkFinalizing(false);
+    }
+
+    if (successCount > 0 && failCount === 0) {
+      toast.success(`Finalized ${successCount} image(s) with accepted boxes.`);
+    } else if (successCount > 0) {
+      toast.warning(`Finalized ${successCount} image(s), ${failCount} failed.`);
+    } else {
+      toast.error("Failed to finalize images with boxes.");
+    }
+  }, [finalizableImageCount, finalizableImages, finalizeImageSegments]);
 
   const handleToggleAutoBoxCorrection = useCallback(() => {
     if (!isAutoBoxCorrection && selectedBoxId === null && boxes.length > 0) {
@@ -255,25 +490,233 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     toast.success("Selected detected box removed.");
   }, [selectedBoxId, boxes, current, deleteBox]);
 
-  // Count images with bounding box annotations for YOLO training
-  const annotatedImageCount = useMemo(() => {
-    return images.filter((img) => (img.boxes || []).length > 0).length;
-  }, [images]);
+  const handleSegmentAllBoxes = useCallback(async () => {
+    if (!samEnabled) {
+      toast.info("Enable SAM2 first, then run segmentation.");
+      return;
+    }
+    const candidates = images
+      .map((img) => {
+        const imgPath = img.path || img.diskPath;
+        const validBoxes = (img.boxes || []).filter((b) => b.width > 0 && b.height > 0);
+        return {
+          image: img,
+          imagePath: imgPath,
+          validBoxes,
+        };
+      })
+      .filter((entry) => Boolean(entry.imagePath) && entry.validBoxes.length > 0);
 
-  const canTrainDetection = annotatedImageCount >= 10;
+    if (candidates.length === 0) {
+      toast.info("No images with valid bounding boxes to segment.");
+      return;
+    }
 
-  // Get speciesId from current image
-  const activeSpeciesId = current?.speciesId;
+    const totalBoxes = candidates.reduce((sum, entry) => sum + entry.validBoxes.length, 0);
+    setIsSegmentingBoxes(true);
+    setSegmentProgress({ current: 0, total: totalBoxes });
+    let success = 0;
+    let failed = 0;
+    let processed = 0;
+    let imagesUpdated = 0;
+    const errorCounts = new Map<string, number>();
+    const updatedBoxesByImageId = new Map<number, BoundingBox[]>();
 
-  // Handle YOLO detection model training
-  const handleTrainDetection = useCallback(async () => {
+    try {
+      for (const entry of candidates) {
+        const imagePath = entry.imagePath!;
+        let localBoxes = (entry.image.boxes || []).map((b) => ({ ...b }));
+        let imageHadUpdate = false;
+
+        for (const box of entry.validBoxes) {
+          processed += 1;
+          setSegmentProgress({ current: processed, total: totalBoxes });
+
+          const left = Math.round(box.left);
+          const top = Math.round(box.top);
+          const width = Math.max(1, Math.round(box.width));
+          const height = Math.max(1, Math.round(box.height));
+
+          try {
+            const result = await window.api.resegmentBox(imagePath, [
+              left,
+              top,
+              left + width,
+              top + height,
+            ]);
+            if (result.ok && Array.isArray(result.maskOutline) && result.maskOutline.length > 2) {
+              localBoxes = localBoxes.map((candidateBox) =>
+                candidateBox.id === box.id
+                  ? {
+                      ...candidateBox,
+                      maskOutline: result.maskOutline,
+                    }
+                  : candidateBox
+              );
+              success += 1;
+              imageHadUpdate = true;
+            } else {
+              failed += 1;
+              const reason = (result.error || "unknown_error").trim();
+              errorCounts.set(reason, (errorCounts.get(reason) || 0) + 1);
+            }
+          } catch (err) {
+            console.error(`SAM segmentation failed for box ${box.id}:`, err);
+            failed += 1;
+            const reason = err instanceof Error ? err.message : "request_failed";
+            errorCounts.set(reason, (errorCounts.get(reason) || 0) + 1);
+          }
+        }
+
+        if (imageHadUpdate) {
+          updatedBoxesByImageId.set(entry.image.id, localBoxes);
+          imagesUpdated += 1;
+        }
+      }
+
+      if (updatedBoxesByImageId.size > 0) {
+        setImages((prev) =>
+          prev.map((img) => {
+            const updatedBoxes = updatedBoxesByImageId.get(img.id);
+            return updatedBoxes ? { ...img, boxes: updatedBoxes } : img;
+          })
+        );
+
+        const persistOps: Promise<unknown>[] = [];
+        for (const [imageId, updatedBoxes] of updatedBoxesByImageId.entries()) {
+          dispatch(updateBoxes({ id: imageId, boxes: updatedBoxes }));
+          const imageMeta = images.find((img) => img.id === imageId);
+          if (imageMeta?.speciesId && imageMeta?.filename) {
+            persistOps.push(
+              window.api.sessionSaveAnnotations(imageMeta.speciesId, imageMeta.filename, updatedBoxes)
+            );
+          }
+        }
+        if (persistOps.length > 0) {
+          await Promise.allSettled(persistOps);
+        }
+      }
+    } finally {
+      setIsSegmentingBoxes(false);
+      setSegmentProgress(null);
+    }
+
+    if (success > 0 && failed === 0) {
+      toast.success(
+        `Segmented ${success} box${success === 1 ? "" : "es"} across ${imagesUpdated} image${imagesUpdated === 1 ? "" : "s"}.`
+      );
+    } else if (success > 0) {
+      const topError = [...errorCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+      toast.warning(
+        `Segmented ${success} box${success === 1 ? "" : "es"} across ${imagesUpdated} image${imagesUpdated === 1 ? "" : "s"}; ${failed} failed` +
+          (topError ? ` (${topError})` : ".")
+      );
+    } else {
+      const topError = [...errorCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+      toast.error(
+        `SAM2 did not produce segments for the current boxes` +
+          (topError ? `: ${topError}` : ".")
+      );
+    }
+  }, [samEnabled, images, setImages, dispatch]);
+
+  // Count finalized images with accepted boxes for YOLO training.
+  const finalizedPositiveImageCount = useMemo(() => {
+    return images.filter((img) => {
+      const finalized = Boolean(img.isFinalized) || finalizedImageIds.has(img.id);
+      const hasBoxes = (img.boxes || []).some((b) => b.width > 0 && b.height > 0);
+      return finalized && hasBoxes;
+    }).length;
+  }, [images, finalizedImageIds]);
+
+  const canTrainDetection = finalizedPositiveImageCount >= 10;
+
+  // Get active species schema from Redux for the zoomed view
+  const activeSpeciesForSchema = useSelector((state: RootState) =>
+    state.species.species.find((s) => s.id === state.species.activeSpeciesId)
+  );
+  const activeSchema = activeSpeciesForSchema
+    ? {
+        id: activeSpeciesForSchema.id,
+        name: activeSpeciesForSchema.name,
+        description: activeSpeciesForSchema.description || "",
+        landmarks: activeSpeciesForSchema.landmarkTemplate,
+      }
+    : undefined;
+
+  const parseOptionalPositiveInt = useCallback((value: string): number | undefined => {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+    return Math.max(1, Math.floor(parsed));
+  }, []);
+
+  const fetchYoloTrainPlan = useCallback(async () => {
+    const promptClass = className.trim();
+    if (!activeSpeciesId || !promptClass) return;
+
+    const datasetSizeOverride = parseOptionalPositiveInt(trainDatasetSizeInput);
+    const epochsOverride = parseOptionalPositiveInt(trainEpochsInput);
+
+    setTrainPlanLoading(true);
+    setTrainPlanError(null);
+    try {
+      const plan = await window.api.getYoloTrainPlan(
+        activeSpeciesId,
+        promptClass,
+        epochsOverride,
+        detectionPreset,
+        datasetSizeOverride,
+        trainAutoTune
+      );
+      if (plan.ok) {
+        setTrainPlanPreview(plan);
+      } else {
+        setTrainPlanPreview(null);
+        setTrainPlanError(plan.error || "Failed to compute YOLO train plan.");
+      }
+    } catch (err: unknown) {
+      setTrainPlanPreview(null);
+      const message =
+        err instanceof Error ? err.message : "Failed to compute YOLO train plan.";
+      setTrainPlanError(message);
+    } finally {
+      setTrainPlanLoading(false);
+    }
+  }, [
+    activeSpeciesId,
+    className,
+    detectionPreset,
+    parseOptionalPositiveInt,
+    trainAutoTune,
+    trainDatasetSizeInput,
+    trainEpochsInput,
+  ]);
+
+  const runTrainDetection = useCallback(async () => {
     const promptClass = className.trim();
     if (!activeSpeciesId || !promptClass) {
       toast.info("Enter an object class name and ensure you're in an active session.");
       return;
     }
+    if (isFinalizePending) {
+      toast.info("Finalize accepted boxes on the current image before training.");
+      return;
+    }
     if (!canTrainDetection) {
-      toast.info(`Need at least 10 annotated images to train. Currently have ${annotatedImageCount}.`);
+      toast.info(`Need at least 10 finalized images to train. Currently have ${finalizedPositiveImageCount}.`);
+      return;
+    }
+
+    const datasetSizeOverride = parseOptionalPositiveInt(trainDatasetSizeInput);
+    const epochsOverride = parseOptionalPositiveInt(trainEpochsInput);
+    if (trainDatasetSizeInput.trim().length > 0 && datasetSizeOverride === undefined) {
+      toast.error("Dataset size must be a positive integer.");
+      return;
+    }
+    if (trainEpochsInput.trim().length > 0 && epochsOverride === undefined) {
+      toast.error("Epochs must be a positive integer.");
       return;
     }
 
@@ -285,14 +728,30 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     });
 
     try {
-      const result = await window.api.trainYolo(activeSpeciesId, promptClass, undefined, detectionPreset);
+      const result = await window.api.trainYolo(
+        activeSpeciesId,
+        promptClass,
+        epochsOverride,
+        detectionPreset,
+        datasetSizeOverride,
+        trainAutoTune
+      );
       if (result.ok) {
         const mapSuffix = result.candidateMap50 != null ? ` mAP50=${(result.candidateMap50 * 100).toFixed(1)}%.` : "";
+        const sizeSuffix = result.datasetSizeEffective
+          ? ` size=${result.datasetSizeEffective} (${result.datasetSizeSource ?? "export"}).`
+          : "";
         toast.success(
           result.promoted
-            ? `Detection model v${result.version ?? "?"} promoted.${mapSuffix}`
-            : `Detection model v${result.version ?? "?"} kept as candidate (not promoted).${mapSuffix}`
+            ? `Detection model v${result.version ?? "?"} promoted.${mapSuffix}${sizeSuffix}`
+            : `Detection model v${result.version ?? "?"} kept as candidate (not promoted).${mapSuffix}${sizeSuffix}`
         );
+        // Corrections queued from inference are now consumed by this manual train.
+        try {
+          await window.api.sessionClearRetrainQueue(activeSpeciesId);
+        } catch (_) {
+          // non-fatal
+        }
       } else {
         toast.error(result.error || "Detection training failed.");
       }
@@ -304,7 +763,48 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       setIsTrainingDetection(false);
       setTrainingProgress(null);
     }
-  }, [activeSpeciesId, className, canTrainDetection, annotatedImageCount, detectionPreset]);
+  }, [
+    activeSpeciesId,
+    className,
+    canTrainDetection,
+    finalizedPositiveImageCount,
+    detectionPreset,
+    isFinalizePending,
+    parseOptionalPositiveInt,
+    trainDatasetSizeInput,
+    trainEpochsInput,
+    trainAutoTune,
+  ]);
+
+  const handleOpenTrainDetectionDialog = useCallback(async () => {
+    const promptClass = className.trim();
+    if (!activeSpeciesId || !promptClass) {
+      toast.info("Enter an object class name and ensure you're in an active session.");
+      return;
+    }
+    if (isFinalizePending) {
+      toast.info("Finalize accepted boxes on the current image before training.");
+      return;
+    }
+    if (!canTrainDetection) {
+      toast.info(`Need at least 10 finalized images to train. Currently have ${finalizedPositiveImageCount}.`);
+      return;
+    }
+    setTrainDialogOpen(true);
+    await fetchYoloTrainPlan();
+  }, [
+    activeSpeciesId,
+    className,
+    isFinalizePending,
+    canTrainDetection,
+    finalizedPositiveImageCount,
+    fetchYoloTrainPlan,
+  ]);
+
+  const handleConfirmTrainDetection = useCallback(async () => {
+    setTrainDialogOpen(false);
+    await runTrainDetection();
+  }, [runTrainDetection]);
 
   const exportCurrent = useCallback(async () => {
     if (!current || !current.boxes?.length) return;
@@ -407,23 +907,35 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
           </div>
 
           <div className="flex min-w-0 flex-1 flex-wrap items-center justify-start gap-2 md:justify-end">
-            {/* Manual mode has no detect button — user draws boxes by dragging */}
-
-            {/* Auto-Detect button - auto mode (AI) */}
-            {detectionMode === "auto" && (
+            {/* Finalized badge — shown in any detection mode once finalized */}
+            {isCurrentFinalized ? (
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-3 py-1 text-xs font-bold text-emerald-400 ring-1 ring-emerald-500/40">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  Detection Finalized
+                </span>
+                <span className="text-xs text-muted-foreground">Landmark mode only</span>
+              </div>
+            ) : (detectionMode === "auto" || isFinalizePending) ? (
+              /* Finalize shared across modes; auto-detect/correction controls in auto mode only */
               <>
                 <motion.div {...buttonHover} {...buttonTap}>
                   <Button
-                    variant="outline"
+                    variant={isFinalizePending ? "default" : "outline"}
                     size="sm"
-                    onClick={handleAutoDetect}
-                    disabled={isDetecting || !current || !className.trim()}
-                    className="font-bold"
+                    onClick={handleAutoDetectOrFinalize}
+                    disabled={isDetecting || !current || (!isFinalizePending && !className.trim())}
+                    className={isFinalizePending ? "font-bold bg-emerald-600 hover:bg-emerald-700 text-white border-0" : "font-bold"}
                   >
                     {isDetecting ? (
                       <>
                         <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
                         {autoDetectProgress?.message || "Processing..."}
+                      </>
+                    ) : isFinalizePending ? (
+                      <>
+                        <Save className="mr-1.5 h-3.5 w-3.5" />
+                        Finalize This Image
                       </>
                     ) : (
                       <>
@@ -434,7 +946,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                   </Button>
                 </motion.div>
 
-                {boxes.length > 0 && (
+                {detectionMode === "auto" && boxes.length > 0 && (
                   <motion.div {...buttonHover} {...buttonTap}>
                     <Button
                       variant={isAutoBoxCorrection ? "default" : "outline"}
@@ -449,7 +961,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                   </motion.div>
                 )}
 
-                {boxes.length > 0 && (
+                {detectionMode === "auto" && boxes.length > 0 && (
                   <motion.div {...buttonHover} {...buttonTap}>
                     <Button
                       variant="outline"
@@ -463,39 +975,96 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                     </Button>
                   </motion.div>
                 )}
+
               </>
+            ) : null}
+
+            {samEnabled && segmentableImageCount > 0 && (
+              <motion.div {...buttonHover} {...buttonTap}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleSegmentAllBoxes}
+                  disabled={isDetecting || isSegmentingBoxes}
+                  className="font-bold"
+                  title="Run SAM2 on every accepted box in all images"
+                >
+                  {isSegmentingBoxes ? (
+                    <>
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      {segmentProgress
+                        ? `Segmenting ${segmentProgress.current}/${segmentProgress.total}`
+                        : "Segmenting..."}
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                      Segment All Boxes ({segmentableImageCount} img)
+                    </>
+                  )}
+                </Button>
+              </motion.div>
             )}
 
             {/* Train Detection Model button — visible when 10+ images annotated */}
+            <motion.div {...buttonHover} {...buttonTap}>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleFinalizeAllWithBoxes}
+                disabled={isBulkFinalizing || isDetecting || isTrainingDetection || finalizableImageCount === 0}
+                className="font-bold"
+                title={
+                  finalizableImageCount > 0
+                    ? "Finalize every image that currently has accepted boxes"
+                    : "No remaining images with boxes to finalize"
+                }
+              >
+                {isBulkFinalizing ? (
+                  <>
+                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    Finalizing...
+                  </>
+                ) : (
+                  <>
+                    <Save className="mr-1.5 h-3.5 w-3.5" />
+                    Finalize All With Boxes ({finalizableImageCount})
+                  </>
+                )}
+              </Button>
+            </motion.div>
+
             {canTrainDetection && activeSpeciesId && className.trim() && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <motion.div {...buttonHover} {...buttonTap}>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={handleTrainDetection}
-                      disabled={isTrainingDetection || isDetecting}
-                      className="font-bold"
-                    >
-                      {isTrainingDetection ? (
-                        <>
-                          <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                          {trainingProgress?.message || "Training..."}
-                        </>
-                      ) : (
-                        <>
-                          <Crosshair className="mr-1.5 h-3.5 w-3.5" />
-                          Train Detection
-                        </>
-                      )}
-                    </Button>
-                  </motion.div>
-                </TooltipTrigger>
-                <TooltipContent>
-                  Fine-tune detection model on {annotatedImageCount} annotated images
-                </TooltipContent>
-              </Tooltip>
+              <>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <motion.div {...buttonHover} {...buttonTap}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleOpenTrainDetectionDialog}
+                        disabled={isTrainingDetection || isDetecting}
+                        className="font-bold"
+                      >
+                        {isTrainingDetection ? (
+                          <>
+                            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                            {trainingProgress?.message || "Training..."}
+                          </>
+                        ) : (
+                          <>
+                            <Crosshair className="mr-1.5 h-3.5 w-3.5" />
+                            Train Detection
+                          </>
+                        )}
+                      </Button>
+                    </motion.div>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    Fine-tune detection model on {finalizedPositiveImageCount} finalized images
+                  </TooltipContent>
+                </Tooltip>
+              </>
             )}
 
             {hasAnnotations && (
@@ -615,7 +1184,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 
           {/* Image display - simple conditional rendering */}
           {current ? (
-            <div key={current.id} className="h-full w-full min-h-0 min-w-0">
+            <div key={current.id} className="relative h-full w-full min-h-0 min-w-0">
               <ImageLabeler
                 key={current.id}
                 imageURL={current.url}
@@ -626,8 +1195,19 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 opacity={opacity}
                 mode={isSwitchOn}
                 detectionMode={detectionMode}
-                autoCorrectionMode={detectionMode === "auto" && isAutoBoxCorrection}
+                autoCorrectionMode={!isCurrentFinalized && detectionMode === "auto" && isAutoBoxCorrection}
+                imagePath={current.path ?? undefined}
+                samEnabled={samEnabled}
+                hideSegmentOutlines={isCurrentFinalized}
+                lockBoxes={isCurrentFinalized}
               />
+              {/* Finalized overlay banner */}
+              {isCurrentFinalized && (
+                <div className="pointer-events-none absolute inset-x-0 top-0 flex items-center justify-center gap-1.5 bg-emerald-500/20 py-1.5 text-xs font-semibold text-emerald-300 backdrop-blur-sm">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  Detection finalized — use landmark mode to annotate
+                </div>
+              )}
             </div>
           ) : (
             <div className="flex h-full w-full items-center justify-center text-muted-foreground">
@@ -681,6 +1261,172 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
           </DialogContent>
         </Dialog>
 
+        {/* Train detection review dialog */}
+        <Dialog
+          open={trainDialogOpen}
+          onOpenChange={(open) => {
+            setTrainDialogOpen(open);
+            if (!open) {
+              setTrainPlanError(null);
+            }
+          }}
+        >
+          <DialogContent className="sm:max-w-xl">
+            <DialogHeader>
+              <DialogTitle className="font-bold">Review Detection Training Settings</DialogTitle>
+              <DialogDescription>
+                Review dataset stats and default hyperparameters before starting YOLO fine-tuning.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-3 text-sm">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-semibold text-muted-foreground">Dataset size override</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={trainDatasetSizeInput}
+                    onChange={(e) => setTrainDatasetSizeInput(e.target.value)}
+                    placeholder="auto"
+                    disabled={isTrainingDetection || trainPlanLoading}
+                    className="h-9 rounded border border-border/70 bg-background px-2 text-xs outline-none focus:border-primary"
+                  />
+                </label>
+
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-semibold text-muted-foreground">Epoch override</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={trainEpochsInput}
+                    onChange={(e) => setTrainEpochsInput(e.target.value)}
+                    placeholder="system default"
+                    disabled={isTrainingDetection || trainPlanLoading}
+                    className="h-9 rounded border border-border/70 bg-background px-2 text-xs outline-none focus:border-primary"
+                  />
+                </label>
+              </div>
+
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={trainAutoTune}
+                  onChange={(e) => setTrainAutoTune(e.target.checked)}
+                  disabled={isTrainingDetection || trainPlanLoading}
+                />
+                Use system auto-tuned defaults for this dataset size
+              </label>
+
+              <div className="rounded-md border border-border/70 bg-background/60 p-3 text-xs">
+                {trainPlanLoading ? (
+                  <div className="flex items-center gap-2 text-muted-foreground">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    Computing train plan...
+                  </div>
+                ) : trainPlanError ? (
+                  <p className="text-destructive">{trainPlanError}</p>
+                ) : trainPlanPreview?.ok ? (
+                  <div className="space-y-1.5">
+                    <p>
+                      Dataset size:{" "}
+                      <span className="font-semibold">
+                        {trainPlanPreview.datasetSizeEffective ?? "-"}
+                      </span>{" "}
+                      ({trainPlanPreview.datasetSizeSource ?? "export"})
+                    </p>
+                    <p>
+                      System default epochs:{" "}
+                      <span className="font-semibold">
+                        {trainPlanPreview.resolvedTrainParams?.epochs ?? "-"}
+                      </span>
+                    </p>
+                    <p>
+                      Batch / Freeze:{" "}
+                      <span className="font-semibold">
+                        {trainPlanPreview.resolvedTrainParams?.batch ?? "-"} / {trainPlanPreview.resolvedTrainParams?.freeze ?? "-"}
+                      </span>
+                    </p>
+                    <p>
+                      Records (train/val):{" "}
+                      <span className="font-semibold">
+                        {trainPlanPreview.dataset?.train_records ?? "-"} / {trainPlanPreview.dataset?.val_records ?? "-"}
+                      </span>
+                    </p>
+                    <p>
+                      Positives / Negatives:{" "}
+                      <span className="font-semibold">
+                        {trainPlanPreview.dataset?.positive_images ?? "-"} / {trainPlanPreview.dataset?.negative_crops ?? "-"}
+                      </span>
+                    </p>
+                    {trainPlanPreview.dataset?.orientation_class_enabled && (
+                      <>
+                        <p>
+                          Real orientation boxes (L/R):{" "}
+                          <span className="font-semibold">
+                            {trainPlanPreview.dataset?.real_orientation_left_boxes ?? "-"} / {trainPlanPreview.dataset?.real_orientation_right_boxes ?? "-"}
+                          </span>
+                        </p>
+                        <p>
+                          Synthetic mode:{" "}
+                          <span className="font-semibold">
+                            {trainPlanPreview.dataset?.synthetic_mode ?? "standard"}
+                          </span>
+                          {" "}
+                          ({trainPlanPreview.dataset?.synthetic_instances_generated ?? "-"} instances)
+                        </p>
+                      </>
+                    )}
+                    {(() => {
+                      const warnings = trainPlanPreview.preflightWarnings
+                        ?? trainPlanPreview.dataset?.orientation_preflight_warnings
+                        ?? [];
+                      if (!warnings.length) return null;
+                      return (
+                        <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-300">
+                          <p className="mb-1 font-semibold">Preflight warnings:</p>
+                          {warnings.map((w, i) => (
+                            <p key={`train-plan-warning-${i}`}>- {w}</p>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground">No plan computed yet.</p>
+                )}
+              </div>
+            </div>
+
+            <DialogFooter className="gap-2 sm:gap-0">
+              <Button
+                variant="outline"
+                onClick={() => setTrainDialogOpen(false)}
+                disabled={isTrainingDetection}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => void fetchYoloTrainPlan()}
+                disabled={isTrainingDetection || trainPlanLoading}
+              >
+                {trainPlanLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Refresh Plan
+              </Button>
+              <Button
+                onClick={() => void handleConfirmTrainDetection()}
+                disabled={isTrainingDetection}
+              >
+                {isTrainingDetection ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Start Training
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         {current && (
           <MagnifiedImageLabeler
             imageURL={current.url}
@@ -692,8 +1438,13 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
             open={isMagnified}
             onClose={toggleMagnifiedView}
             mode={isSwitchOn}
+            schema={activeSchema}
             detectionMode={detectionMode}
-            autoCorrectionMode={detectionMode === "auto" && isAutoBoxCorrection}
+            autoCorrectionMode={!isCurrentFinalized && detectionMode === "auto" && isAutoBoxCorrection}
+            imagePath={current.path ?? undefined}
+            samEnabled={samEnabled}
+            hideSegmentOutlines={isCurrentFinalized}
+            lockBoxes={isCurrentFinalized}
           />
         )}
       </Card>

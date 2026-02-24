@@ -1,4 +1,6 @@
 """Image utilities with EXIF orientation handling."""
+import os
+import sys
 import cv2
 import numpy as np
 
@@ -10,13 +12,45 @@ except ImportError:
     HAS_PIL = False
 
 
+def safe_imread(image_path):
+    """
+    cv2.imread replacement that handles Unicode/non-ASCII paths on Windows.
+    OpenCV's imread uses the narrow Windows API and silently returns None for
+    paths containing characters outside the system ANSI codepage (e.g. U+202F).
+    Reading via Python's open() + cv2.imdecode avoids this limitation.
+    """
+    try:
+        with open(image_path, 'rb') as f:
+            buf = np.frombuffer(f.read(), dtype=np.uint8)
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+def safe_imwrite(image_path, img):
+    """
+    cv2.imwrite replacement that handles Unicode/non-ASCII paths on Windows.
+    Returns True on success, False on failure.
+    """
+    try:
+        ext = os.path.splitext(image_path)[1].lower() or '.png'
+        success, buf = cv2.imencode(ext, img)
+        if not success:
+            return False
+        with open(image_path, 'wb') as f:
+            f.write(buf.tobytes())
+        return True
+    except Exception:
+        return False
+
+
 def load_image(image_path):
     """Load image with EXIF orientation correction. Returns (image, width, height)."""
     if HAS_PIL:
         return _load_with_pil_exif(image_path)
     else:
-        # Fallback to OpenCV without EXIF handling
-        img = cv2.imread(image_path)
+        # Fallback to OpenCV without EXIF handling (use safe_imread for Unicode path support)
+        img = safe_imread(image_path)
         if img is None:
             return None, 0, 0
         h, w = img.shape[:2]
@@ -73,9 +107,14 @@ def _load_with_pil_exif(image_path):
         return img, w, h
 
     except Exception as e:
-        print(f"Warning: PIL load failed for {image_path}: {e}")
-        # Fallback to OpenCV
-        img = cv2.imread(image_path)
+        try:
+            sys.stderr.buffer.write(
+                f"Warning: PIL load failed for {image_path}: {e}\n".encode("utf-8", errors="replace")
+            )
+        except Exception:
+            pass
+        # Fallback: use safe_imread which handles Unicode paths on Windows
+        img = safe_imread(image_path)
         if img is None:
             return None, 0, 0
         h, w = img.shape[:2]

@@ -51,7 +51,7 @@ export const LandmarkPlacementGuide: React.FC<LandmarkPlacementGuideProps> = ({
         {/* Current landmark info */}
         <div className="flex items-start gap-3">
           <div className="shrink-0 rounded-full bg-primary/20 px-3 py-1 font-mono text-sm font-bold text-primary">
-            {nextLandmark.index + 1}
+            {schema.landmarks.indexOf(nextLandmark) + 1}
           </div>
           <div className="flex-1">
             <p className="text-sm font-semibold text-foreground">{nextLandmark.name}</p>

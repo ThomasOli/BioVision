@@ -97,6 +97,13 @@ export function DetectionModeSelector({
           ? "YOLO not attempted: requires more free RAM (>2GB) or GPU."
           : "YOLO pending: click Initialize models."
     : null;
+  const sam2StatusHint = capabilityInfo
+    ? capabilityInfo.sam2_ready
+      ? "SAM2 ready."
+      : sam2Available
+        ? "SAM2 pending: initialize models to enable mask refinement."
+        : "SAM2 system-gated: requires GPU + sufficient memory."
+    : null;
 
   const canInitializeModels = capabilityInfo ? capabilityInfo.mode !== "classic_fallback" : false;
 
@@ -248,6 +255,11 @@ export function DetectionModeSelector({
               capabilityInfo?.yolo_failed ? "text-red-400/90" : "text-zinc-500"
             }`}>
               Status: {yoloStatusHint}
+            </p>
+          )}
+          {sam2StatusHint && (
+            <p className="text-[10px] text-zinc-500">
+              SAM2: {sam2StatusHint}
             </p>
           )}
 

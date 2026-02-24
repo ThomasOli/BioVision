@@ -1,11 +1,325 @@
 import cv2
 import numpy as np
+import os
 import sys
 from image_utils import load_image
 
 
-def detect_specimen(image_path, margin=20):
-    """Detect specimen bounding box. Returns dict with box coordinates."""
+def _infer_session_dir_from_model_path(model_path):
+    """Walk up from model_path and return the nearest folder containing session.json."""
+    if not model_path:
+        return None
+    current = os.path.abspath(model_path)
+    if os.path.isfile(current):
+        current = os.path.dirname(current)
+    for _ in range(8):
+        session_path = os.path.join(current, "session.json")
+        if os.path.exists(session_path):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def _load_head_tail_ids_for_model(model_path):
+    """
+    Resolve head/tail landmark IDs from the owning session.json (if available).
+    """
+    session_dir = _infer_session_dir_from_model_path(model_path)
+    if not session_dir:
+        return None, None
+    session_path = os.path.join(session_dir, "session.json")
+    if not os.path.exists(session_path):
+        return None, None
+    try:
+        import json
+
+        with open(session_path, "r", encoding="utf-8") as f:
+            session = json.load(f)
+    except Exception:
+        return None, None
+
+    template = session.get("landmarkTemplate", [])
+    if not isinstance(template, list):
+        return None, None
+
+    orientation_policy = session.get("orientationPolicy", {})
+    if not isinstance(orientation_policy, dict):
+        orientation_policy = {}
+
+    def _normalize_targets(raw, fallback):
+        if isinstance(raw, (list, tuple)):
+            values = [str(v).strip().lower() for v in raw if str(v).strip()]
+            if values:
+                return set(values)
+        return set(str(v).strip().lower() for v in fallback if str(v).strip())
+
+    head_targets = _normalize_targets(orientation_policy.get("headCategories"), ["head"])
+    tail_targets = _normalize_targets(orientation_policy.get("tailCategories"), ["tail"])
+
+    head_id = None
+    tail_id = None
+    for lm in template:
+        try:
+            idx = int(lm.get("index"))
+        except (TypeError, ValueError):
+            continue
+        cat = str(lm.get("category", "")).strip().lower()
+        if cat in head_targets and head_id is None:
+            head_id = idx
+        elif cat in tail_targets and tail_id is None:
+            tail_id = idx
+    return head_id, tail_id
+
+
+def _load_landmark_order_for_model(model_path):
+    """
+    Resolve sorted session landmark indices to map YOLO-pose keypoint slots.
+    """
+    session_dir = _infer_session_dir_from_model_path(model_path)
+    if not session_dir:
+        return []
+    session_path = os.path.join(session_dir, "session.json")
+    if not os.path.exists(session_path):
+        return []
+    try:
+        import json
+
+        with open(session_path, "r", encoding="utf-8") as f:
+            session = json.load(f)
+    except Exception:
+        return []
+    template = session.get("landmarkTemplate", [])
+    if not isinstance(template, list):
+        return []
+    ids = []
+    for lm in template:
+        try:
+            ids.append(int(lm.get("index")))
+        except Exception:
+            continue
+    return sorted(set(ids))
+
+
+def _extract_orientation_hint(keypoints_data, det_idx, enable_hint,
+                              head_id=None, tail_id=None, landmark_order=None):
+    """
+    Extract left/right orientation from YOLO-pose keypoints.
+
+    Uses explicit head/tail IDs when available; falls back to first two keypoints.
+    """
+    if not enable_hint or keypoints_data is None:
+        return None
+    try:
+        if det_idx >= len(keypoints_data):
+            return None
+        kp_item = keypoints_data[det_idx]
+        kp_xy = kp_item.xy[0].cpu().numpy()
+        if kp_xy is None or kp_xy.shape[0] < 2:
+            return None
+
+        head_idx = 0
+        tail_idx = 1
+        if (
+            landmark_order
+            and head_id is not None
+            and tail_id is not None
+            and len(landmark_order) == kp_xy.shape[0]
+            and int(head_id) in landmark_order
+            and int(tail_id) in landmark_order
+        ):
+            head_idx = int(landmark_order.index(int(head_id)))
+            tail_idx = int(landmark_order.index(int(tail_id)))
+
+        head_pt = kp_xy[head_idx].tolist()
+        tail_pt = kp_xy[tail_idx].tolist()
+        if not np.isfinite(head_pt).all() or not np.isfinite(tail_pt).all():
+            return None
+
+        orientation = "left" if head_pt[0] < tail_pt[0] else "right"
+        hint = {
+            "orientation": orientation,
+            "head_point": [float(head_pt[0]), float(head_pt[1])],
+            "tail_point": [float(tail_pt[0]), float(tail_pt[1])],
+            "source": "yolo_pose",
+        }
+
+        conf_tensor = getattr(kp_item, "conf", None)
+        if conf_tensor is not None:
+            conf_arr = conf_tensor[0].cpu().numpy()
+            if conf_arr is not None and len(conf_arr) > max(head_idx, tail_idx):
+                hint["head_confidence"] = float(conf_arr[head_idx])
+                hint["tail_confidence"] = float(conf_arr[tail_idx])
+                hint["confidence"] = float(min(conf_arr[head_idx], conf_arr[tail_idx]))
+        return hint
+    except Exception:
+        return None
+
+
+def _orientation_from_class_name(class_name):
+    token = str(class_name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not token:
+        return None
+    if token.endswith("_left") or token == "left" or "_left_" in token:
+        return "left"
+    if token.endswith("_right") or token == "right" or "_right_" in token:
+        return "right"
+    return None
+
+
+def detect_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20):
+    """
+    Detect the primary specimen bounding box using a trained YOLO model.
+    Returns the highest-confidence box in the same format as detect_specimen(),
+    or None if YOLO is unavailable / detects nothing.
+    """
+    try:
+        from ultralytics import YOLO
+        model = YOLO(model_path)
+        results = model(image_path, conf=conf_threshold, verbose=False)
+        if not results:
+            return None
+
+        result = results[0]
+        if result.boxes is None or len(result.boxes) == 0:
+            return None
+
+        # Orientation hints only apply to session-trained pose models where
+        # keypoints are [head, tail].
+        head_id, tail_id = _load_head_tail_ids_for_model(model_path)
+        landmark_order = _load_landmark_order_for_model(model_path)
+        can_use_pose_hint = bool(head_id is not None and tail_id is not None)
+
+        # Pick highest-confidence detection
+        boxes = result.boxes
+        best_idx = int(boxes.conf.argmax())
+        keypoints_data = getattr(result, "keypoints", None)
+        orientation_hint = _extract_orientation_hint(
+            keypoints_data,
+            best_idx,
+            enable_hint=can_use_pose_hint,
+            head_id=head_id,
+            tail_id=tail_id,
+            landmark_order=landmark_order,
+        )
+
+        xyxy = boxes.xyxy[best_idx].tolist()
+        left = max(0, int(xyxy[0]) - margin)
+        top = max(0, int(xyxy[1]) - margin)
+        right = int(xyxy[2]) + margin
+        bottom = int(xyxy[3]) + margin
+        output = {
+            'left': left,
+            'top': top,
+            'right': right,
+            'bottom': bottom,
+            'width': right - left,
+            'height': bottom - top,
+            'confidence': float(boxes.conf[best_idx]),
+            'detection_method': 'yolo',
+        }
+        if orientation_hint is None:
+            cls_id = int(boxes.cls[best_idx]) if boxes.cls is not None else 0
+            cls_name = result.names.get(cls_id, "specimen") if hasattr(result, "names") else "specimen"
+            cls_ori = _orientation_from_class_name(cls_name)
+            if cls_ori is not None:
+                orientation_hint = {
+                    "orientation": cls_ori,
+                    "confidence": float(boxes.conf[best_idx]),
+                    "source": "detector_class",
+                }
+        if orientation_hint is not None:
+            output["orientation_hint"] = orientation_hint
+        return output
+    except Exception:
+        return None
+
+
+def detect_multiple_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20,
+                               max_specimens=20):
+    """
+    Detect multiple specimen bounding boxes using a trained YOLO model.
+    Returns list of boxes in the same format as detect_multiple_specimens(),
+    or None if YOLO is unavailable / detects nothing.
+    """
+    try:
+        from ultralytics import YOLO
+        model = YOLO(model_path)
+        results = model(image_path, conf=conf_threshold, verbose=False)
+        if not results:
+            return None
+
+        result = results[0]
+        if result.boxes is None or len(result.boxes) == 0:
+            return None
+
+        img_w = result.orig_shape[1]
+        img_h = result.orig_shape[0]
+        keypoints_data = getattr(result, "keypoints", None)
+        head_id, tail_id = _load_head_tail_ids_for_model(model_path)
+        landmark_order = _load_landmark_order_for_model(model_path)
+        can_use_pose_hint = bool(head_id is not None and tail_id is not None)
+
+        boxes_out = []
+        for i in range(min(len(result.boxes), max_specimens)):
+            xyxy = result.boxes.xyxy[i].tolist()
+            conf = float(result.boxes.conf[i])
+            left = max(0, int(xyxy[0]) - margin)
+            top = max(0, int(xyxy[1]) - margin)
+            right = min(img_w, int(xyxy[2]) + margin)
+            bottom = min(img_h, int(xyxy[3]) + margin)
+            box_out = {
+                'left': left,
+                'top': top,
+                'right': right,
+                'bottom': bottom,
+                'width': right - left,
+                'height': bottom - top,
+                'confidence': conf,
+                'class_id': int(result.boxes.cls[i]) if result.boxes.cls is not None else 0,
+                'class_name': result.names.get(int(result.boxes.cls[i]), 'specimen') if result.boxes.cls is not None else 'specimen',
+            }
+            orientation_hint = _extract_orientation_hint(
+                keypoints_data,
+                i,
+                enable_hint=can_use_pose_hint,
+                head_id=head_id,
+                tail_id=tail_id,
+                landmark_order=landmark_order,
+            )
+            if orientation_hint is None:
+                cls_ori = _orientation_from_class_name(box_out.get("class_name"))
+                if cls_ori is not None:
+                    orientation_hint = {
+                        "orientation": cls_ori,
+                        "confidence": conf,
+                        "source": "detector_class",
+                    }
+            if orientation_hint is not None:
+                box_out["orientation_hint"] = orientation_hint
+            boxes_out.append(box_out)
+
+        # Sort top-to-bottom, left-to-right
+        boxes_out.sort(key=lambda b: (b['top'], b['left']))
+        return boxes_out
+    except Exception:
+        return None
+
+
+def detect_specimen(image_path, margin=20, yolo_model_path=None):
+    """
+    Detect specimen bounding box. Returns dict with box coordinates.
+    If yolo_model_path is provided, tries YOLO detection first and falls
+    back to OpenCV contours only if YOLO finds nothing.
+    """
+    # Try YOLO first if a model path is provided
+    if yolo_model_path:
+        yolo_result = detect_with_yolo(image_path, yolo_model_path, margin=margin)
+        if yolo_result is not None:
+            return yolo_result
+
     img, w, h = load_image(image_path)
     if img is None:
         return None
@@ -155,9 +469,10 @@ def detect_specimen(image_path, margin=20):
 
 
 def detect_multiple_specimens(image_path, margin=20, min_area_ratio=0.02, max_area_ratio=0.6,
-                               iou_threshold=0.3, max_specimens=20):
+                               iou_threshold=0.3, max_specimens=20, yolo_model_path=None):
     """
     Detect multiple specimen bounding boxes using contour detection with watershed separation.
+    If yolo_model_path is provided, uses YOLO and falls back to OpenCV only if YOLO returns nothing.
 
     Args:
         image_path: Path to image
@@ -166,10 +481,28 @@ def detect_multiple_specimens(image_path, margin=20, min_area_ratio=0.02, max_ar
         max_area_ratio: Maximum area as fraction of image (default 60%)
         iou_threshold: IoU threshold for non-max suppression
         max_specimens: Maximum number of specimens to return
+        yolo_model_path: Optional path to a fine-tuned YOLO .pt model
 
     Returns:
         dict with 'boxes' list and metadata
     """
+    # Try YOLO first if a model path is provided
+    if yolo_model_path:
+        yolo_boxes = detect_multiple_with_yolo(image_path, yolo_model_path, margin=margin,
+                                               max_specimens=max_specimens)
+        if yolo_boxes:
+            img, w, h = load_image(image_path)
+            img_w = w if img is not None else 0
+            img_h = h if img is not None else 0
+            return {
+                "ok": True,
+                "boxes": yolo_boxes,
+                "image_width": img_w,
+                "image_height": img_h,
+                "num_detections": len(yolo_boxes),
+                "detection_method": "yolo",
+            }
+
     img, w, h = load_image(image_path)
     if img is None:
         return {"ok": False, "error": f"Could not load image: {image_path}", "boxes": []}
@@ -424,22 +757,43 @@ if __name__ == "__main__":
     import json
 
     if len(sys.argv) < 2:
-        print("Usage: python detect_specimen.py <image_path> [min_area_ratio] | --check")
+        print("Usage: python detect_specimen.py <image_path> [--yolo-model <path>] [--multi] [min_area_ratio] | --check")
         sys.exit(1)
 
     if sys.argv[1] == "--check":
         # Check detection availability
         print(json.dumps(check_detection_available()))
-    elif len(sys.argv) >= 3 and sys.argv[2] != "--multi":
-        # Multi-specimen detection with min_area_ratio parameter
-        min_area = float(sys.argv[2]) if len(sys.argv) > 2 else 0.02
-        result = detect_multiple_specimens(sys.argv[1], min_area_ratio=min_area)
+        sys.exit(0)
+
+    # Parse --yolo-model flag
+    yolo_model = None
+    args = sys.argv[1:]
+    if "--yolo-model" in args:
+        idx = args.index("--yolo-model")
+        if idx + 1 < len(args):
+            yolo_model = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+
+    image_path = args[0]
+
+    if "--multi" in args:
+        min_area = 0.02
+        for a in args[1:]:
+            try:
+                min_area = float(a)
+                break
+            except ValueError:
+                pass
+        result = detect_multiple_specimens(image_path, min_area_ratio=min_area,
+                                           yolo_model_path=yolo_model)
         print(json.dumps(result, indent=2))
-    elif "--multi" in sys.argv:
-        # Multi-specimen detection with default parameters
-        result = detect_multiple_specimens(sys.argv[1])
+    elif len(args) >= 2 and not args[1].startswith("--"):
+        # Legacy: min_area_ratio as positional arg → multi detection
+        min_area = float(args[1])
+        result = detect_multiple_specimens(image_path, min_area_ratio=min_area,
+                                           yolo_model_path=yolo_model)
         print(json.dumps(result, indent=2))
     else:
         # Single specimen detection
-        result = detect_specimen(sys.argv[1])
+        result = detect_specimen(image_path, yolo_model_path=yolo_model)
         print(json.dumps(result))

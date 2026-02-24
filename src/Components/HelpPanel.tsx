@@ -143,17 +143,25 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      BioVision supports a full annotation loop:
-                      detection (YOLO/CV), user correction, landmarking, and model training.
+                      BioVision supports a full loop: detection, correction, landmarking,
+                      training, inference review, and retraining from accepted edits.
                     </p>
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Install:</p>
+                      <ul className="ml-4 list-disc space-y-1">
+                        <li>Windows: run <code>setup.bat</code></li>
+                        <li>macOS/Linux: run <code>bash setup.sh</code></li>
+                      </ul>
+                    </div>
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Quick Start:</p>
                       <ol className="ml-4 list-decimal space-y-1">
-                        <li>Create or resume a session from Annotate Images</li>
+                        <li>Create or resume a schema session</li>
+                        <li>Set orientation policy (Directional/Bilateral/Axial/Invariant)</li>
                         <li>Upload images and optionally import pre-annotated labels/XML</li>
-                        <li>Choose Manual or Auto detection and annotate landmarks</li>
-                        <li>Train landmark model (dlib) and optionally fine-tune session detector (YOLO)</li>
-                        <li>Run inference on unseen images and export CSV/JSON results</li>
+                        <li>Detect boxes (manual/auto), correct, then annotate landmarks</li>
+                        <li>Train landmark model (dlib or CNN) and optionally fine-tune detector</li>
+                        <li>Run inference, review edits, then save/queue retrain</li>
                       </ol>
                     </div>
                   </div>
@@ -177,7 +185,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <p className="font-medium text-foreground">Landmarks</p>
                       <p>
                         Place landmarks consistently inside each accepted box.
-                        Landmark order/ID consistency is critical for reliable dlib training.
+                        Landmark order/ID consistency is critical for reliable landmark model training.
                       </p>
                     </div>
                     <Separator />
@@ -186,6 +194,18 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <p>
                         In Auto mode, correction mode lets you redraw/resize selected boxes.
                         Deleting bad auto boxes records hard negatives for future YOLO fine-tuning.
+                      </p>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Orientation Schemas</p>
+                      <p>
+                        Directional is for strict head/tail objects; Mirrored/Bilateral is for paired left-right structures;
+                        Axial is for elongated rotating specimens; Invariant is for radial/no-stable-direction objects.
+                      </p>
+                      <p>
+                        When SAM2 + PCA are available, the backend can level masks before landmark prediction to improve
+                        orientation consistency.
                       </p>
                     </div>
                   </div>
@@ -220,22 +240,24 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      Landmark training uses dlib shape predictor. Detection fine-tuning
-                      uses session YOLO checkpoints with versioning and promotion.
+                      Landmark training supports <span className="font-medium text-foreground">dlib</span> and{" "}
+                      <span className="font-medium text-foreground">CNN</span> (SimpleBaseline default, with
+                      system-gated variants). Detection fine-tuning uses session-scoped YOLO checkpoints.
                     </p>
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Best Practices:</p>
                       <ul className="ml-4 list-disc space-y-1">
-                        <li>Annotate at least 20-30 images for basic training</li>
+                        <li>Annotate at least 30+ images for stable first models</li>
                         <li>Include diverse examples (angles, lighting, sizes)</li>
                         <li>Be consistent with landmark placement order</li>
-                        <li>Use detection presets based on goal: Precision/Recall/Single Object</li>
+                        <li>Use SAM2 consistently between training and inference when possible</li>
+                        <li>Review preflight warnings before starting long training runs</li>
                       </ul>
                     </div>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
-                        YOLO training keeps versioned candidates and promotes only if validation
-                        quality is not worse than the active detector.
+                        Training progress is staged (dataset prep, fit, parity evaluation, finalize).
+                        Session models remain scoped to the current schema session.
                       </p>
                     </div>
                   </div>
@@ -248,17 +270,25 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      Run inference with your trained dlib model to predict landmarks on new images.
+                      Inference is a review workflow: detect, correct, segment (optional), landmark, then persist.
                     </p>
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Steps:</p>
                       <ol className="ml-4 list-decimal space-y-1">
-                        <li>Go to "Run Inference" from the landing page</li>
-                        <li>Select your trained model</li>
-                        <li>Upload images to analyze</li>
-                        <li>Review predicted landmarks and confidence</li>
-                        <li>Export results as CSV or JSON</li>
+                        <li>Select a trained model tied to the current schema session</li>
+                        <li>Upload images and run detection</li>
+                        <li>Edit/add/delete boxes and set orientation overrides when needed</li>
+                        <li>Optionally run SAM2 segmentation and mask overlay review</li>
+                        <li>Run landmark inference on accepted boxes</li>
+                        <li>Use <span className="font-medium text-foreground">Save all changes</span> to persist edits</li>
+                        <li>Use <span className="font-medium text-foreground">Queue retrain</span> to stage finalized images for next training run</li>
                       </ol>
+                    </div>
+                    <div className="rounded-md bg-muted/50 p-3">
+                      <p className="text-xs">
+                        Compatibility gate: if a model was trained with SAM2/PCA canonicalization and SAM2 is unavailable
+                        at inference time, BioVision warns and requires explicit override.
+                      </p>
                     </div>
                   </div>
                 </AccordionItem>
@@ -277,7 +307,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <li>Correct and delete some auto boxes, then annotate landmarks</li>
                       <li>Train YOLO detection once, then annotate more images and train again</li>
                       <li>Confirm second YOLO run creates a new version and reports promoted/not promoted</li>
-                      <li>Run dlib train preflight, then train dlib model</li>
+                      <li>Run training preflight, then train dlib or CNN model</li>
                       <li>Open Inference page, run model on unseen images, export CSV and JSON</li>
                       <li>Spot-check outputs: landmark IDs, coordinates, and image filenames</li>
                     </ol>
@@ -320,7 +350,8 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <ul className="ml-4 list-disc space-y-1">
                         <li>Use consistent imaging conditions when possible</li>
                         <li>Include scale markers in training images</li>
-                        <li>Crop to standard orientations for best results</li>
+                        <li>Choose an orientation schema that matches specimen geometry before annotating</li>
+                        <li>If SAM2 is enabled, PCA leveling can standardize orientation more reliably</li>
                       </ul>
                     </div>
                     <Separator />

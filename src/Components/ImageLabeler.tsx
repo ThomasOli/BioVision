@@ -15,6 +15,10 @@ interface ImageLabelerProps {
   mode: boolean; // View-only mode
   detectionMode?: DetectionMode;
   autoCorrectionMode?: boolean;
+  imagePath?: string;    // Disk path for SAM2 re-segmentation
+  samEnabled?: boolean;  // Whether SAM2 is active — triggers auto re-segment on box resize
+  hideSegmentOutlines?: boolean; // Hide SAM2 mask overlays (e.g. after finalize)
+  lockBoxes?: boolean;           // Prevent drawing/adding new boxes (landmark-only mode)
 }
 
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
@@ -25,6 +29,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   mode,
   detectionMode = "manual",
   autoCorrectionMode = false,
+  imagePath,
+  samEnabled = false,
+  hideSegmentOutlines = false,
+  lockBoxes = false,
 }) => {
   const {
     addLandmark,
@@ -36,6 +44,9 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     undo,
     redo,
   } = useContext(UndoRedoClearContext);
+
+  // Track which box is currently being re-segmented by SAM2
+  const [resegmentingBoxId, setResegmentingBoxId] = useState<number | null>(null);
 
   // Use refs to avoid re-running keyboard effect when undo/redo change
   const undoRef = useRef(undo);
@@ -156,11 +167,30 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     [imageDimensions]
   );
 
-  // In manual mode, hide predicted boxes until user manually draws/edits boxes.
+  // Re-run SAM2 on a corrected bounding box and update its maskOutline
+  const triggerResegment = useCallback(
+    async (boxId: number, left: number, top: number, width: number, height: number) => {
+      if (!samEnabled || !imagePath) return;
+      setResegmentingBoxId(boxId);
+      try {
+        const result = await window.api.resegmentBox(imagePath, [left, top, left + width, top + height]);
+        if (result.ok && result.maskOutline && result.maskOutline.length > 0) {
+          updateBox(boxId, { maskOutline: result.maskOutline });
+        }
+      } catch (err) {
+        console.error("SAM2 re-segmentation failed:", err);
+      } finally {
+        setResegmentingBoxId(null);
+      }
+    },
+    [samEnabled, imagePath, updateBox]
+  );
+
+  // Keep one shared box set across manual/auto modes so switching modes
+  // never hides or drops accepted boxes.
   const visibleBoxes = useMemo<BoundingBox[]>(() => {
-    if (detectionMode !== "manual") return boxes;
-    return boxes.filter((box) => box.source !== "predicted");
-  }, [boxes, detectionMode]);
+    return boxes;
+  }, [boxes]);
 
   // Check if point is inside a box
   const findBoxAtPoint = useCallback(
@@ -185,7 +215,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   // Drag-to-draw handlers for manual mode
   const handleMouseDown = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
-      if (mode) return;
+      if (mode || lockBoxes) return;
       const pos = getPointerPosition(e);
       if (!pos || !isPointInBounds(pos.x, pos.y)) return;
 
@@ -210,7 +240,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         setDrawCurrent(pos);
       }
     },
-    [mode, detectionMode, autoCorrectionMode, selectedBoxId, getPointerPosition, isPointInBounds, findBoxAtPoint]
+    [mode, lockBoxes, detectionMode, autoCorrectionMode, selectedBoxId, getPointerPosition, isPointInBounds, findBoxAtPoint]
   );
 
   const handleMouseMove = useCallback(
@@ -259,16 +289,21 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
           isRedrawingSelected &&
           selectedBoxId !== null
         ) {
+          const rLeft = Math.round(left);
+          const rTop = Math.round(top);
+          const rWidth = Math.round(width);
+          const rHeight = Math.round(height);
           updateBox(selectedBoxId, {
-            left: Math.round(left),
-            top: Math.round(top),
-            width: Math.round(width),
-            height: Math.round(height),
+            left: rLeft,
+            top: rTop,
+            width: rWidth,
+            height: rHeight,
             source: "corrected",
             confidence: undefined,
             maskOutline: undefined,
             detectionMethod: "human_corrected",
           });
+          triggerResegment(selectedBoxId, rLeft, rTop, rWidth, rHeight);
         }
       }
 
@@ -277,7 +312,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       setDrawStart(null);
       setDrawCurrent(null);
     },
-    [isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox]
+    [isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox, triggerResegment]
   );
 
   // Preview rectangle for drag-to-draw
@@ -424,8 +459,8 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
                 return (
                   <React.Fragment key={`box-${box.id}`}>
-                    {/* SAM2 mask polygon overlay */}
-                    {box.maskOutline && box.maskOutline.length > 0 && (
+                    {/* SAM2 mask polygon overlay — hidden after finalization */}
+                    {!hideSegmentOutlines && box.maskOutline && box.maskOutline.length > 0 && (
                       <Line
                         points={box.maskOutline.flat()}
                         closed={true}
@@ -458,6 +493,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                           maskOutline: undefined,
                           detectionMethod: "human_corrected",
                         });
+                        triggerResegment(box.id, Math.round(nextLeft), Math.round(nextTop), box.width, box.height);
                       }}
                       onTransformEnd={() => {
                         if (!isEditableSelected || !imageDimensions || !selectedRectRef.current) return;
@@ -488,6 +524,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                           maskOutline: undefined,
                           detectionMethod: "human_corrected",
                         });
+                        triggerResegment(box.id, Math.round(left), Math.round(top), Math.round(width), Math.round(height));
                       }}
                     />
                     {/* Box number label */}
@@ -507,6 +544,17 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                         text={`${(box.confidence * 100).toFixed(0)}%`}
                         fontSize={getTextFontSize * 0.9}
                         fill={boxColor}
+                      />
+                    )}
+                    {/* SAM2 re-segmenting indicator */}
+                    {resegmentingBoxId === box.id && (
+                      <Text
+                        x={box.left + 5}
+                        y={box.top + box.height - getTextFontSize * 1.5 - 5}
+                        text="⟳ Segmenting…"
+                        fontSize={getTextFontSize * 0.9}
+                        fill="#60a5fa"
+                        fontStyle="bold"
                       />
                     )}
                   </React.Fragment>

@@ -52,7 +52,8 @@ export interface AnnotatedImage {
 
   // Session context
   speciesId?: string;
-  diskPath?: string; // Persisted path in session directory (survives restarts)
+  diskPath?: string;    // Persisted path in session directory (survives restarts)
+  isFinalized?: boolean; // True once the user has clicked "Finalize This Image"
 
   // Agentic metadata (optional)
   processingStatus?: "pending" | "predicted" | "review" | "approved";
@@ -65,6 +66,17 @@ export interface LandmarkDefinition {
   name: string; // "Left Forewing Apex"
   description?: string;
   category?: string; // "forewing", "head", "body", etc.
+}
+
+type OrientationMode = "directional" | "bilateral" | "axial" | "invariant";
+
+export interface OrientationPolicy {
+  mode: OrientationMode;
+  targetOrientation?: "left" | "right";
+  headCategories?: string[];
+  tailCategories?: string[];
+  bilateralPairs?: [number, number][];
+  pcaLevelingMode?: "off" | "on" | "auto";
 }
 
 export interface LandmarkSchema {
@@ -86,6 +98,7 @@ export interface Species {
     family?: string;
   };
   landmarkTemplate: LandmarkDefinition[];
+  orientationPolicy?: OrientationPolicy;
   models: SpeciesModel[];
   imageCount: number;
   annotationCount?: number;
@@ -93,7 +106,7 @@ export interface Species {
   lastModified?: Date;
 }
 
-export interface SpeciesModel {
+interface SpeciesModel {
   version: string; // "v1", "v2"
   modelPath: string;
   trainedAt: Date;
@@ -101,27 +114,6 @@ export interface SpeciesModel {
   trainingImageCount?: number;
   landmarkCount?: number;
 }
-
-// Correction tracking for Judge Agent
-export interface Correction {
-  id: string;
-  imageId: string;
-  boxId: number;
-  landmarkId: number;
-  predictedX: number;
-  predictedY: number;
-  correctedX: number;
-  correctedY: number;
-  error: number; // Euclidean distance
-  confidence: number;
-  modelVersion: string;
-  correctedAt: Date;
-  correctedBy?: "human" | "auto";
-}
-
-// Tool modes for the annotation workflow
-// Simplified: only landmark mode needed (boxes auto-created)
-export type ToolMode = 'landmark';
 
 // App navigation views
 export type AppView = 'landing' | 'workspace' | 'models' | 'inference' | 'agent';
@@ -132,4 +124,5 @@ export interface TrainedModel {
   path: string;
   size: number;
   createdAt: Date;
+  predictorType?: "dlib" | "cnn" | "yolo_pose";
 }

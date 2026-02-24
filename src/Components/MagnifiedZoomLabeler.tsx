@@ -12,6 +12,8 @@ import {
   Dialog,
   DialogContent,
   DialogClose,
+  DialogTitle,
+  DialogDescription,
 } from "@/Components/ui/dialog";
 import {
   Tooltip,
@@ -35,6 +37,10 @@ interface MagnifiedImageLabelerProps {
   schema?: LandmarkSchema;
   detectionMode?: DetectionMode;
   autoCorrectionMode?: boolean;
+  imagePath?: string;
+  samEnabled?: boolean;
+  hideSegmentOutlines?: boolean;
+  lockBoxes?: boolean;
 }
 
 const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
@@ -47,6 +53,10 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   schema,
   detectionMode = "manual",
   autoCorrectionMode = false,
+  imagePath,
+  samEnabled = false,
+  hideSegmentOutlines = false,
+  lockBoxes = false,
 }) => {
   const {
     addLandmark,
@@ -57,6 +67,26 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     skipLandmark,
     updateBox,
   } = useContext(UndoRedoClearContext);
+
+  const [resegmentingBoxId, setResegmentingBoxId] = useState<number | null>(null);
+
+  const triggerResegment = useCallback(
+    async (boxId: number, left: number, top: number, width: number, height: number) => {
+      if (!samEnabled || !imagePath) return;
+      setResegmentingBoxId(boxId);
+      try {
+        const result = await window.api.resegmentBox(imagePath, [left, top, left + width, top + height]);
+        if (result.ok && result.maskOutline && result.maskOutline.length > 0) {
+          updateBox(boxId, { maskOutline: result.maskOutline });
+        }
+      } catch (err) {
+        console.error("SAM2 re-segmentation failed:", err);
+      } finally {
+        setResegmentingBoxId(null);
+      }
+    },
+    [samEnabled, imagePath, updateBox]
+  );
 
   const [image, imageDimensions, imageError] = useImageLoader(imageURL);
   const stageRef = useRef<Konva.Stage>(null);
@@ -91,11 +121,11 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     return schema || DEFAULT_SCHEMAS.find(s => s.id === "fish-morphometrics") || DEFAULT_SCHEMAS[0];
   }, [schema]);
 
-  // In manual mode, hide predicted boxes until user manually draws/edits boxes.
+  // Keep one shared box set across manual/auto modes so switching modes
+  // never hides or drops accepted boxes.
   const visibleBoxes = useMemo<BoundingBox[]>(() => {
-    if (detectionMode !== "manual") return boxes;
-    return boxes.filter((box) => box.source !== "predicted");
-  }, [boxes, detectionMode]);
+    return boxes;
+  }, [boxes]);
 
   // Get landmarks from the selected box for the guide
   const selectedBoxLandmarks = useMemo(() => {
@@ -335,7 +365,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     }
 
     // Manual mode: start drawing a box if not inside an existing box
-    if (detectionMode === "manual" && !mode && !isSpaceHeld && e.evt.button === 0) {
+    if (detectionMode === "manual" && !mode && !lockBoxes && !isSpaceHeld && e.evt.button === 0) {
       const pos = getPointerPosition(e);
       if (!pos || !isPointInBounds(pos.x, pos.y)) return;
       const clickedBox = findBoxAtPoint(pos.x, pos.y);
@@ -360,7 +390,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
         setDrawCurrent(pos);
       }
     }
-  }, [isSpaceHeld, detectionMode, autoCorrectionMode, mode, selectedBoxId, getPointerPosition, isPointInBounds, findBoxAtPoint]);
+  }, [isSpaceHeld, detectionMode, autoCorrectionMode, mode, lockBoxes, selectedBoxId, getPointerPosition, isPointInBounds, findBoxAtPoint]);
 
   const handleMouseMove = useCallback((e: KonvaEventObject<MouseEvent>) => {
     // Pan mode
@@ -413,16 +443,21 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
           isRedrawingSelected &&
           selectedBoxId !== null
         ) {
+          const rLeft = Math.round(left);
+          const rTop = Math.round(top);
+          const rWidth = Math.round(width);
+          const rHeight = Math.round(height);
           updateBox(selectedBoxId, {
-            left: Math.round(left),
-            top: Math.round(top),
-            width: Math.round(width),
-            height: Math.round(height),
+            left: rLeft,
+            top: rTop,
+            width: rWidth,
+            height: rHeight,
             source: "corrected",
             confidence: undefined,
             maskOutline: undefined,
             detectionMethod: "human_corrected",
           });
+          triggerResegment(selectedBoxId, rLeft, rTop, rWidth, rHeight);
         }
       }
     }
@@ -431,7 +466,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     setIsRedrawingSelected(false);
     setDrawStart(null);
     setDrawCurrent(null);
-  }, [isDragging, isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox]);
+  }, [isDragging, isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox, triggerResegment]);
 
   // Draw preview rect
   const drawPreview = useMemo(() => {
@@ -501,19 +536,24 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     <TooltipProvider>
       <Dialog open={open} onOpenChange={(value) => !value && onClose()}>
         <DialogContent
-          className="max-w-[95vw] max-h-[90vh] p-4 overflow-auto"
+          className="max-w-[95vw] max-h-[90vh] p-4 flex flex-col overflow-hidden"
           hideCloseButton
           style={{
             width: imageDimensions ? Math.min(imageDimensions.width * scale + 320, window.innerWidth * 0.95) : "auto",
           }}
         >
+          <DialogTitle className="sr-only">Magnified Image Labeler</DialogTitle>
+          <DialogDescription className="sr-only">
+            Zoomed view for placing landmark annotations on the selected image.
+          </DialogDescription>
           <motion.div
             variants={modalContent}
             initial="hidden"
             animate="visible"
             exit="exit"
+            className="flex flex-col flex-1 min-h-0"
           >
-            <div className="flex justify-between items-center mb-2">
+            <div className="flex justify-between items-center mb-2 shrink-0">
               <div className="flex items-center gap-2">
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -538,7 +578,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
             </div>
 
           {image && imageDimensions && (
-            <div className="flex gap-4">
+            <div className="flex gap-4 flex-1 min-h-0">
               {/* Canvas */}
               <div ref={canvasContainerRef} className="flex-1 min-w-0 overflow-auto">
                 <Stage
@@ -587,8 +627,8 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
 
                   return (
                     <React.Fragment key={`box-${box.id}`}>
-                      {/* SAM2 mask polygon overlay */}
-                      {box.maskOutline && box.maskOutline.length > 0 && (
+                      {/* SAM2 mask polygon overlay — hidden after finalization */}
+                      {!hideSegmentOutlines && box.maskOutline && box.maskOutline.length > 0 && (
                         <Line
                           points={box.maskOutline.flat()}
                           closed={true}
@@ -621,6 +661,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                             maskOutline: undefined,
                             detectionMethod: "human_corrected",
                           });
+                          triggerResegment(box.id, Math.round(nextLeft), Math.round(nextTop), box.width, box.height);
                         }}
                         onTransformEnd={() => {
                           if (!isEditableSelected || !imageDimensions || !selectedRectRef.current) return;
@@ -651,6 +692,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                             maskOutline: undefined,
                             detectionMethod: "human_corrected",
                           });
+                          triggerResegment(box.id, Math.round(left), Math.round(top), Math.round(width), Math.round(height));
                         }}
                       />
                       {/* Box number label */}
@@ -670,6 +712,17 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                           text={`${(box.confidence * 100).toFixed(0)}%`}
                           fontSize={getTextConfig().fontSize * 0.9}
                           fill={boxColor}
+                        />
+                      )}
+                      {/* SAM2 re-segmenting indicator */}
+                      {resegmentingBoxId === box.id && (
+                        <Text
+                          x={box.left + 5}
+                          y={box.top + box.height - getTextConfig().fontSize * 1.5 - 5}
+                          text="⟳ Segmenting…"
+                          fontSize={getTextConfig().fontSize * 0.9}
+                          fill="#60a5fa"
+                          fontStyle="bold"
                         />
                       )}
                     </React.Fragment>
@@ -744,7 +797,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
 
               {/* Landmark Placement Guide */}
               {showGuide && activeSchema && (
-                <div className="w-64 shrink-0">
+                <div className="w-64 shrink-0 overflow-y-auto">
                   <LandmarkPlacementGuide
                     schema={activeSchema}
                     placedLandmarks={selectedBoxLandmarks}

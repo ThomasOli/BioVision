@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react"
+import { useDispatch, useSelector } from "react-redux"
 import { motion } from "framer-motion"
 
 import { cn } from "@/lib/utils"
@@ -12,8 +13,55 @@ import { UndoRedoClearContextProvider } from "./Components/UndoRedoClearContext"
 import { LandingPage } from "./Components/LandingPage"
 import { MyModelsPage } from "./Components/MyModelsPage"
 import { InferencePage } from "./Components/InferencePage"
-import { AppView } from "./types/Image"
+import { AppView, AnnotatedImage } from "./types/Image"
 import { DetectionMode, DetectionPreset } from "./Components/DetectionModeSelector"
+import { AppDispatch, RootState } from "./state/store"
+import { setSessionImages } from "./state/filesState/fileSlice"
+
+/** Restores session images+annotations from disk whenever the active species changes. */
+function SessionRestorer() {
+  const dispatch = useDispatch<AppDispatch>()
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId)
+
+  useEffect(() => {
+    if (!activeSpeciesId) return
+    let cancelled = false
+
+    window.api.sessionLoad(activeSpeciesId).then((result) => {
+      if (cancelled || !result.ok || !result.images?.length) return
+
+      const restored: AnnotatedImage[] = result.images.map((img, i) => {
+        // Convert base64 → blob URL so Konva/img tags can render it
+        const binary = atob(img.data)
+        const bytes = new Uint8Array(binary.length)
+        for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j)
+        const url = URL.createObjectURL(new Blob([bytes], { type: img.mimeType }))
+
+        return {
+          id: Date.now() + i,
+          path: img.diskPath,
+          url,
+          filename: img.filename,
+          boxes: img.boxes || [],
+          selectedBoxId: null,
+          history: [],
+          future: [],
+          speciesId: activeSpeciesId,
+          diskPath: img.diskPath,
+          isFinalized: img.finalized ?? false,
+        }
+      })
+
+      dispatch(setSessionImages(restored))
+    }).catch((err) => {
+      console.error("Session restore failed:", err)
+    })
+
+    return () => { cancelled = true }
+  }, [activeSpeciesId, dispatch])
+
+  return null
+}
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
@@ -43,14 +91,21 @@ const App: React.FC = () => {
   const handleSwitchChange = () => setIsSwitchOn((prev) => !prev)
   const handleOpacityChange = (selectedOpacity: number) => setOpacity(selectedOpacity)
 
-  // Responsive bounds for menu
-  const [isXs, setIsXs] = useState(window.innerWidth < 900)
-  // Hard clamp: users cannot drag sidebar below 375px.
-  const MIN_MENU = 375
-  const MAX_MENU = isXs ? 440 : 680
+  // Adaptive sidebar bounds — scale with viewport width
+  // 13" (~1280px): min 375, max 480 | 15" (~1600px): min 420, max 600
+  // 24" (~1920px): min 480, max 720 | 27"+ (>1920px): min 545, max 860
+  const getMenuBounds = (vw: number) => {
+    if (vw < 1280) return { min: 375, max: 480, def: 380 }
+    if (vw < 1600) return { min: 420, max: 600, def: 440 }
+    if (vw < 1920) return { min: 480, max: 720, def: 500 }
+    return           { min: 545, max: 860, def: 580 }
+  }
+
+  const [vw, setVw] = useState(window.innerWidth)
+  const { min: MIN_MENU, max: MAX_MENU } = getMenuBounds(vw)
 
   useEffect(() => {
-    const handleResize = () => setIsXs(window.innerWidth < 900)
+    const handleResize = () => setVw(window.innerWidth)
     window.addEventListener("resize", handleResize)
     return () => window.removeEventListener("resize", handleResize)
   }, [])
@@ -63,7 +118,10 @@ const App: React.FC = () => {
 
   const [menuWidth, setMenuWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem("menuWidth"))
-    return Number.isFinite(saved) && saved > 0 ? saved : isXs ? 300 : 380
+    const initBounds = getMenuBounds(window.innerWidth)
+    return Number.isFinite(saved) && saved > 0
+      ? clamp(saved, initBounds.min, initBounds.max)
+      : initBounds.def
   })
 
   useEffect(() => {
@@ -170,7 +228,8 @@ const App: React.FC = () => {
       <motion.div
         animate={{ width: menuWidth }}
         transition={{ duration: 0.15, ease: "easeOut" }}
-        className="shrink-0 h-full min-w-[375px] overflow-hidden border-r bg-card"
+        style={{ minWidth: MIN_MENU }}
+        className="shrink-0 h-full overflow-hidden border-r bg-card"
       >
         <div
           ref={menuWrapRef}
@@ -264,6 +323,7 @@ const App: React.FC = () => {
     <ThemeProvider defaultTheme="system" storageKey="biovision-ui-theme">
       <TooltipProvider>
         <UndoRedoClearContextProvider>
+          <SessionRestorer />
           {renderContent()}
           <Toaster position="bottom-center" />
         </UndoRedoClearContextProvider>

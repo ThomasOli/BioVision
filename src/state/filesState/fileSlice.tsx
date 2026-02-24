@@ -6,7 +6,7 @@ interface FilesState {
   fileArray: AnnotatedImage[];
 }
 
-export const initialState: FilesState = {
+const initialState: FilesState = {
   fileArray: [],
 };
 
@@ -14,19 +14,6 @@ const fileSlice = createSlice({
   name: "files",
   initialState,
   reducers: {
-    addFiles: (state, action: PayloadAction<File[]>) => {
-      const newImages = action.payload.map((file) => ({
-        id: Date.now() + Math.random(),
-        path: file.path,
-        url: URL.createObjectURL(file),
-        filename: file.name,
-        boxes: [] as BoundingBox[],
-        selectedBoxId: null,
-        history: [] as BoundingBox[][],
-        future: [] as BoundingBox[][],
-      }));
-      state.fileArray = [...state.fileArray, ...newImages];
-    },
     removeFile: (state, action: PayloadAction<number>) => {
       const imageToRemove = state.fileArray.find(
         (img) => img.id === action.payload
@@ -74,10 +61,17 @@ const fileSlice = createSlice({
       }));
       state.fileArray = [...state.fileArray, ...tagged];
     },
+    // Mark a single image as finalized (detection locked, landmark-only)
+    setImageFinalized: (state, action: PayloadAction<{ id: number }>) => {
+      const image = state.fileArray.find((img) => img.id === action.payload.id);
+      if (image) {
+        image.isFinalized = true;
+      }
+    },
   },
 });
 
-export const { addFiles, removeFile, updateBoxes, clearFiles, setSessionImages, addFilesWithSpecies } =
+export const { removeFile, updateBoxes, clearFiles, setSessionImages, addFilesWithSpecies, setImageFinalized } =
   fileSlice.actions;
 
 export default fileSlice.reducer;

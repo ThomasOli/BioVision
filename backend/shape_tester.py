@@ -36,13 +36,22 @@ def parse_xml_annotations(xml_path):
 
             landmarks = []
             for part in box.findall("part"):
-                name = int(part.get("name"))
+                raw_name = part.get("name")
+                try:
+                    parsed_id = int(raw_name) if raw_name is not None else -1
+                except (TypeError, ValueError):
+                    parsed_id = raw_name
                 x = int(part.get("x"))
                 y = int(part.get("y"))
-                landmarks.append({"id": name, "x": x, "y": y})
+                landmarks.append({
+                    "name": raw_name if raw_name is not None else "",
+                    "id": parsed_id,
+                    "x": x,
+                    "y": y
+                })
 
-            # Sort by landmark id
-            landmarks.sort(key=lambda lm: lm["id"])
+            # dlib indexes parts by lexical part-name order, not numeric order.
+            landmarks.sort(key=lambda lm: lm.get("name", ""))
 
             annotations.append({
                 "image_path": image_path,
@@ -216,7 +225,7 @@ def test_model(project_root, tag, xml_path=None):
 
     # Save results
     results_path = os.path.join(debug_dir, f"test_results_{tag}.json")
-    with open(results_path, "w") as f:
+    with open(results_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
     print(f"Test results saved to: {results_path}", file=sys.stderr)
