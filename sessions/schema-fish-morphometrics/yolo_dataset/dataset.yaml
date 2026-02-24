@@ -1,6 +1,0 @@
-path: /Users/juntianzhong/BioVision/sessions/schema-fish-morphometrics/yolo_dataset
-train: images/train
-val: images/val
-
-names:
-  0: Whole Fish
