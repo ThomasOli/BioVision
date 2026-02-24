@@ -50,8 +50,23 @@ def send(obj):
     sys.stdout.flush()
 
 
+# Set by the main loop for each incoming command so all outgoing messages
+# (progress and final) can echo the same ID back to Electron.
+_current_request_id = None
+
+
 def send_progress(message, percent, stage="processing"):
-    send({"status": "progress", "message": message, "percent": percent, "stage": stage})
+    obj = {"status": "progress", "message": message, "percent": percent, "stage": stage}
+    if _current_request_id:
+        obj["_request_id"] = _current_request_id
+    send(obj)
+
+
+def send_response(result):
+    """Send a final response, echoing _request_id so Electron can match it."""
+    if _current_request_id:
+        result = {**result, "_request_id": _current_request_id}
+    send(result)
 
 
 class SuperAnnotator:
@@ -1080,16 +1095,19 @@ def main():
             send({"status": "error", "error": f"Invalid JSON: {e}"})
             continue
 
+        global _current_request_id
+        _current_request_id = cmd.get("_request_id")
+
         try:
             command = cmd.get("cmd", "")
 
             if command == "init":
                 result = annotator.init_models()
-                send(result)
+                send_response(result)
 
             elif command == "check":
                 result = annotator.check()
-                send(result)
+                send_response(result)
 
             elif command == "annotate":
                 result = annotator.annotate(
@@ -1099,7 +1117,7 @@ def main():
                     id_mapping_path=cmd.get("id_mapping_path"),
                     options=cmd.get("options"),
                 )
-                send(result)
+                send_response(result)
 
             elif command == "train_yolo":
                 train_summary = annotator.train_yolo(
@@ -1107,7 +1125,7 @@ def main():
                     class_name=cmd.get("class_name", "object"),
                     epochs=cmd.get("epochs", 25),
                 )
-                send({"status": "result", **train_summary})
+                send_response({"status": "result", **train_summary})
 
             elif command == "refine_sam":
                 result = annotator.refine_sam(
@@ -1116,19 +1134,21 @@ def main():
                     click_point=cmd["click_point"],
                     click_label=cmd.get("click_label", 1),
                 )
-                send(result)
+                send_response(result)
 
             elif command == "shutdown":
-                send({"status": "ok", "message": "Shutting down"})
+                send_response({"status": "ok", "message": "Shutting down"})
                 logger.info("Shutdown requested, exiting")
                 break
 
             else:
-                send({"status": "error", "error": f"Unknown command: {command}"})
+                send_response({"status": "error", "error": f"Unknown command: {command}"})
 
         except Exception as e:
             logger.error(f"Error processing command: {traceback.format_exc()}")
-            send({"status": "error", "error": str(e)})
+            send_response({"status": "error", "error": str(e)})
+        finally:
+            _current_request_id = None
 
     sys.exit(0)
 

@@ -639,7 +639,8 @@ def _run_pipeline_parity_eval(project_root, tag, predictor_type, train_xml, test
         return {"error": str(exc)}
 
 
-def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None, model_variant="simplebaseline"):
+def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
+                    model_variant="simplebaseline", skip_parity=False):
     """
     Train a CNN landmark predictor for a given session + model tag.
 
@@ -832,6 +833,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None, mo
             "enabled": True,
             "profile": aug_profile,
         },
+        "skip_parity": bool(skip_parity),
     }
 
     # Unified default: deconv heatmap head with soft-argmax decoding.
@@ -1103,59 +1105,74 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None, mo
     # Compute train / test error (normalised mean landmark distance)
     train_error = _compute_error(model, train_val_loader, device)
     test_error = _compute_error(model, test_loader, device) if test_loader else None
-    print("PROGRESS 98 evaluating_pipeline_parity", file=sys.stderr)
-    print(
-        "PROGRESS_JSON " + json.dumps(
-            {
-                "percent": 98,
-                "stage": "evaluation",
-                "substage": "pipeline_parity",
-                "message": "Running pipeline parity evaluation (GT + detected boxes).",
-            }
-        ),
-        file=sys.stderr,
-    )
-    pipeline_parity = _run_pipeline_parity_eval(
-        project_root,
-        tag,
-        "cnn",
-        train_xml,
-        test_xml,
-        run_dir=run_dir,
-    )
-    if isinstance(pipeline_parity, dict) and not pipeline_parity.get("error"):
-        try:
-            train_gt = (
-                pipeline_parity.get("splits", {})
-                .get("train", {})
-                .get("gt_boxes", {})
-                .get("pixel_error_mean")
-            )
-            test_gt = (
-                pipeline_parity.get("splits", {})
-                .get("test", {})
-                .get("gt_boxes", {})
-                .get("pixel_error_mean")
-            )
-            print(
-                f"Pipeline parity (CNN, GT boxes): train_mean_px={train_gt}, test_mean_px={test_gt}",
-                file=sys.stderr,
-            )
-            orientation_test = (
-                pipeline_parity.get("orientation_signal_summary", {})
-                .get("test", {})
-                .get("detected_boxes", {})
-            )
-            if isinstance(orientation_test, dict):
+    pipeline_parity = {"skipped": True, "reason": "skip_parity"} if skip_parity else None
+    if skip_parity:
+        print("PROGRESS 98 skipping_pipeline_parity", file=sys.stderr)
+        print(
+            "PROGRESS_JSON " + json.dumps(
+                {
+                    "percent": 98,
+                    "stage": "evaluation",
+                    "substage": "pipeline_parity_skipped",
+                    "message": "Skipping pipeline parity evaluation by user option.",
+                }
+            ),
+            file=sys.stderr,
+        )
+    else:
+        print("PROGRESS 98 evaluating_pipeline_parity", file=sys.stderr)
+        print(
+            "PROGRESS_JSON " + json.dumps(
+                {
+                    "percent": 98,
+                    "stage": "evaluation",
+                    "substage": "pipeline_parity",
+                    "message": "Running pipeline parity evaluation (GT + detected boxes).",
+                }
+            ),
+            file=sys.stderr,
+        )
+        pipeline_parity = _run_pipeline_parity_eval(
+            project_root,
+            tag,
+            "cnn",
+            train_xml,
+            test_xml,
+            run_dir=run_dir,
+        )
+        if isinstance(pipeline_parity, dict) and not pipeline_parity.get("error"):
+            try:
+                train_gt = (
+                    pipeline_parity.get("splits", {})
+                    .get("train", {})
+                    .get("gt_boxes", {})
+                    .get("pixel_error_mean")
+                )
+                test_gt = (
+                    pipeline_parity.get("splits", {})
+                    .get("test", {})
+                    .get("gt_boxes", {})
+                    .get("pixel_error_mean")
+                )
                 print(
-                    "Orientation signal (cnn, test/detected): "
-                    f"hint_present={orientation_test.get('detector_hint_present', 0)} "
-                    f"hint_missing={orientation_test.get('detector_hint_missing', 0)} "
-                    f"warnings={orientation_test.get('warning_code_counts', {})}",
+                    f"Pipeline parity (CNN, GT boxes): train_mean_px={train_gt}, test_mean_px={test_gt}",
                     file=sys.stderr,
                 )
-        except Exception:
-            pass
+                orientation_test = (
+                    pipeline_parity.get("orientation_signal_summary", {})
+                    .get("test", {})
+                    .get("detected_boxes", {})
+                )
+                if isinstance(orientation_test, dict):
+                    print(
+                        "Orientation signal (cnn, test/detected): "
+                        f"hint_present={orientation_test.get('detector_hint_present', 0)} "
+                        f"hint_missing={orientation_test.get('detector_hint_missing', 0)} "
+                        f"warnings={orientation_test.get('warning_code_counts', {})}",
+                        file=sys.stderr,
+                    )
+            except Exception:
+                pass
     # Stdout protocol matching train_shape_model.py
     print("MODEL_PATH", model_path)
     print("TRAIN_ERROR", round(train_error, 6))
@@ -1235,6 +1252,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--model-variant", type=str, default="simplebaseline")
+    parser.add_argument("--skip-parity", action="store_true")
     args = parser.parse_args()
 
     train_cnn_model(
@@ -1244,4 +1262,5 @@ if __name__ == "__main__":
         lr=args.lr,
         batch_size=args.batch_size,
         model_variant=args.model_variant,
+        skip_parity=bool(args.skip_parity),
     )

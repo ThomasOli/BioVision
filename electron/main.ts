@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol } from "electron";
 import fs from "fs";
 import * as path from "path";
+import * as os from "os";
 import { spawn, ChildProcess } from "child_process";
 import { createInterface, Interface as ReadlineInterface } from "readline";
 
@@ -1472,7 +1473,7 @@ function summarizeLabelDataset(effectiveRoot: string): {
 interface TrainOptions {
   testSplit?: number;  // Fraction for test set (default 0.2)
   seed?: number;       // Random seed for reproducibility
-  customOptions?: Record<string, number>;  // Custom training parameters
+  customOptions?: Record<string, number | boolean>;  // Custom training parameters
   speciesId?: string;  // Session-scoped training
   useImportedXml?: boolean; // Train directly from existing xml/train_{tag}.xml
   predictorType?: "dlib" | "cnn"; // Predictor backend (default: "dlib")
@@ -1821,6 +1822,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       const epochsRaw = Number(options?.customOptions?.epochs);
       const lrRaw = Number((options as any)?.customOptions?.lr);
       const batchRaw = Number((options as any)?.customOptions?.batch ?? (options as any)?.customOptions?.batch_size);
+      const skipParity = Boolean((options as any)?.customOptions?.skip_parity);
       const cnnArgs = [
         path.join(__dirname, "../backend/train_cnn_model.py"),
         effectiveRoot,
@@ -1847,6 +1849,9 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       }
       if (Number.isFinite(batchRaw) && batchRaw > 0) {
         cnnArgs.push("--batch-size", String(Math.round(batchRaw)));
+      }
+      if (skipParity) {
+        cnnArgs.push("--skip-parity");
       }
       emitTrainProgress(42, "training", "Training CNN model...");
       out = await runPythonWithProgress(cnnArgs, (pct, stage, details) => {
@@ -4769,7 +4774,33 @@ async function ensureSam2Ready(): Promise<{ ok: boolean; error?: string }> {
 
 // ── SuperAnnotator IPC handlers ──
 
+/**
+ * Fast, synchronous capability estimate using Node.js OS APIs.
+ * Used when the Python process isn't running yet to avoid blocking the UI
+ * on a cold Python startup just to show the capability badges.
+ * GPU presence is unknown without Python; mode may be upgraded to
+ * auto_high_performance once the real check runs after init.
+ */
+function getLocalCapabilityEstimate() {
+  const freeRamGb = os.freemem() / (1024 ** 3);
+  const mode = freeRamGb > 1.5 ? "auto_lite" : "classic_fallback";
+  return {
+    available: true,
+    mode,
+    gpu: false,
+    yolo_ready: false,
+    sam2_ready: false,
+    yolo_failed: false,
+    sam2_failed: false,
+  };
+}
+
 ipcMain.handle("ml:check-super-annotator", async () => {
+  // If the process isn't running yet, return an instant local estimate so
+  // the UI renders immediately without waiting for a cold Python startup.
+  if (!superAnnotator.isRunning) {
+    return getLocalCapabilityEstimate();
+  }
   try {
     const result = await superAnnotator.send({ cmd: "check" });
     return result;

@@ -36,6 +36,8 @@ interface TrainModelDialogProps {
   cnnVariant?: string;
   setCnnVariant?: (variant: string) => void;
   cnnVariantWarning?: string;
+  skipParity?: boolean;
+  setSkipParity?: (value: boolean) => void;
   trainingProgress?: {
     percent: number;
     stage: string;
@@ -78,6 +80,8 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   cnnVariant = "simplebaseline",
   setCnnVariant,
   cnnVariantWarning,
+  skipParity = false,
+  setSkipParity,
   trainingProgress = null,
 }) => {
   const [touched, setTouched] = useState(false);
@@ -324,6 +328,27 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
             </div>
           )}
 
+          {setSkipParity && (
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">Evaluation options</Label>
+              <label className="flex items-start gap-3 rounded-md border border-border/50 p-3">
+                <input
+                  type="checkbox"
+                  checked={skipParity}
+                  onChange={(e) => setSkipParity(e.target.checked)}
+                  disabled={isTraining}
+                  className="mt-0.5 accent-primary"
+                />
+                <div>
+                  <p className="text-xs font-semibold">Skip pipeline parity (faster)</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Trains and saves model without running GT/detected parity checks.
+                  </p>
+                </div>
+              </label>
+            </div>
+          )}
+
           {(preflightSummary || preflightWarning) && (
             <div className="rounded-md border border-border/70 bg-muted/30 p-3">
               {preflightSummary && (
@@ -394,4 +419,3 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     </Dialog>
   );
 };
-

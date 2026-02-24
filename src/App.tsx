@@ -67,6 +67,7 @@ const App: React.FC = () => {
   // Navigation state
   const [currentView, setCurrentView] = useState<AppView>("landing")
   const [openTrainDialogOnMount, setOpenTrainDialogOnMount] = useState(false)
+  const [openSchemaDialogOnMount, setOpenSchemaDialogOnMount] = useState(false)
   const [selectedModelForInference, setSelectedModelForInference] = useState<string>("")
 
   // Workspace state
@@ -210,6 +211,14 @@ const App: React.FC = () => {
     if (view !== "inference") {
       setSelectedModelForInference("")
     }
+    if (view !== "landing") {
+      setOpenSchemaDialogOnMount(false)
+    }
+  }
+
+  const handleStartAnnotating = () => {
+    setOpenSchemaDialogOnMount(true)
+    setCurrentView("landing")
   }
 
   const handleSelectModelForInference = (modelName: string) => {
@@ -295,6 +304,8 @@ const App: React.FC = () => {
         return (
           <LandingPage
             onNavigate={handleNavigate}
+            openSchemaDialogOnMount={openSchemaDialogOnMount}
+            onSchemaDialogOpened={() => setOpenSchemaDialogOnMount(false)}
           />
         )
       case "models":
@@ -302,6 +313,7 @@ const App: React.FC = () => {
           <MyModelsPage
             onNavigate={handleNavigate}
             onSelectModelForInference={handleSelectModelForInference}
+            onStartAnnotating={handleStartAnnotating}
           />
         )
       case "inference":

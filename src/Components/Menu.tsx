@@ -114,6 +114,7 @@ const Menu: React.FC<MenuProps> = ({
   const [preflightSummary, setPreflightSummary] = useState("");
   const [preflightWarning, setPreflightWarning] = useState("");
   const [predictorType, setPredictorType] = useState<"dlib" | "cnn">("dlib");
+  const [skipParity, setSkipParity] = useState(false);
   const [cnnVariants, setCnnVariants] = useState<CnnVariantOption[]>([]);
   const [cnnVariant, setCnnVariant] = useState<string>("simplebaseline");
   const [cnnVariantWarning, setCnnVariantWarning] = useState<string>("");
@@ -297,6 +298,9 @@ const Menu: React.FC<MenuProps> = ({
         speciesId: activeSpeciesId ?? undefined,
         predictorType,
         cnnVariant: predictorType === "cnn" ? cnnVariant : undefined,
+        customOptions: {
+          skip_parity: skipParity,
+        },
       });
       if (!result.ok) throw new Error(result.error);
       console.log("Training output:", result.output);
@@ -360,6 +364,8 @@ const Menu: React.FC<MenuProps> = ({
           cnnVariant={cnnVariant}
           setCnnVariant={setCnnVariant}
           cnnVariantWarning={cnnVariantWarning}
+          skipParity={skipParity}
+          setSkipParity={setSkipParity}
           trainingProgress={trainingProgress}
         />
 
@@ -608,6 +614,5 @@ const Menu: React.FC<MenuProps> = ({
 };
 
 export default Menu;
-
 
 

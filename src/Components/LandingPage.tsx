@@ -43,6 +43,8 @@ import { toast } from "sonner";
 
 interface LandingPageProps {
   onNavigate: (view: AppView) => void;
+  openSchemaDialogOnMount?: boolean;
+  onSchemaDialogOpened?: () => void;
 }
 
 interface MenuButtonProps {
@@ -216,6 +218,8 @@ function buildOrientationPolicy(
 
 export const LandingPage: React.FC<LandingPageProps> = ({
   onNavigate,
+  openSchemaDialogOnMount,
+  onSchemaDialogOpened,
 }) => {
   const dispatch = useDispatch();
   const speciesList = useSelector((state: RootState) => state.species.species);
@@ -246,6 +250,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     };
     loadSessions();
   }, []);
+
+  // Auto-open schema dialog when navigated here from models page
+  useEffect(() => {
+    if (openSchemaDialogOnMount) {
+      setSchemaDialogOpen(true);
+      onSchemaDialogOpened?.();
+    }
+  }, [openSchemaDialogOnMount]);
 
   const openOrientationDialogForLaunch = (launch: PendingSessionLaunch) => {
     const suggested = inferDefaultOrientationPolicy(launch.landmarkTemplate).mode;

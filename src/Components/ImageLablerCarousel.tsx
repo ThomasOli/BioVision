@@ -451,10 +451,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const handleAutoDetect = useCallback(async () => {
     const promptClass = className.trim();
     if (!current || !current.path) return;
-    if (!promptClass) {
-      toast.info("Enter an object class prompt first (for example: fish or leaf).");
-      return;
-    }
 
     setIsDetecting(true);
     setAutoDetectProgress({ message: "Starting...", percent: 0 });
@@ -477,7 +473,14 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       if (result.ok && Array.isArray(result.objects) && result.objects.length > 0) {
         setBoxesFromSuperAnnotation(result.objects);
         setIsAutoBoxCorrection(false);
-        toast.success(`Detected ${result.objects.length} object${result.objects.length > 1 ? "s" : ""}.`);
+        const isOpenCv = result.detection_method === "opencv" || result.detection_method === "opencv_fallback";
+        if (isOpenCv) {
+          toast.success(
+            `Detected ${result.objects.length} object${result.objects.length > 1 ? "s" : ""} using OpenCV (YOLO unavailable).`
+          );
+        } else {
+          toast.success(`Detected ${result.objects.length} object${result.objects.length > 1 ? "s" : ""}.`);
+        }
       } else if (result.ok) {
         toast.info("No objects detected. Try a different class prompt or lower confidence.");
       } else {
@@ -999,7 +1002,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                     variant={isFinalizePending ? "default" : "outline"}
                     size="sm"
                     onClick={handleAutoDetectOrFinalize}
-                    disabled={isDetecting || !current || (!isFinalizePending && !className.trim())}
+                    disabled={isDetecting || !current}
                     className={isFinalizePending ? "font-bold bg-emerald-600 hover:bg-emerald-700 text-white border-0" : "font-bold"}
                   >
                     {isDetecting ? (

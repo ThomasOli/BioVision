@@ -406,7 +406,7 @@ def _run_pipeline_parity_eval(project_root, tag, train_xml, test_xml, run_dir=No
 
 
 def train_shape_model(project_root, tag, custom_options=None,
-                      aug_angles=None, aug_flip=None):
+                      aug_angles=None, aug_flip=None, skip_parity=False):
     """
     Train a dlib shape predictor model.
 
@@ -531,6 +531,7 @@ def train_shape_model(project_root, tag, custom_options=None,
         "bilateral_name_swaps": name_swap_map,
         "orientation_mode": orientation_mode,
         "augmented_xml": actual_train_xml if actual_train_xml != train_xml else None,
+        "skip_parity": bool(skip_parity),
     }
     params_path = os.path.join(debug_dir, f"training_params_{tag}.json")
     with open(params_path, "w", encoding="utf-8") as f:
@@ -596,58 +597,73 @@ def train_shape_model(project_root, tag, custom_options=None,
     if os.path.exists(test_xml):
         test_error = dlib.test_shape_predictor(test_xml, predictor_path)
         print("TEST_ERROR", test_error)
-    print("PROGRESS 93 evaluating_pipeline_parity", file=sys.stderr)
-    print(
-        "PROGRESS_JSON " + json.dumps(
-            {
-                "percent": 93,
-                "stage": "evaluation",
-                "substage": "pipeline_parity",
-                "message": "Running pipeline parity evaluation (GT + detected boxes).",
-            }
-        ),
-        file=sys.stderr,
-    )
-    pipeline_parity = _run_pipeline_parity_eval(
-        project_root,
-        tag,
-        train_xml,
-        test_xml,
-        run_dir=run_dir,
-    )
-    if isinstance(pipeline_parity, dict) and not pipeline_parity.get("error"):
-        try:
-            train_gt = (
-                pipeline_parity.get("splits", {})
-                .get("train", {})
-                .get("gt_boxes", {})
-                .get("pixel_error_mean")
-            )
-            test_gt = (
-                pipeline_parity.get("splits", {})
-                .get("test", {})
-                .get("gt_boxes", {})
-                .get("pixel_error_mean")
-            )
-            print(
-                f"Pipeline parity (dlib, GT boxes): train_mean_px={train_gt}, test_mean_px={test_gt}",
-                file=sys.stderr,
-            )
-            orientation_test = (
-                pipeline_parity.get("orientation_signal_summary", {})
-                .get("test", {})
-                .get("detected_boxes", {})
-            )
-            if isinstance(orientation_test, dict):
+    pipeline_parity = {"skipped": True, "reason": "skip_parity"} if skip_parity else None
+    if skip_parity:
+        print("PROGRESS 93 skipping_pipeline_parity", file=sys.stderr)
+        print(
+            "PROGRESS_JSON " + json.dumps(
+                {
+                    "percent": 93,
+                    "stage": "evaluation",
+                    "substage": "pipeline_parity_skipped",
+                    "message": "Skipping pipeline parity evaluation by user option.",
+                }
+            ),
+            file=sys.stderr,
+        )
+    else:
+        print("PROGRESS 93 evaluating_pipeline_parity", file=sys.stderr)
+        print(
+            "PROGRESS_JSON " + json.dumps(
+                {
+                    "percent": 93,
+                    "stage": "evaluation",
+                    "substage": "pipeline_parity",
+                    "message": "Running pipeline parity evaluation (GT + detected boxes).",
+                }
+            ),
+            file=sys.stderr,
+        )
+        pipeline_parity = _run_pipeline_parity_eval(
+            project_root,
+            tag,
+            train_xml,
+            test_xml,
+            run_dir=run_dir,
+        )
+        if isinstance(pipeline_parity, dict) and not pipeline_parity.get("error"):
+            try:
+                train_gt = (
+                    pipeline_parity.get("splits", {})
+                    .get("train", {})
+                    .get("gt_boxes", {})
+                    .get("pixel_error_mean")
+                )
+                test_gt = (
+                    pipeline_parity.get("splits", {})
+                    .get("test", {})
+                    .get("gt_boxes", {})
+                    .get("pixel_error_mean")
+                )
                 print(
-                    "Orientation signal (dlib, test/detected): "
-                    f"hint_present={orientation_test.get('detector_hint_present', 0)} "
-                    f"hint_missing={orientation_test.get('detector_hint_missing', 0)} "
-                    f"warnings={orientation_test.get('warning_code_counts', {})}",
+                    f"Pipeline parity (dlib, GT boxes): train_mean_px={train_gt}, test_mean_px={test_gt}",
                     file=sys.stderr,
                 )
-        except Exception:
-            pass
+                orientation_test = (
+                    pipeline_parity.get("orientation_signal_summary", {})
+                    .get("test", {})
+                    .get("detected_boxes", {})
+                )
+                if isinstance(orientation_test, dict):
+                    print(
+                        "Orientation signal (dlib, test/detected): "
+                        f"hint_present={orientation_test.get('detector_hint_present', 0)} "
+                        f"hint_missing={orientation_test.get('detector_hint_missing', 0)} "
+                        f"warnings={orientation_test.get('warning_code_counts', {})}",
+                        file=sys.stderr,
+                    )
+            except Exception:
+                pass
     # Save results
     results = {
         "model_path": predictor_path,
@@ -707,8 +723,8 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python train_shape_model.py <project_root> <tag> [options_json]")
         print("  options_json: Optional JSON string with custom training options.")
-        print("                Keys: standard dlib options + 'aug_angles' (list), 'aug_flip' (bool).")
-        print("  Example: '{\"aug_angles\": [-15, 15], \"aug_flip\": false}'")
+        print("                Keys: standard dlib options + 'aug_angles' (list), 'aug_flip' (bool), 'skip_parity' (bool).")
+        print("  Example: '{\"aug_angles\": [-15, 15], \"aug_flip\": false, \"skip_parity\": true}'")
         sys.exit(1)
 
     project_root = sys.argv[1]
@@ -721,12 +737,16 @@ if __name__ == "__main__":
     # Pull augmentation params out of custom_options (they're not dlib options)
     aug_angles_arg = None
     aug_flip_arg = None
+    skip_parity_arg = False
     if custom_options:
         aug_angles_arg = custom_options.pop("aug_angles", None)
         if "aug_flip" in custom_options:
             aug_flip_arg = bool(custom_options.pop("aug_flip"))
+        if "skip_parity" in custom_options:
+            skip_parity_arg = bool(custom_options.pop("skip_parity"))
         if not custom_options:
             custom_options = None
 
     train_shape_model(project_root, tag, custom_options,
-                      aug_angles=aug_angles_arg, aug_flip=aug_flip_arg)
+                      aug_angles=aug_angles_arg, aug_flip=aug_flip_arg,
+                      skip_parity=skip_parity_arg)

@@ -83,7 +83,7 @@ export function DetectionModeSelector({
 
   const modeOptions: { value: DetectionMode; label: string; desc: string }[] = [
     { value: "manual", label: "Manual", desc: "Draw bounding boxes manually" },
-    { value: "auto", label: "Auto (AI)", desc: "YOLO-World multi-object detection" },
+    { value: "auto", label: "Auto (AI)", desc: "AI detection (YOLO-World, or OpenCV fallback if unavailable)" },
   ];
 
   const sam2Available = capabilityInfo?.mode === "auto_high_performance";
@@ -105,7 +105,12 @@ export function DetectionModeSelector({
         : "SAM2 system-gated: requires GPU + sufficient memory."
     : null;
 
-  const canInitializeModels = capabilityInfo ? capabilityInfo.mode !== "classic_fallback" : false;
+  const isClassicFallback = capabilityInfo?.mode === "classic_fallback";
+  const classicFallbackReason = capabilityInfo
+    ? capabilityInfo.yolo_failed
+      ? `Python error: ${capabilityInfo.yolo_error ?? "initialization failed"}`
+      : "Requires >1.5 GB free RAM or GPU"
+    : null;
 
   const handleInitializeModels = async () => {
     setIsInitializing(true);
@@ -232,7 +237,7 @@ export function DetectionModeSelector({
                     ? "bg-yellow-500/20 text-yellow-400"
                     : "bg-zinc-500/20 text-zinc-400"
               }`}>
-                YOLO {capabilityInfo.yolo_ready ? "ready" : capabilityInfo.yolo_failed ? "unavailable" : "pending"}
+                YOLO {capabilityInfo.yolo_ready ? "ready" : capabilityInfo.yolo_failed ? "unavailable" : isClassicFallback ? "N/A" : "pending"}
               </span>
               <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${
                 capabilityInfo.sam2_ready
@@ -246,11 +251,25 @@ export function DetectionModeSelector({
               {capabilityInfo.gpu && (
                 <span className="text-[10px] text-zinc-500">GPU</span>
               )}
+              {isClassicFallback && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-500/20 text-blue-400">
+                  OpenCV fallback
+                </span>
+              )}
+              {capabilityInfo.yolo_failed && (
+                <button
+                  type="button"
+                  onClick={refreshCapabilities}
+                  className="text-[10px] text-blue-400 underline cursor-pointer"
+                >
+                  Retry
+                </button>
+              )}
             </div>
           )}
 
-          {/* Small status hint */}
-          {yoloStatusHint && (
+          {/* Small status hint — suppress when classic_fallback since button sub-text already explains it */}
+          {yoloStatusHint && !isClassicFallback && (
             <p className={`text-[10px] ${
               capabilityInfo?.yolo_failed ? "text-red-400/90" : "text-zinc-500"
             }`}>
@@ -263,18 +282,38 @@ export function DetectionModeSelector({
             </p>
           )}
 
-          {canInitializeModels && (
+          {/* Initialize models — always visible in auto mode */}
+          {capabilityInfo === null ? (
+            <button
+              type="button"
+              disabled
+              className="h-8 px-3 rounded-md text-xs font-medium text-white border border-zinc-700 bg-zinc-800/60 opacity-60 cursor-not-allowed"
+            >
+              Checking environment...
+            </button>
+          ) : isClassicFallback ? (
+            <div className="flex flex-col gap-1">
+              <button
+                type="button"
+                disabled
+                className="h-8 px-3 rounded-md text-xs font-medium text-white border border-zinc-700 bg-zinc-800/60 opacity-60 cursor-not-allowed"
+              >
+                Initialize models (unavailable)
+              </button>
+              <p className="text-[10px] text-zinc-500">{classicFallbackReason}. Auto-detect will use OpenCV.</p>
+            </div>
+          ) : (
             <button
               type="button"
               onClick={handleInitializeModels}
-              disabled={disabled || isInitializing || !!capabilityInfo?.yolo_ready}
+              disabled={disabled || isInitializing || !!capabilityInfo.yolo_ready}
               className={`h-8 px-3 rounded-md text-xs font-medium text-white border border-zinc-600 ${
-                disabled || isInitializing || !!capabilityInfo?.yolo_ready
+                disabled || isInitializing || !!capabilityInfo.yolo_ready
                   ? "bg-zinc-800/60 opacity-60 cursor-not-allowed"
                   : "bg-zinc-700 hover:bg-zinc-600"
               }`}
             >
-              {capabilityInfo?.yolo_ready
+              {capabilityInfo.yolo_ready
                 ? "Models initialized"
                 : isInitializing
                   ? "Initializing models..."

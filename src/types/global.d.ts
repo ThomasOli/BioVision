@@ -8,7 +8,7 @@ interface SaveLabelsResult {
 interface TrainOptions {
   testSplit?: number;  // Fraction for test set (default 0.2)
   seed?: number;       // Random seed for reproducibility
-  customOptions?: Record<string, number>;  // Custom training parameters
+  customOptions?: Record<string, number | boolean>;  // Custom training parameters
   speciesId?: string;  // Session-scoped training
   useImportedXml?: boolean; // Train directly from xml/train_{tag}.xml
   predictorType?: "dlib" | "cnn"; // Predictor backend (default: "dlib")

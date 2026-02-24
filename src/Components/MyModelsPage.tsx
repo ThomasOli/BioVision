@@ -40,6 +40,7 @@ import { TrainedModel, AppView } from "@/types/Image";
 interface MyModelsPageProps {
   onNavigate: (view: AppView) => void;
   onSelectModelForInference: (modelName: string) => void;
+  onStartAnnotating: () => void;
 }
 
 function formatFileSize(bytes: number): string {
@@ -208,6 +209,7 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
 export const MyModelsPage: React.FC<MyModelsPageProps> = ({
   onNavigate,
   onSelectModelForInference,
+  onStartAnnotating,
 }) => {
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
   const [models, setModels] = useState<TrainedModel[]>([]);
@@ -338,7 +340,7 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
                 annotation workspace.
               </p>
               <motion.div {...buttonHover} {...buttonTap} className="mt-6">
-                <Button onClick={() => onNavigate("workspace")}>
+                <Button onClick={onStartAnnotating}>
                   Start Annotating
                 </Button>
               </motion.div>

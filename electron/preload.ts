@@ -28,7 +28,7 @@ function withPrototype(obj: Record<string, any>) {
 interface TrainOptions {
   testSplit?: number;
   seed?: number;
-  customOptions?: Record<string, number>;
+  customOptions?: Record<string, number | boolean>;
   speciesId?: string;
   useImportedXml?: boolean;
   predictorType?: "dlib" | "cnn";
