@@ -9,7 +9,13 @@ import json
 import math
 import dlib
 import xml.etree.ElementTree as ET
-from image_utils import load_image
+
+import sys as _sys, os as _os
+_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _BACKEND_ROOT not in _sys.path:
+    _sys.path.insert(0, _BACKEND_ROOT)
+
+from bv_utils.image_utils import load_image
 
 
 def parse_xml_annotations(xml_path):

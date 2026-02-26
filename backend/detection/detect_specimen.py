@@ -2,7 +2,13 @@ import cv2
 import numpy as np
 import os
 import sys
-from image_utils import load_image
+
+import sys as _sys, os as _os
+_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _BACKEND_ROOT not in _sys.path:
+    _sys.path.insert(0, _BACKEND_ROOT)
+
+from bv_utils.image_utils import load_image
 
 
 def _infer_session_dir_from_model_path(model_path):
@@ -183,51 +189,53 @@ def detect_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20):
             return None
 
         result = results[0]
-        if result.boxes is None or len(result.boxes) == 0:
+        is_obb = hasattr(result, "obb") and result.obb is not None
+        boxes_obj = result.obb if is_obb else getattr(result, "boxes", None)
+        if boxes_obj is None or len(boxes_obj) == 0:
             return None
 
-        # Orientation hints only apply to session-trained pose models where
-        # keypoints are [head, tail].
         head_id, tail_id = _load_head_tail_ids_for_model(model_path)
         landmark_order = _load_landmark_order_for_model(model_path)
         can_use_pose_hint = bool(head_id is not None and tail_id is not None)
 
-        # Pick highest-confidence detection
-        boxes = result.boxes
-        best_idx = int(boxes.conf.argmax())
+        best_idx = int(boxes_obj.conf.argmax())
         keypoints_data = getattr(result, "keypoints", None)
         orientation_hint = _extract_orientation_hint(
-            keypoints_data,
-            best_idx,
+            keypoints_data, best_idx,
             enable_hint=can_use_pose_hint,
-            head_id=head_id,
-            tail_id=tail_id,
-            landmark_order=landmark_order,
+            head_id=head_id, tail_id=tail_id, landmark_order=landmark_order,
         )
 
-        xyxy = boxes.xyxy[best_idx].tolist()
-        left = max(0, int(xyxy[0]) - margin)
-        top = max(0, int(xyxy[1]) - margin)
-        right = int(xyxy[2]) + margin
+        obb_corners = None
+        if is_obb:
+            corners = boxes_obj.xyxyxyxy[best_idx].cpu().numpy().tolist()
+            obb_corners = corners
+            xs = [p[0] for p in corners]
+            ys = [p[1] for p in corners]
+            xyxy = [min(xs), min(ys), max(xs), max(ys)]
+        else:
+            xyxy = boxes_obj.xyxy[best_idx].tolist()
+
+        left  = max(0, int(xyxy[0]) - margin)
+        top   = max(0, int(xyxy[1]) - margin)
+        right  = int(xyxy[2]) + margin
         bottom = int(xyxy[3]) + margin
         output = {
-            'left': left,
-            'top': top,
-            'right': right,
-            'bottom': bottom,
-            'width': right - left,
-            'height': bottom - top,
-            'confidence': float(boxes.conf[best_idx]),
-            'detection_method': 'yolo',
+            'left': left, 'top': top, 'right': right, 'bottom': bottom,
+            'width': right - left, 'height': bottom - top,
+            'confidence': float(boxes_obj.conf[best_idx]),
+            'detection_method': 'yolo_obb' if is_obb else 'yolo',
         }
+        if obb_corners:
+            output['obbCorners'] = obb_corners
         if orientation_hint is None:
-            cls_id = int(boxes.cls[best_idx]) if boxes.cls is not None else 0
+            cls_id   = int(boxes_obj.cls[best_idx]) if boxes_obj.cls is not None else 0
             cls_name = result.names.get(cls_id, "specimen") if hasattr(result, "names") else "specimen"
-            cls_ori = _orientation_from_class_name(cls_name)
+            cls_ori  = _orientation_from_class_name(cls_name)
             if cls_ori is not None:
                 orientation_hint = {
                     "orientation": cls_ori,
-                    "confidence": float(boxes.conf[best_idx]),
+                    "confidence": float(boxes_obj.conf[best_idx]),
                     "source": "detector_class",
                 }
         if orientation_hint is not None:
@@ -252,56 +260,58 @@ def detect_multiple_with_yolo(image_path, model_path, conf_threshold=0.25, margi
             return None
 
         result = results[0]
-        if result.boxes is None or len(result.boxes) == 0:
+        is_obb = hasattr(result, "obb") and result.obb is not None
+        boxes_obj = result.obb if is_obb else getattr(result, "boxes", None)
+        if boxes_obj is None or len(boxes_obj) == 0:
             return None
 
         img_w = result.orig_shape[1]
         img_h = result.orig_shape[0]
         keypoints_data = getattr(result, "keypoints", None)
         head_id, tail_id = _load_head_tail_ids_for_model(model_path)
-        landmark_order = _load_landmark_order_for_model(model_path)
+        landmark_order  = _load_landmark_order_for_model(model_path)
         can_use_pose_hint = bool(head_id is not None and tail_id is not None)
 
         boxes_out = []
-        for i in range(min(len(result.boxes), max_specimens)):
-            xyxy = result.boxes.xyxy[i].tolist()
-            conf = float(result.boxes.conf[i])
-            left = max(0, int(xyxy[0]) - margin)
-            top = max(0, int(xyxy[1]) - margin)
-            right = min(img_w, int(xyxy[2]) + margin)
+        for i in range(min(len(boxes_obj), max_specimens)):
+            conf   = float(boxes_obj.conf[i])
+            cls_id = int(boxes_obj.cls[i]) if boxes_obj.cls is not None else 0
+            cls_name = result.names.get(cls_id, 'specimen') if hasattr(result, "names") else 'specimen'
+
+            obb_corners = None
+            if is_obb:
+                corners = boxes_obj.xyxyxyxy[i].cpu().numpy().tolist()
+                obb_corners = corners
+                xs   = [p[0] for p in corners]
+                ys   = [p[1] for p in corners]
+                xyxy = [min(xs), min(ys), max(xs), max(ys)]
+            else:
+                xyxy = boxes_obj.xyxy[i].cpu().numpy().tolist()
+
+            left   = max(0, int(xyxy[0]) - margin)
+            top    = max(0, int(xyxy[1]) - margin)
+            right  = min(img_w, int(xyxy[2]) + margin)
             bottom = min(img_h, int(xyxy[3]) + margin)
             box_out = {
-                'left': left,
-                'top': top,
-                'right': right,
-                'bottom': bottom,
-                'width': right - left,
-                'height': bottom - top,
-                'confidence': conf,
-                'class_id': int(result.boxes.cls[i]) if result.boxes.cls is not None else 0,
-                'class_name': result.names.get(int(result.boxes.cls[i]), 'specimen') if result.boxes.cls is not None else 'specimen',
+                'left': left, 'top': top, 'right': right, 'bottom': bottom,
+                'width': right - left, 'height': bottom - top,
+                'confidence': conf, 'class_id': cls_id, 'class_name': cls_name,
             }
+            if obb_corners:
+                box_out['obbCorners'] = obb_corners
             orientation_hint = _extract_orientation_hint(
-                keypoints_data,
-                i,
+                keypoints_data, i,
                 enable_hint=can_use_pose_hint,
-                head_id=head_id,
-                tail_id=tail_id,
-                landmark_order=landmark_order,
+                head_id=head_id, tail_id=tail_id, landmark_order=landmark_order,
             )
             if orientation_hint is None:
-                cls_ori = _orientation_from_class_name(box_out.get("class_name"))
+                cls_ori = _orientation_from_class_name(cls_name)
                 if cls_ori is not None:
-                    orientation_hint = {
-                        "orientation": cls_ori,
-                        "confidence": conf,
-                        "source": "detector_class",
-                    }
+                    orientation_hint = {"orientation": cls_ori, "confidence": conf, "source": "detector_class"}
             if orientation_hint is not None:
                 box_out["orientation_hint"] = orientation_hint
             boxes_out.append(box_out)
 
-        # Sort top-to-bottom, left-to-right
         boxes_out.sort(key=lambda b: (b['top'], b['left']))
         return boxes_out
     except Exception:

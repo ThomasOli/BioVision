@@ -7,6 +7,57 @@ import { BoundingBox } from "../types/Image";
 import { DetectionMode } from "./DetectionModeSelector";
 import Konva from "konva";
 
+// ── OBB / Transformer helpers ─────────────────────────────────────────────
+/** Derive a center-anchored Konva Rect description from a BoundingBox. */
+function getBoxKonvaParams(box: BoundingBox): {
+  cx: number; cy: number; w: number; h: number; angleDeg: number;
+} {
+  if (box.obbCorners && box.obbCorners.length === 4) {
+    const c = box.obbCorners;
+    const cx = (c[0][0] + c[1][0] + c[2][0] + c[3][0]) / 4;
+    const cy = (c[0][1] + c[1][1] + c[2][1] + c[3][1]) / 4;
+    const w  = Math.hypot(c[1][0] - c[0][0], c[1][1] - c[0][1]);
+    const h  = Math.hypot(c[2][0] - c[1][0], c[2][1] - c[1][1]);
+    const angleDeg = box.angle ??
+      (Math.atan2(c[1][1] - c[0][1], c[1][0] - c[0][0]) * 180 / Math.PI);
+    return { cx, cy, w: Math.max(1, w), h: Math.max(1, h), angleDeg };
+  }
+  return {
+    cx: box.left + box.width / 2,
+    cy: box.top  + box.height / 2,
+    w: box.width,
+    h: box.height,
+    angleDeg: 0,
+  };
+}
+/** Build 4 OBB corner points from center, size, and rotation angle (degrees). */
+function buildObbCorners(
+  cx: number, cy: number, w: number, h: number, angleDeg: number,
+): [number, number][] {
+  const r = angleDeg * (Math.PI / 180);
+  const cos = Math.cos(r), sin = Math.sin(r);
+  const hw = w / 2, hh = h / 2;
+  return [
+    [cx + cos * (-hw) - sin * (-hh), cy + sin * (-hw) + cos * (-hh)],
+    [cx + cos *   hw  - sin * (-hh), cy + sin *   hw  + cos * (-hh)],
+    [cx + cos *   hw  - sin *   hh,  cy + sin *   hw  + cos *   hh ],
+    [cx + cos * (-hw) - sin *   hh,  cy + sin * (-hw) + cos *   hh ],
+  ] as [number, number][];
+}
+/** Compute AABB of 4 corners, clamped to image dimensions. */
+function cornersToAabb(
+  corners: [number, number][], imgW: number, imgH: number,
+): { left: number; top: number; width: number; height: number } {
+  const xs = corners.map(c => c[0]);
+  const ys = corners.map(c => c[1]);
+  const left  = Math.round(Math.max(0,    Math.min(...xs)));
+  const top   = Math.round(Math.max(0,    Math.min(...ys)));
+  const right = Math.round(Math.min(imgW, Math.max(...xs)));
+  const bot   = Math.round(Math.min(imgH, Math.max(...ys)));
+  return { left, top, width: Math.max(12, right - left), height: Math.max(12, bot - top) };
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 interface ImageLabelerProps {
   imageURL: string;
   onBoxesChange: (boxes: BoundingBox[]) => void;
@@ -149,6 +200,15 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     }
   }, [boxes, addLandmark]);
 
+  // Auto-select the most-recently drawn box so the Transformer appears immediately
+  const pendingSelectRef = useRef<boolean>(false);
+  useEffect(() => {
+    if (pendingSelectRef.current && boxes.length > 0) {
+      pendingSelectRef.current = false;
+      selectBox(boxes[boxes.length - 1].id);
+    }
+  }, [boxes, selectBox]);
+
   const getPointerPosition = useCallback((e: KonvaEventObject<MouseEvent>) => {
     const stage = e.target.getStage();
     const pointerPosition = stage?.getPointerPosition();
@@ -283,6 +343,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
             height: Math.round(height),
             source: "manual",
           });
+          pendingSelectRef.current = true;
         } else if (
           detectionMode === "auto" &&
           autoCorrectionMode &&
@@ -378,7 +439,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     const node = selectedRectRef.current;
     if (!tr) return;
 
-    if (detectionMode === "auto" && autoCorrectionMode && node) {
+    const canTransform =
+      !mode && !lockBoxes &&
+      (detectionMode === "manual" || (detectionMode === "auto" && autoCorrectionMode));
+    if (canTransform && node) {
       tr.nodes([node]);
       tr.getLayer()?.batchDraw();
       return;
@@ -386,7 +450,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
     tr.nodes([]);
     tr.getLayer()?.batchDraw();
-  }, [detectionMode, autoCorrectionMode, selectedBoxId, visibleBoxes]);
+  }, [mode, lockBoxes, detectionMode, autoCorrectionMode, selectedBoxId, visibleBoxes]);
 
   useEffect(() => {
     onBoxesChange(boxes);
@@ -455,7 +519,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
               {visibleBoxes.map((box, index) => {
                 const isSelected = selectedBoxId === box.id;
                 const boxColor = getBoxColor(isSelected);
-                const isEditableSelected = detectionMode === "auto" && autoCorrectionMode && isSelected;
+                const isEditableSelected =
+                  isSelected && !mode && !lockBoxes &&
+                  (detectionMode === "manual" || (detectionMode === "auto" && autoCorrectionMode));
+                const kp = getBoxKonvaParams(box);
+                const hasObb = !!(box.obbCorners && box.obbCorners.length === 4);
 
                 return (
                   <React.Fragment key={`box-${box.id}`}>
@@ -469,62 +537,94 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                         strokeWidth={boxStrokeWidth * 0.5}
                       />
                     )}
+                    {/* OBB polygon outline (rendered when obbCorners available) */}
+                    {box.obbCorners && box.obbCorners.length === 4 && (
+                      <Line
+                        points={box.obbCorners.flat()}
+                        closed={true}
+                        stroke={boxColor}
+                        strokeWidth={boxStrokeWidth}
+                        dash={isSelected ? undefined : [8, 4]}
+                        fill={isSelected ? "rgba(59, 130, 246, 0.08)" : "transparent"}
+                        listening={!isEditableSelected}
+                      />
+                    )}
+                    {/* Interactive rect — center-anchored so rotation uses center pivot.
+                        Transparent when OBB polygon (Line above) provides the visual. */}
                     <Rect
                       ref={isEditableSelected ? selectedRectRef : undefined}
-                      x={box.left}
-                      y={box.top}
-                      width={box.width}
-                      height={box.height}
-                      stroke={boxColor}
+                      x={kp.cx}
+                      y={kp.cy}
+                      width={kp.w}
+                      height={kp.h}
+                      offsetX={kp.w / 2}
+                      offsetY={kp.h / 2}
+                      rotation={kp.angleDeg}
+                      stroke={hasObb ? "transparent" : boxColor}
                       strokeWidth={boxStrokeWidth}
                       dash={isSelected ? undefined : [10, 5]}
-                      fill={isSelected ? "rgba(59, 130, 246, 0.1)" : "transparent"}
+                      fill={isEditableSelected && hasObb ? "rgba(0,0,0,0.001)" : "transparent"}
                       draggable={isEditableSelected}
                       onDragEnd={(e) => {
                         if (!isEditableSelected || !imageDimensions) return;
                         const node = e.target;
-                        const nextLeft = Math.max(0, Math.min(node.x(), imageDimensions.width - box.width));
-                        const nextTop = Math.max(0, Math.min(node.y(), imageDimensions.height - box.height));
-                        updateBox(box.id, {
-                          left: Math.round(nextLeft),
-                          top: Math.round(nextTop),
-                          source: "corrected",
-                          confidence: undefined,
-                          maskOutline: undefined,
-                          detectionMethod: "human_corrected",
-                        });
-                        triggerResegment(box.id, Math.round(nextLeft), Math.round(nextTop), box.width, box.height);
+                        const newCx = node.x();
+                        const newCy = node.y();
+                        if (hasObb && box.obbCorners) {
+                          const dx = newCx - kp.cx;
+                          const dy = newCy - kp.cy;
+                          const newCorners = box.obbCorners.map(
+                            ([px, py]) => [px + dx, py + dy] as [number, number],
+                          );
+                          const aabb = cornersToAabb(newCorners, imageDimensions.width, imageDimensions.height);
+                          updateBox(box.id, {
+                            ...aabb,
+                            obbCorners: newCorners,
+                            angle: box.angle,
+                            source: "corrected",
+                            confidence: undefined,
+                            maskOutline: undefined,
+                            detectionMethod: "human_corrected",
+                          });
+                          triggerResegment(box.id, aabb.left, aabb.top, aabb.width, aabb.height);
+                        } else {
+                          const nextLeft = Math.round(Math.max(0, Math.min(newCx - kp.w / 2, imageDimensions.width - kp.w)));
+                          const nextTop  = Math.round(Math.max(0, Math.min(newCy - kp.h / 2, imageDimensions.height - kp.h)));
+                          updateBox(box.id, {
+                            left: nextLeft,
+                            top: nextTop,
+                            source: "corrected",
+                            confidence: undefined,
+                            maskOutline: undefined,
+                            detectionMethod: "human_corrected",
+                          });
+                          triggerResegment(box.id, nextLeft, nextTop, box.width, box.height);
+                        }
                       }}
                       onTransformEnd={() => {
                         if (!isEditableSelected || !imageDimensions || !selectedRectRef.current) return;
                         const node = selectedRectRef.current;
-                        const scaleX = node.scaleX();
-                        const scaleY = node.scaleY();
-
-                        const rawLeft = node.x();
-                        const rawTop = node.y();
-                        const rawWidth = Math.max(12, node.width() * scaleX);
-                        const rawHeight = Math.max(12, node.height() * scaleY);
-
+                        const newCx    = node.x();
+                        const newCy    = node.y();
+                        const newW     = Math.max(12, kp.w * node.scaleX());
+                        const newH     = Math.max(12, kp.h * node.scaleY());
+                        const newAngle = node.rotation();
                         node.scaleX(1);
                         node.scaleY(1);
-
-                        const left = Math.max(0, Math.min(rawLeft, imageDimensions.width - rawWidth));
-                        const top = Math.max(0, Math.min(rawTop, imageDimensions.height - rawHeight));
-                        const width = Math.max(12, Math.min(rawWidth, imageDimensions.width - left));
-                        const height = Math.max(12, Math.min(rawHeight, imageDimensions.height - top));
-
+                        const newCorners = buildObbCorners(newCx, newCy, newW, newH, newAngle);
+                        const aabb = cornersToAabb(newCorners, imageDimensions.width, imageDimensions.height);
+                        const isRotated = Math.abs(newAngle) > 0.5;
                         updateBox(box.id, {
-                          left: Math.round(left),
-                          top: Math.round(top),
-                          width: Math.round(width),
-                          height: Math.round(height),
+                          ...aabb,
+                          ...(isRotated || hasObb
+                            ? { angle: newAngle, obbCorners: newCorners }
+                            : { angle: undefined, obbCorners: undefined }),
                           source: "corrected",
                           confidence: undefined,
                           maskOutline: undefined,
                           detectionMethod: "human_corrected",
                         });
-                        triggerResegment(box.id, Math.round(left), Math.round(top), Math.round(width), Math.round(height));
+                        triggerResegment(box.id, aabb.left, aabb.top, aabb.width, aabb.height);
                       }}
                     />
                     {/* Box number label */}
@@ -561,10 +661,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                 );
               })}
 
-              {detectionMode === "auto" && autoCorrectionMode && (
+              {!mode && !lockBoxes &&
+                (detectionMode === "manual" || (detectionMode === "auto" && autoCorrectionMode)) && (
                 <Transformer
                   ref={transformerRef}
-                  rotateEnabled={false}
+                  rotateEnabled={true}
                   enabledAnchors={[
                     "top-left",
                     "top-center",
@@ -576,11 +677,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                     "middle-left",
                   ]}
                   boundBoxFunc={(oldBox, newBox) => {
-                    if (!imageDimensions) return oldBox;
                     if (newBox.width < 12 || newBox.height < 12) return oldBox;
-                    if (newBox.x < 0 || newBox.y < 0) return oldBox;
-                    if (newBox.x + newBox.width > imageDimensions.width) return oldBox;
-                    if (newBox.y + newBox.height > imageDimensions.height) return oldBox;
                     return newBox;
                   }}
                 />

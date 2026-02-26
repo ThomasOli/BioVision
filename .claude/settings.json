@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C:*)",
+      "Bash(powershell.exe -Command:*)",
+      "Bash(powershell.exe -NoProfile -Command:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

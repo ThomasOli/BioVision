@@ -25,8 +25,14 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-import debug_io as dio
-import orientation_utils as ou
+
+import sys as _sys, os as _os
+_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _BACKEND_ROOT not in _sys.path:
+    _sys.path.insert(0, _BACKEND_ROOT)
+
+import bv_utils.debug_io as dio
+import bv_utils.orientation_utils as ou
 
 try:
     import torch
@@ -624,7 +630,7 @@ def _run_pipeline_parity_eval(project_root, tag, predictor_type, train_xml, test
     Evaluate end-to-end inference parity on train/test XML crops.
     """
     try:
-        from pipeline_parity_eval import evaluate_pipeline_parity
+        from training.pipeline_parity_eval import evaluate_pipeline_parity
 
         return evaluate_pipeline_parity(
             project_root=project_root,
@@ -853,6 +859,10 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         tv_transforms.ToPILImage(),
         tv_transforms.Resize((STANDARD_SIZE, STANDARD_SIZE)),
         tv_transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+        tv_transforms.RandomApply(
+            [tv_transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))],
+            p=0.3,
+        ),
         tv_transforms.ToTensor(),
         tv_transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                 std=[0.229, 0.224, 0.225]),

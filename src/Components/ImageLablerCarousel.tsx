@@ -1,7 +1,7 @@
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { motion } from "framer-motion";
-import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Loader2, Sparkles, Crosshair, PencilRuler, XCircle, Save, CheckCircle2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Loader2, Sparkles, PencilRuler, XCircle, Save, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
 
 import ImageLabeler from "./ImageLabeler";
@@ -72,17 +72,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [isDetecting, setIsDetecting] = useState(false);
   const [autoDetectProgress, setAutoDetectProgress] = useState<{ message: string; percent: number } | null>(null);
-  const [isTrainingDetection, setIsTrainingDetection] = useState(false);
-  const [trainingProgress, setTrainingProgress] = useState<{ message: string; percent: number } | null>(null);
-  const [trainDialogOpen, setTrainDialogOpen] = useState(false);
-  const [trainPlanLoading, setTrainPlanLoading] = useState(false);
-  const [trainPlanError, setTrainPlanError] = useState<string | null>(null);
-  const [trainPlanPreview, setTrainPlanPreview] = useState<
-    Awaited<ReturnType<typeof window.api.getYoloTrainPlan>> | null
-  >(null);
-  const [trainEpochsInput, setTrainEpochsInput] = useState("");
-  const [trainAutoTune, setTrainAutoTune] = useState(true);
-  const [trainDatasetSizeInput, setTrainDatasetSizeInput] = useState("");
   const [isAutoBoxCorrection, setIsAutoBoxCorrection] = useState(false);
   const [isSegmentingBoxes, setIsSegmentingBoxes] = useState(false);
   const [segmentProgress, setSegmentProgress] = useState<{ current: number; total: number } | null>(null);
@@ -337,6 +326,31 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const finalizeImageSegments = useCallback(async (image: (typeof images)[number] | null): Promise<boolean> => {
     if (!image?.speciesId || !image?.filename) return false;
     const sourceBoxes = await ensureImageBoxesLoaded(image);
+
+    // Compute class_ids from placed landmarks via the backend, then persist them
+    // so the training pipeline (prepare_dataset.py / export_obb_dataset) can use them.
+    let classIdMap = new Map<number, number>();
+    const boxesWithObb = (sourceBoxes || []).filter((b) => b.obbCorners && b.obbCorners.length === 4);
+    if (boxesWithObb.length > 0 && image.speciesId) {
+      try {
+        const tagResult = await window.api.tagClassIds(image.speciesId, sourceBoxes || []);
+        if (tagResult.ok && tagResult.taggedBoxes) {
+          for (const { id, class_id } of tagResult.taggedBoxes) {
+            classIdMap.set(id, class_id);
+          }
+          // Merge class_ids into boxes and save so payload.boxes has them on disk
+          const updatedBoxes = (sourceBoxes || []).map((b) => ({
+            ...b,
+            ...(classIdMap.has(b.id) ? { class_id: classIdMap.get(b.id) } : {}),
+          }));
+          dispatch(updateBoxes({ id: image.id, boxes: updatedBoxes }));
+          await window.api.sessionSaveAnnotations(image.speciesId, image.filename, updatedBoxes);
+        }
+      } catch (_) {
+        // Non-fatal: class_id will default to 0 in training pipeline
+      }
+    }
+
     const acceptedBoxes = (sourceBoxes || [])
       .filter((b) => b.width > 0 && b.height > 0)
       .map((b) => ({
@@ -698,17 +712,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     }
   }, [samEnabled, images, setImages, dispatch]);
 
-  // Count finalized images with accepted boxes for YOLO training.
-  const finalizedPositiveImageCount = useMemo(() => {
-    return images.filter((img) => {
-      const finalized = Boolean(img.isFinalized) || finalizedImageIds.has(img.id);
-      const hasBoxes = (img.boxes || []).some((b) => b.width > 0 && b.height > 0);
-      return finalized && hasBoxes;
-    }).length;
-  }, [images, finalizedImageIds]);
-
-  const canTrainDetection = finalizedPositiveImageCount >= 10;
-
   // Get active species schema from Redux for the zoomed view
   const activeSpeciesForSchema = useSelector((state: RootState) =>
     state.species.species.find((s) => s.id === state.species.activeSpeciesId)
@@ -721,168 +724,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         landmarks: activeSpeciesForSchema.landmarkTemplate,
       }
     : undefined;
-
-  const parseOptionalPositiveInt = useCallback((value: string): number | undefined => {
-    const trimmed = value.trim();
-    if (!trimmed) return undefined;
-    const parsed = Number(trimmed);
-    if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
-    return Math.max(1, Math.floor(parsed));
-  }, []);
-
-  const fetchYoloTrainPlan = useCallback(async () => {
-    const promptClass = className.trim();
-    if (!activeSpeciesId || !promptClass) return;
-
-    const datasetSizeOverride = parseOptionalPositiveInt(trainDatasetSizeInput);
-    const epochsOverride = parseOptionalPositiveInt(trainEpochsInput);
-
-    setTrainPlanLoading(true);
-    setTrainPlanError(null);
-    try {
-      const plan = await window.api.getYoloTrainPlan(
-        activeSpeciesId,
-        promptClass,
-        epochsOverride,
-        detectionPreset,
-        datasetSizeOverride,
-        trainAutoTune
-      );
-      if (plan.ok) {
-        setTrainPlanPreview(plan);
-      } else {
-        setTrainPlanPreview(null);
-        setTrainPlanError(plan.error || "Failed to compute YOLO train plan.");
-      }
-    } catch (err: unknown) {
-      setTrainPlanPreview(null);
-      const message =
-        err instanceof Error ? err.message : "Failed to compute YOLO train plan.";
-      setTrainPlanError(message);
-    } finally {
-      setTrainPlanLoading(false);
-    }
-  }, [
-    activeSpeciesId,
-    className,
-    detectionPreset,
-    parseOptionalPositiveInt,
-    trainAutoTune,
-    trainDatasetSizeInput,
-    trainEpochsInput,
-  ]);
-
-  const runTrainDetection = useCallback(async () => {
-    const promptClass = className.trim();
-    if (!activeSpeciesId || !promptClass) {
-      toast.info("Enter an object class name and ensure you're in an active session.");
-      return;
-    }
-    if (isFinalizePending) {
-      toast.info("Finalize accepted boxes on the current image before training.");
-      return;
-    }
-    if (!canTrainDetection) {
-      toast.info(`Need at least 10 finalized images to train. Currently have ${finalizedPositiveImageCount}.`);
-      return;
-    }
-
-    const datasetSizeOverride = parseOptionalPositiveInt(trainDatasetSizeInput);
-    const epochsOverride = parseOptionalPositiveInt(trainEpochsInput);
-    if (trainDatasetSizeInput.trim().length > 0 && datasetSizeOverride === undefined) {
-      toast.error("Dataset size must be a positive integer.");
-      return;
-    }
-    if (trainEpochsInput.trim().length > 0 && epochsOverride === undefined) {
-      toast.error("Epochs must be a positive integer.");
-      return;
-    }
-
-    setIsTrainingDetection(true);
-    setTrainingProgress({ message: "Starting training...", percent: 0 });
-
-    const unsubscribe = window.api.onSuperAnnotateProgress((data) => {
-      setTrainingProgress({ message: data.message, percent: data.percent });
-    });
-
-    try {
-      const result = await window.api.trainYolo(
-        activeSpeciesId,
-        promptClass,
-        epochsOverride,
-        detectionPreset,
-        datasetSizeOverride,
-        trainAutoTune
-      );
-      if (result.ok) {
-        const mapSuffix = result.candidateMap50 != null ? ` mAP50=${(result.candidateMap50 * 100).toFixed(1)}%.` : "";
-        const sizeSuffix = result.datasetSizeEffective
-          ? ` size=${result.datasetSizeEffective} (${result.datasetSizeSource ?? "export"}).`
-          : "";
-        toast.success(
-          result.promoted
-            ? `Detection model v${result.version ?? "?"} promoted.${mapSuffix}${sizeSuffix}`
-            : `Detection model v${result.version ?? "?"} kept as candidate (not promoted).${mapSuffix}${sizeSuffix}`
-        );
-        // Corrections queued from inference are now consumed by this manual train.
-        try {
-          await window.api.sessionClearRetrainQueue(activeSpeciesId);
-        } catch (_) {
-          // non-fatal
-        }
-      } else {
-        toast.error(result.error || "Detection training failed.");
-      }
-    } catch (err) {
-      console.error("Detection training failed:", err);
-      toast.error("Detection training request failed.");
-    } finally {
-      unsubscribe();
-      setIsTrainingDetection(false);
-      setTrainingProgress(null);
-    }
-  }, [
-    activeSpeciesId,
-    className,
-    canTrainDetection,
-    finalizedPositiveImageCount,
-    detectionPreset,
-    isFinalizePending,
-    parseOptionalPositiveInt,
-    trainDatasetSizeInput,
-    trainEpochsInput,
-    trainAutoTune,
-  ]);
-
-  const handleOpenTrainDetectionDialog = useCallback(async () => {
-    const promptClass = className.trim();
-    if (!activeSpeciesId || !promptClass) {
-      toast.info("Enter an object class name and ensure you're in an active session.");
-      return;
-    }
-    if (isFinalizePending) {
-      toast.info("Finalize accepted boxes on the current image before training.");
-      return;
-    }
-    if (!canTrainDetection) {
-      toast.info(`Need at least 10 finalized images to train. Currently have ${finalizedPositiveImageCount}.`);
-      return;
-    }
-    setTrainDialogOpen(true);
-    await fetchYoloTrainPlan();
-  }, [
-    activeSpeciesId,
-    className,
-    isFinalizePending,
-    canTrainDetection,
-    finalizedPositiveImageCount,
-    fetchYoloTrainPlan,
-  ]);
-
-  const handleConfirmTrainDetection = useCallback(async () => {
-    setTrainDialogOpen(false);
-    await runTrainDetection();
-  }, [runTrainDetection]);
 
   const exportCurrent = useCallback(async () => {
     if (!current || !current.boxes?.length) return;
@@ -1054,6 +895,16 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                   </motion.div>
                 )}
 
+                {detectionMode === "manual" && !isCurrentFinalized && selectedBoxId !== null && (
+                  <motion.div {...buttonHover} {...buttonTap}>
+                    <Button variant="outline" size="sm" onClick={handleDeleteSelectedAutoBox}
+                      className="font-bold text-destructive hover:bg-destructive/10 hover:text-destructive">
+                      <XCircle className="mr-1.5 h-3.5 w-3.5" />
+                      Delete Selected Box
+                    </Button>
+                  </motion.div>
+                )}
+
               </>
             ) : null}
 
@@ -1084,13 +935,12 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
               </motion.div>
             )}
 
-            {/* Train Detection Model button — visible when 10+ images annotated */}
             <motion.div {...buttonHover} {...buttonTap}>
               <Button
                 variant="outline"
                 size="sm"
                 onClick={handleFinalizeAllWithBoxes}
-                disabled={isBulkFinalizing || isDetecting || isTrainingDetection || finalizableImageCount === 0}
+                disabled={isBulkFinalizing || isDetecting || finalizableImageCount === 0}
                 className="font-bold"
                 title={
                   finalizableImageCount > 0
@@ -1111,39 +961,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 )}
               </Button>
             </motion.div>
-
-            {canTrainDetection && activeSpeciesId && className.trim() && (
-              <>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <motion.div {...buttonHover} {...buttonTap}>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={handleOpenTrainDetectionDialog}
-                        disabled={isTrainingDetection || isDetecting}
-                        className="font-bold"
-                      >
-                        {isTrainingDetection ? (
-                          <>
-                            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                            {trainingProgress?.message || "Training..."}
-                          </>
-                        ) : (
-                          <>
-                            <Crosshair className="mr-1.5 h-3.5 w-3.5" />
-                            Train Detection
-                          </>
-                        )}
-                      </Button>
-                    </motion.div>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    Fine-tune detection model on {finalizedPositiveImageCount} finalized images
-                  </TooltipContent>
-                </Tooltip>
-              </>
-            )}
 
             {hasAnnotations && (
               <motion.div {...buttonHover} {...buttonTap}>
@@ -1224,22 +1041,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
           <p className="text-xs text-muted-foreground">
             Correction mode: select a box, then drag/resize it. Drag on empty area to redraw selected box.
           </p>
-        )}
-
-        {/* Progress bar for YOLO training */}
-        {trainingProgress && (
-          <div className="w-full">
-            <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
-              <span>{trainingProgress.message}</span>
-              <span>{trainingProgress.percent}%</span>
-            </div>
-            <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-green-500 rounded-full transition-all duration-300"
-                style={{ width: `${trainingProgress.percent}%` }}
-              />
-            </div>
-          </div>
         )}
 
         {/* Image area */}
@@ -1334,172 +1135,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 onClick={handleDeleteImage}
               >
                 Delete
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        {/* Train detection review dialog */}
-        <Dialog
-          open={trainDialogOpen}
-          onOpenChange={(open) => {
-            setTrainDialogOpen(open);
-            if (!open) {
-              setTrainPlanError(null);
-            }
-          }}
-        >
-          <DialogContent className="sm:max-w-xl">
-            <DialogHeader>
-              <DialogTitle className="font-bold">Review Detection Training Settings</DialogTitle>
-              <DialogDescription>
-                Review dataset stats and default hyperparameters before starting YOLO fine-tuning.
-              </DialogDescription>
-            </DialogHeader>
-
-            <div className="space-y-3 text-sm">
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs font-semibold text-muted-foreground">Dataset size override</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={trainDatasetSizeInput}
-                    onChange={(e) => setTrainDatasetSizeInput(e.target.value)}
-                    placeholder="auto"
-                    disabled={isTrainingDetection || trainPlanLoading}
-                    className="h-9 rounded border border-border/70 bg-background px-2 text-xs outline-none focus:border-primary"
-                  />
-                </label>
-
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs font-semibold text-muted-foreground">Epoch override</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={trainEpochsInput}
-                    onChange={(e) => setTrainEpochsInput(e.target.value)}
-                    placeholder="system default"
-                    disabled={isTrainingDetection || trainPlanLoading}
-                    className="h-9 rounded border border-border/70 bg-background px-2 text-xs outline-none focus:border-primary"
-                  />
-                </label>
-              </div>
-
-              <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                <input
-                  type="checkbox"
-                  checked={trainAutoTune}
-                  onChange={(e) => setTrainAutoTune(e.target.checked)}
-                  disabled={isTrainingDetection || trainPlanLoading}
-                />
-                Use system auto-tuned defaults for this dataset size
-              </label>
-
-              <div className="rounded-md border border-border/70 bg-background/60 p-3 text-xs">
-                {trainPlanLoading ? (
-                  <div className="flex items-center gap-2 text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    Computing train plan...
-                  </div>
-                ) : trainPlanError ? (
-                  <p className="text-destructive">{trainPlanError}</p>
-                ) : trainPlanPreview?.ok ? (
-                  <div className="space-y-1.5">
-                    <p>
-                      Dataset size:{" "}
-                      <span className="font-semibold">
-                        {trainPlanPreview.datasetSizeEffective ?? "-"}
-                      </span>{" "}
-                      ({trainPlanPreview.datasetSizeSource ?? "export"})
-                    </p>
-                    <p>
-                      System default epochs:{" "}
-                      <span className="font-semibold">
-                        {trainPlanPreview.resolvedTrainParams?.epochs ?? "-"}
-                      </span>
-                    </p>
-                    <p>
-                      Batch / Freeze:{" "}
-                      <span className="font-semibold">
-                        {trainPlanPreview.resolvedTrainParams?.batch ?? "-"} / {trainPlanPreview.resolvedTrainParams?.freeze ?? "-"}
-                      </span>
-                    </p>
-                    <p>
-                      Records (train/val):{" "}
-                      <span className="font-semibold">
-                        {trainPlanPreview.dataset?.train_records ?? "-"} / {trainPlanPreview.dataset?.val_records ?? "-"}
-                      </span>
-                    </p>
-                    <p>
-                      Positives / Negatives:{" "}
-                      <span className="font-semibold">
-                        {trainPlanPreview.dataset?.positive_images ?? "-"} / {trainPlanPreview.dataset?.negative_crops ?? "-"}
-                      </span>
-                    </p>
-                    {trainPlanPreview.dataset?.orientation_class_enabled && (
-                      <>
-                        <p>
-                          Real orientation boxes (L/R):{" "}
-                          <span className="font-semibold">
-                            {trainPlanPreview.dataset?.real_orientation_left_boxes ?? "-"} / {trainPlanPreview.dataset?.real_orientation_right_boxes ?? "-"}
-                          </span>
-                        </p>
-                        <p>
-                          Synthetic mode:{" "}
-                          <span className="font-semibold">
-                            {trainPlanPreview.dataset?.synthetic_mode ?? "standard"}
-                          </span>
-                          {" "}
-                          ({trainPlanPreview.dataset?.synthetic_instances_generated ?? "-"} instances)
-                        </p>
-                      </>
-                    )}
-                    {(() => {
-                      const warnings = trainPlanPreview.preflightWarnings
-                        ?? trainPlanPreview.dataset?.orientation_preflight_warnings
-                        ?? [];
-                      if (!warnings.length) return null;
-                      return (
-                        <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-300">
-                          <p className="mb-1 font-semibold">Preflight warnings:</p>
-                          {warnings.map((w, i) => (
-                            <p key={`train-plan-warning-${i}`}>- {w}</p>
-                          ))}
-                        </div>
-                      );
-                    })()}
-                  </div>
-                ) : (
-                  <p className="text-muted-foreground">No plan computed yet.</p>
-                )}
-              </div>
-            </div>
-
-            <DialogFooter className="gap-2 sm:gap-0">
-              <Button
-                variant="outline"
-                onClick={() => setTrainDialogOpen(false)}
-                disabled={isTrainingDetection}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => void fetchYoloTrainPlan()}
-                disabled={isTrainingDetection || trainPlanLoading}
-              >
-                {trainPlanLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                Refresh Plan
-              </Button>
-              <Button
-                onClick={() => void handleConfirmTrainDetection()}
-                disabled={isTrainingDetection}
-              >
-                {isTrainingDetection ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                Start Training
               </Button>
             </DialogFooter>
           </DialogContent>

@@ -25,6 +25,12 @@ interface TrainModelDialogProps {
   preflightWarning?: string;
   predictorType?: "dlib" | "cnn";
   setPredictorType?: (type: "dlib" | "cnn") => void;
+  // OBB detector training (Phase 3 - step before landmarker)
+  obbDetectorReady?: boolean;
+  hasObbAnnotations?: boolean;
+  isTrainingObb?: boolean;
+  handleTrainObbDetector?: () => Promise<void>;
+  obbTrainingMessage?: string;
   cnnVariants?: {
     id: string;
     label: string;
@@ -83,6 +89,11 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   skipParity = false,
   setSkipParity,
   trainingProgress = null,
+  obbDetectorReady = false,
+  hasObbAnnotations = false,
+  isTrainingObb = false,
+  handleTrainObbDetector,
+  obbTrainingMessage,
 }) => {
   const [touched, setTouched] = useState(false);
 
@@ -93,7 +104,11 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   const trimmed = useMemo(() => modelName.trim(), [modelName]);
 
   const nameOk = useMemo(() => /^[a-zA-Z0-9._-]+$/.test(trimmed), [trimmed]);
-  const canTrain = trimmed.length > 0 && nameOk && !isTraining;
+  const canTrain =
+    trimmed.length > 0 &&
+    nameOk &&
+    !isTraining &&
+    (!hasObbAnnotations || obbDetectorReady);
 
   const helperText = useMemo(() => {
     if (!touched)
@@ -189,6 +204,43 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
             Give your model a clear, versioned name (Ctrl/Cmd+Enter to start).
           </DialogDescription>
         </DialogHeader>
+
+        {/* Step 1: OBB Detector — shown when session has OBB annotations or detector already trained */}
+        {(hasObbAnnotations || obbDetectorReady) && (
+          <div className={`rounded-md border px-3 py-2 mb-1 ${obbDetectorReady ? "border-green-500/40 bg-green-500/5" : "border-amber-500/40 bg-amber-500/5"}`}>
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-xs font-semibold">
+                  {obbDetectorReady ? "✓ Step 1: OBB Detector — ready" : "Step 1: Train OBB Detector"}
+                </p>
+                <p className="text-[11px] text-muted-foreground">
+                  {obbDetectorReady
+                    ? (obbTrainingMessage ?? "Retrain to update with new annotations.")
+                    : (obbTrainingMessage ?? "Train the orientation detector before landmarking.")}
+                </p>
+              </div>
+              {handleTrainObbDetector && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="shrink-0 text-xs h-7"
+                  disabled={isTrainingObb || isTraining}
+                  onClick={handleTrainObbDetector}
+                >
+                  {isTrainingObb
+                    ? <><Loader2 className="mr-1 h-3 w-3 animate-spin" />Training…</>
+                    : obbDetectorReady ? "Retrain OBB" : "Train OBB"}
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+        {/* Step 2 label when OBB step is shown */}
+        {hasObbAnnotations && (
+          <p className="text-[11px] font-semibold text-muted-foreground px-1">
+            Step 2: Train Landmark Predictor
+          </p>
+        )}
 
         <div className="space-y-4 py-4">
           <div className="space-y-2">

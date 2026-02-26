@@ -118,11 +118,19 @@ const Menu: React.FC<MenuProps> = ({
   const [cnnVariants, setCnnVariants] = useState<CnnVariantOption[]>([]);
   const [cnnVariant, setCnnVariant] = useState<string>("simplebaseline");
   const [cnnVariantWarning, setCnnVariantWarning] = useState<string>("");
+  const [obbDetectorReady, setObbDetectorReady] = useState(false);
+  const [isTrainingObb, setIsTrainingObb] = useState(false);
+  const [obbTrainingMessage, setObbTrainingMessage] = useState<string>("");
 
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
   const hasWorkspaceData = (fileArray?.length ?? 0) > 0;
   const canTrain = hasWorkspaceData && !isTraining;
+
+  // Derive whether session has any OBB annotations from the current file array
+  const hasObbAnnotations = (fileArray ?? []).some((img) =>
+    img.boxes?.some((b) => Array.isArray((b as any).obbCorners) && (b as any).obbCorners.length === 4)
+  );
 
   useEffect(() => {
     const fetchProjectRoot = async () => {
@@ -191,6 +199,38 @@ const Menu: React.FC<MenuProps> = ({
       cnnVariants.find((v) => v.selectable)?.id;
     if (fallback) setCnnVariant(fallback);
   }, [predictorType, cnnVariants, cnnVariant]);
+
+  // Check OBB detector readiness when species or train dialog opens
+  useEffect(() => {
+    if (!activeSpeciesId) {
+      setObbDetectorReady(false);
+      return;
+    }
+    window.api
+      .checkModelCompatibility({ speciesId: activeSpeciesId, modelName: modelName || "_preflight" })
+      .then((r) => setObbDetectorReady(r?.obbDetectorReady ?? false))
+      .catch(() => setObbDetectorReady(false));
+  }, [activeSpeciesId, openTrainDialog, modelName]);
+
+  const handleTrainObbDetector = async () => {
+    if (!activeSpeciesId || isTrainingObb) return;
+    setIsTrainingObb(true);
+    setObbTrainingMessage("Exporting OBB dataset and starting training…");
+    try {
+      const result = await window.api.trainObbDetector(activeSpeciesId);
+      if (result?.ok) {
+        setObbDetectorReady(true);
+        const mapStr = typeof result.map50 === "number" ? ` (mAP50: ${result.map50.toFixed(3)})` : "";
+        setObbTrainingMessage(`OBB detector trained${mapStr} — ready.`);
+      } else {
+        setObbTrainingMessage(`OBB training failed: ${result?.error ?? "unknown error"}`);
+      }
+    } catch (err: any) {
+      setObbTrainingMessage(`OBB training error: ${err?.message ?? String(err)}`);
+    } finally {
+      setIsTrainingObb(false);
+    }
+  };
 
   const handleSelectModelPath = async () => {
     try {
@@ -367,6 +407,11 @@ const Menu: React.FC<MenuProps> = ({
           skipParity={skipParity}
           setSkipParity={setSkipParity}
           trainingProgress={trainingProgress}
+          obbDetectorReady={obbDetectorReady}
+          hasObbAnnotations={hasObbAnnotations}
+          isTrainingObb={isTrainingObb}
+          handleTrainObbDetector={handleTrainObbDetector}
+          obbTrainingMessage={obbTrainingMessage}
         />
 
         <ScrollArea className="flex-1">

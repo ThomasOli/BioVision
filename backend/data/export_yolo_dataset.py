@@ -20,7 +20,12 @@ import sys
 import cv2
 import numpy as np
 
-from image_utils import safe_imread, safe_imwrite
+import sys as _sys, os as _os
+_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _BACKEND_ROOT not in _sys.path:
+    _sys.path.insert(0, _BACKEND_ROOT)
+
+from bv_utils.image_utils import safe_imread, safe_imwrite
 
 
 def _clamp(v, lo, hi):
@@ -441,7 +446,7 @@ def _normalize_box(box):
         if orientation_override_raw in {"left", "right", "uncertain"}
         else None
     )
-    return {
+    out = {
         "left": left,
         "top": top,
         "width": width,
@@ -449,6 +454,23 @@ def _normalize_box(box):
         **({"orientation_override": orientation_override} if orientation_override else {}),
         "landmarks": _normalize_landmarks(box.get("landmarks", [])),
     }
+    # Preserve OBB geometry fields so export_obb_dataset can use the 4-corner format.
+    obb_corners = box.get("obbCorners") or box.get("obb_corners")
+    if obb_corners and len(obb_corners) == 4:
+        out["obbCorners"] = [[float(c[0]), float(c[1])] for c in obb_corners]
+    angle_val = box.get("angle")
+    if angle_val is not None:
+        try:
+            out["angle"] = float(angle_val)
+        except (TypeError, ValueError):
+            pass
+    class_id_val = box.get("class_id")
+    if class_id_val is not None:
+        try:
+            out["class_id"] = int(class_id_val)
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def _get_finalized_boxes(label_data, image_filename, finalized_set):
@@ -489,7 +511,7 @@ def _get_finalized_boxes(label_data, image_filename, finalized_set):
                 if nb:
                     # Backfill landmarks from draft boxes when finalized snapshot
                     # was stored as geometry-only.
-                    if not nb.get("landmarks"):
+                    if not nb.get("landmarks") or not nb.get("obbCorners"):
                         sig = _box_signature(nb)
                         candidates = draft_by_signature.get(sig, []) if sig else []
                         if candidates:
@@ -497,10 +519,17 @@ def _get_finalized_boxes(label_data, image_filename, finalized_set):
                                 candidates,
                                 key=lambda x: len(x.get("landmarks", [])),
                             )
-                            if best.get("landmarks"):
+                            if best.get("landmarks") and not nb.get("landmarks"):
                                 nb["landmarks"] = [dict(lm) for lm in best["landmarks"]]
                             if not nb.get("orientation_override") and best.get("orientation_override"):
                                 nb["orientation_override"] = best.get("orientation_override")
+                            # Backfill OBB geometry from draft box when not in accepted snapshot
+                            if not nb.get("obbCorners") and best.get("obbCorners"):
+                                nb["obbCorners"] = list(best["obbCorners"])
+                            if nb.get("angle") is None and best.get("angle") is not None:
+                                nb["angle"] = best["angle"]
+                            if nb.get("class_id") is None and best.get("class_id") is not None:
+                                nb["class_id"] = best["class_id"]
                     accepted.append(nb)
 
     # Backward compatibility: older finalized sessions may not have
@@ -841,6 +870,7 @@ def _augment_segment_chip(chip_rgba, rng,
       aug_rgba, head_tail_aug
     """
     aug = chip_rgba.copy()
+    did_flip = False
     points = None
     if head_tail_chip is not None:
         try:
@@ -850,6 +880,7 @@ def _augment_segment_chip(chip_rgba, rng,
             points = None
 
     if rng.random() < flip_prob:
+        did_flip = True
         h0, w0 = aug.shape[:2]
         aug = cv2.flip(aug, 1)
         if points is not None:
@@ -905,7 +936,7 @@ def _augment_segment_chip(chip_rgba, rng,
             (float(points[1, 0]), float(points[1, 1])),
         )
 
-    return aug, head_tail_aug
+    return aug, head_tail_aug, {"flipped": did_flip, "angle": angle}
 
 
 def _random_canvas_background(width, height, rng):
@@ -1000,193 +1031,6 @@ def _place_chip(canvas, chip_rgba, placed_boxes, rng, min_gap_px=8, max_attempts
 
     return None
 
-
-def _generate_synthetic_images(
-    session_dir,
-    out_dir,
-    positives,
-    head_id=None,
-    tail_id=None,
-    orientation_class_enabled=False,
-    n_per_segment=8,
-    max_objects=4,
-    max_total_images=None,
-    max_total_instances=None,
-    seed=0,
-    split="train",
-    manifest=None,
-):
-    """
-    Generate synthetic train images from finalized segment crops only.
-    Uses synthetic backgrounds + strict non-overlapping multi-instance placement.
-    """
-    anchor_index = _build_anchor_index(positives or [], head_id, tail_id)
-    segments, seg_stats = _collect_finalized_segments(session_dir, anchor_index=anchor_index)
-    if not segments:
-        return {
-            "num_generated": 0,
-            "num_left": 0,
-            "num_right": 0,
-            "num_ambiguous_skipped": 0,
-            "num_missing_anchor_skipped": 0,
-            **seg_stats,
-        }
-
-    img_dir = os.path.join(out_dir, "images", split)
-    lbl_dir = os.path.join(out_dir, "labels", split)
-    os.makedirs(img_dir, exist_ok=True)
-    os.makedirs(lbl_dir, exist_ok=True)
-
-    rng = random.Random(seed)
-    n_generated = 0
-    n_instances_generated = 0
-    n_left = 0
-    n_right = 0
-    n_ambiguous_skipped = 0
-    n_missing_anchor_skipped = 0
-    total_iters = max(1, int(n_per_segment)) * len(segments)
-
-    for i in range(total_iters):
-        if max_total_images is not None and n_generated >= int(max_total_images):
-            break
-        if max_total_instances is not None and n_instances_generated >= int(max_total_instances):
-            break
-
-        canvas_size = rng.choice([768, 896, 1024])
-        bg = _random_canvas_background(canvas_size, canvas_size, rng)
-        labels = []
-        placed = []
-        object_manifest = []
-
-        if len(segments) > 1:
-            target_objects = rng.randint(2, max(2, int(max_objects)))
-        else:
-            target_objects = 1
-
-        seg_indices = list(range(len(segments)))
-        rng.shuffle(seg_indices)
-        chosen = seg_indices[: min(target_objects, len(seg_indices))]
-        while len(chosen) < target_objects:
-            chosen.append(rng.choice(seg_indices))
-
-        for seg_idx in chosen:
-            raw = segments[seg_idx]["rgba"]
-            head_tail_fg = segments[seg_idx].get("head_tail_fg")
-            if orientation_class_enabled and head_tail_fg is None:
-                n_missing_anchor_skipped += 1
-                continue
-
-            chip, head_tail_chip = _prepare_segment_chip(
-                raw,
-                pad_ratio=rng.uniform(0.12, 0.28),
-                head_tail_fg=head_tail_fg,
-            )
-            aug, head_tail_aug = _augment_segment_chip(
-                chip,
-                rng,
-                rot_range=(-60.0, 60.0),
-                head_tail_chip=head_tail_chip,
-            )
-
-            class_id = 0
-            if orientation_class_enabled:
-                if head_tail_aug is None:
-                    n_missing_anchor_skipped += 1
-                    continue
-                (hx, _hy), (tx, _ty) = head_tail_aug
-                dx = float(hx) - float(tx)
-                ambiguous_dx_px = max(6.0, 0.02 * float(canvas_size))
-                if abs(dx) < ambiguous_dx_px:
-                    n_ambiguous_skipped += 1
-                    continue
-                class_id = 0 if dx < 0.0 else 1
-
-            # Keep chips within a useful relative size range.
-            ch, cw = bg.shape[:2]
-            ah, aw = aug.shape[:2]
-            max_frac = 0.45
-            if aw >= int(cw * max_frac) or ah >= int(ch * max_frac):
-                scale = min((cw * max_frac) / max(aw, 1), (ch * max_frac) / max(ah, 1))
-                nw = max(8, int(round(aw * scale)))
-                nh = max(8, int(round(ah * scale)))
-                aug = cv2.resize(aug, (nw, nh), interpolation=cv2.INTER_LINEAR)
-                if head_tail_aug is not None:
-                    sx = float(nw) / max(1.0, float(aw))
-                    sy = float(nh) / max(1.0, float(ah))
-                    (hx, hy), (tx, ty) = head_tail_aug
-                    head_tail_aug = ((hx * sx, hy * sy), (tx * sx, ty * sy))
-
-            placement = _place_chip(bg, aug, placed, rng, min_gap_px=8, max_attempts=100)
-            if placement is None:
-                continue
-
-            bbox = placement["bbox"]
-            x1, y1, x2, y2 = bbox
-            bw = x2 - x1
-            bh = y2 - y1
-            if bw <= 1 or bh <= 1:
-                continue
-
-            cx_n = _clamp((x1 + bw / 2.0) / cw, 0.0, 1.0)
-            cy_n = _clamp((y1 + bh / 2.0) / ch, 0.0, 1.0)
-            w_n = _clamp(bw / cw, 0.0, 1.0)
-            h_n = _clamp(bh / ch, 0.0, 1.0)
-
-            labels.append(f"{class_id} {cx_n:.6f} {cy_n:.6f} {w_n:.6f} {h_n:.6f}")
-            offset_x, offset_y = placement["offset"]
-            head_abs = None
-            tail_abs = None
-            if head_tail_aug is not None:
-                (hx, hy), (tx, ty) = head_tail_aug
-                head_abs = [round(float(offset_x + hx), 2), round(float(offset_y + hy), 2)]
-                tail_abs = [round(float(offset_x + tx), 2), round(float(offset_y + ty), 2)]
-            object_manifest.append(
-                {
-                    "split": split,
-                    "image": f"__synth_{i:05d}.jpg",
-                    "segment_id": segments[seg_idx]["id"],
-                    "class_id": int(class_id),
-                    "bbox_xyxy": [int(x1), int(y1), int(x2), int(y2)],
-                    "head_xy": head_abs,
-                    "tail_xy": tail_abs,
-                }
-            )
-            if orientation_class_enabled:
-                if class_id == 0:
-                    n_left += 1
-                else:
-                    n_right += 1
-
-        min_required = 2 if len(segments) > 1 else 1
-        if len(labels) < min_required:
-            continue
-        if (
-            max_total_instances is not None
-            and n_instances_generated + len(labels) > int(max_total_instances)
-            and n_generated > 0
-        ):
-            break
-
-        synth_name = f"__synth_{i:05d}"
-        img_out = os.path.join(img_dir, f"{synth_name}.jpg")
-        lbl_out = os.path.join(lbl_dir, f"{synth_name}.txt")
-        safe_imwrite(img_out, bg)
-        with open(lbl_out, "w", encoding="utf-8") as f:
-            f.write("\n".join(labels) + "\n")
-        n_generated += 1
-        n_instances_generated += len(labels)
-        if isinstance(manifest, list):
-            manifest.extend(object_manifest)
-
-    return {
-        "num_generated": n_generated,
-        "num_instances_generated": n_instances_generated,
-        "num_left": n_left,
-        "num_right": n_right,
-        "num_ambiguous_skipped": n_ambiguous_skipped,
-        "num_missing_anchor_skipped": n_missing_anchor_skipped,
-        **seg_stats,
-    }
 
 
 # -----------------------------------------------------------------------------
@@ -1468,36 +1312,8 @@ def export_dataset(
             f.write("")
         num_negative_crops += 1
 
-    synthetic_enabled = True
+    num_synthetic = 0
     synth_manifest = []
-    synthetic_mode = "standard"
-    synthetic_n_per_segment = 8
-    synthetic_max_images = None
-    synthetic_max_instances = None
-    if orientation_class_enabled:
-        # Keep synthetic as a supplement for orientation classes.
-        synthetic_mode = "supplement"
-        real_oriented_instances = max(1, real_orientation_left_boxes + real_orientation_right_boxes)
-        synthetic_n_per_segment = 2
-        synthetic_max_instances = max(24, int(round(real_oriented_instances * 0.75)))
-        synthetic_max_images = max(12, int(round(max(1, len(positives)) * 0.50)))
-        synthetic_max_images = min(synthetic_max_images, max(12, len(positives)))
-    synthetic_stats = _generate_synthetic_images(
-        session_dir,
-        out_dir,
-        positives=positives,
-        head_id=head_id,
-        tail_id=tail_id,
-        orientation_class_enabled=orientation_class_enabled,
-        n_per_segment=synthetic_n_per_segment,
-        max_objects=4,
-        max_total_images=synthetic_max_images,
-        max_total_instances=synthetic_max_instances,
-        seed=seed,
-        split="train",
-        manifest=synth_manifest,
-    )
-    num_synthetic = int(synthetic_stats.get("num_generated", 0))
 
     val_counts_before_balance = _count_label_class_instances(os.path.join(out_dir, "labels", "val"))
     val_right_before = int(val_counts_before_balance.get("class_counts", {}).get(1, 0))
@@ -1570,20 +1386,20 @@ def export_dataset(
         "positive_images": num_positive_images,
         "negative_crops": num_negative_crops,
         "num_synthetic": num_synthetic,
-        "synthetic_enabled": synthetic_enabled,
-        "synthetic_disabled_reason": None,
-        "synthetic_mode": synthetic_mode,
-        "synthetic_n_per_segment": synthetic_n_per_segment,
-        "synthetic_max_images": synthetic_max_images,
-        "synthetic_max_instances": synthetic_max_instances,
-        "synthetic_instances_generated": int(synthetic_stats.get("num_instances_generated", 0)),
-        "synthetic_left_instances": int(synthetic_stats.get("num_left", 0)),
-        "synthetic_right_instances": int(synthetic_stats.get("num_right", 0)),
-        "synthetic_ambiguous_skipped": int(synthetic_stats.get("num_ambiguous_skipped", 0)),
-        "synthetic_missing_anchor_skipped": int(synthetic_stats.get("num_missing_anchor_skipped", 0)),
-        "synthetic_segments_total": int(synthetic_stats.get("segments_total", 0)),
-        "synthetic_segments_with_anchors": int(synthetic_stats.get("segments_with_anchors", 0)),
-        "synthetic_segments_missing_anchors": int(synthetic_stats.get("segments_missing_anchors", 0)),
+        "synthetic_enabled": False,
+        "synthetic_disabled_reason": "obb_pipeline",
+        "synthetic_mode": None,
+        "synthetic_n_per_segment": 0,
+        "synthetic_max_images": None,
+        "synthetic_max_instances": None,
+        "synthetic_instances_generated": 0,
+        "synthetic_left_instances": 0,
+        "synthetic_right_instances": 0,
+        "synthetic_ambiguous_skipped": 0,
+        "synthetic_missing_anchor_skipped": 0,
+        "synthetic_segments_total": 0,
+        "synthetic_segments_with_anchors": 0,
+        "synthetic_segments_missing_anchors": 0,
         "synthetic_manifest_path": synth_manifest_path,
         "synthetic_val_balance_applied": bool(
             orientation_class_enabled and int(synthetic_val_balance.get("moved_images", 0)) > 0
@@ -1612,6 +1428,428 @@ def export_dataset(
     if return_details:
         return stats
     return yaml_path
+
+
+# -----------------------------------------------------------------------------
+# OBB dataset export for YOLOv8-OBB training
+# -----------------------------------------------------------------------------
+
+def _load_orientation_mode(session_dir):
+    session_path = os.path.join(session_dir, "session.json")
+    try:
+        with open(session_path, "r", encoding="utf-8") as f:
+            session = json.load(f)
+        mode = str(session.get("orientationPolicy", {}).get("mode", "invariant")).lower()
+        return mode if mode in ("directional", "bilateral", "axial", "invariant") else "invariant"
+    except Exception:
+        return "invariant"
+
+
+def _compute_base_class_id(head_tail_chip, orientation_schema):
+    """Derive class_id from head/tail chip-space positions before augmentation."""
+    if head_tail_chip is None:
+        return 0
+    (hx, hy), (tx, ty) = head_tail_chip
+    if orientation_schema == "axial":
+        return 0 if float(hy) < float(ty) else 1
+    elif orientation_schema == "directional":
+        return 0 if float(hx) < float(tx) else 1
+    else:
+        return 0
+
+
+def _apply_schema_class_transform(base_class_id, aug_info, orientation_schema):
+    class_id = base_class_id
+    if orientation_schema == "directional":
+        if aug_info.get("flipped"):
+            class_id = 1 - class_id
+    elif orientation_schema == "axial":
+        if abs(aug_info.get("angle", 0.0)) > 90.0:
+            class_id = 1 - class_id
+    else:
+        class_id = 0
+    return class_id
+
+
+def _compute_obb_from_placed_chip(aug_rgba, offset_x, offset_y, canvas_w, canvas_h):
+    """Return 8 normalized corner coords (x1 y1 x2 y2 x3 y3 x4 y4) for OBB label."""
+    alpha = aug_rgba[:, :, 3]
+    ys, xs = np.where(alpha > 10)
+    if len(xs) < 4:
+        return None
+    pts = np.column_stack([
+        xs.astype(np.float32) + offset_x,
+        ys.astype(np.float32) + offset_y,
+    ])
+    rect = cv2.minAreaRect(pts)
+    corners = cv2.boxPoints(rect)
+    cw_f = float(canvas_w)
+    ch_f = float(canvas_h)
+    result = []
+    for px, py in corners:
+        result.extend([
+            _clamp(float(px) / cw_f, 0.0, 1.0),
+            _clamp(float(py) / ch_f, 0.0, 1.0),
+        ])
+    return result
+
+
+def _mask_outline_from_placed_chip(aug_rgba, offset_x, offset_y, max_points=128):
+    """
+    Derive a mask_outline polygon (in canvas coordinates) from the augmented
+    chip's alpha channel.  Returns a list of [x, y] floats, or None.
+    """
+    if aug_rgba is None or aug_rgba.ndim < 3 or aug_rgba.shape[2] < 4:
+        return None
+    alpha = aug_rgba[:, :, 3]
+    mask_u8 = (alpha > 10).astype(np.uint8)
+    if int(mask_u8.sum()) < 20:
+        return None
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < 8:
+        return None
+    perimeter = cv2.arcLength(contour, True)
+    eps = max(1.0, 0.003 * float(perimeter))
+    approx = cv2.approxPolyDP(contour, eps, True)
+    pts = approx.reshape(-1, 2).astype(np.float32)
+    if len(pts) > max_points:
+        step = max(1, len(pts) // max_points)
+        pts = pts[::step]
+    return [[float(p[0] + offset_x), float(p[1] + offset_y)] for p in pts]
+
+
+def _generate_synthetic_obb_images(
+    session_dir,
+    out_dir,
+    positives,
+    orientation_schema="invariant",
+    head_id=None,
+    tail_id=None,
+    n_per_segment=15,
+    max_objects=4,
+    max_images=None,
+    seed=0,
+    split="train",
+    manifest=None,
+):
+    """
+    Generate synthetic OBB train images from finalized segment crops.
+    Outputs 8-point OBB polygon labels for YOLOv8-OBB format.
+    Uses full 360° rotation and schema-aware class_id mapping.
+    """
+    needs_anchor = orientation_schema in ("directional", "axial")
+    anchor_index = _build_anchor_index(positives or [], head_id, tail_id) if needs_anchor else {}
+    segments, seg_stats = _collect_finalized_segments(
+        session_dir, anchor_index=anchor_index if needs_anchor else None
+    )
+    if not segments:
+        return {"num_generated": 0, "num_instances_generated": 0, **seg_stats}
+
+    img_dir = os.path.join(out_dir, "images", split)
+    lbl_dir = os.path.join(out_dir, "labels", split)
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(lbl_dir, exist_ok=True)
+
+    rng = random.Random(seed)
+    n_generated = 0
+    n_instances_generated = 0
+    total_iters = max(1, int(n_per_segment)) * len(segments)
+
+    for i in range(total_iters):
+        if max_images is not None and n_generated >= int(max_images):
+            break
+
+        canvas_size = rng.choice([768, 896, 1024])
+        bg = _random_canvas_background(canvas_size, canvas_size, rng)
+        labels = []
+        placed = []
+        object_manifest = []
+
+        if len(segments) > 1:
+            target_objects = rng.randint(2, max(2, int(max_objects)))
+        else:
+            target_objects = 1
+
+        seg_indices = list(range(len(segments)))
+        rng.shuffle(seg_indices)
+        chosen = seg_indices[: min(target_objects, len(seg_indices))]
+        while len(chosen) < target_objects:
+            chosen.append(rng.choice(seg_indices))
+
+        for seg_idx in chosen:
+            raw = segments[seg_idx]["rgba"]
+            head_tail_fg = segments[seg_idx].get("head_tail_fg")
+
+            if needs_anchor and head_tail_fg is None:
+                continue
+
+            chip, head_tail_chip = _prepare_segment_chip(
+                raw,
+                pad_ratio=rng.uniform(0.12, 0.28),
+                head_tail_fg=head_tail_fg,
+            )
+
+            base_class_id = _compute_base_class_id(head_tail_chip, orientation_schema)
+
+            aug, head_tail_aug, aug_info = _augment_segment_chip(
+                chip,
+                rng,
+                rot_range=(-180.0, 180.0),
+                head_tail_chip=head_tail_chip,
+            )
+
+            class_id = _apply_schema_class_transform(base_class_id, aug_info, orientation_schema)
+
+            ch, cw = bg.shape[:2]
+            ah, aw = aug.shape[:2]
+            max_frac = 0.45
+            if aw >= int(cw * max_frac) or ah >= int(ch * max_frac):
+                scale = min((cw * max_frac) / max(aw, 1), (ch * max_frac) / max(ah, 1))
+                nw = max(8, int(round(aw * scale)))
+                nh = max(8, int(round(ah * scale)))
+                aug = cv2.resize(aug, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+            placement = _place_chip(bg, aug, placed, rng, min_gap_px=8, max_attempts=100)
+            if placement is None:
+                continue
+
+            offset_x, offset_y = placement["offset"]
+            obb_pts = _compute_obb_from_placed_chip(aug, offset_x, offset_y, cw, ch)
+            if obb_pts is None:
+                continue
+
+            mask_outline_canvas = _mask_outline_from_placed_chip(
+                aug, offset_x, offset_y
+            )
+
+            labels.append(f"{class_id} " + " ".join(f"{v:.6f}" for v in obb_pts))
+            object_manifest.append({
+                "split": split,
+                "image": f"__synth_obb_{i:05d}.jpg",
+                "segment_id": segments[seg_idx]["id"],
+                "class_id": int(class_id),
+                "obb_pts": obb_pts,
+                **({"mask_outline": mask_outline_canvas} if mask_outline_canvas else {}),
+            })
+
+        min_required = 2 if len(segments) > 1 else 1
+        if len(labels) < min_required:
+            continue
+        if max_images is not None and n_generated >= int(max_images):
+            break
+
+        synth_name = f"__synth_obb_{i:05d}"
+        img_out = os.path.join(img_dir, f"{synth_name}.jpg")
+        lbl_out = os.path.join(lbl_dir, f"{synth_name}.txt")
+        safe_imwrite(img_out, bg)
+        with open(lbl_out, "w", encoding="utf-8") as f:
+            f.write("\n".join(labels) + "\n")
+        n_generated += 1
+        n_instances_generated += len(labels)
+        if isinstance(manifest, list):
+            manifest.extend(object_manifest)
+
+    return {
+        "num_generated": n_generated,
+        "num_instances_generated": n_instances_generated,
+        **seg_stats,
+    }
+
+
+def export_obb_dataset(
+    session_dir,
+    val_ratio=0.2,
+    seed=42,
+):
+    """
+    Export session annotations to YOLOv8-OBB format.
+
+    Boxes with obbCorners get the 4-corner format:
+      class_id x1 y1 x2 y2 x3 y3 x4 y4  (all normalized)
+    Boxes without obbCorners fall back to axis-aligned corners derived from AABB.
+
+    Writes to session_dir/obb_dataset/ with dataset.yaml.
+    Returns {"ok": True, "yaml_path": ..., "num_images": ..., "num_boxes": ...}
+    """
+    labels_dir = os.path.join(session_dir, "labels")
+    images_dir = os.path.join(session_dir, "images")
+
+    if not os.path.isdir(labels_dir):
+        return {"ok": False, "error": f"Labels directory not found: {labels_dir}"}
+    if not os.path.isdir(images_dir):
+        return {"ok": False, "error": f"Images directory not found: {images_dir}"}
+
+    head_id, tail_id = _load_head_tail_ids(session_dir)
+    finalized_set = _load_finalized_filenames(session_dir)
+
+    out_dir = os.path.join(session_dir, "obb_dataset")
+    for split in ("train", "val"):
+        os.makedirs(os.path.join(out_dir, "images", split), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, "labels", split), exist_ok=True)
+
+    # Gather all finalized samples
+    samples = []
+    for fname in sorted(os.listdir(labels_dir)):
+        if not fname.endswith(".json"):
+            continue
+        label_path = os.path.join(labels_dir, fname)
+        try:
+            with open(label_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        image_filename = data.get("imageFilename", "")
+        if not image_filename:
+            continue
+
+        is_finalized, boxes, _ = _get_finalized_boxes(data, image_filename, finalized_set)
+        if not is_finalized or not boxes:
+            continue
+
+        image_path = os.path.join(images_dir, image_filename)
+        if not os.path.exists(image_path):
+            base = os.path.splitext(image_filename)[0]
+            resolved = None
+            for ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"]:
+                candidate = os.path.join(images_dir, base + ext)
+                if os.path.exists(candidate):
+                    resolved = candidate
+                    image_filename = base + ext
+                    break
+            if not resolved:
+                continue
+            image_path = resolved
+
+        samples.append({"image_path": image_path, "image_filename": image_filename, "boxes": boxes})
+
+    if not samples:
+        return {"ok": False, "error": "No finalized samples with OBB annotations found"}
+
+    # Split train/val
+    rng = random.Random(seed)
+    indices = list(range(len(samples)))
+    rng.shuffle(indices)
+    n_val = max(1, int(len(indices) * val_ratio)) if len(indices) > 1 else 0
+    val_set = set(indices[:n_val])
+
+    num_boxes = 0
+    num_images = 0
+    orientation_class_enabled = head_id is not None and tail_id is not None
+
+    for i, sample in enumerate(samples):
+        split = "val" if i in val_set else "train"
+
+        img = safe_imread(sample["image_path"])
+        if img is None:
+            continue
+        img_h, img_w = img.shape[:2]
+        if img_w == 0 or img_h == 0:
+            continue
+
+        dest_img = os.path.join(out_dir, "images", split, sample["image_filename"])
+        if not os.path.exists(dest_img):
+            shutil.copy2(sample["image_path"], dest_img)
+
+        label_basename = os.path.splitext(sample["image_filename"])[0] + ".txt"
+        label_path = os.path.join(out_dir, "labels", split, label_basename)
+
+        lines = []
+        for box in sample["boxes"]:
+            # Determine class_id from orientation
+            class_id = 0
+            if orientation_class_enabled:
+                orientation = _compute_box_orientation(box, head_id, tail_id)
+                if orientation == "right":
+                    class_id = 1
+
+            obb_corners = box.get("obbCorners") or box.get("obb_corners")
+            if obb_corners and len(obb_corners) == 4:
+                # 4-corner OBB format (already in image pixel coords)
+                pts = []
+                for px, py in obb_corners:
+                    pts.extend([
+                        _clamp(float(px) / img_w, 0.0, 1.0),
+                        _clamp(float(py) / img_h, 0.0, 1.0),
+                    ])
+                lines.append(f"{class_id} " + " ".join(f"{v:.6f}" for v in pts))
+            else:
+                # Fallback: derive 4 axis-aligned corners from AABB
+                left = float(box.get("left", 0))
+                top = float(box.get("top", 0))
+                width = float(box.get("width", 0))
+                height = float(box.get("height", 0))
+                if width <= 0 or height <= 0:
+                    continue
+                # AABB corners: top-left, top-right, bottom-right, bottom-left
+                pts = [
+                    _clamp(left / img_w, 0.0, 1.0),           _clamp(top / img_h, 0.0, 1.0),
+                    _clamp((left + width) / img_w, 0.0, 1.0), _clamp(top / img_h, 0.0, 1.0),
+                    _clamp((left + width) / img_w, 0.0, 1.0), _clamp((top + height) / img_h, 0.0, 1.0),
+                    _clamp(left / img_w, 0.0, 1.0),           _clamp((top + height) / img_h, 0.0, 1.0),
+                ]
+                lines.append(f"{class_id} " + " ".join(f"{v:.6f}" for v in pts))
+
+            num_boxes += 1
+
+        with open(label_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n" if lines else "")
+
+        num_images += 1
+
+    # Write dataset.yaml
+    nc = 2 if orientation_class_enabled else 1
+    names = ["left", "right"] if orientation_class_enabled else ["specimen"]
+    yaml_path = os.path.join(out_dir, "dataset.yaml")
+    yaml_lines = [
+        f"path: {out_dir}",
+        "train: images/train",
+        "val: images/val",
+        f"nc: {nc}",
+        f"names: {names}",
+        "task: obb",
+    ]
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(yaml_lines) + "\n")
+
+    # --- Synthetic data augmentation ---
+    orientation_schema = _load_orientation_mode(session_dir)
+    SYNTHETIC_RATIO = 2
+    n_real_train = sum(1 for i in range(len(samples)) if i not in val_set)
+    max_synth = max(0, int(n_real_train * SYNTHETIC_RATIO))
+
+    synth_stats = {"num_generated": 0, "num_instances_generated": 0}
+    if max_synth > 0:
+        positives = [s for i, s in enumerate(samples) if i not in val_set]
+        synth_manifest = []
+        synth_stats = _generate_synthetic_obb_images(
+            session_dir=session_dir,
+            out_dir=out_dir,
+            positives=positives,
+            orientation_schema=orientation_schema,
+            head_id=head_id,
+            tail_id=tail_id,
+            n_per_segment=15,
+            max_objects=4,
+            max_images=max_synth,
+            seed=seed + 1,
+            split="train",
+            manifest=synth_manifest,
+        )
+        manifest_path = os.path.join(out_dir, "synth_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(synth_manifest, f, indent=2)
+
+    return {
+        "ok": True,
+        "yaml_path": yaml_path,
+        "num_images": num_images,
+        "num_boxes": num_boxes,
+        "synthetic": synth_stats,
+    }
 
 
 if __name__ == "__main__":

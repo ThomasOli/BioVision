@@ -10,9 +10,14 @@ import math
 import xml.etree.ElementTree as ET
 import cv2
 import numpy as np
-from detect_specimen import detect_specimen
-from image_utils import load_image, safe_imread, safe_imwrite
-import orientation_utils as ou
+import sys as _sys, os as _os
+_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _BACKEND_ROOT not in _sys.path:
+    _sys.path.insert(0, _BACKEND_ROOT)
+
+from detection.detect_specimen import detect_specimen
+from bv_utils.image_utils import load_image, safe_imread, safe_imwrite
+import bv_utils.orientation_utils as ou
 
 
 def _ascii_safe_base(name):
@@ -353,8 +358,72 @@ def standardize_crop(
     are mirrored within the 512x512 crop space. The flip remains local to each
     specimen crop.
 
+    When the box has obbCorners, the OBB geometry engine is used instead of the
+    PCA/AABB path: extract_obb_crop() deskews the specimen, apply_obb_geometry()
+    applies schema-specific canonical flips, and landmarks are remapped via the
+    same affine matrix M that was applied to the image pixels.
+
     Returns (cropped_image, remapped_landmarks, crop_metadata).
     """
+    # --- OBB fast-path (takes priority when obbCorners are present) ---
+    obb_corners = box.get("obbCorners") or box.get("obb_corners")
+    class_id = box.get("class_id", 0)
+    if obb_corners and len(obb_corners) == 4:
+        apply_leveling = ((orientation_policy or {}).get("obbLevelingMode", "on") == "on")
+        crop, crop_meta = ou.extract_obb_crop(
+            image, obb_corners, pad_ratio=0.15, apply_leveling=apply_leveling
+        )
+        crop, crop_meta, debug = ou.apply_obb_geometry(
+            crop, crop_meta, int(class_id), orientation_policy or {}
+        )
+
+        # Affine-correct landmark remap:
+        # Step 1 — Rotate landmark coords by M (the same warpAffine applied to pixels).
+        # Guard: empty landmarks (box drawn but no points placed) → skip dot-product.
+        M = np.array(crop_meta["affine_M"], dtype=np.float64)  # 2×3
+        lm_pts = np.array([[lm["x"], lm["y"]] for lm in landmarks], dtype=np.float64)
+        if apply_leveling and len(lm_pts):
+            ones = np.ones((len(lm_pts), 1), dtype=np.float64)
+            rotated_pts = (M @ np.hstack([lm_pts, ones]).T).T  # shape (N, 2)
+        else:
+            rotated_pts = lm_pts  # no rotation (leveling off) or empty landmark set
+
+        # Step 2 — Shift by crop_origin, scale to STANDARD_SIZE, mirror/rotate if flipped.
+        ox, oy = crop_meta["crop_origin"]
+        scale = crop_meta["scale"]
+        was_flipped = bool(crop_meta.get("canonical_flip_applied", False))
+        was_rotated_180 = bool(debug.get("rotated_180", False))
+        landmarks_512 = []
+        for i, lm in enumerate(landmarks):
+            x512 = (rotated_pts[i][0] - ox) * scale
+            y512 = (rotated_pts[i][1] - oy) * scale
+            if was_flipped:
+                x512 = (STANDARD_SIZE - 1) - x512  # horizontal mirror (directional/bilateral)
+            if was_rotated_180:
+                # cv2.ROTATE_180 → both axes mirrored (axial mode, large OBB angle)
+                x512 = (STANDARD_SIZE - 1) - x512
+                y512 = (STANDARD_SIZE - 1) - y512
+            x512 = float(np.clip(x512, 0, STANDARD_SIZE - 1))
+            y512 = float(np.clip(y512, 0, STANDARD_SIZE - 1))
+            landmarks_512.append({**lm, "x": x512, "y": y512})
+
+        meta = {
+            **crop_meta,
+            "original_box": {
+                "left": box.get("left", 0),
+                "top": box.get("top", 0),
+                "width": box.get("width", 0),
+                "height": box.get("height", 0),
+            },
+            "mirrored": bool(was_flipped) ^ bool(mirror),
+            "manual_mirror_requested": bool(mirror),
+            "canonical_flip_applied": was_flipped,
+            "canonicalization": debug,
+            "canonical_mask_source": "obb",
+        }
+        return crop, landmarks_512, meta
+
+    # --- Existing PCA/AABB path (boxes without obbCorners) ---
     bx, by = int(box["left"]), int(box["top"])
     bw, bh = int(box["width"]), int(box["height"])
     xyxy = [bx, by, bx + bw, by + bh]
@@ -771,6 +840,18 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                         "width": box_data.get("width", w),
                         "height": box_data.get("height", h)
                     }
+
+                # Pass through OBB geometry fields (scale corners if image was resized)
+                obb_corners_raw = box_data.get("obbCorners") or box_data.get("obb_corners")
+                if obb_corners_raw and len(obb_corners_raw) == 4:
+                    if scale != 1.0:
+                        box_coords["obbCorners"] = [[c[0] * scale, c[1] * scale] for c in obb_corners_raw]
+                    else:
+                        box_coords["obbCorners"] = obb_corners_raw
+                    if box_data.get("angle") is not None:
+                        box_coords["angle"] = box_data["angle"]
+                if box_data.get("class_id") is not None:
+                    box_coords["class_id"] = box_data["class_id"]
 
                 # Detect orientation for this individual specimen.
                 # The flip is deferred to standardize_crop (mirror=was_mirrored) so that

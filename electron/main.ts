@@ -300,6 +300,8 @@ type ModelCompatibilityResult = {
     error?: string;
   };
   error?: string;
+  obbDetectorReady?: boolean;
+  obbDetectorPath?: string;
 };
 
 const COMPAT_ORIENTATION_MODES = new Set<OrientationMode>([
@@ -774,6 +776,11 @@ async function evaluateModelCompatibility(args: {
       }
     }
 
+    // Check for session OBB detector
+    const effectiveRoot = getEffectiveRoot(args.speciesId);
+    const obbDetectorPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
+    const obbDetectorExists = fs.existsSync(obbDetectorPath);
+
     const blocking = issues.some((issue) => issue.severity === "error");
     return {
       ok: true,
@@ -784,6 +791,8 @@ async function evaluateModelCompatibility(args: {
       sessionPolicy: session.policy,
       modelProfile: profile,
       runtime,
+      obbDetectorReady: obbDetectorExists,
+      obbDetectorPath: obbDetectorExists ? obbDetectorPath : undefined,
     };
   } catch (error: any) {
     return {
@@ -1534,7 +1543,7 @@ async function resolveCnnVariantCapabilities(): Promise<{
   warning?: string;
 }> {
   try {
-    const out = await runPython([path.join(__dirname, "../backend/list_cnn_variants.py")]);
+    const out = await runPython([path.join(__dirname, "../backend/inference/list_cnn_variants.py")]);
     const parsed = JSON.parse(out || "{}");
     if (!parsed || !Array.isArray(parsed.variants)) {
       throw new Error("Invalid CNN variant response payload.");
@@ -1591,7 +1600,7 @@ ipcMain.handle(
       const useImportedXml = !!args?.useImportedXml;
 
       if (useImportedXml) {
-        const xmlValidator = path.join(__dirname, "../backend/validate_dlib_xml.py");
+        const xmlValidator = path.join(__dirname, "../backend/data/validate_dlib_xml.py");
         const trainXml = path.join(effectiveRoot, "xml", `train_${modelName}.xml`);
         if (!fs.existsSync(trainXml)) {
           return { ok: false, error: `train_${modelName}.xml not found.` };
@@ -1711,7 +1720,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
     emitTrainProgress(3, "preflight", "Validating training inputs...");
 
     if (options?.useImportedXml) {
-      const xmlValidator = path.join(__dirname, "../backend/validate_dlib_xml.py");
+      const xmlValidator = path.join(__dirname, "../backend/data/validate_dlib_xml.py");
       const trainXml = path.join(effectiveRoot, "xml", `train_${modelName}.xml`);
       if (!fs.existsSync(trainXml)) {
         throw new Error(`train_${modelName}.xml not found. Import a dlib train XML file first.`);
@@ -1734,7 +1743,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       // Prepare dataset with train/test split
       emitTrainProgress(12, "prepare_dataset", "Preparing dataset...");
       await runPythonWithProgress([
-        path.join(__dirname, "../backend/prepare_dataset.py"),
+        path.join(__dirname, "../backend/data/prepare_dataset.py"),
         effectiveRoot,
         modelName,
         testSplit.toString(),
@@ -1752,7 +1761,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
     let auditReport: Record<string, unknown> | null = null;
     emitTrainProgress(35, "evaluation", "Auditing dataset...");
     try {
-      const auditScript = path.join(__dirname, "../backend/audit_dataset.py");
+      const auditScript = path.join(__dirname, "../backend/data/audit_dataset.py");
       if (fs.existsSync(auditScript)) {
         const auditOut = await runPython([
           auditScript,
@@ -1824,7 +1833,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       const batchRaw = Number((options as any)?.customOptions?.batch ?? (options as any)?.customOptions?.batch_size);
       const skipParity = Boolean((options as any)?.customOptions?.skip_parity);
       const cnnArgs = [
-        path.join(__dirname, "../backend/train_cnn_model.py"),
+        path.join(__dirname, "../backend/training/train_cnn_model.py"),
         effectiveRoot,
         modelName,
         "--model-variant", cnnVariant,
@@ -1862,7 +1871,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       });
     } else {
       const trainArgs = [
-        path.join(__dirname, "../backend/train_shape_model.py"),
+        path.join(__dirname, "../backend/training/train_shape_model.py"),
         effectiveRoot,
         modelName,
       ];
@@ -2002,7 +2011,7 @@ ipcMain.handle("ml:import-dlib-xml", async (_event, args: { modelName: string; s
     const effectiveRoot = getEffectiveRoot(args.speciesId);
     ensureTrainingLayout(effectiveRoot);
     const xmlDir = path.join(effectiveRoot, "xml");
-    const xmlValidator = path.join(__dirname, "../backend/validate_dlib_xml.py");
+    const xmlValidator = path.join(__dirname, "../backend/data/validate_dlib_xml.py");
 
     const trainDest = path.join(xmlDir, `train_${modelName}.xml`);
     const trainValidation = JSON.parse(await runPython([xmlValidator, trainXml, trainDest]));
@@ -2064,7 +2073,7 @@ ipcMain.handle("ml:test-model", async (_event, args: string | { modelName: strin
     const effectiveRoot = getEffectiveRoot(speciesId);
 
     const out = await runPython([
-      path.join(__dirname, "../backend/shape_tester.py"),
+      path.join(__dirname, "../backend/inference/shape_tester.py"),
       effectiveRoot,
       modelName,
     ]);
@@ -2145,6 +2154,7 @@ interface PredictOptions {
 ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string, speciesId?: string, options?: PredictOptions) => {
   let tempFile: string | null = null;
   let tempBoxesFile: string | null = null;
+  let obbJsonFile: string | null = null;
   try {
     const modelRoot = getEffectiveRoot(speciesId);
 
@@ -2202,13 +2212,50 @@ ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string, spec
       );
     }
 
+    // OBB detect-first: if session_obb_detector.pt exists and no boxes were
+    // already provided by the caller, run the OBB detector on the image first
+    // and pass the best detection as --obb-json so predict.py uses the
+    // geometry engine instead of the PCA fallback.
+    const obbDetectorPath = compatibility.obbDetectorPath;
+    if (obbDetectorPath && superAnnotator && !options?.boxes?.length) {
+      try {
+        const obbResult = await superAnnotator.send({
+          cmd: "detect_obb",
+          image_path: effectivePath,
+          model_path: obbDetectorPath,
+          conf: 0.35,
+        });
+        const detections: Array<{ corners: [number,number][]; angle: number; class_id: number; confidence: number }> =
+          Array.isArray(obbResult) ? obbResult : (obbResult?.detections ?? []);
+        if (detections.length > 0) {
+          // Pick the highest-confidence detection
+          const best = detections.reduce((a, b) => (a.confidence >= b.confidence ? a : b));
+          obbJsonFile = path.join(
+            app.getPath("temp"),
+            `bv_obb_${Date.now()}_${Math.random().toString(16).slice(2)}.json`
+          );
+          fs.writeFileSync(obbJsonFile, JSON.stringify({
+            obbCorners: best.corners,
+            angle: best.angle,
+            class_id: best.class_id,
+            confidence: best.confidence,
+          }));
+        }
+      } catch (obbErr) {
+        console.warn("OBB detection failed (non-fatal), falling back to standard crop:", obbErr);
+      }
+    }
+
     const pythonArgs = [
-      path.join(__dirname, "../backend/predict.py"),
+      path.join(__dirname, "../backend/inference/predict.py"),
       modelRoot,
       tag,
       effectivePath,
       "--predictor-type", predictorType,
     ];
+    if (obbJsonFile) {
+      pythonArgs.push("--obb-json", obbJsonFile);
+    }
     if (options?.multiSpecimen) {
       pythonArgs.push("--multi");
     }
@@ -2239,6 +2286,9 @@ ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string, spec
     }
     if (tempBoxesFile) {
       try { fs.unlinkSync(tempBoxesFile); } catch {}
+    }
+    if (obbJsonFile) {
+      try { fs.unlinkSync(obbJsonFile); } catch {}
     }
   }
 });
@@ -2767,7 +2817,7 @@ ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?
     const yoloModel = getSessionYoloModel(speciesId);
 
     const pythonArgs = [
-      path.join(__dirname, "../backend/detect_specimen.py"),
+      path.join(__dirname, "../backend/detection/detect_specimen.py"),
       imagePath,
       "--multi",
     ];
@@ -2818,7 +2868,7 @@ ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?
 ipcMain.handle("ml:check-yolo", async () => {
   try {
     const out = await runPython([
-      path.join(__dirname, "../backend/detect_specimen.py"),
+      path.join(__dirname, "../backend/detection/detect_specimen.py"),
       "--check",
     ]);
 
@@ -3440,22 +3490,31 @@ ipcMain.handle(
 
       const basename = args.filename.replace(/\.\w+$/, ".json");
       const labelPath = path.join(labelsDir, basename);
-      const boxes = (args.boxes || []).map((box: any) => ({
-        id: box.id,
-        left: box.left,
-        top: box.top,
-        width: box.width,
-        height: box.height,
-        confidence: box.confidence,
-        source: box.source,
-        landmarks: (box.landmarks || []).map((lm: any) => ({
-          x: lm.x,
-          y: lm.y,
-          id: lm.id,
-          isSkipped: lm.isSkipped,
-          label: lm.label,
-        })),
-      }));
+      const boxes = (args.boxes || []).map((box: any) => {
+        const b: any = {
+          id: box.id,
+          left: box.left,
+          top: box.top,
+          width: box.width,
+          height: box.height,
+          confidence: box.confidence,
+          source: box.source,
+          landmarks: (box.landmarks || []).map((lm: any) => ({
+            x: lm.x,
+            y: lm.y,
+            id: lm.id,
+            isSkipped: lm.isSkipped,
+            label: lm.label,
+          })),
+        };
+        // Preserve OBB geometry fields for training pipeline
+        if (Array.isArray(box.obbCorners) && box.obbCorners.length === 4) {
+          b.obbCorners = box.obbCorners;
+        }
+        if (box.angle != null) b.angle = box.angle;
+        if (box.class_id != null) b.class_id = box.class_id;
+        return b;
+      });
 
       let rejectedDetections: any[] = [];
       let finalizedDetection: any = undefined;
@@ -4522,7 +4581,7 @@ class SuperAnnotatorProcess {
     if (this.process) return; // already running
 
     const pyPath = getPythonPath();
-    const scriptPath = path.join(__dirname, "../backend/super_annotator.py");
+    const scriptPath = path.join(__dirname, "../backend/annotation/super_annotator.py");
 
     this.process = spawn(pyPath, [scriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -4537,6 +4596,18 @@ class SuperAnnotatorProcess {
       const text = d.toString();
       this.pushStderr(text);
       console.log("[SuperAnnotator]", text.trim());
+    });
+
+    // Absorb EPIPE and other stdin write errors so they don't surface as an
+    // uncaught exception and crash the main process.  The 'close' handler
+    // already rejects all pending requests when the subprocess dies, so
+    // there is nothing else to do here.
+    this.process.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
+        console.warn("[SuperAnnotator] stdin write error (process likely died):", err.code);
+      } else {
+        console.error("[SuperAnnotator] stdin error:", err);
+      }
     });
 
     this.rl = createInterface({ input: this.process.stdout! });
@@ -4648,7 +4719,10 @@ class SuperAnnotatorProcess {
       });
 
       try {
-        this.process!.stdin!.write(JSON.stringify(payload) + "\n");
+        if (!this.process?.stdin || this.process.stdin.destroyed) {
+          throw new Error("stdin is closed or destroyed");
+        }
+        this.process.stdin.write(JSON.stringify(payload) + "\n");
       } catch (err: any) {
         clearTimeout(timeout);
         this.pending.delete(id);
@@ -4664,7 +4738,9 @@ class SuperAnnotatorProcess {
     }
     if (!this.process) return;
     try {
-      this.process.stdin!.write(JSON.stringify({ cmd: "shutdown" }) + "\n");
+      if (!this.process.stdin?.destroyed) {
+        this.process.stdin!.write(JSON.stringify({ cmd: "shutdown" }) + "\n");
+      }
     } catch (_) {
       // process may already be dead
     }
@@ -4827,6 +4903,87 @@ ipcMain.handle("ml:init-super-annotator", async () => {
   }
 });
 
+ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small" }) => {
+  try {
+    if (!superAnnotator.isRunning) {
+      await superAnnotator.send({ cmd: "init" });
+    }
+    const sessionDir = path.join(projectRoot, "sessions", speciesId);
+    if (!fs.existsSync(sessionDir)) {
+      return { ok: false, error: `Session directory not found: ${sessionDir}` };
+    }
+
+    // Get hardware tier; user-provided modelTier takes precedence
+    const caps = await superAnnotator.send({ cmd: "check" });
+    const modelTier = options?.modelTier ?? caps?.obb_model_tier ?? "nano";
+
+    const result = await superAnnotator.send({
+      cmd: "train_yolo_obb",
+      session_dir: sessionDir,
+      epochs: options?.epochs ?? 50,
+      model_tier: modelTier,
+    });
+
+    if (result?.status === "error") {
+      return { ok: false, error: result.error ?? "OBB detector training failed" };
+    }
+
+    // Mark session as obb_detector_ready
+    const sessionJsonPath = path.join(sessionDir, "session.json");
+    if (fs.existsSync(sessionJsonPath)) {
+      try {
+        const session = safeReadJson(sessionJsonPath) ?? {};
+        (session as any).obbDetectorReady = true;
+        fs.writeFileSync(sessionJsonPath, JSON.stringify(session, null, 2), "utf-8");
+      } catch (_e) {
+        // non-fatal
+      }
+    }
+
+    return { ok: true, modelPath: result?.model_path, map50: result?.map50 ?? null };
+  } catch (e: any) {
+    console.error("OBB detector training failed:", e);
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle("ml:tag-class-ids", async (_event, speciesId: string, boxes: any[]) => {
+  try {
+    if (!superAnnotator.isRunning) {
+      await superAnnotator.send({ cmd: "init" });
+    }
+    const sessionDir = path.join(projectRoot, "sessions", speciesId);
+    if (!fs.existsSync(sessionDir)) {
+      return { ok: false, error: `Session not found: ${sessionDir}` };
+    }
+
+    // Load orientation policy from session.json
+    let orientationPolicy: any = null;
+    const sessionJsonPath = path.join(sessionDir, "session.json");
+    if (fs.existsSync(sessionJsonPath)) {
+      try {
+        const session = safeReadJson(sessionJsonPath) ?? {};
+        orientationPolicy = (session as any).orientationPolicy ?? null;
+      } catch (_) { /* non-fatal */ }
+    }
+
+    const result = await superAnnotator.send({
+      cmd: "tag_class_ids",
+      session_dir: sessionDir,
+      boxes: boxes || [],
+      orientation_policy: orientationPolicy,
+    });
+
+    if (result?.status === "error") {
+      return { ok: false, error: result.error ?? "tag_class_ids failed" };
+    }
+    return { ok: true, taggedBoxes: result?.tagged_boxes ?? [] };
+  } catch (e: any) {
+    console.error("ml:tag-class-ids failed:", e);
+    return { ok: false, error: e.message };
+  }
+});
+
 ipcMain.handle(
   "ml:super-annotate",
   async (
@@ -4877,6 +5034,67 @@ ipcMain.handle(
         ? getSessionYoloAliasPath(args.speciesId, args.className)
         : path.join(effectiveRoot, "models", `yolo_${safeClassName(args.className)}.pt`);
       const finetunedModel = fs.existsSync(ftModelPath) ? ftModelPath : undefined;
+
+      // If a session OBB detector exists, use it for annotation auto-detect
+      // instead of YOLO-World, since it is trained specifically for this session's data.
+      const sessionObbPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
+      if (fs.existsSync(sessionObbPath) && superAnnotator) {
+        try {
+          const obbResult = await superAnnotator.send({
+            cmd: "detect_obb",
+            image_path: args.imagePath,
+            model_path: sessionObbPath,
+            conf: args.options?.confThreshold ?? 0.35,
+          });
+          const rawDetections: any[] = Array.isArray(obbResult?.detections) ? obbResult.detections : [];
+          const maxObj = args.options?.maxObjects ?? 20;
+          const limited = rawDetections.slice(0, maxObj);
+
+          if (limited.length > 0) {
+            const objects: any[] = [];
+            for (const det of limited) {
+              const corners: [number, number][] = det.corners ?? [];
+              const xs = corners.map((p) => p[0]);
+              const ys = corners.map((p) => p[1]);
+              const left   = Math.round(Math.min(...xs));
+              const top    = Math.round(Math.min(...ys));
+              const right  = Math.round(Math.max(...xs));
+              const bottom = Math.round(Math.max(...ys));
+              const obj: any = {
+                box: { left, top, right, bottom, width: right - left, height: bottom - top },
+                obb: {
+                  corners: corners,
+                  angle: det.angle ?? 0,
+                  center: [(left + right) / 2, (top + bottom) / 2],
+                  size: [right - left, bottom - top],
+                },
+                confidence: det.confidence ?? 0,
+                class_name: args.className ?? "specimen",
+                detection_method: "yolo_obb",
+                mask_outline: [],
+                landmarks: [],
+              };
+              // Optionally refine with SAM2 segmentation
+              if (args.options?.samEnabled !== false) {
+                try {
+                  const seg = await superAnnotator.send({
+                    cmd: "resegment_box",
+                    image_path: args.imagePath,
+                    box_xyxy: [left, top, right, bottom],
+                  });
+                  if (seg?.ok && Array.isArray(seg.mask_outline) && seg.mask_outline.length > 0) {
+                    obj.mask_outline = seg.mask_outline;
+                  }
+                } catch (_) { /* non-fatal */ }
+              }
+              objects.push(obj);
+            }
+            return { ok: true, objects, detection_method: "yolo_obb" };
+          }
+        } catch (_) {
+          // Fall through to normal annotate pipeline on any error
+        }
+      }
 
       const samEnabled = args.options?.samEnabled ?? true;
       const result = await superAnnotator.send({

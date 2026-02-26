@@ -11,6 +11,7 @@ Commands (JSON per line on stdin):
   {"cmd": "check"}
   {"cmd": "annotate", "image_path": "...", "class_name": "Fish", ...}
   {"cmd": "refine_sam", "image_path": "...", "object_index": 0, "click_point": [x,y], "click_label": 1}
+  {"cmd": "resegment_box", "image_path": "...", "box_xyxy": [x1,y1,x2,y2]}
   {"cmd": "shutdown"}
 
 Responses (JSON per line on stdout):
@@ -36,9 +37,12 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="[SuperAnnotator] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Add parent directory to path for image_utils
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from image_utils import load_image
+import sys as _sys, os as _os
+_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _BACKEND_ROOT not in _sys.path:
+    _sys.path.insert(0, _BACKEND_ROOT)
+
+from bv_utils.image_utils import load_image
 
 STANDARD_SIZE = 512
 
@@ -97,6 +101,25 @@ class SuperAnnotator:
                 "pip install git+https://github.com/openai/CLIP.git"
             )
         return msg
+
+    def _set_yolo_classes(self, classes):
+        """Call set_classes and fix CUDA/CPU device mismatch for text features.
+
+        After the first predict(device='cuda'), PyTorch's .to('cuda') moves all
+        nn.Module parameters — including CLIP's token_embedding — to CUDA.
+        But the CLIP wrapper's self.device attribute is a plain Python string
+        that never gets updated, so its tokenize() still sends tokens to CPU
+        while token_embedding is now on CUDA.  We sync clip_model.device to
+        match the actual parameter device before every set_classes() call.
+        """
+        try:
+            clip_model = getattr(self.yolo_model.model, "clip_model", None)
+            if clip_model is not None:
+                actual_device = next(clip_model.model.parameters()).device
+                clip_model.device = actual_device
+        except Exception:
+            pass
+        self.yolo_model.set_classes(classes)
 
     @staticmethod
     def _build_class_prompts(class_name):
@@ -253,11 +276,22 @@ class SuperAnnotator:
         else:
             mode = "classic_fallback"
 
+        obb_capable = gpu or free_ram_gb > 1.5
+        obb_model_tier = "none"
+        if gpu and free_ram_gb > 4:
+            obb_model_tier = "medium"   # yolov8m-obb.pt
+        elif free_ram_gb > 1.5:
+            obb_model_tier = "nano"     # yolov8n-obb.pt, freeze backbone
+        elif gpu:
+            obb_model_tier = "small"    # yolov8s-obb.pt
+
         self.gpu = gpu
         return {
             "mode": mode,
             "gpu": gpu,
             "free_ram_gb": free_ram_gb,
+            "obb_capable": obb_capable,
+            "obb_model_tier": obb_model_tier,
         }
 
     # ------------------------------------------------------------------
@@ -281,7 +315,7 @@ class SuperAnnotator:
                 self.yolo_model = YOLOWorld("yolov8s-worldv2.pt")
                 # Smoke-test open-vocabulary text encoder so missing CLIP is caught at init,
                 # not only during first detection call.
-                self.yolo_model.set_classes(["object"])
+                self._set_yolo_classes(["object"])
                 yolo_loaded = True
                 logger.info("YOLO-World loaded successfully")
             except Exception as e:
@@ -339,6 +373,8 @@ class SuperAnnotator:
             "sam2_failed": self.sam2_init_attempted and self.sam2_model is None and self.sam2_init_error is not None,
             "yolo_error": self.yolo_init_error,
             "sam2_error": self.sam2_init_error,
+            "obb_capable": caps["obb_capable"],
+            "obb_model_tier": caps["obb_model_tier"],
         }
 
     # ------------------------------------------------------------------
@@ -360,7 +396,7 @@ class SuperAnnotator:
     def detect_yolo(self, image, class_name, conf_threshold=0.5, nms_iou=0.6, top_k=10, imgsz=1280):
         """YOLO-World open-vocabulary detection with NMS and top-k filtering."""
         prompts = self._build_class_prompts(class_name)
-        self.yolo_model.set_classes(prompts)
+        self._set_yolo_classes(prompts)
         results = self.yolo_model.predict(
             image,
             conf=conf_threshold,
@@ -491,7 +527,7 @@ class SuperAnnotator:
 
     def detect_classic(self, image, min_area_ratio=0.02):
         """OpenCV Otsu + contour detection fallback."""
-        from detect_specimen import detect_multiple_specimens
+        from detection.detect_specimen import detect_multiple_specimens
         h, w = image.shape[:2]
 
         # Save to temp file for detect_multiple_specimens (expects path)
@@ -567,6 +603,30 @@ class SuperAnnotator:
         biggest = max(contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(biggest)
         return [x, y, x + w, y + h]
+
+    def extract_obb_from_mask(self, mask):
+        """
+        Compute an oriented bounding box (OBB) from a binary mask using cv2.minAreaRect.
+        Returns a dict with angle, corners (4×2), center, and size — or None if mask is empty.
+        mask: uint8 binary array (0/1 or 0/255).
+        """
+        if mask is None:
+            return None
+        mask_u8 = (np.asarray(mask) > 0).astype(np.uint8)
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < 16:
+            return None
+        rect = cv2.minAreaRect(largest)   # ((cx,cy), (w,h), angle)
+        corners = cv2.boxPoints(rect)     # 4×2 float32
+        return {
+            "angle": float(rect[2]),
+            "corners": corners.tolist(),  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            "center": [float(rect[0][0]), float(rect[0][1])],
+            "size": [float(rect[1][0]), float(rect[1][1])],
+        }
 
     # ------------------------------------------------------------------
     # Stage B: Normalization (The "Standardizer")
@@ -727,7 +787,7 @@ class SuperAnnotator:
     def train_yolo(self, session_dir, class_name, epochs=25):
         """Fine-tune session YOLO with versioning + validation-based promotion."""
         send_progress("Exporting dataset...", 5, "training")
-        from export_yolo_dataset import export_dataset
+        from data.export_yolo_dataset import export_dataset
         export_details = export_dataset(session_dir, class_name, return_details=True)
         dataset_yaml = export_details["yaml_path"]
 
@@ -1008,6 +1068,8 @@ class SuperAnnotator:
             # Mask outline
             outline = self.mask_to_outline(mask)
 
+            obb_info = self.extract_obb_from_mask(mask)
+
             obj = {
                 "box": {
                     "left": int(x1),
@@ -1023,6 +1085,7 @@ class SuperAnnotator:
                 "class_name": box_data["class_name"],
                 "instance_metadata": metadata,
                 "detection_method": detection_method,
+                "obb": obb_info,  # OBB from SAM2 mask; None when no mask
             }
             objects.append(obj)
 
@@ -1036,6 +1099,216 @@ class SuperAnnotator:
             "detection_method": detection_method,
             "num_detections": len(objects),
         }
+
+    # ------------------------------------------------------------------
+    # OBB dataset export
+    # ------------------------------------------------------------------
+    def export_obb_dataset(self, session_dir):
+        """
+        Export OBB-format YOLO dataset from session annotations.
+        Boxes with obbCorners get 4-corner format; boxes without fall back to AABB.
+        Writes to session_dir/obb_dataset/ with dataset.yaml.
+        """
+        from data.export_yolo_dataset import export_obb_dataset as _export_obb
+        result = _export_obb(session_dir)
+        return result
+
+    # ------------------------------------------------------------------
+    # OBB detector training
+    # ------------------------------------------------------------------
+    def train_yolo_obb(self, session_dir, epochs=50, model_tier="nano"):
+        """
+        Train a YOLOv8-OBB detector on the session's OBB dataset.
+        Unloads YOLO-World and SAM2 first to free memory.
+        """
+        import gc
+
+        # Unload large models before training to reclaim memory
+        if self.yolo_model is not None:
+            self.yolo_model = None
+            logger.info("Unloaded YOLO-World before OBB training")
+        if self.sam2_model is not None:
+            self.sam2_model = None
+            logger.info("Unloaded SAM2 before OBB training")
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+        # Export OBB dataset first
+        send_progress("Exporting OBB dataset...", 5, "training")
+        export_result = self.export_obb_dataset(session_dir)
+        if not export_result.get("ok"):
+            return {"status": "error", "error": export_result.get("error", "OBB dataset export failed")}
+
+        dataset_yaml = export_result["yaml_path"]
+        models_dir = os.path.join(session_dir, "models")
+        os.makedirs(models_dir, exist_ok=True)
+
+        base_map = {
+            "nano": "yolov8n-obb.pt",
+            "small": "yolov8s-obb.pt",
+            "medium": "yolov8m-obb.pt",
+        }
+        base_model = base_map.get(model_tier, "yolov8n-obb.pt")
+        freeze_layers = 14 if model_tier == "nano" else 0
+
+        send_progress(f"Starting YOLOv8-OBB training ({model_tier})...", 10, "training")
+        from ultralytics import YOLO
+        model = YOLO(base_model)
+
+        def on_train_epoch_end(trainer):
+            epoch = trainer.epoch + 1
+            total = trainer.epochs
+            pct = 10 + int(80 * (epoch / total))
+            send_progress(f"OBB training epoch {epoch}/{total}...", pct, "training")
+
+        model.add_callback("on_train_epoch_end", on_train_epoch_end)
+
+        output_dir = os.path.join(session_dir, "models", "obb_training")
+        model.train(
+            data=dataset_yaml,
+            epochs=epochs,
+            imgsz=640,
+            batch=-1,
+            freeze=freeze_layers,
+            project=output_dir,
+            name="session_obb",
+            exist_ok=True,
+            verbose=False,
+            task="obb",
+        )
+
+        best_pt = os.path.join(output_dir, "session_obb", "weights", "best.pt")
+        if not os.path.exists(best_pt):
+            best_pt = os.path.join(output_dir, "session_obb", "weights", "last.pt")
+        if not os.path.exists(best_pt):
+            return {"status": "error", "error": "OBB training finished but no best.pt found"}
+
+        dest = os.path.join(models_dir, "session_obb_detector.pt")
+        shutil.copy2(best_pt, dest)
+
+        send_progress("OBB detector training complete", 100, "done")
+        return {"status": "result", "ok": True, "model_path": dest}
+
+    # ------------------------------------------------------------------
+    # OBB inference
+    # ------------------------------------------------------------------
+    def detect_obb(self, image_path, model_path, conf=0.4):
+        """
+        Run the trained session OBB detector on an image.
+        Returns list of detections: [{corners, angle, class_id, confidence}]
+        """
+        from ultralytics import YOLO
+        model = YOLO(model_path)
+        results = model.predict(image_path, conf=conf, imgsz=640, task="obb", verbose=False)
+        detections = []
+        for r in results:
+            if r.obb is None:
+                continue
+            for i in range(len(r.obb)):
+                try:
+                    corners = r.obb.xyxyxyxy[i].cpu().numpy().tolist()
+                    class_id = int(r.obb.cls[i])
+                    confidence = float(r.obb.conf[i])
+                    # angle stored in obb.data col 4
+                    angle = float(r.obb.data[i][4]) if r.obb.data.shape[1] > 4 else 0.0
+                    detections.append({
+                        "corners": corners,
+                        "angle": angle,
+                        "class_id": class_id,
+                        "confidence": confidence,
+                    })
+                except Exception as e:
+                    logger.warning(f"OBB detection parse error at index {i}: {e}")
+        return detections
+
+    # ------------------------------------------------------------------
+    # OBB class_id tagging from placed landmarks
+    # ------------------------------------------------------------------
+    def tag_class_ids(self, session_dir, boxes, orientation_policy=None):
+        """
+        Compute class_id for each box from placed head/tail landmark coordinates.
+
+        class_id encoding:
+          directional: 0=left-facing (canonical), 1=right-facing
+          axial:        0=up-facing (canonical), 1=down-facing (triggers 180° spin)
+          bilateral/invariant: always 0 (orientation handled differently)
+
+        Returns list of {"id": ..., "class_id": 0|1}.
+        """
+        from data.export_yolo_dataset import _load_head_tail_ids, _compute_box_orientation
+
+        mode = str((orientation_policy or {}).get("mode", "invariant")).strip().lower()
+
+        if mode not in ("directional", "axial"):
+            return [{"id": b.get("id"), "class_id": 0} for b in boxes]
+
+        head_id, tail_id = _load_head_tail_ids(session_dir)
+        if head_id is None or tail_id is None:
+            return [{"id": b.get("id"), "class_id": 0} for b in boxes]
+
+        result = []
+        for b in boxes:
+            if mode == "directional":
+                orientation = _compute_box_orientation(b, head_id, tail_id)
+                class_id = 1 if orientation == "right" else 0
+            else:
+                # Axial: determine up/down from head vs tail Y coordinate
+                landmarks = [
+                    lm for lm in b.get("landmarks", [])
+                    if not lm.get("isSkipped")
+                    and lm.get("x", -1) >= 0
+                    and lm.get("y", -1) >= 0
+                ]
+                head_lm = next(
+                    (lm for lm in landmarks if int(lm.get("id", -1)) == head_id), None
+                )
+                tail_lm = next(
+                    (lm for lm in landmarks if int(lm.get("id", -1)) == tail_id), None
+                )
+                if head_lm and tail_lm:
+                    # head Y > tail Y means head is below tail → down-facing = class_id=1
+                    class_id = 1 if float(head_lm["y"]) > float(tail_lm["y"]) else 0
+                else:
+                    class_id = 0
+            result.append({"id": b.get("id"), "class_id": class_id})
+        return result
+
+    # ------------------------------------------------------------------
+    # SAM2 direct box segmentation (no cached state required)
+    # ------------------------------------------------------------------
+    def resegment_box(self, image_path, box_xyxy):
+        """Run SAM2 on a single bounding box, independent of any annotation cache."""
+        if self.sam2_model is None:
+            return {"status": "error", "error": "SAM2 not loaded"}
+
+        image = self._load_image(image_path)
+        try:
+            results = self.sam2_model.predict(image, bboxes=[box_xyxy], verbose=False)
+            masks_data = results[0].masks
+            if masks_data is None or len(masks_data.data) == 0:
+                return {"status": "error", "error": "SAM2 returned no mask for this box"}
+            mask = masks_data.data[0].cpu().numpy().astype(np.uint8)
+            outline = self.mask_to_outline(mask)
+            if not outline:
+                return {"status": "error", "error": "SAM2 mask produced an empty outline"}
+            # SAM2 stores per-mask IoU quality in boxes.conf when prompting with bboxes
+            try:
+                score = float(results[0].boxes.conf[0])
+            except Exception:
+                score = 1.0
+            return {
+                "status": "result",
+                "ok": True,
+                "mask_outline": outline,
+                "score": score,
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     # ------------------------------------------------------------------
     # SAM2 re-prompt (interactive refinement)
@@ -1135,6 +1408,41 @@ def main():
                     click_label=cmd.get("click_label", 1),
                 )
                 send_response(result)
+
+            elif command == "resegment_box":
+                result = annotator.resegment_box(
+                    image_path=cmd["image_path"],
+                    box_xyxy=cmd["box_xyxy"],
+                )
+                send_response(result)
+
+            elif command == "export_obb_dataset":
+                result = annotator.export_obb_dataset(cmd["session_dir"])
+                send_response({"status": "result", **result})
+
+            elif command == "train_yolo_obb":
+                result = annotator.train_yolo_obb(
+                    session_dir=cmd["session_dir"],
+                    epochs=cmd.get("epochs", 50),
+                    model_tier=cmd.get("model_tier", "nano"),
+                )
+                send_response(result)
+
+            elif command == "detect_obb":
+                detections = annotator.detect_obb(
+                    image_path=cmd["image_path"],
+                    model_path=cmd["model_path"],
+                    conf=cmd.get("conf", 0.4),
+                )
+                send_response({"status": "result", "detections": detections})
+
+            elif command == "tag_class_ids":
+                tagged = annotator.tag_class_ids(
+                    session_dir=cmd["session_dir"],
+                    boxes=cmd.get("boxes", []),
+                    orientation_policy=cmd.get("orientation_policy"),
+                )
+                send_response({"status": "result", "tagged_boxes": tagged})
 
             elif command == "shutdown":
                 send_response({"status": "ok", "message": "Shutting down"})

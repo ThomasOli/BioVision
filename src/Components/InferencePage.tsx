@@ -246,6 +246,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     stage: string;
     message: string;
   } | null>(null);
+  const [obbDetectorReady, setObbDetectorReady] = useState<boolean | null>(null);
 
   const markImageEdited = useCallback((index: number) => {
     setEditedImageIndices((prev) => {
@@ -1371,6 +1372,25 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     };
   }, [activeSpeciesId, getSelectedModel, selectedModelKey]);
 
+  // Fetch OBB detector readiness whenever species or selected model changes
+  useEffect(() => {
+    if (!activeSpeciesId || !selectedModelKey) {
+      setObbDetectorReady(null);
+      return;
+    }
+    const selectedModel = models.find((m) => modelToKey(m) === selectedModelKey);
+    if (!selectedModel) {
+      setObbDetectorReady(null);
+      return;
+    }
+    window.api
+      .checkModelCompatibility({ speciesId: activeSpeciesId, modelName: selectedModel.name })
+      .then((result) => {
+        setObbDetectorReady(result?.obbDetectorReady ?? false);
+      })
+      .catch(() => setObbDetectorReady(null));
+  }, [activeSpeciesId, selectedModelKey, models, modelToKey]);
+
   const handleSelectImages = async () => {
     if (!activeSpeciesId) {
       toast.error("Select an active session first. Inference is session-scoped.");
@@ -2374,6 +2394,19 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             </option>
                           ))}
                         </select>
+                        {/* OBB detector readiness indicator */}
+                        {obbDetectorReady === false && (
+                          <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 mt-1">
+                            <p className="text-[11px] font-semibold text-amber-700 dark:text-amber-400">
+                              No OBB detector trained — orientation accuracy may be reduced. Train an OBB detector in the Training dialog.
+                            </p>
+                          </div>
+                        )}
+                        {obbDetectorReady === true && (
+                          <p className="text-[11px] text-green-600 dark:text-green-400 mt-1">
+                            ✓ OBB detector active — orientation from detector geometry.
+                          </p>
+                        )}
                       </div>
                     )}
                   </CardContent>

@@ -183,6 +183,10 @@ contextBridge.exposeInMainWorld("api", {
       datasetSize,
       autoTune,
     }),
+  trainObbDetector: (speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small" }) =>
+    ipcRenderer.invoke("ml:train-obb-detector", speciesId, options),
+  tagClassIds: (speciesId: string, boxes: any[]) =>
+    ipcRenderer.invoke("ml:tag-class-ids", speciesId, boxes),
   getYoloTrainPlan: (
     speciesId: string,
     className: string,

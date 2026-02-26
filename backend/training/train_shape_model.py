@@ -8,10 +8,24 @@ import time
 import xml.etree.ElementTree as ET
 import cv2
 import dlib
-import debug_io as dio
-import orientation_utils as ou
+import sys as _sys, os as _os
+_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _BACKEND_ROOT not in _sys.path:
+    _sys.path.insert(0, _BACKEND_ROOT)
+
+import bv_utils.debug_io as dio
+import bv_utils.orientation_utils as ou
 
 STANDARD_SIZE = 512
+import numpy as np
+
+
+def _apply_photo_jitter(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Apply random brightness/contrast shift. Used for offline dlib augmentation."""
+    assert img.ndim == 3 and img.shape[2] == 3, "Expected 3-channel BGR image"
+    alpha = 1.0 + rng.uniform(-0.15, 0.15)   # contrast multiplier
+    beta  = rng.uniform(-20.0, 20.0)          # brightness offset (pixels)
+    return np.clip(img.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
 
 
 def _resolve_orientation_mode(project_root, tag):
@@ -115,6 +129,7 @@ def augment_training_data(
 
     cx, cy = STANDARD_SIZE / 2.0, STANDARD_SIZE / 2.0
     augmented_entries = []  # list of (file_path, parts_list) where parts_list = [(name,x,y),...]
+    rng = np.random.default_rng()
 
     for img_el in images_el.findall("image"):
         img_file = img_el.get("file")
@@ -140,6 +155,7 @@ def augment_training_data(
             M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
             rotated = cv2.warpAffine(img, M, (STANDARD_SIZE, STANDARD_SIZE),
                                      borderMode=cv2.BORDER_REPLICATE)
+            rotated = _apply_photo_jitter(rotated, rng)
             rot_parts = [
                 (name, *_rotate_point(x, y, cx, cy, angle))
                 for name, x, y in parts
@@ -152,6 +168,7 @@ def augment_training_data(
             if add_flip:
                 # Also include mirrored rotated variants to cover diagonal-right poses.
                 rot_flip = cv2.flip(rotated, 1)
+                rot_flip = _apply_photo_jitter(rot_flip, rng)
                 rot_flip_parts = [
                     (name_swap_map.get(name, name), float(STANDARD_SIZE - 1 - rx), float(ry))
                     for name, rx, ry in rot_parts
@@ -162,6 +179,7 @@ def augment_training_data(
 
         if add_flip:
             flipped = cv2.flip(img, 1)
+            flipped = _apply_photo_jitter(flipped, rng)
             flip_parts = [
                 (name_swap_map.get(name, name), float(STANDARD_SIZE - 1 - x), float(y))
                 for name, x, y in parts
@@ -355,6 +373,18 @@ def get_training_options(num_images, num_landmarks, orientation_mode="invariant"
         for key, value in profile.items():
             setattr(options, key, value)
 
+    # Axial schemas: OBB leveling already aligns the specimen vertically; tighten
+    # translation jitter to prevent the model from learning a spatially wandering target.
+    if str(orientation_mode).strip().lower() == "axial":
+        axial_jitter = {
+            "tiny":   0.04,
+            "small":  0.04,
+            "medium": 0.03,
+            "large":  0.03,
+            "xlarge": 0.02,
+        }
+        options.oversampling_translation_jitter = axial_jitter.get(bucket, 0.03)
+
     options.random_seed = "42"
     options.be_verbose = True
 
@@ -390,7 +420,7 @@ def _run_pipeline_parity_eval(project_root, tag, train_xml, test_xml, run_dir=No
     Evaluate end-to-end inference parity on train/test XML crops.
     """
     try:
-        from pipeline_parity_eval import evaluate_pipeline_parity
+        from training.pipeline_parity_eval import evaluate_pipeline_parity
 
         return evaluate_pipeline_parity(
             project_root=project_root,

@@ -9,7 +9,10 @@
       "Bash(git restore:*)",
       "Bash(npm run build:*)",
       "Bash(find:*)",
-      "Bash(npm run lint:*)"
+      "Bash(npm run lint:*)",
+      "Bash(\"C:/Users/yupin/Downloads/BioVision/venv/Scripts/python.exe\":*)",
+      "Bash(cd \"C:/Users/yupin/Downloads/BioVision\" && python -c \"import ast; ast.parse\\(open\\('backend/data/export_yolo_dataset.py'\\).read\\(\\)\\); print\\('OK'\\)\" 2>&1)",
+      "Bash(cd \"C:/Users/yupin/Downloads/BioVision\" && python -c \"import ast; ast.parse\\(open\\('backend/bv_utils/orientation_utils.py'\\).read\\(\\)\\); print\\('OK'\\)\" 2>&1)"
     ]
   }
 }

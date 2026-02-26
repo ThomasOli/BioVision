@@ -174,13 +174,13 @@ const ORIENTATION_MODE_LABELS: Record<OrientationPolicy["mode"], { title: string
 
 const ORIENTATION_MODE_DETAILS: Record<OrientationPolicy["mode"], string> = {
   directional:
-    "Backend goal: align the major axis, then force a canonical facing direction (for example head-left). Best for side-view organisms.",
+    "Backend goal: the OBB detector levels the crop to the major axis, then class_id enforces a canonical facing direction (head-left). Best for side-view organisms.",
   bilateral:
-    "Backend goal: align symmetry axis and allow mirrored augmentation for paired structures (left/right sides).",
+    "Backend goal: the OBB detector levels the crop along the symmetry axis; class_id tags mirrored specimens; bilateral augmentation handles paired left/right structures.",
   axial:
-    "Backend goal: align long axis while keeping stronger rotational augmentation for elongated specimens with variable pose.",
+    "Backend goal: the OBB detector levels the long axis; class_id (0=up, 1=down) triggers a 180° rotation to a canonical up-facing orientation.",
   invariant:
-    "Backend goal: avoid forced PCA direction when no stable axis exists; rely on broad rotational augmentation.",
+    "Backend goal: OBB crops the specimen without orientation enforcement; wide rotational augmentation (±6° dlib, full 360° CNN) exploits complete angular coverage.",
 };
 
 function buildOrientationPolicy(
@@ -691,9 +691,10 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </div>
           <div className="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
             <p>
-              SAM2 + PCA (when available) will level specimens before landmark prediction.
-              Directional schemas then enforce a canonical facing direction; bilateral and axial
-              schemas keep symmetry-aware augmentation; invariant schemas avoid unstable forced leveling.
+              The OBB detector levels each specimen crop to a canonical orientation before
+              landmark prediction. class_id (0 = canonical, 1 = mirrored) is computed from head/tail
+              landmark positions at annotation time and flows through training and inference automatically.
+              Invariant schemas skip orientation enforcement and rely on broad augmentation instead.
             </p>
           </div>
           <DialogFooter>

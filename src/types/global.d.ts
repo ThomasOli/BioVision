@@ -185,6 +185,8 @@ interface ModelCompatibilityResult {
     error?: string;
   };
   error?: string;
+  obbDetectorReady?: boolean;
+  obbDetectorPath?: string;
 }
 
 interface SelectImageFolderResult {
@@ -311,6 +313,12 @@ interface SuperAnnotateObject {
   class_name: string;
   instance_metadata: InstanceMetadata;
   detection_method: string;
+  obb?: {
+    angle: number;
+    corners: [number, number][];
+    center: [number, number];
+    size: [number, number];
+  } | null;
 }
 
 interface SuperAnnotateResult {
@@ -334,6 +342,8 @@ interface CheckSuperAnnotatorResult {
   yolo_error?: string | null;
   sam2_error?: string | null;
   error?: string;
+  obbCapable?: boolean;
+  obbModelTier?: "none" | "nano" | "small" | "medium";
 }
 
 interface InitSuperAnnotatorResult {
@@ -604,6 +614,7 @@ interface SessionMeta {
   landmarkCount: number;
   orientationPolicy?: OrientationPolicy;
   orientationPolicyConfigured?: boolean;
+  obbDetectorReady?: boolean;
 }
 
   interface Window {
@@ -744,6 +755,17 @@ interface SessionMeta {
         datasetSize?: number,
         autoTune?: boolean
       ) => Promise<TrainYoloResult>;
+      trainObbDetector: (speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small" }) => Promise<{
+        ok: boolean;
+        modelPath?: string;
+        map50?: number | null;
+        error?: string;
+      }>;
+      tagClassIds: (speciesId: string, boxes: import("./Image").BoundingBox[]) => Promise<{
+        ok: boolean;
+        taggedBoxes?: { id: number; class_id: number }[];
+        error?: string;
+      }>;
       getYoloTrainPlan: (
         speciesId: string,
         className: string,

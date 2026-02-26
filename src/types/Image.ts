@@ -38,6 +38,10 @@ export interface BoundingBox {
     scale: number;
   };
   detectionMethod?: string; // "yolo_world+sam2", "opencv", etc.
+  // OBB fields (set when annotated via YOLO-World+SAM2 or manual OBB tool)
+  angle?: number;                  // OBB rotation angle in degrees
+  obbCorners?: [number, number][]; // 4 corners [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+  class_id?: number;               // 0=canonical (left/up), 1=mirror (right/down), from OBB orientation
 }
 
 export interface AnnotatedImage {
@@ -78,6 +82,7 @@ export interface OrientationPolicy {
   tailCategories?: string[];
   bilateralPairs?: [number, number][];
   pcaLevelingMode?: "off" | "on" | "auto";
+  obbLevelingMode?: "on" | "off";  // Controls whether OBB rotation is applied during crop extraction
 }
 
 export interface LandmarkSchema {

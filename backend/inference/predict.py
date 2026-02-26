@@ -8,10 +8,16 @@ from datetime import datetime
 import dlib
 import cv2
 import numpy as np
-from detect_specimen import detect_specimen
-from image_utils import load_image
-import orientation_utils as ou
-import debug_io as dio
+
+import sys as _sys, os as _os
+_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _BACKEND_ROOT not in _sys.path:
+    _sys.path.insert(0, _BACKEND_ROOT)
+
+from detection.detect_specimen import detect_specimen
+from bv_utils.image_utils import load_image
+import bv_utils.orientation_utils as ou
+import bv_utils.debug_io as dio
 
 STANDARD_SIZE = ou.STANDARD_SIZE
 
@@ -999,7 +1005,7 @@ def _make_cnn_predict_fn(model, landmark_ids):
     return _predict
 
 
-def predict_image(project_root, tag, image_path, yolo_model_path=None):
+def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box=None):
     """
     Predict landmarks using trained dlib shape predictor.
     Uses tight-crop standardization (crop + pad + resize to 512x512) to match training.
@@ -1012,6 +1018,8 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None):
         yolo_model_path: Optional path to session-specific YOLO detection model.
                          When provided, YOLO is used for specimen detection;
                          falls back to OpenCV contours if YOLO finds nothing.
+        input_box: Optional pre-detected box dict. When provided with obbCorners, the
+                   OBB geometry engine is used instead of detection + PCA canonicalization.
     """
     modeldir = os.path.join(project_root, "models")
     debug_dir = os.path.join(project_root, "debug")
@@ -1063,63 +1071,81 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None):
         w, h = int(orig_w * scale), int(orig_h * scale)
         img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
 
-    # Detect specimen bounding box
+    # Detect specimen bounding box (skip when caller provides input_box)
     temp_path = None
-    if scale != 1.0:
-        temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
-        os.close(temp_fd)
-        cv2.imwrite(temp_path, img)
-        detection_path = temp_path
+    if input_box is not None:
+        detected = dict(input_box)
     else:
-        detection_path = image_path
+        if scale != 1.0:
+            temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
+            os.close(temp_fd)
+            cv2.imwrite(temp_path, img)
+            detection_path = temp_path
+        else:
+            detection_path = image_path
 
-    detected = detect_specimen(detection_path, margin=20, yolo_model_path=yolo_model_path)
-    if temp_path and os.path.exists(temp_path):
-        os.remove(temp_path)
+        detected = detect_specimen(detection_path, margin=20, yolo_model_path=yolo_model_path)
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        if detected is None:
+            detected = {'left': 0, 'top': 0, 'right': w, 'bottom': h, 'width': w, 'height': h}
 
     print("PROGRESS 30 detecting", file=sys.stderr)
 
-    if detected is None:
-        detected = {'left': 0, 'top': 0, 'right': w, 'bottom': h, 'width': w, 'height': h}
     orientation_hint = _resolve_orientation_hint_from_box(
         detected,
         min_confidence=0.25,
         min_dx_ratio=0.06,
     )
 
-    # Standardize: crop to bounding box + padding, resize to 512x512
-    cropped, crop_meta = standardize_crop(img, detected)
+    # Standardize: crop using OBB geometry engine when obb_corners available,
+    # otherwise fall back to axis-aligned crop + PCA canonicalization.
+    cropped = None
+    crop_meta = None
     canonicalization_debug = None
     mask_outline = None
-    if _should_try_canonicalization(orientation_policy):
-        sam_mask = _sam2_mask_for_box(img, detected)
-        if sam_mask is not None:
-            mask_outline = _mask_outline_from_full_mask(
-                sam_mask,
-                scale=scale,
-                image_shape=(orig_h, orig_w),
-            )
-            cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_mask(
-                cropped,
-                crop_meta,
-                sam_mask,
-                orientation_policy,
-                orientation_hint,
-            )
-            if isinstance(canonicalization_debug, dict):
-                canonicalization_debug["mask_source"] = "sam2"
-        else:
-            rough_mask = _rough_mask_from_crop(cropped)
-            if rough_mask is not None:
-                cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_standard_mask(
+
+    obb_corners = detected.get("obbCorners") or detected.get("obb_corners") if isinstance(detected, dict) else None
+    obb_class_id = int(detected.get("class_id", 0)) if isinstance(detected, dict) else 0
+    if obb_corners and len(obb_corners) == 4:
+        apply_leveling = (orientation_policy.get("obbLevelingMode", "on") == "on")
+        cropped, crop_meta = ou.extract_obb_crop(img, obb_corners, pad_ratio=0.15, apply_leveling=apply_leveling)
+        cropped, crop_meta, canonicalization_debug = ou.apply_obb_geometry(
+            cropped, crop_meta, obb_class_id, orientation_policy
+        )
+        if isinstance(canonicalization_debug, dict):
+            canonicalization_debug["source"] = "obb_geometry"
+    else:
+        cropped, crop_meta = standardize_crop(img, detected)
+        if _should_try_canonicalization(orientation_policy):
+            sam_mask = _sam2_mask_for_box(img, detected)
+            if sam_mask is not None:
+                mask_outline = _mask_outline_from_full_mask(
+                    sam_mask,
+                    scale=scale,
+                    image_shape=(orig_h, orig_w),
+                )
+                cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_mask(
                     cropped,
                     crop_meta,
-                    rough_mask,
+                    sam_mask,
                     orientation_policy,
                     orientation_hint,
                 )
                 if isinstance(canonicalization_debug, dict):
-                    canonicalization_debug["mask_source"] = "rough_otsu"
+                    canonicalization_debug["mask_source"] = "sam2"
+            else:
+                rough_mask = _rough_mask_from_crop(cropped)
+                if rough_mask is not None:
+                    cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_standard_mask(
+                        cropped,
+                        crop_meta,
+                        rough_mask,
+                        orientation_policy,
+                        orientation_hint,
+                    )
+                    if isinstance(canonicalization_debug, dict):
+                        canonicalization_debug["mask_source"] = "rough_otsu"
 
     # Run dlib on the standardized 512x512 image (full-image rect)
     rect = dlib.rectangle(0, 0, STANDARD_SIZE, STANDARD_SIZE)
@@ -1215,7 +1241,7 @@ def predict_multi_specimen(
     Args:
         yolo_model_path: Optional path to session YOLO detection model; preferred over OpenCV.
     """
-    from detect_specimen import detect_multiple_specimens
+    from detection.detect_specimen import detect_multiple_specimens
 
     modeldir = os.path.join(project_root, "models")
     debug_dir = os.path.join(project_root, "debug")
@@ -1379,7 +1405,17 @@ def predict_multi_specimen(
         )
 
         # Scale bounding box back to original size
-        scaled_box = {k: int(v / scale) if scale != 1.0 else v for k, v in box.items() if isinstance(v, (int, float))}
+        scaled_box = {}
+        if scale != 1.0:
+            for k, v in box.items():
+                if isinstance(v, (int, float)):
+                    scaled_box[k] = int(v / scale)
+                elif k in ("obbCorners", "obb_corners") and isinstance(v, list):
+                    scaled_box[k] = [[pt[0] / scale, pt[1] / scale] for pt in v]
+                else:
+                    scaled_box[k] = v
+        else:
+            scaled_box = dict(box)
         scaled_box["confidence"] = box.get("confidence")
         scaled_box["class_name"] = box.get("class_name")
         if isinstance(box.get("orientation_hint"), dict):
@@ -1701,7 +1737,7 @@ def predict_cnn_multi_specimen(
     """
     Predict landmarks for multiple specimens using detection + CNN.
     """
-    from detect_specimen import detect_multiple_specimens
+    from detection.detect_specimen import detect_multiple_specimens
 
     debug_dir = os.path.join(project_root, "debug")
 
@@ -1834,7 +1870,18 @@ def predict_cnn_multi_specimen(
             key=lambda lm: lm["id"]
         )
 
-        scaled_box = {k: int(v / scale) if scale != 1.0 else v for k, v in box.items() if isinstance(v, (int, float))}
+        # Scale bounding box back to original size
+        scaled_box = {}
+        if scale != 1.0:
+            for k, v in box.items():
+                if isinstance(v, (int, float)):
+                    scaled_box[k] = int(v / scale)
+                elif k in ("obbCorners", "obb_corners") and isinstance(v, list):
+                    scaled_box[k] = [[pt[0] / scale, pt[1] / scale] for pt in v]
+                else:
+                    scaled_box[k] = v
+        else:
+            scaled_box = dict(box)
         scaled_box["confidence"] = box.get("confidence")
         scaled_box["class_name"] = box.get("class_name")
         if isinstance(box.get("orientation_hint"), dict):
@@ -1881,284 +1928,12 @@ def predict_cnn_multi_specimen(
     return result
 
 
-def _resolve_pose_model_path(project_root, tag, explicit_pose_model=None):
-    def _is_pose_checkpoint(model_path):
-        if not model_path or not os.path.exists(model_path):
-            return False
-        try:
-            from ultralytics import YOLO
-
-            task = str(getattr(YOLO(model_path), "task", "")).strip().lower()
-            return task == "pose"
-        except Exception:
-            return False
-
-    if explicit_pose_model and os.path.exists(explicit_pose_model):
-        if _is_pose_checkpoint(explicit_pose_model):
-            return explicit_pose_model
-
-    modeldir = os.path.join(project_root, "models")
-    candidates = [
-        os.path.join(modeldir, f"pose_{tag}.pt"),
-        os.path.join(modeldir, f"yolo_pose_{tag}.pt"),
-        os.path.join(modeldir, f"yolo_{tag}.pt"),
-    ]
-    for path in candidates:
-        if os.path.exists(path) and _is_pose_checkpoint(path):
-            return path
-
-    if tag.lower().endswith(".pt") and os.path.exists(tag) and _is_pose_checkpoint(tag):
-        return tag
-    raise FileNotFoundError(
-        f"YOLO-pose model not found for '{tag}'. Tried explicit path and pose_/yolo_pose_/yolo_ variants, but only pose-task checkpoints are accepted."
-    )
-
-
-def _pose_landmark_ids(project_root, num_keypoints):
-    template_order = _resolve_template_landmark_order(project_root)
-    head_id = _resolve_landmark_id_by_category(project_root, "head")
-    tail_id = _resolve_tail_landmark_id(project_root)
-    if len(template_order) == int(num_keypoints):
-        return [int(x) for x in template_order], head_id, tail_id
-    if (
-        int(num_keypoints) == 2
-        and head_id is not None
-        and tail_id is not None
-        and int(head_id) != int(tail_id)
-    ):
-        return [int(head_id), int(tail_id)], int(head_id), int(tail_id)
-    return list(range(int(num_keypoints))), head_id, tail_id
-
-
-def _pose_landmarks_from_detection(project_root, keypoints_data, det_idx):
-    if keypoints_data is None or det_idx >= len(keypoints_data):
-        return [], None
-    kp_xy = keypoints_data.xy[det_idx].cpu().numpy()
-    kp_conf = None
-    if getattr(keypoints_data, "conf", None) is not None:
-        kp_conf = keypoints_data.conf[det_idx].cpu().numpy()
-
-    landmark_ids, head_id, tail_id = _pose_landmark_ids(project_root, kp_xy.shape[0])
-    landmarks = []
-    for i in range(kp_xy.shape[0]):
-        x, y = float(kp_xy[i][0]), float(kp_xy[i][1])
-        if not np.isfinite(x) or not np.isfinite(y):
-            continue
-        if kp_conf is not None:
-            try:
-                if float(kp_conf[i]) < 0.01:
-                    continue
-            except Exception:
-                pass
-        landmarks.append({
-            "id": int(landmark_ids[i]),
-            "x": int(round(x)),
-            "y": int(round(y)),
-        })
-
-    orientation_hint = None
-    if head_id is not None and tail_id is not None:
-        head = next((lm for lm in landmarks if int(lm["id"]) == int(head_id)), None)
-        tail = next((lm for lm in landmarks if int(lm["id"]) == int(tail_id)), None)
-        if head is not None and tail is not None:
-            orientation_hint = {
-                "orientation": "left" if head["x"] < tail["x"] else "right",
-                "head_point": [float(head["x"]), float(head["y"])],
-                "tail_point": [float(tail["x"]), float(tail["y"])],
-                "source": "yolo_pose",
-            }
-    return landmarks, orientation_hint
-
-
-def predict_pose_image(project_root, tag, image_path, pose_model_path=None):
-    from ultralytics import YOLO
-
-    debug_dir = os.path.join(project_root, "debug")
-    print("PROGRESS 10 loading_model", file=sys.stderr)
-    model_path = _resolve_pose_model_path(project_root, tag, explicit_pose_model=pose_model_path)
-    model = YOLO(model_path)
-
-    print("PROGRESS 30 detecting", file=sys.stderr)
-    results = model(image_path, verbose=False)
-    if not results:
-        raise RuntimeError("YOLO-pose returned no inference results.")
-    result0 = results[0]
-    boxes = result0.boxes
-    if boxes is None or len(boxes) == 0:
-        img, w, h = load_image(image_path)
-        return {
-            "image": image_path,
-            "landmarks": [],
-            "detected_box": None,
-            "image_dimensions": {"width": w, "height": h},
-            "num_landmarks": 0,
-            "predictor_type": "yolo_pose",
-        }
-
-    best_idx = int(boxes.conf.argmax())
-    xyxy = boxes.xyxy[best_idx].cpu().numpy().tolist()
-    left, top, right, bottom = [int(round(v)) for v in xyxy]
-
-    print("PROGRESS 65 predicting", file=sys.stderr)
-    landmarks, orientation_hint = _pose_landmarks_from_detection(
-        project_root,
-        getattr(result0, "keypoints", None),
-        best_idx,
-    )
-    landmarks = sorted(landmarks, key=lambda lm: lm["id"])
-
-    print("PROGRESS 90 mapping", file=sys.stderr)
-    img, w, h = load_image(image_path)
-    detected_box = {
-        "left": left,
-        "top": top,
-        "right": right,
-        "bottom": bottom,
-        "width": max(0, right - left),
-        "height": max(0, bottom - top),
-        "confidence": float(boxes.conf[best_idx]),
-        "class_id": int(boxes.cls[best_idx]) if boxes.cls is not None else 0,
-        "class_name": (
-            result0.names.get(int(boxes.cls[best_idx]), "specimen")
-            if boxes.cls is not None and hasattr(result0, "names")
-            else "specimen"
-        ),
-        "detection_method": "yolo_pose",
-    }
-    if orientation_hint is not None:
-        detected_box["orientation_hint"] = orientation_hint
-
-    out = {
-        "image": image_path,
-        "landmarks": landmarks,
-        "detected_box": detected_box,
-        "image_dimensions": {"width": w, "height": h},
-        "num_landmarks": len(landmarks),
-        "predictor_type": "yolo_pose",
-        "orientation_hint": orientation_hint,
-    }
-    save_prediction_log(
-        debug_dir,
-        tag,
-        {
-            "timestamp": datetime.now().isoformat(),
-            "image": os.path.basename(image_path),
-            "predictor_type": "yolo_pose",
-            "num_landmarks": len(landmarks),
-            "detected_box": detected_box,
-            "orientation_hint": orientation_hint,
-        },
-        predictor_type="yolo_pose",
-    )
-    return out
-
-
-def predict_pose_multi_specimen(project_root, tag, image_path, pose_model_path=None):
-    from ultralytics import YOLO
-
-    debug_dir = os.path.join(project_root, "debug")
-    print("PROGRESS 10 loading_model", file=sys.stderr)
-    model_path = _resolve_pose_model_path(project_root, tag, explicit_pose_model=pose_model_path)
-    model = YOLO(model_path)
-
-    print("PROGRESS 30 detecting", file=sys.stderr)
-    results = model(image_path, verbose=False)
-    if not results:
-        raise RuntimeError("YOLO-pose returned no inference results.")
-    result0 = results[0]
-    boxes = result0.boxes
-    img, w, h = load_image(image_path)
-    if boxes is None or len(boxes) == 0:
-        return {
-            "image": image_path,
-            "specimens": [],
-            "num_specimens": 0,
-            "image_dimensions": {"width": w, "height": h},
-            "predictor_type": "yolo_pose",
-        }
-
-    order = list(range(len(boxes)))
-    order.sort(
-        key=lambda idx: (
-            float(boxes.xyxy[idx][1].cpu().item()),
-            float(boxes.xyxy[idx][0].cpu().item()),
-        )
-    )
-
-    keypoints_data = getattr(result0, "keypoints", None)
-    specimens = []
-    total = max(1, len(order))
-    for rank, det_idx in enumerate(order):
-        pct = 40 + int(45 * (rank / total))
-        print(f"PROGRESS {pct} predicting", file=sys.stderr)
-
-        xyxy = boxes.xyxy[det_idx].cpu().numpy().tolist()
-        left, top, right, bottom = [int(round(v)) for v in xyxy]
-        landmarks, orientation_hint = _pose_landmarks_from_detection(project_root, keypoints_data, det_idx)
-        landmarks = sorted(landmarks, key=lambda lm: lm["id"])
-
-        box_out = {
-            "left": left,
-            "top": top,
-            "right": right,
-            "bottom": bottom,
-            "width": max(0, right - left),
-            "height": max(0, bottom - top),
-            "confidence": float(boxes.conf[det_idx]),
-            "class_id": int(boxes.cls[det_idx]) if boxes.cls is not None else 0,
-            "class_name": (
-                result0.names.get(int(boxes.cls[det_idx]), "specimen")
-                if boxes.cls is not None and hasattr(result0, "names")
-                else "specimen"
-            ),
-            "detection_method": "yolo_pose",
-        }
-        if orientation_hint is not None:
-            box_out["orientation_hint"] = orientation_hint
-
-        specimens.append(
-            {
-                "box": box_out,
-                "landmarks": landmarks,
-                "num_landmarks": len(landmarks),
-                "orientation_debug": {
-                    "selection_reason": "native_pose_prediction",
-                    "used_flipped_crop": False,
-                },
-            }
-        )
-
-    print("PROGRESS 90 mapping", file=sys.stderr)
-    out = {
-        "image": image_path,
-        "specimens": specimens,
-        "num_specimens": len(specimens),
-        "image_dimensions": {"width": w, "height": h},
-        "detection_method": "yolo_pose",
-        "predictor_type": "yolo_pose",
-    }
-    save_prediction_log(
-        debug_dir,
-        tag,
-        {
-            "timestamp": datetime.now().isoformat(),
-            "image": os.path.basename(image_path),
-            "mode": "multi-specimen",
-            "predictor_type": "yolo_pose",
-            "num_specimens": len(specimens),
-            "detection_method": "yolo_pose",
-        },
-        predictor_type="yolo_pose",
-    )
-    return out
-
-
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print(
             "Usage: python predict.py <project_root> <tag> <image_path> "
-            "[--multi] [--yolo-model <path>] [--pose-model <path>] "
-            "[--boxes-json <path>] [--predictor-type dlib|cnn|yolo_pose]"
+            "[--multi] [--yolo-model <path>] "
+            "[--boxes-json <path>] [--obb-json <path>] [--predictor-type dlib|cnn]"
         )
         sys.exit(1)
 
@@ -2172,12 +1947,6 @@ if __name__ == "__main__":
         idx = sys.argv.index("--yolo-model")
         if idx + 1 < len(sys.argv):
             yolo_model_path = sys.argv[idx + 1]
-
-    pose_model_path = None
-    if "--pose-model" in sys.argv:
-        idx = sys.argv.index("--pose-model")
-        if idx + 1 < len(sys.argv):
-            pose_model_path = sys.argv[idx + 1]
 
     predictor_type = "dlib"
     if "--predictor-type" in sys.argv:
@@ -2199,6 +1968,19 @@ if __name__ == "__main__":
                 except Exception:
                     input_boxes = None
 
+    # --obb-json: path to a single OBB detection dict (for single-specimen OBB inference)
+    obb_input_box = None
+    if "--obb-json" in sys.argv:
+        idx = sys.argv.index("--obb-json")
+        if idx + 1 < len(sys.argv):
+            obb_json_path = sys.argv[idx + 1]
+            if os.path.exists(obb_json_path):
+                try:
+                    with open(obb_json_path, "r", encoding="utf-8") as f:
+                        obb_input_box = json.load(f)
+                except Exception:
+                    obb_input_box = None
+
     if input_boxes is not None and not multi_mode:
         multi_mode = True
 
@@ -2207,8 +1989,6 @@ if __name__ == "__main__":
             result = predict_cnn_multi_specimen(project_root, tag, image_path,
                                                 yolo_model_path=yolo_model_path,
                                                 input_boxes=input_boxes)
-        elif predictor_type == "yolo_pose":
-            result = predict_pose_multi_specimen(project_root, tag, image_path, pose_model_path=pose_model_path)
         else:
             result = predict_multi_specimen(project_root, tag, image_path,
                                             yolo_model_path=yolo_model_path,
@@ -2217,11 +1997,10 @@ if __name__ == "__main__":
         if predictor_type == "cnn":
             result = predict_cnn_image(project_root, tag, image_path,
                                        yolo_model_path=yolo_model_path)
-        elif predictor_type == "yolo_pose":
-            result = predict_pose_image(project_root, tag, image_path, pose_model_path=pose_model_path)
         else:
             result = predict_image(project_root, tag, image_path,
-                                   yolo_model_path=yolo_model_path)
+                                   yolo_model_path=yolo_model_path,
+                                   input_box=obb_input_box)
 
     print("PROGRESS 100 done", file=sys.stderr)
     print(json.dumps(result))

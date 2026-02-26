@@ -129,16 +129,26 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
                 </div>
               ) : (
                 <>
-                  <div className="flex items-center gap-2 min-w-0">
-                    <CardTitle className="text-sm font-semibold truncate">{model.name}</CardTitle>
-                    {model.predictorType === "cnn" ? (
-                      <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-purple-500/15 text-purple-400 border border-purple-500/30">
-                        CNN
-                      </span>
-                    ) : (
-                      <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-blue-500/15 text-blue-400 border border-blue-500/30">
-                        dlib
-                      </span>
+                  <div className="flex flex-col min-w-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <CardTitle className="text-sm font-semibold truncate">{model.name}</CardTitle>
+                      {model.predictorType === "cnn" ? (
+                        <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-purple-500/15 text-purple-400 border border-purple-500/30">
+                          CNN
+                        </span>
+                      ) : (
+                        <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-blue-500/15 text-blue-400 border border-blue-500/30">
+                          dlib
+                        </span>
+                      )}
+                    </div>
+                    {model.path && (
+                      <p
+                        className="mt-0.5 text-[10px] text-muted-foreground font-mono truncate"
+                        title={model.path}
+                      >
+                        {model.path}
+                      </p>
                     )}
                   </div>
                   <Popover open={menuOpen} onOpenChange={setMenuOpen}>

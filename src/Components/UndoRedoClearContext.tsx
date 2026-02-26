@@ -49,6 +49,12 @@ interface SuperAnnotateObjectData {
     scale: number;
   };
   detection_method: string;
+  obb?: {
+    angle: number;
+    corners: [number, number][];
+    center: [number, number];
+    size: [number, number];
+  } | null;
 }
 
 interface UndoRedoClearContextProps {
@@ -667,6 +673,10 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
             className: obj.class_name,
             instanceMetadata: obj.instance_metadata,
             detectionMethod: obj.detection_method,
+            ...(obj.obb ? {
+              angle: obj.obb.angle,
+              obbCorners: obj.obb.corners as [number, number][],
+            } : {}),
           };
         });
 

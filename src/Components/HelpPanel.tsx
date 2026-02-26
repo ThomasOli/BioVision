@@ -204,8 +204,9 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                         Axial is for elongated rotating specimens; Invariant is for radial/no-stable-direction objects.
                       </p>
                       <p>
-                        When SAM2 + PCA are available, the backend can level masks before landmark prediction to improve
-                        orientation consistency.
+                        The OBB detector levels specimen crops to a canonical orientation before landmark
+                        prediction. class_id (0 = canonical, 1 = mirrored) is tagged at annotation time and
+                        corrects orientation automatically during both training and inference.
                       </p>
                     </div>
                   </div>
@@ -286,7 +287,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                     </div>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
-                        Compatibility gate: if a model was trained with SAM2/PCA canonicalization and SAM2 is unavailable
+                        Compatibility gate: if a model was trained with OBB canonicalization and no OBB detector is available
                         at inference time, BioVision warns and requires explicit override.
                       </p>
                     </div>
@@ -351,7 +352,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                         <li>Use consistent imaging conditions when possible</li>
                         <li>Include scale markers in training images</li>
                         <li>Choose an orientation schema that matches specimen geometry before annotating</li>
-                        <li>If SAM2 is enabled, PCA leveling can standardize orientation more reliably</li>
+                        <li>When OBB annotations are present, the geometry engine levels specimens to canonical orientation more reliably than PCA-based approaches</li>
                       </ul>
                     </div>
                     <Separator />

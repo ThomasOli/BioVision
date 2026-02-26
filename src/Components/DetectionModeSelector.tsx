@@ -151,7 +151,7 @@ export function DetectionModeSelector({
       {mode === "manual" && (
         <div className="flex flex-col gap-2 pt-2 border-t border-zinc-700">
           <p className="text-xs text-zinc-500">
-            Click and drag on the canvas to draw bounding boxes.
+            Drag to draw a box. Select a box to drag, resize, or rotate it — use the rotation handle above the box to create oriented (OBB) boxes.
           </p>
         </div>
       )}

@@ -134,9 +134,14 @@ def sanitize_orientation_policy(
             except Exception:
                 continue
 
+    obb_leveling_mode = str(raw.get("obbLevelingMode", "on")).strip().lower()
+    if obb_leveling_mode not in ("on", "off"):
+        obb_leveling_mode = "on"
+
     out: dict[str, Any] = {
         "mode": mode,
         "pcaLevelingMode": pca_mode,
+        "obbLevelingMode": obb_leveling_mode,
         "directionPriority": direction_priority,
         "minMomentDirectionConfidence": float(min_moment_conf),
         "templateDirectionFallback": template_direction_fallback,
@@ -377,46 +382,57 @@ def get_schema_augmentation_profile(mode: str | None, *, engine: str) -> dict[st
     eng = str(engine or "").strip().lower()
 
     if eng == "dlib":
+        # With OBB leveling, the specimen is already axis-aligned in the 512×512 crop.
+        # Tight rotation angles (±6°) preserve sub-pixel spatial stability.
+        # Axial schemas no longer need 180° augmentation: apply_obb_geometry handles
+        # the canonical flip via class_id at both training and inference time.
         profiles = {
-            # Directional schemas are canonicalized to a target facing; keep
-            # augmentation conservative to protect mean-shape stability.
-            "directional": {"angles": [-5.0, 5.0], "flip": False},
-            "bilateral": {"angles": [-15.0, -7.0, 7.0, 15.0], "flip": True},
-            "axial": {"angles": [180.0], "flip": True},
-            "invariant": {"angles": [], "flip": False},
+            "directional": {"angles": [-6.0, -3.0, 3.0, 6.0], "flip": False},
+            "bilateral": {"angles": [-6.0, -3.0, 3.0, 6.0], "flip": True},
+            "axial": {"angles": [-6.0, -3.0, 3.0, 6.0], "flip": True},
+            # Invariant specimens (starfish, shell fragments, etc.) have no canonical
+            # orientation, so they are immune to the bimodal-target trap. Keep the
+            # same ±6° envelope as directional/axial — wide angles (e.g. ±30°) cause
+            # mean-shape collapse in dlib because the predictor cannot distinguish a
+            # rotated specimen from a different pose. flip: True and box-jitter provide
+            # the extra augmentation variance that invariant schemas need. The CNN
+            # handles wide angular invariance via its continuous (-180°, 180°) range.
+            "invariant": {"angles": [-6.0, -3.0, 3.0, 6.0], "flip": True},
         }
         return dict(profiles.get(resolved_mode, profiles["invariant"]))
 
     if eng == "cnn":
+        # With OBB leveling, OBB-oriented schemas use tighter rotation ranges (±10°)
+        # to exploit specimen alignment without overriding the geometry engine's work.
+        # Invariant schemas retain wide augmentation since they have no orientation concept.
         profiles = {
-            # Keep left/right learning for directional schemas.
             "directional": {
                 "flip_prob": 0.5,
                 "vertical_flip_prob": 0.0,
-                "rotation_range": (-20.0, 20.0),
+                "rotation_range": (-15.0, 15.0),
                 "rotate_180_prob": 0.0,
                 "scale_range": (0.92, 1.08),
                 "translate_ratio": 0.06,
             },
-            # Bilateral schemas allow mirroring but require pair swaps.
             "bilateral": {
                 "flip_prob": 0.5,
                 "vertical_flip_prob": 0.0,
-                "rotation_range": (-25.0, 25.0),
+                "rotation_range": (-15.0, 15.0),
                 "rotate_180_prob": 0.0,
-                "scale_range": (0.90, 1.12),
+                "scale_range": (0.90, 1.10),
                 "translate_ratio": 0.08,
             },
-            # Axial schemas are safe under 180-degree turns.
+            # Axial: 180° augmentation retained for CNN (class_id-based flip is primary
+            # but CNN benefits from rotate_180 augmentation for axial variation).
             "axial": {
                 "flip_prob": 0.5,
                 "vertical_flip_prob": 0.0,
-                "rotation_range": (-20.0, 20.0),
+                "rotation_range": (-15.0, 15.0),
                 "rotate_180_prob": 0.5,
-                "scale_range": (0.90, 1.12),
+                "scale_range": (0.90, 1.10),
                 "translate_ratio": 0.08,
             },
-            # Invariant schemas rely on strong augmentation.
+            # Invariant schemas rely on strong augmentation (no OBB leveling concept).
             "invariant": {
                 "flip_prob": 0.5,
                 "vertical_flip_prob": 0.25,
@@ -443,6 +459,9 @@ def get_box_jitter_profile(mode: str | None, *, engine: str) -> dict[str, Any]:
     eng = str(engine or "").strip().lower()
 
     if eng == "dlib":
+        # Geometric lock: OBB-leveled crops occupy the canvas tightly.
+        # Cap translate at ±3% and scale at ±5% max to avoid wasting model
+        # capacity on a spatially wandering specimen.
         profiles = {
             "directional": {
                 "enabled": True,
@@ -459,14 +478,14 @@ def get_box_jitter_profile(mode: str | None, *, engine: str) -> dict[str, Any]:
             "axial": {
                 "enabled": True,
                 "copies_per_sample": 2,
-                "translate_ratio": 0.035,
+                "translate_ratio": 0.03,   # tightened from 0.035 (±3% max)
                 "scale_range": (0.95, 1.05),
             },
             "invariant": {
                 "enabled": True,
                 "copies_per_sample": 2,
-                "translate_ratio": 0.04,
-                "scale_range": (0.94, 1.06),
+                "translate_ratio": 0.03,   # tightened from 0.04 (±3% max)
+                "scale_range": (0.95, 1.05),  # tightened from (0.94, 1.06)
             },
         }
         return dict(profiles.get(resolved_mode, profiles["invariant"]))
@@ -570,18 +589,40 @@ def base_standardize(
     crop_w = max(1, int(crop_w))
     crop_h = max(1, int(crop_h))
 
-    crop_512 = cv2.resize(crop, (STANDARD_SIZE, STANDARD_SIZE), interpolation=cv2.INTER_LINEAR)
-    sx = float(STANDARD_SIZE / crop_w)
-    sy = float(STANDARD_SIZE / crop_h)
+    sq = max(crop_w, crop_h)
+    pad_left = (sq - crop_w) // 2
+    pad_top  = (sq - crop_h) // 2
+    pad_right  = sq - crop_w - pad_left
+    pad_bottom = sq - crop_h - pad_top
+   # 1. Sample the outermost pixels of the crop
+    perimeter = np.concatenate([
+        crop[0, :],    # Top edge
+        crop[-1, :],   # Bottom edge
+        crop[:, 0],    # Left edge
+        crop[:, -1]    # Right edge
+    ], axis=0)
+    
+    # 2. Find the median background color (avoids outlier specimen pixels)
+    bg_color = [int(x) for x in np.median(perimeter, axis=0)]
+
+    # 3. Pad with the exact background color
+    padded = cv2.copyMakeBorder(
+        crop, pad_top, pad_bottom, pad_left, pad_right,
+        cv2.BORDER_CONSTANT, value=bg_color
+    )
+    scale = float(STANDARD_SIZE) / float(sq)
+    crop_512 = cv2.resize(padded, (STANDARD_SIZE, STANDARD_SIZE), interpolation=cv2.INTER_LINEAR)
 
     meta = {
-        "center": [int((x1 + x2) / 2), int((y1 + y2) / 2)],
+        "center":      [int((x1 + x2) / 2), int((y1 + y2) / 2)],
         "crop_origin": [int(cx1), int(cy1)],
-        "crop_size": [int(crop_w), int(crop_h)],
-        "rotation": 0.0,
-        "scale_x": sx,
-        "scale_y": sy,
-        "scale": sx,
+        "crop_size":   [int(crop_w), int(crop_h)],
+        "rotation":    0.0,
+        "scale_x":     scale,
+        "scale_y":     scale,
+        "scale":       scale,
+        "pad_left":    pad_left,
+        "pad_top":     pad_top,
     }
     return crop_512, meta
 
@@ -595,11 +636,13 @@ def remap_landmarks_to_standard(
     ox, oy = metadata["crop_origin"]
     sx = float(metadata.get("scale_x", metadata.get("scale", 1.0)))
     sy = float(metadata.get("scale_y", metadata.get("scale", 1.0)))
+    pad_left = float(metadata.get("pad_left", 0.0))
+    pad_top  = float(metadata.get("pad_top",  0.0))
 
     remapped: list[dict[str, Any]] = []
     for lm in landmarks:
-        x = (float(lm["x"]) - float(ox)) * sx
-        y = (float(lm["y"]) - float(oy)) * sy
+        x = (float(lm["x"]) - float(ox) + pad_left) * sx
+        y = (float(lm["y"]) - float(oy) + pad_top)  * sy
         if mirror:
             x = _mirror_x(x, STANDARD_SIZE)
         # Keep standardized coordinates within the 512x512 crop frame.
@@ -1203,8 +1246,13 @@ def map_to_original(
         else:
             x_u, y_u = x_s, y_s
 
-        x_crop = x_u / sx
-        y_crop = y_u / sy
+        pad_left = float(metadata.get("pad_left", 0.0))
+        pad_top  = float(metadata.get("pad_top",  0.0))
+
+        x_padded = x_u / sx
+        y_padded = y_u / sy
+        x_crop = x_padded - pad_left
+        y_crop = y_padded - pad_top
         x_orig = x_crop + float(ox)
         y_orig = y_crop + float(oy)
 
@@ -1222,3 +1270,145 @@ def map_to_original(
             "y": round(y_orig, 1),
         })
     return mapped
+
+
+# ===========================================================================
+# OBB Universal Geometry Engine
+# ===========================================================================
+
+def extract_obb_crop(
+    image: np.ndarray,
+    obb_corners: list,
+    pad_ratio: float = 0.15,
+    target_size: int = STANDARD_SIZE,
+    apply_leveling: bool = True,
+) -> tuple:
+    """
+    Extract a square crop deskewed to the OBB angle using BORDER_REFLECT_101.
+
+    Args:
+        image: Full-resolution BGR image.
+        obb_corners: 4-corner list [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in image pixels.
+        pad_ratio: Fraction of max side added as padding.
+        target_size: Output crop size (default 512).
+        apply_leveling: If True (default), rotate the image to deskew the OBB. If False,
+            pixels are untouched (AABB-like crop), but affine_M is still stored so
+            downstream landmark remapping can apply or skip the same transform.
+
+    Returns:
+        (crop_512, metadata) — crop_512 is (target_size, target_size, C);
+        metadata is compatible with existing map_to_original().
+        metadata["affine_M"] always contains the 2×3 rotation matrix as a nested list,
+        and metadata["leveling_applied"] indicates whether warpAffine was executed.
+    """
+    pts = np.array(obb_corners, dtype=np.float32).reshape(-1, 2)
+    rect = cv2.minAreaRect(pts)          # ((cx,cy), (w,h), angle_deg)
+    center, (rw, rh), angle = rect
+
+    # Square side = max of OBB dims + padding
+    sq = float(max(rw, rh)) * (1.0 + 2.0 * pad_ratio)
+    half = int(sq / 2)
+
+    img_h, img_w = image.shape[:2]
+    cx_i, cy_i = int(round(center[0])), int(round(center[1]))
+
+    # Build the rotation matrix (always computed; used for coord transforms even when
+    # leveling is disabled so downstream landmark remapping stays consistent).
+    M = cv2.getRotationMatrix2D((float(cx_i), float(cy_i)), angle, 1.0)
+
+    if apply_leveling:
+        # Rotate the entire image to deskew the OBB
+        rotated = cv2.warpAffine(
+            image, M, (img_w, img_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+    else:
+        # Pixels untouched; M is still stored for coordinate transforms
+        rotated = image
+
+    # Crop a square region centered at the OBB center
+    x1 = max(0, cx_i - half)
+    y1 = max(0, cy_i - half)
+    x2 = min(img_w, cx_i + half)
+    y2 = min(img_h, cy_i + half)
+    crop = rotated[y1:y2, x1:x2]
+
+    ch, cw = crop.shape[:2]
+    if cw != ch:
+        s = max(cw, ch)
+        crop = cv2.copyMakeBorder(crop, 0, s - ch, 0, s - cw, cv2.BORDER_REFLECT_101)
+        cw = ch = s
+
+    scale = float(target_size) / float(max(1, cw))
+    crop_512 = cv2.resize(crop, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+
+    meta = {
+        "center": [cx_i, cy_i],
+        "crop_origin": [x1, y1],
+        "crop_size": [cw, ch],
+        "rotation": float(angle),
+        "scale_x": scale,
+        "scale_y": scale,
+        "scale": scale,
+        "pad_left": 0,
+        "pad_top": 0,
+        "obb_deskewed": True,
+        "affine_M": M.tolist(),       # 2×3 matrix for downstream landmark remapping
+        "leveling_applied": bool(apply_leveling),
+    }
+    return crop_512, meta
+
+
+def apply_obb_geometry(
+    crop_512: np.ndarray,
+    metadata: dict,
+    class_id: int,
+    orientation_policy: dict,
+) -> tuple:
+    """
+    Schema-specific routing using OBB class_id.
+    Replaces PCA canonicalization for all orientation modes.
+
+    Args:
+        crop_512: Deskewed 512×512 crop from extract_obb_crop().
+        metadata: Crop metadata dict (modified in-place copy on flip).
+        class_id: 0 = left-facing, 1 = right-facing (from OBB detector).
+        orientation_policy: Session orientation policy dict.
+
+    Returns:
+        (crop_512, metadata, debug) — debug is a dict with flip info.
+    """
+    if not isinstance(orientation_policy, dict):
+        return crop_512, metadata, {"mode": "invariant", "flip_applied": False}
+
+    mode = str(orientation_policy.get("mode", "invariant")).lower()
+    debug = {"mode": mode, "class_id": class_id, "flip_applied": False}
+
+    if mode == "directional":
+        target = str(orientation_policy.get("targetOrientation", "left")).lower()
+        detected = "left" if class_id == 0 else "right"
+        if detected != target:
+            crop_512 = cv2.flip(crop_512, 1)
+            metadata = {**metadata, "canonical_flip_applied": True}
+            debug["flip_applied"] = True
+            debug["flip_reason"] = f"class_id={class_id} contradicts target={target}"
+
+    elif mode == "bilateral":
+        # Always normalize to left-facing (class_id=0); record flip for coord mirroring
+        if class_id == 1:
+            crop_512 = cv2.flip(crop_512, 1)
+            metadata = {**metadata, "canonical_flip_applied": True, "bilateral_flip": True}
+            debug["flip_applied"] = True
+            debug["flip_reason"] = "bilateral normalization"
+
+    elif mode == "axial":
+        # If OBB angle is significantly off from horizontal, rotate 180°
+        obb_angle = float(metadata.get("rotation", 0.0))
+        if abs(obb_angle) > 45:
+            crop_512 = cv2.rotate(crop_512, cv2.ROTATE_180)
+            debug["rotated_180"] = True
+
+    # invariant: deskew was applied by extract_obb_crop; no flip needed
+
+    return crop_512, metadata, debug
