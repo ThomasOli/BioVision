@@ -271,16 +271,16 @@ class SuperAnnotator:
 
         if gpu and free_ram_gb > 4:
             mode = "auto_high_performance"
-        elif free_ram_gb > 1.5:
+        elif free_ram_gb > 1.0:
             mode = "auto_lite"
         else:
             mode = "classic_fallback"
 
-        obb_capable = gpu or free_ram_gb > 1.5
+        obb_capable = gpu or free_ram_gb > 1.0
         obb_model_tier = "none"
         if gpu and free_ram_gb > 4:
             obb_model_tier = "medium"   # yolov8m-obb.pt
-        elif free_ram_gb > 1.5:
+        elif free_ram_gb > 1.0:
             obb_model_tier = "nano"     # yolov8n-obb.pt, freeze backbone
         elif gpu:
             obb_model_tier = "small"    # yolov8s-obb.pt
@@ -298,7 +298,15 @@ class SuperAnnotator:
     # Model loading
     # ------------------------------------------------------------------
     def init_models(self):
-        """Load models based on detected capabilities."""
+        """Load models based on detected capabilities. Idempotent — safe to call multiple times."""
+        if self.yolo_init_attempted and self.mode not in (None, "unknown"):
+            return {
+                "status": "already_initialized",
+                "yolo_ready": self.yolo_model is not None,
+                "sam2_ready": self.sam2_model is not None,
+                "mode": self.mode,
+            }
+
         caps = self.check_capabilities()
         self.mode = caps["mode"]
 
@@ -1103,25 +1111,52 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     # OBB dataset export
     # ------------------------------------------------------------------
-    def export_obb_dataset(self, session_dir):
+    def export_obb_dataset(self, session_dir, generate_synthetic=True):
         """
         Export OBB-format YOLO dataset from session annotations.
-        Boxes with obbCorners get 4-corner format; boxes without fall back to AABB.
-        Writes to session_dir/obb_dataset/ with dataset.yaml.
+        Boxes with obbCorners get 4-corner format; boxes without fall back to AABB (0° OBB).
+
+        Args:
+            generate_synthetic: Pass False when SAM2 is unavailable (CPU-only) to
+                skip synthetic rotational augmentation and avoid edge-artifact poisoning.
         """
         from data.export_yolo_dataset import export_obb_dataset as _export_obb
-        result = _export_obb(session_dir)
+        result = _export_obb(session_dir, generate_synthetic=generate_synthetic)
         return result
 
     # ------------------------------------------------------------------
     # OBB detector training
     # ------------------------------------------------------------------
-    def train_yolo_obb(self, session_dir, epochs=50, model_tier="nano"):
+    def train_yolo_obb(self, session_dir, epochs=None, model_tier="nano",
+                       device="cpu", sam2_enabled=True):
         """
         Train a YOLOv8-OBB detector on the session's OBB dataset.
         Unloads YOLO-World and SAM2 first to free memory.
+
+        Args:
+            device: Compute device ('cpu', 'mps', 'cuda'). Controls batch size
+                and epoch defaults for thermal safety and performance.
+            sam2_enabled: When False, synthetic augmentation is skipped to
+                prevent edge-artifact poisoning on CPU-only systems.
         """
         import gc
+
+        # Hardware-routed hyperparameters
+        if device in ("cuda", "mps"):
+            default_epochs = 100
+            default_batch = 16
+        else:  # cpu
+            default_epochs = 30
+            # Capped between 4-8 — YOLO batch=-1 autotune can be dangerous on CPU
+            default_batch = 6
+
+        resolved_epochs = epochs if (epochs is not None and epochs != 50) else default_epochs
+        resolved_batch = default_batch  # Always explicit; avoid YOLO autotune on CPU
+
+        logger.info(
+            "OBB training: device=%s, epochs=%d, batch=%d, sam2=%s",
+            device, resolved_epochs, resolved_batch, sam2_enabled,
+        )
 
         # Unload large models before training to reclaim memory
         if self.yolo_model is not None:
@@ -1138,9 +1173,9 @@ class SuperAnnotator:
         except ImportError:
             pass
 
-        # Export OBB dataset first
+        # Export OBB dataset — pass sam2_enabled to control synthetic generation
         send_progress("Exporting OBB dataset...", 5, "training")
-        export_result = self.export_obb_dataset(session_dir)
+        export_result = self.export_obb_dataset(session_dir, generate_synthetic=sam2_enabled)
         if not export_result.get("ok"):
             return {"status": "error", "error": export_result.get("error", "OBB dataset export failed")}
 
@@ -1156,7 +1191,7 @@ class SuperAnnotator:
         base_model = base_map.get(model_tier, "yolov8n-obb.pt")
         freeze_layers = 14 if model_tier == "nano" else 0
 
-        send_progress(f"Starting YOLOv8-OBB training ({model_tier})...", 10, "training")
+        send_progress(f"Starting YOLOv8-OBB training ({model_tier}, {device})...", 10, "training")
         from ultralytics import YOLO
         model = YOLO(base_model)
 
@@ -1171,9 +1206,10 @@ class SuperAnnotator:
         output_dir = os.path.join(session_dir, "models", "obb_training")
         model.train(
             data=dataset_yaml,
-            epochs=epochs,
+            epochs=resolved_epochs,
             imgsz=640,
-            batch=-1,
+            batch=resolved_batch,
+            device=device,
             freeze=freeze_layers,
             project=output_dir,
             name="session_obb",
@@ -1423,8 +1459,10 @@ def main():
             elif command == "train_yolo_obb":
                 result = annotator.train_yolo_obb(
                     session_dir=cmd["session_dir"],
-                    epochs=cmd.get("epochs", 50),
+                    epochs=cmd.get("epochs"),          # None → hardware default
                     model_tier=cmd.get("model_tier", "nano"),
+                    device=cmd.get("device", "cpu"),
+                    sam2_enabled=cmd.get("sam2_enabled", True),
                 )
                 send_response(result)
 

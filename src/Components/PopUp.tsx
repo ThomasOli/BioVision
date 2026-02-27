@@ -5,6 +5,8 @@ import { Button } from "@/Components/ui/button";
 import { Input } from "@/Components/ui/input";
 import { Label } from "@/Components/ui/label";
 import { Progress } from "@/Components/ui/progress";
+import { Slider } from "@/Components/ui/slider";
+import { Switch } from "@/Components/ui/switch";
 import {
   Dialog,
   DialogContent,
@@ -13,6 +15,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/Components/ui/dialog";
+
+const SCHEMA_DEFAULTS: Record<string, { flip_prob: number; vertical_flip_prob: number; rotate_180_prob: number }> = {
+  directional: { flip_prob: 0.5, vertical_flip_prob: 0.0, rotate_180_prob: 0.0 },
+  bilateral:   { flip_prob: 0.5, vertical_flip_prob: 0.0, rotate_180_prob: 0.0 },
+  axial:       { flip_prob: 0.5, vertical_flip_prob: 0.0, rotate_180_prob: 0.5 },
+  invariant:   { flip_prob: 0.5, vertical_flip_prob: 0.25, rotate_180_prob: 0.0 },
+};
 
 interface TrainModelDialogProps {
   open: boolean;
@@ -27,7 +36,8 @@ interface TrainModelDialogProps {
   setPredictorType?: (type: "dlib" | "cnn") => void;
   // OBB detector training (Phase 3 - step before landmarker)
   obbDetectorReady?: boolean;
-  hasObbAnnotations?: boolean;
+  /** Show the OBB detector step — true when user has finalized boxes (flat or OBB) */
+  showObbStep?: boolean;
   isTrainingObb?: boolean;
   handleTrainObbDetector?: () => Promise<void>;
   obbTrainingMessage?: string;
@@ -44,6 +54,10 @@ interface TrainModelDialogProps {
   cnnVariantWarning?: string;
   skipParity?: boolean;
   setSkipParity?: (value: boolean) => void;
+  speciesId?: string;
+  augmentationPolicy?: AugmentationPolicy;
+  onAugmentationPolicyChange?: (policy: AugmentationPolicy) => void;
+  orientationMode?: string;
   trainingProgress?: {
     percent: number;
     stage: string;
@@ -88,18 +102,59 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   cnnVariantWarning,
   skipParity = false,
   setSkipParity,
+  speciesId,
+  augmentationPolicy,
+  onAugmentationPolicyChange,
+  orientationMode,
   trainingProgress = null,
   obbDetectorReady = false,
-  hasObbAnnotations = false,
+  showObbStep = false,
   isTrainingObb = false,
   handleTrainObbDetector,
   obbTrainingMessage,
 }) => {
   const [touched, setTouched] = useState(false);
 
+  // Local editable copy of augmentationPolicy; syncs from props when dialog opens
+  const [localAugPolicy, setLocalAugPolicy] = useState<AugmentationPolicy>({
+    gravity_aligned: true,
+    rotation_range: [-15, 15],
+    scale_range: [0.9, 1.1],
+    flip_prob: 0.5,
+    vertical_flip_prob: 0.0,
+    rotate_180_prob: 0.0,
+  });
+
   useEffect(() => {
-    if (!open) setTouched(false);
-  }, [open]);
+    if (!open) {
+      setTouched(false);
+      return;
+    }
+    const sd = SCHEMA_DEFAULTS[orientationMode ?? "invariant"] ?? SCHEMA_DEFAULTS.invariant;
+    const gravAlign = augmentationPolicy?.gravity_aligned ?? true;
+    const maxRot = !gravAlign && orientationMode === "invariant" ? 180 : 15;
+    const rawRange = augmentationPolicy?.rotation_range ?? [-15, 15];
+    const clampedRange: [number, number] = [
+      Math.max(-maxRot, rawRange[0]),
+      Math.min(maxRot,  rawRange[1]),
+    ];
+    setLocalAugPolicy({
+      gravity_aligned:    gravAlign,
+      rotation_range:     clampedRange,
+      scale_range:        augmentationPolicy?.scale_range        ?? [0.9, 1.1],
+      flip_prob:           augmentationPolicy?.flip_prob           ?? sd.flip_prob,
+      vertical_flip_prob: augmentationPolicy?.vertical_flip_prob ?? sd.vertical_flip_prob,
+      rotate_180_prob:    augmentationPolicy?.rotate_180_prob    ?? sd.rotate_180_prob,
+    });
+  }, [open, augmentationPolicy, orientationMode]);
+
+  const handleAugPolicyChange = useCallback((patch: Partial<AugmentationPolicy>) => {
+    setLocalAugPolicy((prev) => {
+      const next = { ...prev, ...patch };
+      onAugmentationPolicyChange?.(next);
+      return next;
+    });
+  }, [onAugmentationPolicyChange]);
 
   const trimmed = useMemo(() => modelName.trim(), [modelName]);
 
@@ -108,7 +163,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     trimmed.length > 0 &&
     nameOk &&
     !isTraining &&
-    (!hasObbAnnotations || obbDetectorReady);
+    (!showObbStep || obbDetectorReady);
 
   const helperText = useMemo(() => {
     if (!touched)
@@ -178,6 +233,13 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     [cnnVariants]
   );
 
+  // Schema-aware gate variables for the Augmentation Studio
+  const gravityAligned = localAugPolicy.gravity_aligned ?? true;
+  const rotationMax = !gravityAligned && orientationMode === "invariant" ? 180 : 15;
+  const showVerticalFlip = !gravityAligned && orientationMode === "invariant";
+  const showRotate180 = !gravityAligned && orientationMode === "axial";
+  const showDirectionalHint = orientationMode === "directional";
+
   useEffect(() => {
     if (!open) return;
 
@@ -206,7 +268,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
         </DialogHeader>
 
         {/* Step 1: OBB Detector — shown when session has OBB annotations or detector already trained */}
-        {(hasObbAnnotations || obbDetectorReady) && (
+        {(showObbStep || obbDetectorReady) && (
           <div className={`rounded-md border px-3 py-2 mb-1 ${obbDetectorReady ? "border-green-500/40 bg-green-500/5" : "border-amber-500/40 bg-amber-500/5"}`}>
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
@@ -236,7 +298,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
           </div>
         )}
         {/* Step 2 label when OBB step is shown */}
-        {hasObbAnnotations && (
+        {showObbStep && (
           <p className="text-[11px] font-semibold text-muted-foreground px-1">
             Step 2: Train Landmark Predictor
           </p>
@@ -260,8 +322,8 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                 className={cn(
                   "pl-10",
                   touched &&
-                    (!trimmed || !nameOk) &&
-                    "border-destructive focus-visible:ring-destructive"
+                  (!trimmed || !nameOk) &&
+                  "border-destructive focus-visible:ring-destructive"
                 )}
               />
             </div>
@@ -302,7 +364,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                   <div>
                     <p className="text-xs font-semibold">dlib Shape Predictor</p>
                     <p className="text-[11px] text-muted-foreground">
-                      Fast training - best for standardized, controlled-conditions images
+                      Fast training - best for standardized, controlled-conditions images (mean shape predictor)
                     </p>
                   </div>
                 </label>
@@ -399,6 +461,119 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                 </div>
               </label>
             </div>
+          )}
+
+          {/* Augmentation & Schema Studio — only shown when a session is active and CNN is selected */}
+          {speciesId && predictorType === "cnn" && (
+            <details className="rounded-md border border-border/60 bg-muted/20">
+              <summary className="cursor-pointer px-3 py-2 text-xs font-semibold select-none">
+                Augmentation &amp; Schema Studio
+              </summary>
+              <div className="flex flex-col gap-3 px-3 pb-3 pt-1">
+                {/* Gravity-aligned toggle */}
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label className="text-xs font-medium">Gravity-aligned imaging</Label>
+                    <p className="text-[11px] text-muted-foreground">
+                      Locks synthetic rotation to ±15° (for specimens always upright)
+                    </p>
+                  </div>
+                  <Switch
+                    checked={localAugPolicy.gravity_aligned ?? true}
+                    onCheckedChange={(v) => {
+                      const newPolicy: Partial<AugmentationPolicy> = { gravity_aligned: v };
+                      if (v) newPolicy.rotation_range = [-15, 15];
+                      handleAugPolicyChange(newPolicy);
+                    }}
+                    disabled={isTraining}
+                  />
+                </div>
+
+                {/* Rotation range — CNN micro-augmentation only; Dlib is always capped at ±6° in Python */}
+                <div className="flex flex-col gap-1">
+                  <Label className="text-xs text-muted-foreground">
+                    CNN rotation: {(localAugPolicy.rotation_range?.[0] ?? -15).toFixed(0)}° to {(localAugPolicy.rotation_range?.[1] ?? 15).toFixed(0)}°
+                  </Label>
+                  <Slider
+                    value={localAugPolicy.rotation_range ?? [-15, 15]}
+                    onValueChange={([lo, hi]) => handleAugPolicyChange({ rotation_range: [lo, hi] })}
+                    min={-rotationMax}
+                    max={rotationMax}
+                    step={1}
+                    disabled={isTraining}
+                  />
+                </div>
+
+                {/* Scale range */}
+                <div className="flex flex-col gap-1">
+                  <Label className="text-xs text-muted-foreground">
+                    Scale range: {(localAugPolicy.scale_range?.[0] ?? 0.9).toFixed(2)}× to {(localAugPolicy.scale_range?.[1] ?? 1.1).toFixed(2)}×
+                  </Label>
+                  <Slider
+                    value={localAugPolicy.scale_range ?? [0.9, 1.1]}
+                    onValueChange={([lo, hi]) => handleAugPolicyChange({ scale_range: [lo, hi] })}
+                    min={0.7}
+                    max={1.3}
+                    step={0.01}
+                    disabled={isTraining}
+                  />
+                </div>
+
+                {/* Horizontal flip probability */}
+                <div className="flex flex-col gap-1">
+                  <Label className="text-xs text-muted-foreground">
+                    Horizontal flip: {((localAugPolicy.flip_prob ?? 0.5) * 100).toFixed(0)}%
+                  </Label>
+                  <Slider
+                    value={[localAugPolicy.flip_prob ?? 0.5]}
+                    onValueChange={([v]) => handleAugPolicyChange({ flip_prob: v })}
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    disabled={isTraining}
+                  />
+                  {showDirectionalHint && (
+                    <p className="text-[10px] text-amber-500">
+                      Tip: Set to 0% for strictly directional specimens where left/right carries biological meaning.
+                    </p>
+                  )}
+                </div>
+
+                {/* Vertical flip — invariant schema only, gravity OFF */}
+                {showVerticalFlip && (
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs text-muted-foreground">
+                      Vertical flip: {((localAugPolicy.vertical_flip_prob ?? 0) * 100).toFixed(0)}%
+                    </Label>
+                    <Slider
+                      value={[localAugPolicy.vertical_flip_prob ?? 0]}
+                      onValueChange={([v]) => handleAugPolicyChange({ vertical_flip_prob: v })}
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      disabled={isTraining}
+                    />
+                  </div>
+                )}
+
+                {/* Rotate 180° — axial schema only, gravity OFF */}
+                {showRotate180 && (
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs text-muted-foreground">
+                      Rotate 180°: {((localAugPolicy.rotate_180_prob ?? 0) * 100).toFixed(0)}%
+                    </Label>
+                    <Slider
+                      value={[localAugPolicy.rotate_180_prob ?? 0]}
+                      onValueChange={([v]) => handleAugPolicyChange({ rotate_180_prob: v })}
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      disabled={isTraining}
+                    />
+                  </div>
+                )}
+              </div>
+            </details>
           )}
 
           {(preflightSummary || preflightWarning) && (

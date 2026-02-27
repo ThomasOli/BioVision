@@ -118,6 +118,8 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.invoke("session:create", { speciesId, name, landmarkTemplate, orientationPolicy }),
   sessionUpdateOrientationPolicy: (speciesId: string, orientationPolicy: OrientationPolicy) =>
     ipcRenderer.invoke("session:update-orientation-policy", { speciesId, orientationPolicy }),
+  sessionUpdateAugmentation: (speciesId: string, augmentationPolicy: Record<string, unknown>) =>
+    ipcRenderer.invoke("session:update-augmentation", { speciesId, augmentationPolicy }),
   sessionSaveImage: (speciesId: string, imageData: string, filename: string, mimeType: string) =>
     ipcRenderer.invoke("session:save-image", { speciesId, imageData, filename, mimeType }),
   sessionSaveAnnotations: (speciesId: string, filename: string, boxes: any[]) =>
@@ -358,6 +360,8 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.invoke("session:get-retrain-queue", { speciesId, inferenceSessionId }),
   sessionClearRetrainQueue: (speciesId: string, inferenceSessionId?: string, filenames?: string[]) =>
     ipcRenderer.invoke("session:clear-retrain-queue", { speciesId, inferenceSessionId, filenames }),
+  // Hardware capability probe — called once at app startup
+  probeHardware: () => ipcRenderer.invoke("system:probe-hardware"),
 });
 
 // --------- Preload scripts loading ---------

@@ -17,6 +17,7 @@ import { AppView, AnnotatedImage } from "./types/Image"
 import { DetectionMode, DetectionPreset } from "./Components/DetectionModeSelector"
 import { AppDispatch, RootState } from "./state/store"
 import { setSessionImages } from "./state/filesState/fileSlice"
+import { setHardwareCapabilities } from "./state/hardwareSlice"
 
 /** Restores session images+annotations from disk whenever the active species changes. */
 function SessionRestorer() {
@@ -64,6 +65,28 @@ function SessionRestorer() {
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
 const App: React.FC = () => {
+  const dispatch = useDispatch<AppDispatch>()
+
+  // Probe hardware capabilities once at startup and populate Redux
+  useEffect(() => {
+    window.api.probeHardware()
+      .then((caps) => {
+        const sam2Enabled = caps.device !== "cpu" && (caps.ramGb ?? 0) >= 8
+        dispatch(setHardwareCapabilities({
+          probed: true,
+          device: caps.device,
+          ramGb: caps.ramGb,
+          gpuName: caps.gpuName,
+          sam2Enabled,
+          yoloWorldEnabled: true,
+          cnnTier: caps.device === "cpu" ? "slow" : "fast",
+        }))
+      })
+      .catch(() => {
+        // Probe failed — stay at conservative defaults (all false/null)
+      })
+  }, [dispatch])
+
   // Navigation state
   const [currentView, setCurrentView] = useState<AppView>("landing")
   const [openTrainDialogOnMount, setOpenTrainDialogOnMount] = useState(false)

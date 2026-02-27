@@ -11,6 +11,17 @@ STANDARD_SIZE = 512
 ORIENTATION_MODES = {"directional", "bilateral", "axial", "invariant"}
 
 
+def load_augmentation_policy(session_dir: str) -> dict:
+    """Load augmentationPolicy block from session.json, or {} if absent/unreadable."""
+    session_path = os.path.join(session_dir, "session.json")
+    try:
+        with open(session_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return dict(meta.get("augmentationPolicy") or {})
+    except Exception:
+        return {}
+
+
 def _safe_list_of_str(value: Any, default: Sequence[str] | None = None) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return [str(v).strip().lower() for v in (default or []) if str(v).strip()]
@@ -363,7 +374,9 @@ def build_dlib_name_swap_map(
     return name_swap
 
 
-def get_schema_augmentation_profile(mode: str | None, *, engine: str) -> dict[str, Any]:
+def get_schema_augmentation_profile(
+    mode: str | None, *, engine: str, augmentation_override: dict | None = None
+) -> dict[str, Any]:
     """
     Return schema-driven augmentation defaults by model engine.
 
@@ -377,6 +390,9 @@ def get_schema_augmentation_profile(mode: str | None, *, engine: str) -> dict[st
             "scale_range": (min_scale, max_scale),
             "translate_ratio": float,
         }
+
+    augmentation_override: optional dict loaded from session.json augmentationPolicy.
+      Fields present in the override replace the corresponding hardcoded defaults.
     """
     resolved_mode = _safe_orientation_mode(mode)
     eng = str(engine or "").strip().lower()
@@ -399,7 +415,15 @@ def get_schema_augmentation_profile(mode: str | None, *, engine: str) -> dict[st
             # handles wide angular invariance via its continuous (-180°, 180°) range.
             "invariant": {"angles": [-6.0, -3.0, 3.0, 6.0], "flip": True},
         }
-        return dict(profiles.get(resolved_mode, profiles["invariant"]))
+        profile = dict(profiles.get(resolved_mode, profiles["invariant"]))
+        if augmentation_override:
+            if "angles" in augmentation_override:
+                # Dlib regression trees collapse above ±6°; enforce hard cap.
+                clamped = [max(-6.0, min(6.0, float(a))) for a in augmentation_override["angles"]]
+                profile["angles"] = clamped or [-6.0, -3.0, 3.0, 6.0]
+            if "dlib_flip" in augmentation_override:
+                profile["flip"] = bool(augmentation_override["dlib_flip"])
+        return profile
 
     if eng == "cnn":
         # With OBB leveling, OBB-oriented schemas use tighter rotation ranges (±10°)
@@ -442,7 +466,18 @@ def get_schema_augmentation_profile(mode: str | None, *, engine: str) -> dict[st
                 "translate_ratio": 0.10,
             },
         }
-        return dict(profiles.get(resolved_mode, profiles["invariant"]))
+        profile = dict(profiles.get(resolved_mode, profiles["invariant"]))
+        if augmentation_override:
+            for k in ("flip_prob", "vertical_flip_prob", "rotate_180_prob", "translate_ratio"):
+                if k in augmentation_override:
+                    profile[k] = float(augmentation_override[k])
+            if "rotation_range" in augmentation_override:
+                rr = augmentation_override["rotation_range"]
+                profile["rotation_range"] = tuple(rr) if isinstance(rr, list) else rr
+            if "scale_range" in augmentation_override:
+                sr = augmentation_override["scale_range"]
+                profile["scale_range"] = tuple(sr) if isinstance(sr, list) else sr
+        return profile
 
     raise ValueError(f"Unsupported engine '{engine}' for schema augmentation profile.")
 

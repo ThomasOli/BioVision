@@ -205,6 +205,26 @@ function runPythonWithProgress(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Hardware capability probe — called once at app startup from React
+// ---------------------------------------------------------------------------
+ipcMain.handle("system:probe-hardware", async () => {
+  try {
+    const script = path.join(__dirname, "../backend/hardware_probe.py");
+    const out = await runPython([script]);
+    const parsed = JSON.parse(out.trim());
+    return {
+      device: parsed.device ?? "cpu",
+      gpuName: parsed.gpu_name ?? null,
+      ramGb: parsed.ram_gb ?? null,
+    };
+  } catch (err) {
+    console.warn("Hardware probe failed:", err);
+    // Safe fallback — treat as CPU-only
+    return { device: "cpu", gpuName: null, ramGb: null };
+  }
+});
+
 ipcMain.handle("ml:get-project-root", async () => {
   return { projectRoot };
 });
@@ -1838,6 +1858,10 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
         modelName,
         "--model-variant", cnnVariant,
       ];
+      // Pass resolved device so Python honours hardware routing + AMP selection
+      if (cnnCapabilities.device && ["cpu", "mps", "cuda"].includes(cnnCapabilities.device)) {
+        cnnArgs.push("--device", cnnCapabilities.device);
+      }
       emitTrainProgress(
         40,
         "preflight",
@@ -3394,6 +3418,7 @@ ipcMain.handle(
             orientationPolicyConfiguredAt: args.orientationPolicy
               ? new Date().toISOString()
               : undefined,
+            augmentationPolicy: { gravity_aligned: true },
             createdAt: new Date().toISOString(),
             lastModified: new Date().toISOString(),
             imageCount: 0,
@@ -4287,6 +4312,41 @@ ipcMain.handle(
 );
 
 ipcMain.handle(
+  "session:update-augmentation",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      augmentationPolicy: {
+        gravity_aligned?: boolean;
+        rotation_range?: [number, number];
+        scale_range?: [number, number];
+        flip_prob?: number;
+        vertical_flip_prob?: number;
+        rotate_180_prob?: number;
+        translate_ratio?: number;
+      };
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      if (!fs.existsSync(sessionJsonPath)) {
+        return { ok: false, error: `Session not found: ${args.speciesId}` };
+      }
+      const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+      meta.augmentationPolicy = args.augmentationPolicy;
+      meta.lastModified = new Date().toISOString();
+      fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:update-augmentation failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
   "session:load-inference-review-drafts",
   async (_event, args: { speciesId: string; inferenceSessionId?: string }) => {
     try {
@@ -4573,6 +4633,8 @@ class SuperAnnotatorProcess {
   > = new Map();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private requestId = 0;
+  /** True after a successful `init` command — models are loaded and ready. */
+  initCompleted = false;
   private readonly IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
   private stderrTail: string[] = [];
   private readonly MAX_STDERR_TAIL_LINES = 60;
@@ -4675,6 +4737,7 @@ class SuperAnnotatorProcess {
       this.pending.clear();
       this.process = null;
       this.rl = null;
+      this.initCompleted = false; // models must be reloaded on next start
     });
 
     this.process.on("error", (err: Error) => {
@@ -4859,7 +4922,7 @@ async function ensureSam2Ready(): Promise<{ ok: boolean; error?: string }> {
  */
 function getLocalCapabilityEstimate() {
   const freeRamGb = os.freemem() / (1024 ** 3);
-  const mode = freeRamGb > 1.5 ? "auto_lite" : "classic_fallback";
+  const mode = freeRamGb > 1.0 ? "auto_lite" : "classic_fallback";
   return {
     available: true,
     mode,
@@ -4917,11 +4980,26 @@ ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, option
     const caps = await superAnnotator.send({ cmd: "check" });
     const modelTier = options?.modelTier ?? caps?.obb_model_tier ?? "nano";
 
+    // Probe hardware to determine device + SAM2 availability for routing
+    let hwDevice = "cpu";
+    let hwSam2Enabled = false;
+    try {
+      const hwScript = path.join(__dirname, "../backend/hardware_probe.py");
+      const hwOut = await runPython([hwScript]);
+      const hw = JSON.parse(hwOut.trim());
+      hwDevice = hw.device ?? "cpu";
+      hwSam2Enabled = hwDevice !== "cpu" && (hw.ram_gb ?? 0) >= 8;
+    } catch (_hwErr) {
+      console.warn("Hardware probe failed during OBB training — defaulting to cpu");
+    }
+
     const result = await superAnnotator.send({
       cmd: "train_yolo_obb",
       session_dir: sessionDir,
-      epochs: options?.epochs ?? 50,
+      epochs: options?.epochs,   // undefined → Python selects hardware-appropriate default
       model_tier: modelTier,
+      device: hwDevice,
+      sam2_enabled: hwSam2Enabled,
     });
 
     if (result?.status === "error") {
@@ -5005,9 +5083,12 @@ ipcMain.handle(
     }
   ) => {
     try {
-      // Ensure process is running and initialized
-      if (!superAnnotator.isRunning) {
+      // Ensure models are initialized. Use initCompleted (not isRunning) so that
+      // if the process was started by a prior command (e.g. check-super-annotator)
+      // without loading models, we still call init before running annotation.
+      if (!superAnnotator.initCompleted) {
         await superAnnotator.send({ cmd: "init" });
+        superAnnotator.initCompleted = true;
       }
 
       // Resolve session root
@@ -5212,9 +5293,9 @@ ipcMain.handle(
         return { ok: false, error: `Session directory not found: ${sessionDir}` };
       }
 
-      // Ensure process is running and initialized
-      if (!superAnnotator.isRunning) {
+      if (!superAnnotator.initCompleted) {
         await superAnnotator.send({ cmd: "init" });
+        superAnnotator.initCompleted = true;
       }
 
       const result = await superAnnotator.send({
@@ -5268,9 +5349,9 @@ ipcMain.handle(
         return { ok: false, error: `Session directory not found: ${sessionDir}` };
       }
 
-      // Ensure process is running and initialized
-      if (!superAnnotator.isRunning) {
+      if (!superAnnotator.initCompleted) {
         await superAnnotator.send({ cmd: "init" });
+        superAnnotator.initCompleted = true;
       }
 
       const result = await superAnnotator.send({

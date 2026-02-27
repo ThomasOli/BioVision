@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
 import { clearFiles } from "../state/filesState/fileSlice";
+import { selectCnnTier } from "../state/hardwareSlice";
 import Landmark from "./Landmark";
 import { TrainModelDialog } from "./PopUp";
 import { DetectionModeSelector, DetectionMode, DetectionPreset } from "./DetectionModeSelector";
@@ -121,16 +122,24 @@ const Menu: React.FC<MenuProps> = ({
   const [obbDetectorReady, setObbDetectorReady] = useState(false);
   const [isTrainingObb, setIsTrainingObb] = useState(false);
   const [obbTrainingMessage, setObbTrainingMessage] = useState<string>("");
+  const [augmentationPolicy, setAugmentationPolicy] = useState<AugmentationPolicy | undefined>(undefined);
+  const [orientationMode, setOrientationMode] = useState<string | undefined>(undefined);
 
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
+  const cnnTier = useSelector(selectCnnTier); // "fast" (gpu/mps) | "slow" (cpu)
   const hasWorkspaceData = (fileArray?.length ?? 0) > 0;
-  const canTrain = hasWorkspaceData && !isTraining;
 
-  // Derive whether session has any OBB annotations from the current file array
+  // Derive OBB readiness for the training dialog:
+  // - hasFinalizedBoxes: user has locked at least one detection box (flat AABB or OBB)
+  // - hasObbAnnotations: user has at least one box with explicit OBB corners
+  // Either condition unlocks the "Train OBB Detector" step in PopUp
+  const hasFinalizedBoxes = (fileArray ?? []).some((img) => img.isFinalized === true);
+  const canTrain = hasFinalizedBoxes && !isTraining;
   const hasObbAnnotations = (fileArray ?? []).some((img) =>
     img.boxes?.some((b) => Array.isArray((b as any).obbCorners) && (b as any).obbCorners.length === 4)
   );
+  const showObbStep = hasFinalizedBoxes || hasObbAnnotations;
 
   useEffect(() => {
     const fetchProjectRoot = async () => {
@@ -144,6 +153,20 @@ const Menu: React.FC<MenuProps> = ({
     };
     fetchProjectRoot();
   }, []);
+
+  // Load augmentationPolicy and orientationMode from session when the train dialog opens
+  useEffect(() => {
+    if (!openTrainDialog || !activeSpeciesId) return;
+    window.api.sessionLoad(activeSpeciesId).then((result) => {
+      if (result?.ok) {
+        if (result.meta?.augmentationPolicy) {
+          setAugmentationPolicy(result.meta.augmentationPolicy as AugmentationPolicy);
+        }
+        const mode = result.meta?.orientationPolicy?.mode;
+        if (typeof mode === "string") setOrientationMode(mode);
+      }
+    }).catch(() => {/* ignore */});
+  }, [openTrainDialog, activeSpeciesId]);
 
   useEffect(() => {
     const loadCnnVariants = async () => {
@@ -159,6 +182,8 @@ const Menu: React.FC<MenuProps> = ({
         const hasRequested =
           !!requestedDefault &&
           selectable.some((v) => v.id === requestedDefault);
+
+        // Python-recommended default (or first selectable as fallback)
         const resolvedDefault = hasRequested
           ? String(requestedDefault)
           : selectable[0]?.id ?? parsed[0]?.id ?? "simplebaseline";
@@ -194,11 +219,17 @@ const Menu: React.FC<MenuProps> = ({
     if (predictorType !== "cnn" || cnnVariants.length === 0) return;
     const current = cnnVariants.find((v) => v.id === cnnVariant);
     if (current?.selectable) return;
+    // Prefer tier-appropriate backbone, then Python-recommended, then first selectable
+    const tierPreferred = cnnTier === "slow" ? "mobilenet_v3_large" : cnnTier === "fast" ? "resnet50" : null;
+    const tierMatch = tierPreferred
+      ? cnnVariants.find((v) => v.id === tierPreferred && v.selectable)?.id
+      : undefined;
     const fallback =
+      tierMatch ??
       cnnVariants.find((v) => v.recommended && v.selectable)?.id ??
       cnnVariants.find((v) => v.selectable)?.id;
     if (fallback) setCnnVariant(fallback);
-  }, [predictorType, cnnVariants, cnnVariant]);
+  }, [predictorType, cnnVariants, cnnVariant, cnnTier]);
 
   // Check OBB detector readiness when species or train dialog opens
   useEffect(() => {
@@ -408,10 +439,19 @@ const Menu: React.FC<MenuProps> = ({
           setSkipParity={setSkipParity}
           trainingProgress={trainingProgress}
           obbDetectorReady={obbDetectorReady}
-          hasObbAnnotations={hasObbAnnotations}
+          showObbStep={showObbStep}
           isTrainingObb={isTrainingObb}
           handleTrainObbDetector={handleTrainObbDetector}
           obbTrainingMessage={obbTrainingMessage}
+          speciesId={activeSpeciesId ?? undefined}
+          augmentationPolicy={augmentationPolicy}
+          onAugmentationPolicyChange={(policy) => {
+            setAugmentationPolicy(policy);
+            if (activeSpeciesId) {
+              window.api.sessionUpdateAugmentation(activeSpeciesId, policy).catch(() => {/* ignore */});
+            }
+          }}
+          orientationMode={orientationMode}
         />
 
         <ScrollArea className="flex-1">

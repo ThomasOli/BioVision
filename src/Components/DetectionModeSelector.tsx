@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
+import { useSelector } from "react-redux";
 import { Label } from "./ui/label";
 import { Slider } from "./ui/slider";
 import { Input } from "./ui/input";
 import { Switch } from "./ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { selectSam2Enabled } from "../state/hardwareSlice";
 
 export type DetectionMode = "manual" | "auto";
 export type DetectionPreset = "balanced" | "precision" | "recall" | "single_object";
@@ -34,6 +37,9 @@ export function DetectionModeSelector({
   samEnabled = false,
   onSamEnabledChange,
 }: DetectionModeSelectorProps) {
+  // Redux-backed hardware capability (computed from system probe at startup)
+  const reduxSam2Enabled = useSelector(selectSam2Enabled);
+
   const [capabilityInfo, setCapabilityInfo] = useState<{
     mode: string;
     gpu: boolean;
@@ -43,7 +49,6 @@ export function DetectionModeSelector({
     sam2_failed: boolean;
     yolo_error?: string | null;
   } | null>(null);
-  const [isInitializing, setIsInitializing] = useState(false);
 
   const refreshCapabilities = useCallback(() => {
     window.api.checkSuperAnnotator().then((result) => {
@@ -72,14 +77,17 @@ export function DetectionModeSelector({
     refreshCapabilities();
   }, [refreshCapabilities]);
 
-  // Re-check capabilities after models load (triggered by first auto-detect)
+  // Poll capabilities while YOLO is pending so the badge updates after auto-init
   useEffect(() => {
-    const recheck = () => {
-      refreshCapabilities();
-    };
-    window.addEventListener("super-annotator-ready", recheck);
-    return () => window.removeEventListener("super-annotator-ready", recheck);
-  }, [refreshCapabilities]);
+    if (
+      !capabilityInfo ||
+      capabilityInfo.yolo_ready ||
+      capabilityInfo.yolo_failed ||
+      capabilityInfo.mode === "classic_fallback"
+    ) return;
+    const id = setInterval(refreshCapabilities, 4000);
+    return () => clearInterval(id);
+  }, [capabilityInfo, refreshCapabilities]);
 
   const modeOptions: { value: DetectionMode; label: string; desc: string }[] = [
     { value: "manual", label: "Manual", desc: "Draw bounding boxes manually" },
@@ -87,41 +95,15 @@ export function DetectionModeSelector({
   ];
 
   const sam2Available = capabilityInfo?.mode === "auto_high_performance";
-
-  const yoloStatusHint = capabilityInfo
-    ? capabilityInfo.yolo_ready
-      ? "YOLO ready."
-      : capabilityInfo.yolo_failed
-        ? `YOLO unavailable: ${capabilityInfo.yolo_error ?? "initialization failed"}`
-        : capabilityInfo.mode === "classic_fallback"
-          ? "YOLO not attempted: requires more free RAM (>2GB) or GPU."
-          : "YOLO pending: click Initialize models."
-    : null;
-  const sam2StatusHint = capabilityInfo
-    ? capabilityInfo.sam2_ready
-      ? "SAM2 ready."
-      : sam2Available
-        ? "SAM2 pending: initialize models to enable mask refinement."
-        : "SAM2 system-gated: requires GPU + sufficient memory."
-    : null;
-
   const isClassicFallback = capabilityInfo?.mode === "classic_fallback";
   const classicFallbackReason = capabilityInfo
     ? capabilityInfo.yolo_failed
       ? `Python error: ${capabilityInfo.yolo_error ?? "initialization failed"}`
-      : "Requires >1.5 GB free RAM or GPU"
+      : "Requires >1 GB free RAM or GPU"
     : null;
 
-  const handleInitializeModels = async () => {
-    setIsInitializing(true);
-    try {
-      await window.api.initSuperAnnotator();
-    } finally {
-      refreshCapabilities();
-      window.dispatchEvent(new CustomEvent("super-annotator-ready"));
-      setIsInitializing(false);
-    }
-  };
+  // SAM2 is interactable only when hardware AND runtime capability both confirm it
+  const sam2Disabled = disabled || !reduxSam2Enabled || (capabilityInfo !== null && !sam2Available);
 
   return (
     <div className="flex flex-col gap-3 p-3 bg-zinc-800 rounded-lg">
@@ -206,7 +188,7 @@ export function DetectionModeSelector({
             />
           </div>
 
-          {/* SAM2 refinement toggle */}
+          {/* SAM2 refinement toggle — gated by both hardware probe and runtime capability */}
           <div className="flex items-center justify-between pt-1">
             <div className="flex flex-col gap-0.5">
               <Label className="text-xs text-zinc-400">
@@ -215,14 +197,29 @@ export function DetectionModeSelector({
               <p className="text-[10px] text-zinc-500">
                 {sam2Available
                   ? "Precise pixel masks for crowded scenes"
-                  : "Requires GPU + SAM2 model"}
+                  : reduxSam2Enabled
+                    ? "Not available in current detection mode"
+                    : "Requires GPU + 8 GB RAM"}
               </p>
             </div>
-            <Switch
-              checked={samEnabled}
-              onCheckedChange={(checked) => onSamEnabledChange?.(checked)}
-              disabled={disabled || !sam2Available}
-            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Switch
+                    checked={samEnabled}
+                    onCheckedChange={(checked) => onSamEnabledChange?.(checked)}
+                    disabled={sam2Disabled}
+                  />
+                </span>
+              </TooltipTrigger>
+              {sam2Disabled && (
+                <TooltipContent side="left">
+                  {!reduxSam2Enabled
+                    ? "SAM2 requires a GPU (CUDA or Apple MPS) and at least 8 GB of system RAM."
+                    : "SAM2 is only available in high-performance mode (GPU detected but running in lite mode)."}
+                </TooltipContent>
+              )}
+            </Tooltip>
           </div>
 
           {/* Capability badges */}
@@ -239,17 +236,14 @@ export function DetectionModeSelector({
               }`}>
                 YOLO {capabilityInfo.yolo_ready ? "ready" : capabilityInfo.yolo_failed ? "unavailable" : isClassicFallback ? "N/A" : "pending"}
               </span>
-              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${
-                capabilityInfo.sam2_ready
-                  ? "bg-green-500/20 text-green-400"
-                  : sam2Available
-                    ? "bg-yellow-500/20 text-yellow-400"
-                    : "bg-zinc-500/20 text-zinc-400"
-              }`}>
-                SAM2 {capabilityInfo.sam2_ready ? "ready" : sam2Available ? "pending" : "N/A"}
-              </span>
-              {capabilityInfo.gpu && (
-                <span className="text-[10px] text-zinc-500">GPU</span>
+              {(sam2Available || capabilityInfo.sam2_ready) && (
+                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                  capabilityInfo.sam2_ready
+                    ? "bg-green-500/20 text-green-400"
+                    : "bg-yellow-500/20 text-yellow-400"
+                }`}>
+                  SAM2 {capabilityInfo.sam2_ready ? "ready" : "pending"}
+                </span>
               )}
               {isClassicFallback && (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-500/20 text-blue-400">
@@ -268,57 +262,11 @@ export function DetectionModeSelector({
             </div>
           )}
 
-          {/* Small status hint — suppress when classic_fallback since button sub-text already explains it */}
-          {yoloStatusHint && !isClassicFallback && (
-            <p className={`text-[10px] ${
-              capabilityInfo?.yolo_failed ? "text-red-400/90" : "text-zinc-500"
-            }`}>
-              Status: {yoloStatusHint}
-            </p>
-          )}
-          {sam2StatusHint && (
+          {/* Classic fallback info */}
+          {isClassicFallback && classicFallbackReason && (
             <p className="text-[10px] text-zinc-500">
-              SAM2: {sam2StatusHint}
+              {classicFallbackReason}. Auto-detect will use OpenCV.
             </p>
-          )}
-
-          {/* Initialize models — always visible in auto mode */}
-          {capabilityInfo === null ? (
-            <button
-              type="button"
-              disabled
-              className="h-8 px-3 rounded-md text-xs font-medium text-white border border-zinc-700 bg-zinc-800/60 opacity-60 cursor-not-allowed"
-            >
-              Checking environment...
-            </button>
-          ) : isClassicFallback ? (
-            <div className="flex flex-col gap-1">
-              <button
-                type="button"
-                disabled
-                className="h-8 px-3 rounded-md text-xs font-medium text-white border border-zinc-700 bg-zinc-800/60 opacity-60 cursor-not-allowed"
-              >
-                Initialize models (unavailable)
-              </button>
-              <p className="text-[10px] text-zinc-500">{classicFallbackReason}. Auto-detect will use OpenCV.</p>
-            </div>
-          ) : (
-            <button
-              type="button"
-              onClick={handleInitializeModels}
-              disabled={disabled || isInitializing || !!capabilityInfo.yolo_ready}
-              className={`h-8 px-3 rounded-md text-xs font-medium text-white border border-zinc-600 ${
-                disabled || isInitializing || !!capabilityInfo.yolo_ready
-                  ? "bg-zinc-800/60 opacity-60 cursor-not-allowed"
-                  : "bg-zinc-700 hover:bg-zinc-600"
-              }`}
-            >
-              {capabilityInfo.yolo_ready
-                ? "Models initialized"
-                : isInitializing
-                  ? "Initializing models..."
-                  : "Initialize models"}
-            </button>
           )}
         </div>
       )}

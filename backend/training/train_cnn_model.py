@@ -51,7 +51,10 @@ STANDARD_SIZE = 512
 def _resolve_orientation_aug_policy(project_root):
     orientation_policy = ou.load_orientation_policy(project_root)
     orientation_mode = ou.get_orientation_mode(orientation_policy)
-    aug_profile = ou.get_schema_augmentation_profile(orientation_mode, engine="cnn")
+    aug_override = ou.load_augmentation_policy(project_root)
+    aug_profile = ou.get_schema_augmentation_profile(
+        orientation_mode, engine="cnn", augmentation_override=aug_override or None
+    )
     return orientation_policy, orientation_mode, aug_profile
 
 
@@ -607,12 +610,18 @@ def _compute_error(model, loader, device):
     total = 0.0
     count = 0
     with torch.no_grad():
-        use_amp_eval = str(device) == "cuda"
+        dev_str = str(device)
+        if dev_str == "cuda":
+            use_amp_eval, amp_eval_type, amp_eval_dtype = True, "cuda", torch.float16
+        elif dev_str == "mps":
+            use_amp_eval, amp_eval_type, amp_eval_dtype = True, "mps", torch.bfloat16
+        else:
+            use_amp_eval, amp_eval_type, amp_eval_dtype = False, "cpu", torch.float32
         for imgs, targets in loader:
-            imgs = imgs.to(device, non_blocking=use_amp_eval)
-            targets = targets.to(device, non_blocking=use_amp_eval)
+            imgs = imgs.to(device, non_blocking=(dev_str == "cuda"))
+            targets = targets.to(device, non_blocking=(dev_str == "cuda"))
             amp_ctx = (
-                torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+                torch.autocast(device_type=amp_eval_type, dtype=amp_eval_dtype, enabled=True)
                 if use_amp_eval
                 else nullcontext()
             )
@@ -646,7 +655,7 @@ def _run_pipeline_parity_eval(project_root, tag, predictor_type, train_xml, test
 
 
 def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
-                    model_variant="simplebaseline", skip_parity=False):
+                    model_variant="simplebaseline", skip_parity=False, device_override=None):
     """
     Train a CNN landmark predictor for a given session + model tag.
 
@@ -752,8 +761,11 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
           f"{len(test_records)} test samples, {n_landmarks} landmarks",
           file=sys.stderr)
 
-    # Determine device
-    if torch.cuda.is_available():
+    # Determine device — honour explicit override from Electron (--device flag)
+    if device_override and device_override in ("cpu", "mps", "cuda"):
+        device = torch.device(device_override)
+        print(f"Device: {device} (overridden by --device flag)", file=sys.stderr)
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -794,8 +806,21 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
 
-    use_amp = str(device) == "cuda"
-    if use_amp:
+    # AMP is supported on both CUDA and MPS (PyTorch >= 2.0).
+    # MPS uses bfloat16; CUDA uses float16 with GradScaler.
+    if str(device) == "cuda":
+        use_amp = True
+        amp_device_type = "cuda"
+        amp_dtype = torch.float16
+    elif str(device) == "mps":
+        use_amp = True
+        amp_device_type = "mps"
+        amp_dtype = torch.bfloat16
+    else:
+        use_amp = False
+        amp_device_type = "cpu"
+        amp_dtype = torch.float32
+    if str(device) == "cuda":
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:
@@ -934,7 +959,9 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     optimizer = optim.AdamW(model.parameters(), lr=resolved_lr, weight_decay=resolved_weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=resolved_epochs)
     epoch_losses = []
-    if use_amp:
+    # GradScaler is only used with CUDA float16. MPS uses bfloat16 and
+    # does not require a gradient scaler.
+    if use_amp and amp_device_type == "cuda":
         try:
             scaler = torch.amp.GradScaler("cuda", enabled=True)
         except Exception:
@@ -942,6 +969,8 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     else:
         scaler = None
     train_started_at = time.time()
+    consecutive_nan_batches = 0
+    MAX_CONSECUTIVE_NAN = 3
 
     print(
         "PROGRESS_JSON " + json.dumps({
@@ -973,13 +1002,34 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             targets = targets.to(device, non_blocking=bool(pin_memory))
             optimizer.zero_grad()
             amp_ctx = (
-                torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+                torch.autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=True)
                 if use_amp
                 else nullcontext()
             )
             with amp_ctx:
                 preds = model(imgs)
                 loss = wing_loss(preds, targets)
+            if not torch.isfinite(loss):
+                consecutive_nan_batches += 1
+                print(
+                    f"WARNING: Non-finite loss ({loss.item()}) on epoch {epoch}, batch skipped. "
+                    f"({consecutive_nan_batches}/{MAX_CONSECUTIVE_NAN})",
+                    file=sys.stderr,
+                )
+                if use_amp and consecutive_nan_batches >= MAX_CONSECUTIVE_NAN:
+                    use_amp = False
+                    amp_device_type = "cpu"
+                    amp_dtype = torch.float32
+                    amp_ctx = nullcontext()
+                    scaler = None
+                    print(
+                        "WARNING: AMP disabled for the rest of training due to repeated NaN losses.",
+                        file=sys.stderr,
+                    )
+                optimizer.zero_grad()
+                continue
+            else:
+                consecutive_nan_batches = 0
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -1263,6 +1313,13 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--model-variant", type=str, default="simplebaseline")
     parser.add_argument("--skip-parity", action="store_true")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cpu", "mps", "cuda"],
+        help="Force compute device, overriding auto-detection.",
+    )
     args = parser.parse_args()
 
     train_cnn_model(
@@ -1273,4 +1330,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         model_variant=args.model_variant,
         skip_parity=bool(args.skip_parity),
+        device_override=args.device,
     )

@@ -972,6 +972,51 @@ def _random_canvas_background(width, height, rng):
     return cv2.GaussianBlur(bg, (5, 5), 0)
 
 
+def _sample_real_background(positives, canvas_size, rng, max_attempts=30):
+    """
+    Sample a canvas_size×canvas_size crop from a real source image,
+    choosing a region that does not overlap any annotated bounding box.
+    Returns an (H, W, 3) uint8 array, or None if no clean crop is found.
+    """
+    if not positives:
+        return None
+    pool = list(positives)
+    rng.shuffle(pool)
+    for sample in pool[:max_attempts]:
+        img_path = sample.get("image_path") or sample.get("path")
+        if not img_path or not os.path.exists(img_path):
+            continue
+        img = safe_imread(img_path)
+        if img is None:
+            continue
+        ih, iw = img.shape[:2]
+        if iw < canvas_size or ih < canvas_size:
+            scale = canvas_size / min(iw, ih) * 1.05
+            img = cv2.resize(img, (int(iw * scale), int(ih * scale)), interpolation=cv2.INTER_LINEAR)
+            ih, iw = img.shape[:2]
+        occupied = []
+        for box in (sample.get("boxes") or []):
+            x1 = _safe_int(box.get("x", 0))
+            y1 = _safe_int(box.get("y", 0))
+            x2 = x1 + _safe_int(box.get("width", 0))
+            y2 = y1 + _safe_int(box.get("height", 0))
+            if x2 > x1 and y2 > y1:
+                occupied.append((x1, y1, x2, y2))
+        for _ in range(20):
+            cx = rng.randint(0, max(0, iw - canvas_size))
+            cy = rng.randint(0, max(0, ih - canvas_size))
+            if not any(
+                cx < ox2 and (cx + canvas_size) > ox1 and
+                cy < oy2 and (cy + canvas_size) > oy1
+                for (ox1, oy1, ox2, oy2) in occupied
+            ):
+                crop = img[cy:cy + canvas_size, cx:cx + canvas_size]
+                if crop.shape[2] == 4:
+                    crop = crop[:, :, :3]
+                return crop
+    return None
+
+
 def _overlaps_with_gap(candidate, placed, min_gap_px=8):
     """
     True if candidate overlaps any existing box, considering minimum gap.
@@ -1434,15 +1479,25 @@ def export_dataset(
 # OBB dataset export for YOLOv8-OBB training
 # -----------------------------------------------------------------------------
 
-def _load_orientation_mode(session_dir):
+def _load_orientation_config(session_dir):
+    """Returns (orientation_mode: str, gravity_aligned: bool)."""
     session_path = os.path.join(session_dir, "session.json")
     try:
         with open(session_path, "r", encoding="utf-8") as f:
             session = json.load(f)
-        mode = str(session.get("orientationPolicy", {}).get("mode", "invariant")).lower()
-        return mode if mode in ("directional", "bilateral", "axial", "invariant") else "invariant"
+        policy = session.get("orientationPolicy", {})
+        mode = str(policy.get("mode", "invariant")).lower()
+        if mode not in ("directional", "bilateral", "axial", "invariant"):
+            mode = "invariant"
+        aug_policy = session.get("augmentationPolicy", {})
+        gravity_aligned = bool(aug_policy.get("gravity_aligned", True))
+        return mode, gravity_aligned
     except Exception:
-        return "invariant"
+        return "invariant", True
+
+
+def _load_orientation_mode(session_dir):
+    return _load_orientation_config(session_dir)[0]
 
 
 def _compute_base_class_id(head_tail_chip, orientation_schema):
@@ -1534,11 +1589,13 @@ def _generate_synthetic_obb_images(
     seed=0,
     split="train",
     manifest=None,
+    gravity_aligned=False,
 ):
     """
     Generate synthetic OBB train images from finalized segment crops.
     Outputs 8-point OBB polygon labels for YOLOv8-OBB format.
-    Uses full 360° rotation and schema-aware class_id mapping.
+    Uses schema-aware class_id mapping. When gravity_aligned=True, rotation is
+    clamped to ±15° to match gravity-constrained imaging setups.
     """
     needs_anchor = orientation_schema in ("directional", "axial")
     anchor_index = _build_anchor_index(positives or [], head_id, tail_id) if needs_anchor else {}
@@ -1563,7 +1620,11 @@ def _generate_synthetic_obb_images(
             break
 
         canvas_size = rng.choice([768, 896, 1024])
-        bg = _random_canvas_background(canvas_size, canvas_size, rng)
+        if rng.random() < 0.65:
+            bg = _sample_real_background(positives, canvas_size, rng) \
+                 or _random_canvas_background(canvas_size, canvas_size, rng)
+        else:
+            bg = _random_canvas_background(canvas_size, canvas_size, rng)
         labels = []
         placed = []
         object_manifest = []
@@ -1597,7 +1658,7 @@ def _generate_synthetic_obb_images(
             aug, head_tail_aug, aug_info = _augment_segment_chip(
                 chip,
                 rng,
-                rot_range=(-180.0, 180.0),
+                rot_range=(-15.0, 15.0) if gravity_aligned else (-180.0, 180.0),
                 head_tail_chip=head_tail_chip,
             )
 
@@ -1663,13 +1724,19 @@ def export_obb_dataset(
     session_dir,
     val_ratio=0.2,
     seed=42,
+    generate_synthetic=True,
 ):
     """
     Export session annotations to YOLOv8-OBB format.
 
     Boxes with obbCorners get the 4-corner format:
       class_id x1 y1 x2 y2 x3 y3 x4 y4  (all normalized)
-    Boxes without obbCorners fall back to axis-aligned corners derived from AABB.
+    Boxes without obbCorners fall back to axis-aligned 4-corner format at 0°.
+
+    Args:
+        generate_synthetic: When False, skip the SAM2-based synthetic augmentation
+            step entirely.  Set to False when SAM2 is unavailable (CPU-only systems)
+            to avoid edge-artifact poisoning from low-quality crops.
 
     Writes to session_dir/obb_dataset/ with dataset.yaml.
     Returns {"ok": True, "yaml_path": ..., "num_images": ..., "num_boxes": ...}
@@ -1816,13 +1883,13 @@ def export_obb_dataset(
         f.write("\n".join(yaml_lines) + "\n")
 
     # --- Synthetic data augmentation ---
-    orientation_schema = _load_orientation_mode(session_dir)
+    orientation_schema, gravity_aligned = _load_orientation_config(session_dir)
     SYNTHETIC_RATIO = 2
     n_real_train = sum(1 for i in range(len(samples)) if i not in val_set)
     max_synth = max(0, int(n_real_train * SYNTHETIC_RATIO))
 
     synth_stats = {"num_generated": 0, "num_instances_generated": 0}
-    if max_synth > 0:
+    if generate_synthetic and max_synth > 0:
         positives = [s for i, s in enumerate(samples) if i not in val_set]
         synth_manifest = []
         synth_stats = _generate_synthetic_obb_images(
@@ -1838,10 +1905,17 @@ def export_obb_dataset(
             seed=seed + 1,
             split="train",
             manifest=synth_manifest,
+            gravity_aligned=gravity_aligned,
         )
         manifest_path = os.path.join(out_dir, "synth_manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(synth_manifest, f, indent=2)
+    elif not generate_synthetic:
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "Synthetic OBB augmentation skipped (generate_synthetic=False). "
+            "Dataset will use real annotated images only."
+        )
 
     return {
         "ok": True,

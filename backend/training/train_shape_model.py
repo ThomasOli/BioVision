@@ -485,7 +485,10 @@ def train_shape_model(project_root, tag, custom_options=None,
     )
 
     orientation_mode = _resolve_orientation_mode(project_root, tag)
-    aug_profile = ou.get_schema_augmentation_profile(orientation_mode, engine="dlib")
+    aug_override = ou.load_augmentation_policy(project_root)
+    aug_profile = ou.get_schema_augmentation_profile(
+        orientation_mode, engine="dlib", augmentation_override=aug_override or None
+    )
     if aug_flip is None:
         aug_flip = bool(aug_profile.get("flip", ou.default_allow_flip_augmentation(orientation_mode)))
 

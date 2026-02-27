@@ -606,6 +606,16 @@ declare global {
     finalized?: boolean;
   }
 
+interface AugmentationPolicy {
+  gravity_aligned?: boolean;
+  rotation_range?: [number, number];
+  scale_range?: [number, number];
+  flip_prob?: number;
+  vertical_flip_prob?: number;
+  rotate_180_prob?: number;
+  translate_ratio?: number;
+}
+
 interface SessionMeta {
   speciesId: string;
   name: string;
@@ -615,6 +625,7 @@ interface SessionMeta {
   orientationPolicy?: OrientationPolicy;
   orientationPolicyConfigured?: boolean;
   obbDetectorReady?: boolean;
+  augmentationPolicy?: AugmentationPolicy;
 }
 
   interface Window {
@@ -682,6 +693,10 @@ interface SessionMeta {
         speciesId: string,
         orientationPolicy: OrientationPolicy
       ) => Promise<{ ok: boolean; error?: string }>;
+      sessionUpdateAugmentation: (
+        speciesId: string,
+        augmentationPolicy: AugmentationPolicy
+      ) => Promise<{ ok: boolean; error?: string }>;
       sessionSaveImage: (speciesId: string, imageData: string, filename: string, mimeType: string) => Promise<{ ok: boolean; diskPath: string; error?: string }>;
       sessionSaveAnnotations: (speciesId: string, filename: string, boxes: import("./Image").BoundingBox[]) => Promise<{ ok: boolean; error?: string }>;
       sessionFinalizeAcceptedBoxes: (
@@ -726,6 +741,7 @@ interface SessionMeta {
           speciesId?: string;
           orientationPolicy?: OrientationPolicy;
           orientationPolicyConfigured?: boolean;
+          augmentationPolicy?: AugmentationPolicy;
         };
         error?: string;
       }>;
@@ -871,6 +887,17 @@ interface SessionMeta {
         inferenceSessionId?: string,
         filenames?: string[]
       ) => Promise<{ ok: boolean; count?: number; error?: string }>;
+      /** Lightweight hardware probe — called once at startup to populate Redux hardwareSlice */
+      probeHardware: () => Promise<HardwareCapabilities>;
     };
   }
+}
+
+interface HardwareCapabilities {
+  /** Active compute device detected at startup */
+  device: "cpu" | "mps" | "cuda";
+  /** Human-readable GPU name, or null for CPU-only */
+  gpuName: string | null;
+  /** Total system RAM in GB, or null if detection failed */
+  ramGb: number | null;
 }
