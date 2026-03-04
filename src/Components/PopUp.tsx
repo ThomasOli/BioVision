@@ -41,6 +41,8 @@ interface TrainModelDialogProps {
   isTrainingObb?: boolean;
   handleTrainObbDetector?: () => Promise<void>;
   obbTrainingMessage?: string;
+  obbHyperparams?: { iou: number; cls: number; box: number };
+  onObbHyperparamsChange?: (v: { iou: number; cls: number; box: number }) => void;
   cnnVariants?: {
     id: string;
     label: string;
@@ -112,6 +114,8 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   isTrainingObb = false,
   handleTrainObbDetector,
   obbTrainingMessage,
+  obbHyperparams = { iou: 0.3, cls: 1.5, box: 5.0 },
+  onObbHyperparamsChange,
 }) => {
   const [touched, setTouched] = useState(false);
 
@@ -295,6 +299,51 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                 </Button>
               )}
             </div>
+            {/* Advanced OBB hyperparameters accordion */}
+            {onObbHyperparamsChange && (
+              <details className="mt-2 rounded-md border border-border/60 bg-muted/20">
+                <summary className="cursor-pointer px-3 py-2 text-xs font-semibold select-none">
+                  Advanced Training Hyperparameters
+                </summary>
+                <div className="flex flex-col gap-3 px-3 pb-3 pt-1">
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs text-muted-foreground">
+                      NMS IoU threshold: {obbHyperparams.iou.toFixed(2)}
+                      <span className="ml-1 text-[10px] opacity-60">(lower = suppress more overlapping boxes)</span>
+                    </Label>
+                    <Slider
+                      value={[obbHyperparams.iou]}
+                      onValueChange={([v]) => onObbHyperparamsChange({ ...obbHyperparams, iou: v })}
+                      min={0.1} max={0.9} step={0.05}
+                      disabled={isTrainingObb || isTraining}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs text-muted-foreground">
+                      Classification loss weight: {obbHyperparams.cls.toFixed(1)}
+                      <span className="ml-1 text-[10px] opacity-60">(higher = sharper confidence scores)</span>
+                    </Label>
+                    <Slider
+                      value={[obbHyperparams.cls]}
+                      onValueChange={([v]) => onObbHyperparamsChange({ ...obbHyperparams, cls: v })}
+                      min={0.1} max={3.0} step={0.1}
+                      disabled={isTrainingObb || isTraining}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs text-muted-foreground">
+                      Box regression loss weight: {obbHyperparams.box.toFixed(1)}
+                    </Label>
+                    <Slider
+                      value={[obbHyperparams.box]}
+                      onValueChange={([v]) => onObbHyperparamsChange({ ...obbHyperparams, box: v })}
+                      min={1.0} max={10.0} step={0.5}
+                      disabled={isTrainingObb || isTraining}
+                    />
+                  </div>
+                </div>
+              </details>
+            )}
           </div>
         )}
         {/* Step 2 label when OBB step is shown */}

@@ -66,6 +66,7 @@ const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(mi
 
 const App: React.FC = () => {
   const dispatch = useDispatch<AppDispatch>()
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId)
 
   // Probe hardware capabilities once at startup and populate Redux
   useEffect(() => {
@@ -92,6 +93,7 @@ const App: React.FC = () => {
   const [openTrainDialogOnMount, setOpenTrainDialogOnMount] = useState(false)
   const [openSchemaDialogOnMount, setOpenSchemaDialogOnMount] = useState(false)
   const [selectedModelForInference, setSelectedModelForInference] = useState<string>("")
+  const [hasActivatedSchemaThisRun, setHasActivatedSchemaThisRun] = useState(false)
 
   // Workspace state
   const [color, setColor] = useState<string>(() =>
@@ -248,6 +250,12 @@ const App: React.FC = () => {
     setSelectedModelForInference(modelName)
   }
 
+  useEffect(() => {
+    if (currentView === "workspace" && activeSpeciesId) {
+      setHasActivatedSchemaThisRun(true)
+    }
+  }, [activeSpeciesId, currentView])
+
   // Render workspace (annotation view)
   const renderWorkspace = () => (
     <div
@@ -344,6 +352,7 @@ const App: React.FC = () => {
           <InferencePage
             onNavigate={handleNavigate}
             initialModel={selectedModelForInference}
+            hasActivatedSchemaThisRun={hasActivatedSchemaThisRun}
           />
         )
       case "workspace":

@@ -240,27 +240,6 @@ def resolve_head_tail_landmark_ids(
     return head_id, tail_id
 
 
-def should_mirror_to_target(
-    original_orientation: str | None,
-    *,
-    policy: Mapping[str, Any] | None = None,
-    mode: str | None = None,
-    target_orientation: str | None = None,
-) -> bool:
-    original = str(original_orientation or "").strip().lower()
-    if original not in ("left", "right"):
-        return False
-
-    resolved_mode = _safe_orientation_mode(mode or (policy or {}).get("mode"))
-    if resolved_mode != "directional":
-        return False
-
-    target = _safe_orientation_target(
-        target_orientation if target_orientation is not None else (policy or {}).get("targetOrientation")
-    )
-    return original != target
-
-
 def default_allow_flip_augmentation(mode: str | None) -> bool:
     resolved_mode = _safe_orientation_mode(mode)
     if resolved_mode == "directional":
@@ -755,58 +734,6 @@ def _rotate_mask_512(mask_512: np.ndarray, angle_deg: float) -> np.ndarray:
     return (rotated > 0).astype(np.uint8)
 
 
-def estimate_direction_from_moments(
-    mask_512: np.ndarray | None,
-    *,
-    min_mass_delta_ratio: float = 0.03,
-    min_center_delta_ratio: float = 0.01,
-) -> tuple[str | None, float, dict[str, Any]]:
-    """
-    Infer left/right direction from mask mass distribution.
-
-    Heuristic:
-      - Compare left-half vs right-half mask mass.
-      - Compare center-of-mass x against image center.
-      - Return None when both cues are too weak.
-    """
-    if mask_512 is None:
-        return None, 0.0, {"reason": "no_mask"}
-
-    mask = (mask_512 > 0).astype(np.uint8)
-    total = float(np.count_nonzero(mask))
-    if total <= 0:
-        return None, 0.0, {"reason": "empty_mask"}
-
-    mid = STANDARD_SIZE // 2
-    left_mass = float(np.count_nonzero(mask[:, :mid]))
-    right_mass = float(np.count_nonzero(mask[:, mid:]))
-    mass_delta = right_mass - left_mass
-    mass_delta_ratio = mass_delta / max(total, 1.0)
-
-    moments = cv2.moments(mask)
-    cx = None
-    center_delta_ratio = 0.0
-    if moments.get("m00", 0.0):
-        cx = float(moments["m10"] / moments["m00"])
-        center_delta_ratio = (cx - (STANDARD_SIZE / 2.0)) / float(STANDARD_SIZE)
-
-    direction = None
-    confidence = 0.0
-    if abs(mass_delta_ratio) >= float(min_mass_delta_ratio):
-        # In directional schemas we treat the heavier side as the "head side".
-        direction = "right" if mass_delta_ratio > 0 else "left"
-        confidence = abs(float(mass_delta_ratio))
-    elif abs(center_delta_ratio) >= float(min_center_delta_ratio):
-        direction = "right" if center_delta_ratio > 0 else "left"
-        confidence = abs(float(center_delta_ratio))
-
-    return direction, float(confidence), {
-        "left_mass": left_mass,
-        "right_mass": right_mass,
-        "mass_delta_ratio": float(mass_delta_ratio),
-        "center_x": None if cx is None else float(cx),
-        "center_delta_ratio": float(center_delta_ratio),
-    }
 
 
 def canonicalize_with_mask(
@@ -1339,6 +1266,12 @@ def extract_obb_crop(
     pts = np.array(obb_corners, dtype=np.float32).reshape(-1, 2)
     rect = cv2.minAreaRect(pts)          # ((cx,cy), (w,h), angle_deg)
     center, (rw, rh), angle = rect
+    # minAreaRect guarantees angle ∈ (−90°, 0°].  Adding 90° is correct only when
+    # it moves the angle *closer* to 0° (i.e. |angle+90°| < |angle|), which
+    # simplifies to angle < −45°.  The old rw<rh heuristic fails for near-square
+    # OBBs where both sides are almost equal and the wrong side wins by a pixel.
+    if angle < -45.0:    # long axis is steep; add 90° to bring it near-horizontal
+        angle += 90.0
 
     # Square side = max of OBB dims + padding
     sq = float(max(rw, rh)) * (1.0 + 2.0 * pad_ratio)
@@ -1352,11 +1285,15 @@ def extract_obb_crop(
     M = cv2.getRotationMatrix2D((float(cx_i), float(cy_i)), angle, 1.0)
 
     if apply_leveling:
-        # Rotate the entire image to deskew the OBB
+        # Rotate the entire image to deskew the OBB.  Use BORDER_CONSTANT (black)
+        # instead of BORDER_REFLECT_101 so that areas swept outside the original
+        # image boundary are filled with neutral zeros rather than mirrored fish
+        # content, which would contaminate the crop with fake landmark targets.
         rotated = cv2.warpAffine(
             image, M, (img_w, img_h),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
         )
     else:
         # Pixels untouched; M is still stored for coordinate transforms
@@ -1372,7 +1309,8 @@ def extract_obb_crop(
     ch, cw = crop.shape[:2]
     if cw != ch:
         s = max(cw, ch)
-        crop = cv2.copyMakeBorder(crop, 0, s - ch, 0, s - cw, cv2.BORDER_REFLECT_101)
+        crop = cv2.copyMakeBorder(crop, 0, s - ch, 0, s - cw,
+                                  cv2.BORDER_CONSTANT, value=0)
         cw = ch = s
 
     scale = float(target_size) / float(max(1, cw))

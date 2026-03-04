@@ -636,19 +636,111 @@ class SuperAnnotator:
             "size": [float(rect[1][0]), float(rect[1][1])],
         }
 
+    def save_segments_for_boxes(self, image_path, boxes, session_dir):
+        """Save SAM2 mask crops to session_dir/segments/ for each accepted box.
+
+        Called by Electron after the user finalizes accepted boxes so that
+        the OBB synthetic data generator can find the segment files.
+        """
+        import hashlib
+        import json as _json
+
+        if not boxes:
+            return {"status": "ok", "saved": 0}
+
+        image = cv2.imread(image_path)
+        if image is None:
+            return {"status": "error", "error": f"Could not load image: {image_path}"}
+        img_h, img_w = image.shape[:2]
+
+        path_hash = hashlib.md5(image_path.encode()).hexdigest()[:10]
+
+        seg_dir = os.path.join(session_dir, "segments")
+        os.makedirs(seg_dir, exist_ok=True)
+
+        # Use cached SAM2 masks only when they belong to this exact image
+        cached_lookup = {}
+        if (self._cached_image_path == image_path
+                and self._cached_sam_results is not None):
+            for box_data, mask in self._cached_sam_results:
+                key = tuple(int(v) for v in box_data["xyxy"])
+                cached_lookup[key] = mask
+
+        saved = 0
+        for idx, box_xyxy in enumerate(boxes):
+            x1 = max(0, int(box_xyxy[0]))
+            y1 = max(0, int(box_xyxy[1]))
+            x2 = min(img_w, int(box_xyxy[2]))
+            y2 = min(img_h, int(box_xyxy[3]))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            mask = cached_lookup.get((x1, y1, x2, y2))
+
+            # Fall back to fresh SAM2 inference if no cached mask
+            if mask is None and self.sam2_model is not None:
+                try:
+                    results = self.sam2_model.predict(
+                        image, bboxes=[[x1, y1, x2, y2]], verbose=False)
+                    mask = results[0].masks.data[0].cpu().numpy().astype(np.uint8)
+                except Exception as e:
+                    logger.warning(f"SAM2 failed for box {idx}: {e}")
+
+            # Fallback: solid rectangle mask so the segment is still usable
+            if mask is None:
+                mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                mask[y1:y2, x1:x2] = 1
+
+            crop_img  = image[y1:y2, x1:x2]
+            crop_mask = mask[y1:y2, x1:x2]
+            if crop_img.size == 0:
+                continue
+
+            if crop_mask.shape != crop_img.shape[:2]:
+                crop_mask = cv2.resize(
+                    crop_mask, (crop_img.shape[1], crop_img.shape[0]),
+                    interpolation=cv2.INTER_NEAREST)
+
+            alpha = (crop_mask * 255).astype(np.uint8)
+            bgra = cv2.cvtColor(crop_img, cv2.COLOR_BGR2BGRA)
+            bgra[:, :, 3] = alpha
+
+            base = f"{path_hash}_{idx}"
+            cv2.imwrite(os.path.join(seg_dir, f"{base}_fg.png"), bgra)
+
+            meta = {
+                "accepted_by_user": True,
+                "source_image": image_path,
+                "box": {
+                    "left": x1, "top": y1, "right": x2, "bottom": y2,
+                    "width": x2 - x1, "height": y2 - y1,
+                },
+                "crop_origin": [x1, y1],
+            }
+            with open(os.path.join(seg_dir, f"{base}_meta.json"),
+                      "w", encoding="utf-8") as f:
+                _json.dump(meta, f)
+
+            saved += 1
+
+        logger.info(
+            f"save_segments_for_boxes: saved {saved}/{len(boxes)} segments → {seg_dir}")
+        return {"status": "ok", "saved": saved}
+
     # ------------------------------------------------------------------
     # Stage B: Normalization (The "Standardizer")
     # ------------------------------------------------------------------
     def standardize_instance(self, image, xyxy, mask=None):
         """
-        Crop, rotate via PCA, and resize to STANDARD_SIZE × STANDARD_SIZE.
-        Returns (standardized_image, instance_metadata).
+        Crop and resize to STANDARD_SIZE × STANDARD_SIZE.
+        No angle estimation — PCA removed as it is biologically ambiguous (±180° flip
+        uncertainty). Use the OBB path in annotate() when OBB corners are available.
+        mask parameter retained for API compatibility.
         """
         x1, y1, x2, y2 = [int(v) for v in xyxy]
         img_h, img_w = image.shape[:2]
         w, h = x2 - x1, y2 - y1
 
-        # 1. Crop with 20% padding
         pad = 0.20
         crop_x1 = max(0, int(x1 - w * pad))
         crop_y1 = max(0, int(y1 - h * pad))
@@ -657,7 +749,6 @@ class SuperAnnotator:
         crop = image[crop_y1:crop_y2, crop_x1:crop_x2]
 
         if crop.size == 0:
-            # Fallback: use original box
             crop = image[y1:y2, x1:x2]
             crop_x1, crop_y1 = x1, y1
             crop_x2, crop_y2 = x2, y2
@@ -665,49 +756,17 @@ class SuperAnnotator:
         crop_w = crop_x2 - crop_x1
         crop_h = crop_y2 - crop_y1
 
-        # 2. PCA orientation from mask
-        angle = 0.0
-        if mask is not None:
-            # Crop the mask to match
-            mask_crop = mask[crop_y1:crop_y2, crop_x1:crop_x2]
-            points = np.column_stack(np.where(mask_crop > 0))
-            if len(points) > 10:
-                try:
-                    from sklearn.decomposition import PCA
-                    pca = PCA(n_components=2)
-                    pca.fit(points)
-                    angle = float(np.degrees(
-                        np.arctan2(pca.components_[0, 1], pca.components_[0, 0])
-                    ))
-                except ImportError:
-                    # sklearn not available, use minAreaRect fallback
-                    contours, _ = cv2.findContours(
-                        mask_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    if contours:
-                        rect = cv2.minAreaRect(max(contours, key=cv2.contourArea))
-                        angle = float(rect[2])
-                        if angle < -45:
-                            angle += 90
-
-        # 3. Rotate so main axis is horizontal
-        center = (crop.shape[1] // 2, crop.shape[0] // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(crop, M, (crop.shape[1], crop.shape[0]),
-                                  borderMode=cv2.BORDER_REPLICATE)
-
-        # 4. Resize to standard size
-        standardized = cv2.resize(rotated, (STANDARD_SIZE, STANDARD_SIZE),
+        standardized = cv2.resize(crop, (STANDARD_SIZE, STANDARD_SIZE),
                                    interpolation=cv2.INTER_LINEAR)
 
         metadata = {
             "center": [int((x1 + x2) / 2), int((y1 + y2) / 2)],
             "crop_origin": [crop_x1, crop_y1],
             "crop_size": [crop_w, crop_h],
-            "rotation": angle,
+            "rotation": 0.0,    # no rotation applied
             "scale": float(STANDARD_SIZE / max(crop_w, crop_h)) if max(crop_w, crop_h) > 0 else 1.0,
+            "was_flipped": False,
         }
-
         return standardized, metadata
 
     # ------------------------------------------------------------------
@@ -758,8 +817,8 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     # Stage D: Global mapping (inverse transform)
     # ------------------------------------------------------------------
-    def map_to_original(self, landmarks_512, metadata):
-        """Map 512×512 landmarks back to original image coordinates."""
+    def map_to_original(self, landmarks_512, metadata, was_flipped=False):
+        """Map 512×512 landmarks back to original image coordinates (AABB fallback path)."""
         scale = metadata["scale"]
         crop_w, crop_h = metadata["crop_size"]
         cx, cy = crop_w / 2.0, crop_h / 2.0
@@ -770,9 +829,16 @@ class SuperAnnotator:
 
         mapped = []
         for lm in landmarks_512:
+            x_s = float(lm["x"])
+            y_s = float(lm["y"])
+
+            # 0. Un-flip in 512 space (must precede un-rotate)
+            if was_flipped:
+                x_s = float(STANDARD_SIZE - 1) - x_s
+
             # 1. Un-resize: 512 → crop size
-            x_crop = lm["x"] / scale
-            y_crop = lm["y"] / scale
+            x_crop = x_s / scale
+            y_crop = y_s / scale
 
             # 2. Un-rotate by -θ around crop center
             x_unrot = cx + (x_crop - cx) * cos_a - (y_crop - cy) * sin_a
@@ -912,26 +978,44 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     # Fine-tuned YOLOv8 detection
     # ------------------------------------------------------------------
-    def detect_finetuned(self, image, finetuned_path, class_name, conf_threshold=0.5, top_k=10):
-        """Run detection with a fine-tuned YOLOv8 model."""
+    def detect_finetuned(self, image, finetuned_path, class_name, conf_threshold=0.5, top_k=10, nms_iou=0.3):
+        """Run detection with a fine-tuned YOLOv8 model (regular or OBB)."""
         from ultralytics import YOLO
         ft_model = YOLO(finetuned_path)
-        results = ft_model.predict(image, conf=conf_threshold, imgsz=1280, verbose=False)
+        results = ft_model.predict(image, conf=conf_threshold, iou=float(nms_iou), imgsz=1280, verbose=False)
 
         boxes = []
-        for box in results[0].boxes:
-            xyxy = box.xyxy[0].cpu().numpy().tolist()
-            conf = float(box.conf[0])
-            boxes.append({
-                "xyxy": xyxy,
-                "confidence": round(conf, 3),
-                "class_name": class_name,
-            })
+        r = results[0]
+        if r.obb is not None and len(r.obb):
+            # OBB model — extract corners, class_id, and AABB envelope
+            for i in range(len(r.obb)):
+                corners = r.obb.xyxyxyxy[i].cpu().numpy().tolist()   # [[x,y]×4]
+                conf = float(r.obb.conf[i])
+                class_id = int(r.obb.cls[i])
+                xs = [p[0] for p in corners]
+                ys = [p[1] for p in corners]
+                xyxy = [min(xs), min(ys), max(xs), max(ys)]          # AABB envelope
+                boxes.append({
+                    "xyxy": xyxy,
+                    "confidence": round(conf, 3),
+                    "class_name": class_name,
+                    "obb_corners": corners,   # 4×[x,y] in image pixels
+                    "class_id": class_id,     # 0 = left (canonical), 1 = right
+                })
+        else:
+            # Regular (axis-aligned) model
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().tolist()
+                conf = float(box.conf[0])
+                boxes.append({
+                    "xyxy": xyxy,
+                    "confidence": round(conf, 3),
+                    "class_name": class_name,
+                })
 
         boxes.sort(key=lambda b: b["confidence"], reverse=True)
         if top_k > 0 and len(boxes) > top_k:
             boxes = boxes[:top_k]
-
         return boxes
 
     # ------------------------------------------------------------------
@@ -946,6 +1030,8 @@ class SuperAnnotator:
         nms_iou = options.get("nms_iou", 0.6)
         detection_mode = options.get("detection_mode", "auto")  # "auto" or "manual"
         finetuned_model = options.get("finetuned_model")
+        orientation_policy = options.get("orientation_policy") or {}
+        orientation_schema = str(orientation_policy.get("mode", "invariant")).strip().lower()
         detection_preset = options.get("detection_preset", "balanced")
         resolved = self._resolve_detection_preset(
             conf_threshold=conf_threshold,
@@ -972,8 +1058,20 @@ class SuperAnnotator:
 
         if use_finetuned:
             try:
+                # Load the NMS IoU that was saved when this OBB model was trained.
+                import json as _json_inf
+                _obb_cfg = os.path.join(os.path.dirname(os.path.dirname(finetuned_model)),
+                                        "obb_config.json")
+                _obb_nms_iou = 0.3  # biological default
+                if os.path.exists(_obb_cfg):
+                    try:
+                        with open(_obb_cfg, "r", encoding="utf-8") as _f:
+                            _obb_nms_iou = float(_json_inf.load(_f).get("nms_iou", 0.3))
+                    except Exception:
+                        pass
                 boxes = self.detect_finetuned(image, finetuned_model, class_name,
-                                               conf_threshold, top_k=max_objects)
+                                               conf_threshold, top_k=max_objects,
+                                               nms_iou=_obb_nms_iou)
                 detection_method = "yolov8_finetuned"
             except Exception as e:
                 logger.warning(f"Fine-tuned model failed, falling back: {e}")
@@ -1043,6 +1141,11 @@ class SuperAnnotator:
         self._cached_sam_results = list(zip(boxes, masks))
 
         # Stage B + C + D: Normalize, predict, map back
+        from bv_utils.orientation_utils import (
+            extract_obb_crop,
+            map_to_original as ou_map_to_original,
+        )
+
         has_dlib = False
         if dlib_model and os.path.exists(dlib_model):
             try:
@@ -1059,19 +1162,72 @@ class SuperAnnotator:
 
             xyxy = box_data["xyxy"]
             x1, y1, x2, y2 = xyxy
+            obb_corners = box_data.get("obb_corners")
+            class_id = box_data.get("class_id", 0)
 
-            # Use tight box from mask if available
-            tight_xyxy = self.tight_box_from_mask(mask) if mask is not None else None
-            effective_xyxy = tight_xyxy if tight_xyxy else xyxy
+            # --- Neighbor Ghosting ---
+            # Paint every other detected object pure black on a scratch copy so that
+            # adjacent specimens cannot contaminate this object's deskewed crop,
+            # regardless of padding size or OBB rotation angle.
+            # Single-object images skip the copy entirely (no-op fast path).
+            if len(boxes) > 1:
+                scene_image = image.copy()
+                for j, other in enumerate(boxes):
+                    if j == i:
+                        continue
+                    other_corners = other.get("obb_corners")
+                    if other_corners:
+                        ghost_pts = np.array(other_corners, dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.fillPoly(scene_image, [ghost_pts], (0, 0, 0))
+                    else:
+                        ox1, oy1, ox2, oy2 = (int(v) for v in other["xyxy"])
+                        ox1 = max(0, ox1); oy1 = max(0, oy1)
+                        ox2 = min(img_w, ox2); oy2 = min(img_h, oy2)
+                        scene_image[oy1:oy2, ox1:ox2] = 0
+            else:
+                scene_image = image
+            # --- End Neighbor Ghosting ---
 
-            # Standardize
-            standardized, metadata = self.standardize_instance(image, effective_xyxy, mask)
+            if obb_corners:
+                # OBB path: deskew using the detector's angle, then flip to canonical
+                # orientation for dlib landmark prediction.
+                # invariant: no leveling (spatial anchor — center + scale only)
+                # axial: deskew but no flip (ends are biologically interchangeable)
+                # directional/bilateral: deskew + flip right-facing to canonical left
+                apply_leveling = (orientation_schema != "invariant")
+                standardized, metadata = extract_obb_crop(
+                    scene_image, obb_corners, pad_ratio=0.15, apply_leveling=apply_leveling
+                )
+                was_flipped = False
+                if orientation_schema in ("directional", "bilateral"):
+                    was_flipped = (class_id != 0)   # 0 = left = canonical training orientation
+                    if was_flipped:
+                        standardized = cv2.flip(standardized, 1)
+                # invariant: leveling skipped → zero rotation so map_to_original won't un-rotate
+                if orientation_schema == "invariant":
+                    metadata = {**metadata, "rotation": 0.0}
+                metadata["was_flipped"] = was_flipped
+            else:
+                # AABB fallback: plain padded crop + resize, no angle correction.
+                # Used for YOLO-World, classic CV, or non-OBB fine-tuned models.
+                tight_xyxy = self.tight_box_from_mask(mask) if mask is not None else None
+                effective_xyxy = tight_xyxy if tight_xyxy else xyxy
+                standardized, metadata = self.standardize_instance(scene_image, effective_xyxy, mask)
 
             # Predict landmarks
             landmarks = []
             if has_dlib:
                 landmarks_512 = self.predict_landmarks(standardized)
-                landmarks = self.map_to_original(landmarks_512, metadata)
+                was_flipped = metadata.get("was_flipped", False)
+                if metadata.get("obb_deskewed"):
+                    # Full orientation_utils mapper handles was_flipped + affine_M
+                    landmarks = ou_map_to_original(
+                        landmarks_512, metadata,
+                        was_flipped=was_flipped,
+                        image_shape=(img_h, img_w),
+                    )
+                else:
+                    landmarks = self.map_to_original(landmarks_512, metadata, was_flipped=was_flipped)
 
             # Mask outline
             outline = self.mask_to_outline(mask)
@@ -1094,6 +1250,7 @@ class SuperAnnotator:
                 "instance_metadata": metadata,
                 "detection_method": detection_method,
                 "obb": obb_info,  # OBB from SAM2 mask; None when no mask
+                "obbCorners": [[int(x), int(y)] for x, y in obb_corners] if obb_corners else None,
             }
             objects.append(obj)
 
@@ -1111,7 +1268,7 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     # OBB dataset export
     # ------------------------------------------------------------------
-    def export_obb_dataset(self, session_dir, generate_synthetic=True):
+    def export_obb_dataset(self, session_dir, generate_synthetic=True, orientation_schema="invariant"):
         """
         Export OBB-format YOLO dataset from session annotations.
         Boxes with obbCorners get 4-corner format; boxes without fall back to AABB (0° OBB).
@@ -1119,16 +1276,24 @@ class SuperAnnotator:
         Args:
             generate_synthetic: Pass False when SAM2 is unavailable (CPU-only) to
                 skip synthetic rotational augmentation and avoid edge-artifact poisoning.
+            orientation_schema: One of "directional", "bilateral", "axial", "invariant".
+                Vector schemas (directional/bilateral) export 2-class OBB; others export 1-class.
         """
+        import importlib, sys
+        if "data.export_yolo_dataset" in sys.modules:
+            importlib.reload(sys.modules["data.export_yolo_dataset"])
         from data.export_yolo_dataset import export_obb_dataset as _export_obb
-        result = _export_obb(session_dir, generate_synthetic=generate_synthetic)
+        result = _export_obb(session_dir, generate_synthetic=generate_synthetic,
+                             orientation_schema=orientation_schema)
         return result
 
     # ------------------------------------------------------------------
     # OBB detector training
     # ------------------------------------------------------------------
     def train_yolo_obb(self, session_dir, epochs=None, model_tier="nano",
-                       device="cpu", sam2_enabled=True):
+                       device="cpu", sam2_enabled=True,
+                       iou_loss=0.3, cls_loss=1.5, box_loss=5.0,
+                       orientation_schema="invariant"):
         """
         Train a YOLOv8-OBB detector on the session's OBB dataset.
         Unloads YOLO-World and SAM2 first to free memory.
@@ -1175,7 +1340,8 @@ class SuperAnnotator:
 
         # Export OBB dataset — pass sam2_enabled to control synthetic generation
         send_progress("Exporting OBB dataset...", 5, "training")
-        export_result = self.export_obb_dataset(session_dir, generate_synthetic=sam2_enabled)
+        export_result = self.export_obb_dataset(session_dir, generate_synthetic=sam2_enabled,
+                                                orientation_schema=orientation_schema)
         if not export_result.get("ok"):
             return {"status": "error", "error": export_result.get("error", "OBB dataset export failed")}
 
@@ -1216,7 +1382,21 @@ class SuperAnnotator:
             exist_ok=True,
             verbose=False,
             task="obb",
+            fliplr=0.0,         # horizontal flip corrupts orientation labels (left vs right class)
+            degrees=0.0,        # explicit: rotation augmentation must stay off for OBB angle regression
+            iou=float(iou_loss),   # NMS IoU threshold for validation during training
+            cls=float(cls_loss),   # classification loss gain
+            box=float(box_loss),   # box regression loss gain
         )
+
+        # Save NMS IoU preference alongside the run so detect_finetuned() can restore it.
+        import json as _json_obb
+        obb_config_path = os.path.join(output_dir, "session_obb", "obb_config.json")
+        try:
+            with open(obb_config_path, "w", encoding="utf-8") as _f:
+                _json_obb.dump({"nms_iou": float(iou_loss)}, _f)
+        except Exception:
+            pass
 
         best_pt = os.path.join(output_dir, "session_obb", "weights", "best.pt")
         if not os.path.exists(best_pt):
@@ -1233,14 +1413,30 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     # OBB inference
     # ------------------------------------------------------------------
-    def detect_obb(self, image_path, model_path, conf=0.4):
+    def detect_obb(self, image_path, model_path, conf=0.4, nms_iou=None):
         """
         Run the trained session OBB detector on an image.
         Returns list of detections: [{corners, angle, class_id, confidence}]
         """
+        import json as _json_obb
         from ultralytics import YOLO
+
+        # Load the NMS IoU that was saved when this model was trained.
+        # The sidecar lives at {models_dir}/obb_training/session_obb/obb_config.json.
+        if nms_iou is None:
+            _cfg = os.path.join(os.path.dirname(model_path),
+                                "obb_training", "session_obb", "obb_config.json")
+            nms_iou = 0.3   # biological default
+            if os.path.exists(_cfg):
+                try:
+                    with open(_cfg, "r", encoding="utf-8") as _f:
+                        nms_iou = float(_json_obb.load(_f).get("nms_iou", 0.3))
+                except Exception:
+                    pass
+
         model = YOLO(model_path)
-        results = model.predict(image_path, conf=conf, imgsz=640, task="obb", verbose=False)
+        results = model.predict(image_path, conf=conf, iou=float(nms_iou),
+                                imgsz=640, task="obb", verbose=False)
         detections = []
         for r in results:
             if r.obb is None:
@@ -1271,8 +1467,9 @@ class SuperAnnotator:
 
         class_id encoding:
           directional: 0=left-facing (canonical), 1=right-facing
+          bilateral:   0=canonical, 1=flipped (same X-based logic as directional)
           axial:        0=up-facing (canonical), 1=down-facing (triggers 180° spin)
-          bilateral/invariant: always 0 (orientation handled differently)
+          invariant:   always 0
 
         Returns list of {"id": ..., "class_id": 0|1}.
         """
@@ -1280,7 +1477,7 @@ class SuperAnnotator:
 
         mode = str((orientation_policy or {}).get("mode", "invariant")).strip().lower()
 
-        if mode not in ("directional", "axial"):
+        if mode not in ("directional", "bilateral", "axial"):
             return [{"id": b.get("id"), "class_id": 0} for b in boxes]
 
         head_id, tail_id = _load_head_tail_ids(session_dir)
@@ -1289,7 +1486,7 @@ class SuperAnnotator:
 
         result = []
         for b in boxes:
-            if mode == "directional":
+            if mode in ("directional", "bilateral"):
                 orientation = _compute_box_orientation(b, head_id, tail_id)
                 class_id = 1 if orientation == "right" else 0
             else:
@@ -1453,7 +1650,10 @@ def main():
                 send_response(result)
 
             elif command == "export_obb_dataset":
-                result = annotator.export_obb_dataset(cmd["session_dir"])
+                result = annotator.export_obb_dataset(
+                    cmd["session_dir"],
+                    orientation_schema=cmd.get("orientation_schema", "invariant"),
+                )
                 send_response({"status": "result", **result})
 
             elif command == "train_yolo_obb":
@@ -1463,6 +1663,10 @@ def main():
                     model_tier=cmd.get("model_tier", "nano"),
                     device=cmd.get("device", "cpu"),
                     sam2_enabled=cmd.get("sam2_enabled", True),
+                    iou_loss=cmd.get("iou_loss", 0.3),
+                    cls_loss=cmd.get("cls_loss", 1.5),
+                    box_loss=cmd.get("box_loss", 5.0),
+                    orientation_schema=cmd.get("orientation_schema", "invariant"),
                 )
                 send_response(result)
 
@@ -1471,6 +1675,7 @@ def main():
                     image_path=cmd["image_path"],
                     model_path=cmd["model_path"],
                     conf=cmd.get("conf", 0.4),
+                    nms_iou=cmd.get("nms_iou"),   # None → auto-load from sidecar
                 )
                 send_response({"status": "result", "detections": detections})
 
@@ -1481,6 +1686,14 @@ def main():
                     orientation_policy=cmd.get("orientation_policy"),
                 )
                 send_response({"status": "result", "tagged_boxes": tagged})
+
+            elif command == "save_segments_for_boxes":
+                result = annotator.save_segments_for_boxes(
+                    image_path=cmd["image_path"],
+                    boxes=cmd.get("boxes", []),
+                    session_dir=cmd["session_dir"],
+                )
+                send_response(result)
 
             elif command == "shutdown":
                 send_response({"status": "ok", "message": "Shutting down"})

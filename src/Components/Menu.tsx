@@ -122,6 +122,7 @@ const Menu: React.FC<MenuProps> = ({
   const [obbDetectorReady, setObbDetectorReady] = useState(false);
   const [isTrainingObb, setIsTrainingObb] = useState(false);
   const [obbTrainingMessage, setObbTrainingMessage] = useState<string>("");
+  const [obbHyperparams, setObbHyperparams] = useState({ iou: 0.3, cls: 1.5, box: 5.0 });
   const [augmentationPolicy, setAugmentationPolicy] = useState<AugmentationPolicy | undefined>(undefined);
   const [orientationMode, setOrientationMode] = useState<string | undefined>(undefined);
 
@@ -137,7 +138,7 @@ const Menu: React.FC<MenuProps> = ({
   const hasFinalizedBoxes = (fileArray ?? []).some((img) => img.isFinalized === true);
   const canTrain = hasFinalizedBoxes && !isTraining;
   const hasObbAnnotations = (fileArray ?? []).some((img) =>
-    img.boxes?.some((b) => Array.isArray((b as any).obbCorners) && (b as any).obbCorners.length === 4)
+    img.boxes?.some((b) => Array.isArray(b.obbCorners) && b.obbCorners.length === 4)
   );
   const showObbStep = hasFinalizedBoxes || hasObbAnnotations;
 
@@ -248,7 +249,11 @@ const Menu: React.FC<MenuProps> = ({
     setIsTrainingObb(true);
     setObbTrainingMessage("Exporting OBB dataset and starting training…");
     try {
-      const result = await window.api.trainObbDetector(activeSpeciesId);
+      const result = await window.api.trainObbDetector(activeSpeciesId, {
+        iou: obbHyperparams.iou,
+        cls: obbHyperparams.cls,
+        box: obbHyperparams.box,
+      });
       if (result?.ok) {
         setObbDetectorReady(true);
         const mapStr = typeof result.map50 === "number" ? ` (mAP50: ${result.map50.toFixed(3)})` : "";
@@ -256,8 +261,9 @@ const Menu: React.FC<MenuProps> = ({
       } else {
         setObbTrainingMessage(`OBB training failed: ${result?.error ?? "unknown error"}`);
       }
-    } catch (err: any) {
-      setObbTrainingMessage(`OBB training error: ${err?.message ?? String(err)}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setObbTrainingMessage(`OBB training error: ${message}`);
     } finally {
       setIsTrainingObb(false);
     }
@@ -443,6 +449,8 @@ const Menu: React.FC<MenuProps> = ({
           isTrainingObb={isTrainingObb}
           handleTrainObbDetector={handleTrainObbDetector}
           obbTrainingMessage={obbTrainingMessage}
+          obbHyperparams={obbHyperparams}
+          onObbHyperparamsChange={setObbHyperparams}
           speciesId={activeSpeciesId ?? undefined}
           augmentationPolicy={augmentationPolicy}
           onAugmentationPolicyChange={(policy) => {

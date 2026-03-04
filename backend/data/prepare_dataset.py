@@ -496,10 +496,6 @@ def detect_orientation(landmarks, head_id=None, tail_id=None):
     return ou.detect_orientation(landmarks, head_id=head_id, tail_id=tail_id)
 
 
-def mirror_landmarks(landmarks, width):
-    """Mirror landmark x-coordinates horizontally."""
-    return [{**lm, 'x': _mirror_x(float(lm['x']), width) if lm.get('x', -1) >= 0 else lm['x']} for lm in landmarks]
-
 
 def _dataset_size_bucket(n_samples):
     n = int(max(0, n_samples))

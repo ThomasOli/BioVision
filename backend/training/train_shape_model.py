@@ -8,10 +8,9 @@ import time
 import xml.etree.ElementTree as ET
 import cv2
 import dlib
-import sys as _sys, os as _os
-_BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-if _BACKEND_ROOT not in _sys.path:
-    _sys.path.insert(0, _BACKEND_ROOT)
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, _BACKEND_ROOT)
 
 import bv_utils.debug_io as dio
 import bv_utils.orientation_utils as ou

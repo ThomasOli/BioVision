@@ -24,7 +24,6 @@ function withPrototype(obj: Record<string, any>) {
   return obj
 }
 
-
 interface TrainOptions {
   testSplit?: number;
   seed?: number;
@@ -61,13 +60,10 @@ interface DetectionOptions {
 }
 
 contextBridge.exposeInMainWorld("api", {
-  saveLabels: (data : AnnotatedImage []) => ipcRenderer.invoke("ml:save-labels", data),
-  trainModel: (modelName: string, options?: TrainOptions) => ipcRenderer.invoke("ml:train", modelName, options),
+  saveLabels: (data: AnnotatedImage[]) => ipcRenderer.invoke("ml:save-labels", data),
+  trainModel: (modelName: string, options?: TrainOptions) =>
+    ipcRenderer.invoke("ml:train", modelName, options),
   getCnnVariants: () => ipcRenderer.invoke("ml:get-cnn-variants"),
-  importPreAnnotatedDataset: (options?: { speciesId?: string }) =>
-    ipcRenderer.invoke("ml:import-preannotated-dataset", options),
-  importDlibXml: (args: { modelName: string; speciesId?: string }) =>
-    ipcRenderer.invoke("ml:import-dlib-xml", args),
   trainingPreflight: (args: {
     speciesId?: string;
     modelName: string;
@@ -75,8 +71,12 @@ contextBridge.exposeInMainWorld("api", {
     workspaceImages?: number;
     importedImagesHint?: number;
   }) => ipcRenderer.invoke("ml:training-preflight", args),
-  predictImage: (imagePath: string, tag: string, speciesId?: string, options?: PredictOptions) =>
-    ipcRenderer.invoke("ml:predict", imagePath, tag, speciesId, options),
+  predictImage: (
+    imagePath: string,
+    tag: string,
+    speciesId?: string,
+    options?: PredictOptions
+  ) => ipcRenderer.invoke("ml:predict", imagePath, tag, speciesId, options),
   checkModelCompatibility: (args: {
     speciesId?: string;
     modelName: string;
@@ -87,15 +87,17 @@ contextBridge.exposeInMainWorld("api", {
   getProjectRoot: () => ipcRenderer.invoke("ml:get-project-root"),
   selectProjectRoot: () => ipcRenderer.invoke("ml:select-project-root"),
   listModels: (speciesId?: string) => ipcRenderer.invoke("ml:list-models", speciesId),
-  deleteModel: (modelName: string, speciesId?: string, predictorType?: "dlib" | "cnn" | "yolo_pose") =>
-    ipcRenderer.invoke("ml:delete-model", modelName, speciesId, predictorType),
+  deleteModel: (
+    modelName: string,
+    speciesId?: string,
+    predictorType?: "dlib" | "cnn" | "yolo_pose"
+  ) => ipcRenderer.invoke("ml:delete-model", modelName, speciesId, predictorType),
   renameModel: (
     oldName: string,
     newName: string,
     speciesId?: string,
     predictorType?: "dlib" | "cnn" | "yolo_pose"
   ) => ipcRenderer.invoke("ml:rename-model", oldName, newName, speciesId, predictorType),
-  getModelInfo: (modelName: string, speciesId?: string) => ipcRenderer.invoke("ml:get-model-info", modelName, speciesId),
   selectImages: () => ipcRenderer.invoke("select-images"),
   selectFolderPath: () => ipcRenderer.invoke("select-folder-path"),
   selectAnnotationFile: () => ipcRenderer.invoke("select-annotation-file"),
@@ -104,18 +106,16 @@ contextBridge.exposeInMainWorld("api", {
     annotationFilePath: string;
     speciesId: string;
   }) => ipcRenderer.invoke("ml:load-annotated-folder", args),
-  testModel: (modelName: string, speciesId?: string) => ipcRenderer.invoke("ml:test-model", { modelName, speciesId }),
   // Multi-specimen detection
-  detectSpecimens: (imagePath: string, options?: DetectionOptions) => ipcRenderer.invoke("ml:detect-specimens", imagePath, options),
-  checkYolo: () => ipcRenderer.invoke("ml:check-yolo"),
+  detectSpecimens: (imagePath: string, options?: DetectionOptions) =>
+    ipcRenderer.invoke("ml:detect-specimens", imagePath, options),
   // Session management
   sessionCreate: (
     speciesId: string,
     name: string,
     landmarkTemplate: any[],
     orientationPolicy?: OrientationPolicy
-  ) =>
-    ipcRenderer.invoke("session:create", { speciesId, name, landmarkTemplate, orientationPolicy }),
+  ) => ipcRenderer.invoke("session:create", { speciesId, name, landmarkTemplate, orientationPolicy }),
   sessionUpdateOrientationPolicy: (speciesId: string, orientationPolicy: OrientationPolicy) =>
     ipcRenderer.invoke("session:update-orientation-policy", { speciesId, orientationPolicy }),
   sessionUpdateAugmentation: (speciesId: string, augmentationPolicy: Record<string, unknown>) =>
@@ -135,8 +135,7 @@ contextBridge.exposeInMainWorld("api", {
       landmarks?: { id: number; x: number; y: number; isSkipped?: boolean }[];
     }[],
     imagePath?: string
-  ) =>
-    ipcRenderer.invoke("session:finalize-accepted-boxes", { speciesId, filename, boxes, imagePath }),
+  ) => ipcRenderer.invoke("session:finalize-accepted-boxes", { speciesId, filename, boxes, imagePath }),
   sessionAddRejectedDetection: (
     speciesId: string,
     filename: string,
@@ -150,61 +149,36 @@ contextBridge.exposeInMainWorld("api", {
       detectionMethod?: string;
     }
   ) => ipcRenderer.invoke("session:add-rejected-detection", { speciesId, filename, rejectedDetection }),
-  sessionLoad: (speciesId: string) =>
-    ipcRenderer.invoke("session:load", { speciesId }),
+  sessionLoad: (speciesId: string) => ipcRenderer.invoke("session:load", { speciesId }),
   sessionLoadAnnotation: (speciesId: string, filename: string) =>
     ipcRenderer.invoke("session:load-annotation", { speciesId, filename }),
-  sessionList: () =>
-    ipcRenderer.invoke("session:list"),
+  sessionList: () => ipcRenderer.invoke("session:list"),
   sessionDeleteImage: (speciesId: string, filename: string) =>
     ipcRenderer.invoke("session:delete-image", { speciesId, filename }),
-  sessionDeleteAllImages: (speciesId: string) =>
-    ipcRenderer.invoke("session:delete-all-images", { speciesId }),
+  sessionDeleteAllImages: (speciesId: string) => ipcRenderer.invoke("session:delete-all-images", { speciesId }),
   // SuperAnnotator pipeline
-  superAnnotate: (imagePath: string, className: string, modelTag?: string, options?: { confThreshold?: number; samEnabled?: boolean; maxObjects?: number; detectionMode?: string; detectionPreset?: string; pcaMode?: "off" | "on" | "auto"; useOrientationHint?: boolean }, speciesId?: string) =>
-    ipcRenderer.invoke("ml:super-annotate", { imagePath, className, modelTag, options, speciesId }),
+  superAnnotate: (
+    imagePath: string,
+    className: string,
+    modelTag?: string,
+    options?: {
+      confThreshold?: number;
+      samEnabled?: boolean;
+      maxObjects?: number;
+      detectionMode?: string;
+      detectionPreset?: string;
+      pcaMode?: "off" | "on" | "auto";
+      useOrientationHint?: boolean;
+    },
+    speciesId?: string
+  ) => ipcRenderer.invoke("ml:super-annotate", { imagePath, className, modelTag, options, speciesId }),
   checkSuperAnnotator: () => ipcRenderer.invoke("ml:check-super-annotator"),
-  initSuperAnnotator: () => ipcRenderer.invoke("ml:init-super-annotator"),
-  refineSam: (imagePath: string, objectIndex: number, clickPoint: [number, number], clickLabel: number) =>
-    ipcRenderer.invoke("ml:refine-sam", { imagePath, objectIndex, clickPoint, clickLabel }),
   resegmentBox: (imagePath: string, boxXyxy: [number, number, number, number]) =>
     ipcRenderer.invoke("ml:resegment-box", { imagePath, boxXyxy }),
-  trainYolo: (
-    speciesId: string,
-    className: string,
-    epochs?: number,
-    detectionPreset?: string,
-    datasetSize?: number,
-    autoTune?: boolean
-  ) =>
-    ipcRenderer.invoke("ml:train-yolo", {
-      speciesId,
-      className,
-      epochs,
-      detectionPreset,
-      datasetSize,
-      autoTune,
-    }),
   trainObbDetector: (speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small" }) =>
     ipcRenderer.invoke("ml:train-obb-detector", speciesId, options),
   tagClassIds: (speciesId: string, boxes: any[]) =>
     ipcRenderer.invoke("ml:tag-class-ids", speciesId, boxes),
-  getYoloTrainPlan: (
-    speciesId: string,
-    className: string,
-    epochs?: number,
-    detectionPreset?: string,
-    datasetSize?: number,
-    autoTune?: boolean
-  ) =>
-    ipcRenderer.invoke("ml:get-yolo-train-plan", {
-      speciesId,
-      className,
-      epochs,
-      detectionPreset,
-      datasetSize,
-      autoTune,
-    }),
   onSuperAnnotateProgress: (callback: (data: any) => void) => {
     ipcRenderer.on("ml:super-annotate-progress", (_event: any, data: any) => callback(data));
     return () => { ipcRenderer.removeAllListeners("ml:super-annotate-progress"); };
@@ -225,69 +199,40 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.on("ml:train-progress", handler);
     return () => { ipcRenderer.removeListener("ml:train-progress", handler); };
   },
-  sessionSaveInferenceCorrection: (
+  sessionListInferenceSessions: () => ipcRenderer.invoke("session:list-inference-sessions"),
+  sessionCreateInferenceSession: (speciesId: string, displayName?: string) =>
+    ipcRenderer.invoke("session:create-inference-session", { speciesId, displayName }),
+  sessionGetInferenceSession: (speciesId: string) =>
+    ipcRenderer.invoke("session:get-inference-session", { speciesId }),
+  sessionUpdateInferenceSessionPreferences: (
     speciesId: string,
-    imagePath: string,
-    box?: { left: number; top: number; width: number; height: number },
-    landmarks?: { id: number; x: number; y: number }[],
-    filename?: string,
-    specimens?: {
-      box: {
-        left: number;
-        top: number;
-        width: number;
-        height: number;
-        confidence?: number;
-        class_id?: number;
-        class_name?: string;
-        orientation_override?: "left" | "right" | "uncertain";
-        orientation_hint?: {
-          orientation?: "left" | "right";
-          confidence?: number;
-          source?: string;
-          head_point?: [number, number];
-          tail_point?: [number, number];
-        };
+    inferenceSessionId: string | undefined,
+    options?: {
+      displayName?: string;
+      preferences?: {
+        lastUsedLandmarkModelKey?: string;
+        lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+        detectionModelKey?: string;
+        detectionModelName?: string;
       };
-      landmarks: { id: number; x: number; y: number }[];
-    }[],
-    rejectedDetections?: {
-      left: number;
-      top: number;
-      width: number;
-      height: number;
-      confidence?: number;
-      className?: string;
-      detectionMethod?: string;
-    }[],
-    options?: { allowEmpty?: boolean }
+    }
   ) =>
-    ipcRenderer.invoke("session:save-inference-correction", {
+    ipcRenderer.invoke("session:update-inference-session-preferences", {
       speciesId,
-      imagePath,
-      box,
-      landmarks,
-      filename,
-      specimens,
-      rejectedDetections,
-      allowEmpty: options?.allowEmpty,
+      inferenceSessionId,
+      displayName: options?.displayName,
+      preferences: options?.preferences,
     }),
-  sessionSaveDetectionCorrection: (
+  sessionCommitInferenceReview: (
     speciesId: string,
-    imagePath: string,
-    boxes: { left: number; top: number; width: number; height: number }[],
-    imageWidth: number,
-    imageHeight: number,
-    filename?: string
-  ) => ipcRenderer.invoke("session:save-detection-correction", { speciesId, imagePath, boxes, imageWidth, imageHeight, filename }),
-  sessionOpenInferenceSession: (args: {
-    speciesId: string;
-    landmarkModelKey: string;
-    landmarkModelName?: string;
-    landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
-    detectionModelKey?: string;
-    detectionModelName?: string;
-  }) => ipcRenderer.invoke("session:open-inference-session", args),
+    inferenceSessionId?: string,
+    options?: { onlyReviewComplete?: boolean }
+  ) =>
+    ipcRenderer.invoke("session:commit-inference-review", {
+      speciesId,
+      inferenceSessionId,
+      onlyReviewComplete: options?.onlyReviewComplete,
+    }),
   sessionSaveInferenceReviewDraft: (
     speciesId: string,
     inferenceSessionId: string | undefined,
@@ -312,7 +257,14 @@ contextBridge.exposeInMainWorld("api", {
       };
       landmarks: { id: number; x: number; y: number }[];
     }[],
-    options?: { filename?: string; edited?: boolean; saved?: boolean; clear?: boolean }
+    options?: {
+      filename?: string;
+      edited?: boolean;
+      saved?: boolean;
+      reviewComplete?: boolean;
+      committedAt?: string | null;
+      clear?: boolean;
+    }
   ) =>
     ipcRenderer.invoke("session:save-inference-review-draft", {
       speciesId,
@@ -322,45 +274,21 @@ contextBridge.exposeInMainWorld("api", {
       filename: options?.filename,
       edited: options?.edited,
       saved: options?.saved,
+      reviewComplete: options?.reviewComplete,
+      committedAt: options?.committedAt,
       clear: options?.clear,
     }),
   sessionLoadInferenceReviewDrafts: (speciesId: string, inferenceSessionId?: string) =>
     ipcRenderer.invoke("session:load-inference-review-drafts", { speciesId, inferenceSessionId }),
-  sessionQueueRetrainItem: (
+  sessionSaveInferenceImagePaths: (
     speciesId: string,
-    inferenceSessionId: string | undefined,
-    filename: string,
-    options?: {
-      imagePath?: string;
-      source?: string;
-      boxesCount?: number;
-      landmarksCount?: number;
-      landmarkModelKey?: string;
-      landmarkModelName?: string;
-      landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
-      detectionModelKey?: string;
-      detectionModelName?: string;
-    }
+    inferenceSessionId: string,
+    imagePaths: { path: string; name: string }[]
   ) =>
-    ipcRenderer.invoke("session:queue-retrain-item", {
-      speciesId,
-      inferenceSessionId,
-      filename,
-      imagePath: options?.imagePath,
-      source: options?.source,
-      boxesCount: options?.boxesCount,
-      landmarksCount: options?.landmarksCount,
-      landmarkModelKey: options?.landmarkModelKey,
-      landmarkModelName: options?.landmarkModelName,
-      landmarkPredictorType: options?.landmarkPredictorType,
-      detectionModelKey: options?.detectionModelKey,
-      detectionModelName: options?.detectionModelName,
-    }),
-  sessionGetRetrainQueue: (speciesId: string, inferenceSessionId?: string) =>
-    ipcRenderer.invoke("session:get-retrain-queue", { speciesId, inferenceSessionId }),
-  sessionClearRetrainQueue: (speciesId: string, inferenceSessionId?: string, filenames?: string[]) =>
-    ipcRenderer.invoke("session:clear-retrain-queue", { speciesId, inferenceSessionId, filenames }),
-  // Hardware capability probe — called once at app startup
+    ipcRenderer.invoke("session:save-inference-image-paths", { speciesId, inferenceSessionId, imagePaths }),
+  sessionLoadInferenceImagePaths: (speciesId: string, inferenceSessionId: string) =>
+    ipcRenderer.invoke("session:load-inference-image-paths", { speciesId, inferenceSessionId }),
+  // Hardware capability probe - called once at app startup
   probeHardware: () => ipcRenderer.invoke("system:probe-hardware"),
 });
 

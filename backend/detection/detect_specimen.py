@@ -11,169 +11,6 @@ if _BACKEND_ROOT not in _sys.path:
 from bv_utils.image_utils import load_image
 
 
-def _infer_session_dir_from_model_path(model_path):
-    """Walk up from model_path and return the nearest folder containing session.json."""
-    if not model_path:
-        return None
-    current = os.path.abspath(model_path)
-    if os.path.isfile(current):
-        current = os.path.dirname(current)
-    for _ in range(8):
-        session_path = os.path.join(current, "session.json")
-        if os.path.exists(session_path):
-            return current
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
-    return None
-
-
-def _load_head_tail_ids_for_model(model_path):
-    """
-    Resolve head/tail landmark IDs from the owning session.json (if available).
-    """
-    session_dir = _infer_session_dir_from_model_path(model_path)
-    if not session_dir:
-        return None, None
-    session_path = os.path.join(session_dir, "session.json")
-    if not os.path.exists(session_path):
-        return None, None
-    try:
-        import json
-
-        with open(session_path, "r", encoding="utf-8") as f:
-            session = json.load(f)
-    except Exception:
-        return None, None
-
-    template = session.get("landmarkTemplate", [])
-    if not isinstance(template, list):
-        return None, None
-
-    orientation_policy = session.get("orientationPolicy", {})
-    if not isinstance(orientation_policy, dict):
-        orientation_policy = {}
-
-    def _normalize_targets(raw, fallback):
-        if isinstance(raw, (list, tuple)):
-            values = [str(v).strip().lower() for v in raw if str(v).strip()]
-            if values:
-                return set(values)
-        return set(str(v).strip().lower() for v in fallback if str(v).strip())
-
-    head_targets = _normalize_targets(orientation_policy.get("headCategories"), ["head"])
-    tail_targets = _normalize_targets(orientation_policy.get("tailCategories"), ["tail"])
-
-    head_id = None
-    tail_id = None
-    for lm in template:
-        try:
-            idx = int(lm.get("index"))
-        except (TypeError, ValueError):
-            continue
-        cat = str(lm.get("category", "")).strip().lower()
-        if cat in head_targets and head_id is None:
-            head_id = idx
-        elif cat in tail_targets and tail_id is None:
-            tail_id = idx
-    return head_id, tail_id
-
-
-def _load_landmark_order_for_model(model_path):
-    """
-    Resolve sorted session landmark indices to map YOLO-pose keypoint slots.
-    """
-    session_dir = _infer_session_dir_from_model_path(model_path)
-    if not session_dir:
-        return []
-    session_path = os.path.join(session_dir, "session.json")
-    if not os.path.exists(session_path):
-        return []
-    try:
-        import json
-
-        with open(session_path, "r", encoding="utf-8") as f:
-            session = json.load(f)
-    except Exception:
-        return []
-    template = session.get("landmarkTemplate", [])
-    if not isinstance(template, list):
-        return []
-    ids = []
-    for lm in template:
-        try:
-            ids.append(int(lm.get("index")))
-        except Exception:
-            continue
-    return sorted(set(ids))
-
-
-def _extract_orientation_hint(keypoints_data, det_idx, enable_hint,
-                              head_id=None, tail_id=None, landmark_order=None):
-    """
-    Extract left/right orientation from YOLO-pose keypoints.
-
-    Uses explicit head/tail IDs when available; falls back to first two keypoints.
-    """
-    if not enable_hint or keypoints_data is None:
-        return None
-    try:
-        if det_idx >= len(keypoints_data):
-            return None
-        kp_item = keypoints_data[det_idx]
-        kp_xy = kp_item.xy[0].cpu().numpy()
-        if kp_xy is None or kp_xy.shape[0] < 2:
-            return None
-
-        head_idx = 0
-        tail_idx = 1
-        if (
-            landmark_order
-            and head_id is not None
-            and tail_id is not None
-            and len(landmark_order) == kp_xy.shape[0]
-            and int(head_id) in landmark_order
-            and int(tail_id) in landmark_order
-        ):
-            head_idx = int(landmark_order.index(int(head_id)))
-            tail_idx = int(landmark_order.index(int(tail_id)))
-
-        head_pt = kp_xy[head_idx].tolist()
-        tail_pt = kp_xy[tail_idx].tolist()
-        if not np.isfinite(head_pt).all() or not np.isfinite(tail_pt).all():
-            return None
-
-        orientation = "left" if head_pt[0] < tail_pt[0] else "right"
-        hint = {
-            "orientation": orientation,
-            "head_point": [float(head_pt[0]), float(head_pt[1])],
-            "tail_point": [float(tail_pt[0]), float(tail_pt[1])],
-            "source": "yolo_pose",
-        }
-
-        conf_tensor = getattr(kp_item, "conf", None)
-        if conf_tensor is not None:
-            conf_arr = conf_tensor[0].cpu().numpy()
-            if conf_arr is not None and len(conf_arr) > max(head_idx, tail_idx):
-                hint["head_confidence"] = float(conf_arr[head_idx])
-                hint["tail_confidence"] = float(conf_arr[tail_idx])
-                hint["confidence"] = float(min(conf_arr[head_idx], conf_arr[tail_idx]))
-        return hint
-    except Exception:
-        return None
-
-
-def _orientation_from_class_name(class_name):
-    token = str(class_name or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if not token:
-        return None
-    if token.endswith("_left") or token == "left" or "_left_" in token:
-        return "left"
-    if token.endswith("_right") or token == "right" or "_right_" in token:
-        return "right"
-    return None
-
 
 def detect_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20):
     """
@@ -194,17 +31,7 @@ def detect_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20):
         if boxes_obj is None or len(boxes_obj) == 0:
             return None
 
-        head_id, tail_id = _load_head_tail_ids_for_model(model_path)
-        landmark_order = _load_landmark_order_for_model(model_path)
-        can_use_pose_hint = bool(head_id is not None and tail_id is not None)
-
         best_idx = int(boxes_obj.conf.argmax())
-        keypoints_data = getattr(result, "keypoints", None)
-        orientation_hint = _extract_orientation_hint(
-            keypoints_data, best_idx,
-            enable_hint=can_use_pose_hint,
-            head_id=head_id, tail_id=tail_id, landmark_order=landmark_order,
-        )
 
         obb_corners = None
         if is_obb:
@@ -228,34 +55,35 @@ def detect_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20):
         }
         if obb_corners:
             output['obbCorners'] = obb_corners
-        if orientation_hint is None:
-            cls_id   = int(boxes_obj.cls[best_idx]) if boxes_obj.cls is not None else 0
-            cls_name = result.names.get(cls_id, "specimen") if hasattr(result, "names") else "specimen"
-            cls_ori  = _orientation_from_class_name(cls_name)
-            if cls_ori is not None:
-                orientation_hint = {
-                    "orientation": cls_ori,
-                    "confidence": float(boxes_obj.conf[best_idx]),
-                    "source": "detector_class",
-                }
-        if orientation_hint is not None:
-            output["orientation_hint"] = orientation_hint
         return output
     except Exception:
         return None
 
 
 def detect_multiple_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20,
-                               max_specimens=20):
+                               max_specimens=20, nms_iou=None):
     """
     Detect multiple specimen bounding boxes using a trained YOLO model.
     Returns list of boxes in the same format as detect_multiple_specimens(),
     or None if YOLO is unavailable / detects nothing.
     """
     try:
+        import json as _json_ds
+        if nms_iou is None:
+            _cfg = os.path.join(os.path.dirname(model_path),
+                                "obb_training", "session_obb", "obb_config.json")
+            if os.path.exists(_cfg):
+                try:
+                    with open(_cfg, "r", encoding="utf-8") as _f:
+                        nms_iou = float(_json_ds.load(_f).get("nms_iou", 0.3))
+                except Exception:
+                    nms_iou = 0.3
         from ultralytics import YOLO
         model = YOLO(model_path)
-        results = model(image_path, conf=conf_threshold, verbose=False)
+        predict_kwargs = {"conf": conf_threshold, "verbose": False}
+        if nms_iou is not None:
+            predict_kwargs["iou"] = nms_iou
+        results = model(image_path, **predict_kwargs)
         if not results:
             return None
 
@@ -267,10 +95,6 @@ def detect_multiple_with_yolo(image_path, model_path, conf_threshold=0.25, margi
 
         img_w = result.orig_shape[1]
         img_h = result.orig_shape[0]
-        keypoints_data = getattr(result, "keypoints", None)
-        head_id, tail_id = _load_head_tail_ids_for_model(model_path)
-        landmark_order  = _load_landmark_order_for_model(model_path)
-        can_use_pose_hint = bool(head_id is not None and tail_id is not None)
 
         boxes_out = []
         for i in range(min(len(boxes_obj), max_specimens)):
@@ -299,17 +123,6 @@ def detect_multiple_with_yolo(image_path, model_path, conf_threshold=0.25, margi
             }
             if obb_corners:
                 box_out['obbCorners'] = obb_corners
-            orientation_hint = _extract_orientation_hint(
-                keypoints_data, i,
-                enable_hint=can_use_pose_hint,
-                head_id=head_id, tail_id=tail_id, landmark_order=landmark_order,
-            )
-            if orientation_hint is None:
-                cls_ori = _orientation_from_class_name(cls_name)
-                if cls_ori is not None:
-                    orientation_hint = {"orientation": cls_ori, "confidence": conf, "source": "detector_class"}
-            if orientation_hint is not None:
-                box_out["orientation_hint"] = orientation_hint
             boxes_out.append(box_out)
 
         boxes_out.sort(key=lambda b: (b['top'], b['left']))

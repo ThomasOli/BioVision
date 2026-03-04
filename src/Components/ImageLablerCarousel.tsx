@@ -11,7 +11,7 @@ import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 import { AppDispatch, RootState } from "../state/store";
 import { removeFile, updateBoxes, setImageFinalized } from "../state/filesState/fileSlice";
-import { BoundingBox } from "../types/Image";
+import { AnnotatedImage, BoundingBox } from "../types/Image";
 
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent } from "@/Components/ui/card";
@@ -296,7 +296,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   }, [current, reduxFileArray, dispatch, setSelectedImage]);
 
   const ensureImageBoxesLoaded = useCallback(
-    async (image: (typeof images)[number] | null): Promise<BoundingBox[]> => {
+    async (image: AnnotatedImage | null): Promise<BoundingBox[]> => {
       if (!image?.speciesId || !image?.filename) return image?.boxes || [];
       if ((image.boxes || []).length > 0) return image.boxes || [];
       if (annotationLoadInFlight.current.has(image.id)) return image.boxes || [];
@@ -320,16 +320,16 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         annotationLoadInFlight.current.delete(image.id);
       }
     },
-    [dispatch, images]
+    [dispatch]
   );
 
-  const finalizeImageSegments = useCallback(async (image: (typeof images)[number] | null): Promise<boolean> => {
+  const finalizeImageSegments = useCallback(async (image: AnnotatedImage | null): Promise<boolean> => {
     if (!image?.speciesId || !image?.filename) return false;
     const sourceBoxes = await ensureImageBoxesLoaded(image);
 
     // Compute class_ids from placed landmarks via the backend, then persist them
     // so the training pipeline (prepare_dataset.py / export_obb_dataset) can use them.
-    let classIdMap = new Map<number, number>();
+    const classIdMap = new Map<number, number>();
     const boxesWithObb = (sourceBoxes || []).filter((b) => b.obbCorners && b.obbCorners.length === 4);
     if (boxesWithObb.length > 0 && image.speciesId) {
       try {
@@ -724,6 +724,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         landmarks: activeSpeciesForSchema.landmarkTemplate,
       }
     : undefined;
+  const activeOrientationMode = activeSpeciesForSchema?.orientationPolicy?.mode;
 
   const exportCurrent = useCallback(async () => {
     if (!current || !current.boxes?.length) return;
@@ -1079,6 +1080,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 samEnabled={samEnabled}
                 hideSegmentOutlines={isCurrentFinalized}
                 lockBoxes={isCurrentFinalized}
+                orientationMode={activeOrientationMode}
               />
               {/* Finalized overlay banner */}
               {isCurrentFinalized && (
@@ -1158,6 +1160,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
             samEnabled={samEnabled}
             hideSegmentOutlines={isCurrentFinalized}
             lockBoxes={isCurrentFinalized}
+            orientationMode={activeOrientationMode}
           />
         )}
       </Card>

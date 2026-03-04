@@ -2838,7 +2838,63 @@ interface DetectionOptions {
 ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?: DetectionOptions) => {
   try {
     const speciesId = options?.speciesId;
-    const yoloModel = getSessionYoloModel(speciesId);
+    const effectiveRoot = getEffectiveRoot(speciesId);
+
+    // Priority 1: session OBB detector via superAnnotator (respects obb_config.json NMS IoU=0.3).
+    // session_obb_detector.pt is never matched by getSessionYoloModel (yolo_*.pt pattern), so we
+    // check for it explicitly here.
+    const sessionObbPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
+    if (fs.existsSync(sessionObbPath) && superAnnotator) {
+      try {
+        const obbResult = await superAnnotator.send({
+          cmd: "detect_obb",
+          image_path: imagePath,
+          model_path: sessionObbPath,
+          conf: 0.35,
+          // nms_iou omitted → detect_obb() auto-loads from obb_config.json sidecar (0.3)
+        });
+        const rawDetections: any[] = Array.isArray(obbResult?.detections) ? obbResult.detections : [];
+        if (rawDetections.length > 0) {
+          const MAX_SPECIMENS = 8;
+          const topDetections = [...rawDetections]
+            .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))
+            .slice(0, MAX_SPECIMENS);
+          const boxes = topDetections.map((det: any) => {
+            const corners: [number, number][] = det.corners ?? [];
+            const classId = Number.isFinite(Number(det.class_id)) ? Number(det.class_id) : 0;
+            const conf = Number.isFinite(Number(det.confidence)) ? Number(det.confidence) : 1.0;
+            const xs = corners.map((p: [number, number]) => p[0]);
+            const ys = corners.map((p: [number, number]) => p[1]);
+            const left   = Math.round(Math.min(...xs));
+            const top    = Math.round(Math.min(...ys));
+            const right  = Math.round(Math.max(...xs));
+            const bottom = Math.round(Math.max(...ys));
+            return {
+              left, top, right, bottom,
+              width: right - left, height: bottom - top,
+              obbCorners: corners,
+              angle: det.angle ?? 0,
+              class_id: classId,
+              confidence: conf,
+              class_name: "specimen",
+              detection_method: "yolo_obb",
+              orientation_hint: {
+                orientation: classId === 0 ? "left" : "right",
+                confidence: conf,
+                source: "obb_class_id",
+              },
+            };
+          });
+          return { ok: true, boxes, detection_method: "yolo_obb" };
+        }
+      } catch (err) {
+        console.error("[detect-specimens] detect_obb failed, falling back to detect_specimen.py:", err);
+      }
+    }
+
+    // Priority 2: detect_specimen.py with best available model (yolo_*.pt or session_obb_detector.pt fallback)
+    const yoloModel = getSessionYoloModel(speciesId)
+      ?? (fs.existsSync(sessionObbPath) ? sessionObbPath : undefined);
 
     const pythonArgs = [
       path.join(__dirname, "../backend/detection/detect_specimen.py"),
@@ -2915,6 +2971,8 @@ const INFERENCE_REVIEW_DRAFTS_FILE = "inference_review_drafts.json";
 const RETRAIN_QUEUE_FILE = "retrain_queue.json";
 const INFERENCE_SESSIONS_DIR = "inference_sessions";
 const INFERENCE_SESSION_MANIFEST_FILE = "manifest.json";
+const INFERENCE_SESSION_INDEX_FILE = "session_index.json";
+const CANONICAL_INFERENCE_SESSION_ID = "default";
 
 type InferenceDraftSpecimen = {
   box: {
@@ -2925,6 +2983,8 @@ type InferenceDraftSpecimen = {
     confidence?: number;
     class_id?: number;
     class_name?: string;
+    obbCorners?: [number, number][];
+    angle?: number;
     orientation_override?: "left" | "right" | "uncertain";
     orientation_hint?: {
       orientation?: "left" | "right";
@@ -2944,6 +3004,8 @@ type InferenceReviewDraftItem = {
   specimens: InferenceDraftSpecimen[];
   edited: boolean;
   saved: boolean;
+  reviewComplete?: boolean;
+  committedAt?: string | null;
   updatedAt: string;
 };
 
@@ -2981,6 +3043,7 @@ type InferenceSessionManifest = {
   version: 1;
   sessionId: string;
   speciesId: string;
+  displayName?: string;
   models: {
     landmark: {
       key: string;
@@ -2992,7 +3055,20 @@ type InferenceSessionManifest = {
       name?: string;
     };
   };
+  preferences?: {
+    lastUsedLandmarkModelKey?: string;
+    lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+    detectionModelKey?: string;
+    detectionModelName?: string;
+  };
   createdAt: string;
+  updatedAt: string;
+};
+
+type InferenceSessionIndex = {
+  version: 1;
+  canonicalSessionId: string;
+  migratedFromSessionId?: string;
   updatedAt: string;
 };
 
@@ -3024,11 +3100,71 @@ function getInferenceSessionDir(speciesId: string, inferenceSessionId: string): 
   );
 }
 
+function getInferenceSessionsRoot(speciesId: string): string {
+  return path.join(getSessionDir(speciesId), INFERENCE_SESSIONS_DIR);
+}
+
 function getInferenceSessionManifestPath(speciesId: string, inferenceSessionId: string): string {
   return path.join(
     getInferenceSessionDir(speciesId, inferenceSessionId),
     INFERENCE_SESSION_MANIFEST_FILE
   );
+}
+
+function getInferenceSessionIndexPath(speciesId: string): string {
+  return path.join(getInferenceSessionsRoot(speciesId), INFERENCE_SESSION_INDEX_FILE);
+}
+
+function readInferenceSessionManifest(
+  speciesId: string,
+  inferenceSessionId: string
+): InferenceSessionManifest | null {
+  const manifestPath = getInferenceSessionManifestPath(speciesId, inferenceSessionId);
+  if (!fs.existsSync(manifestPath)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed as InferenceSessionManifest;
+  } catch {
+    return null;
+  }
+}
+
+function readInferenceSessionIndex(speciesId: string): InferenceSessionIndex | null {
+  const indexPath = getInferenceSessionIndexPath(speciesId);
+  if (!fs.existsSync(indexPath)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    const canonicalSessionId = sanitizeInferenceSessionId(parsed.canonicalSessionId);
+    if (!canonicalSessionId) return null;
+    return {
+      version: 1,
+      canonicalSessionId,
+      migratedFromSessionId: parsed.migratedFromSessionId
+        ? sanitizeInferenceSessionId(parsed.migratedFromSessionId)
+        : undefined,
+      updatedAt: String(parsed.updatedAt || new Date().toISOString()),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeInferenceSessionIndex(speciesId: string, payload: InferenceSessionIndex): void {
+  const sessionsRoot = getInferenceSessionsRoot(speciesId);
+  fs.mkdirSync(sessionsRoot, { recursive: true });
+  fs.writeFileSync(getInferenceSessionIndexPath(speciesId), JSON.stringify(payload, null, 2));
+}
+
+function copyFileIfMissing(sourcePath: string, targetPath: string): void {
+  if (!fs.existsSync(sourcePath) || fs.existsSync(targetPath)) return;
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  try {
+    fs.copyFileSync(sourcePath, targetPath);
+  } catch {
+    // non-fatal migration helper
+  }
 }
 
 function getInferenceReviewDraftsPath(speciesId: string, inferenceSessionId?: string): string {
@@ -3048,11 +3184,18 @@ function getRetrainQueuePath(speciesId: string, inferenceSessionId?: string): st
 function ensureInferenceSessionManifest(args: {
   speciesId: string;
   inferenceSessionId: string;
+  displayName?: string;
   landmarkModelKey?: string;
   landmarkModelName?: string;
   landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
   detectionModelKey?: string;
   detectionModelName?: string;
+  preferences?: {
+    lastUsedLandmarkModelKey?: string;
+    lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+    detectionModelKey?: string;
+    detectionModelName?: string;
+  };
 }): InferenceSessionManifest {
   const sessionDir = getInferenceSessionDir(args.speciesId, args.inferenceSessionId);
   fs.mkdirSync(sessionDir, { recursive: true });
@@ -3071,6 +3214,10 @@ function ensureInferenceSessionManifest(args: {
     version: 1,
     sessionId: args.inferenceSessionId,
     speciesId: args.speciesId,
+    displayName:
+      (typeof args.displayName === "string" && args.displayName.trim()) ||
+      existing?.displayName ||
+      args.inferenceSessionId,
     models: {
       landmark: {
         key: args.landmarkModelKey || existing?.models?.landmark?.key || "unknown_landmark",
@@ -3084,11 +3231,164 @@ function ensureInferenceSessionManifest(args: {
         name: args.detectionModelName || existing?.models?.detection?.name,
       },
     },
+    preferences: {
+      lastUsedLandmarkModelKey:
+        args.preferences?.lastUsedLandmarkModelKey ??
+        existing?.preferences?.lastUsedLandmarkModelKey,
+      lastUsedPredictorType:
+        args.preferences?.lastUsedPredictorType ??
+        existing?.preferences?.lastUsedPredictorType,
+      detectionModelKey:
+        args.preferences?.detectionModelKey ??
+        existing?.preferences?.detectionModelKey ??
+        args.detectionModelKey,
+      detectionModelName:
+        args.preferences?.detectionModelName ??
+        existing?.preferences?.detectionModelName ??
+        args.detectionModelName,
+    },
     createdAt: existing?.createdAt || now,
     updatedAt: now,
   };
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
   return manifest;
+}
+
+function resolveCanonicalInferenceSession(
+  speciesId: string,
+  options?: { createIfMissing?: boolean }
+): { inferenceSessionId: string | null; manifest: InferenceSessionManifest | null; migratedFrom?: string } {
+  const sessionsRoot = getInferenceSessionsRoot(speciesId);
+  const canonicalSessionId = CANONICAL_INFERENCE_SESSION_ID;
+  const canonicalManifest = readInferenceSessionManifest(speciesId, canonicalSessionId);
+  if (canonicalManifest) {
+    writeInferenceSessionIndex(speciesId, {
+      version: 1,
+      canonicalSessionId,
+      updatedAt: new Date().toISOString(),
+    });
+    return { inferenceSessionId: canonicalSessionId, manifest: canonicalManifest };
+  }
+
+  fs.mkdirSync(sessionsRoot, { recursive: true });
+  const index = readInferenceSessionIndex(speciesId);
+  if (index?.canonicalSessionId && index.canonicalSessionId !== canonicalSessionId) {
+    const legacyByIndex = readInferenceSessionManifest(speciesId, index.canonicalSessionId);
+    if (legacyByIndex) {
+      const sourceDir = getInferenceSessionDir(speciesId, index.canonicalSessionId);
+      const targetDir = getInferenceSessionDir(speciesId, canonicalSessionId);
+      fs.mkdirSync(targetDir, { recursive: true });
+      copyFileIfMissing(
+        path.join(sourceDir, INFERENCE_REVIEW_DRAFTS_FILE),
+        path.join(targetDir, INFERENCE_REVIEW_DRAFTS_FILE)
+      );
+      copyFileIfMissing(
+        path.join(sourceDir, RETRAIN_QUEUE_FILE),
+        path.join(targetDir, RETRAIN_QUEUE_FILE)
+      );
+      copyFileIfMissing(
+        path.join(sourceDir, "image_paths.json"),
+        path.join(targetDir, "image_paths.json")
+      );
+      const migrated = ensureInferenceSessionManifest({
+        speciesId,
+        inferenceSessionId: canonicalSessionId,
+        displayName: legacyByIndex.displayName || legacyByIndex.sessionId,
+        landmarkModelKey: legacyByIndex.models?.landmark?.key,
+        landmarkModelName: legacyByIndex.models?.landmark?.name,
+        landmarkPredictorType: legacyByIndex.models?.landmark?.predictorType,
+        detectionModelKey: legacyByIndex.models?.detection?.key,
+        detectionModelName: legacyByIndex.models?.detection?.name,
+        preferences: legacyByIndex.preferences,
+      });
+      writeInferenceSessionIndex(speciesId, {
+        version: 1,
+        canonicalSessionId,
+        migratedFromSessionId: index.canonicalSessionId,
+        updatedAt: new Date().toISOString(),
+      });
+      return {
+        inferenceSessionId: canonicalSessionId,
+        manifest: migrated,
+        migratedFrom: index.canonicalSessionId,
+      };
+    }
+  }
+
+  const legacyCandidates = fs
+    .readdirSync(sessionsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => sanitizeInferenceSessionId(entry.name))
+    .filter((id) => id && id !== canonicalSessionId)
+    .map((id) => {
+      const manifest = readInferenceSessionManifest(speciesId, id);
+      if (!manifest) return null;
+      const dir = getInferenceSessionDir(speciesId, id);
+      const updatedMs = Number.isFinite(Date.parse(manifest.updatedAt))
+        ? Date.parse(manifest.updatedAt)
+        : fs.statSync(dir).mtimeMs;
+      return { id, manifest, dir, updatedMs };
+    })
+    .filter((entry): entry is { id: string; manifest: InferenceSessionManifest; dir: string; updatedMs: number } => Boolean(entry))
+    .sort((a, b) => b.updatedMs - a.updatedMs);
+
+  if (legacyCandidates.length > 0) {
+    const pick = legacyCandidates[0];
+    const targetDir = getInferenceSessionDir(speciesId, canonicalSessionId);
+    fs.mkdirSync(targetDir, { recursive: true });
+    copyFileIfMissing(
+      path.join(pick.dir, INFERENCE_REVIEW_DRAFTS_FILE),
+      path.join(targetDir, INFERENCE_REVIEW_DRAFTS_FILE)
+    );
+    copyFileIfMissing(
+      path.join(pick.dir, RETRAIN_QUEUE_FILE),
+      path.join(targetDir, RETRAIN_QUEUE_FILE)
+    );
+    copyFileIfMissing(
+      path.join(pick.dir, "image_paths.json"),
+      path.join(targetDir, "image_paths.json")
+    );
+    const migrated = ensureInferenceSessionManifest({
+      speciesId,
+      inferenceSessionId: canonicalSessionId,
+      displayName: pick.manifest.displayName || pick.manifest.sessionId,
+      landmarkModelKey: pick.manifest.models?.landmark?.key,
+      landmarkModelName: pick.manifest.models?.landmark?.name,
+      landmarkPredictorType: pick.manifest.models?.landmark?.predictorType,
+      detectionModelKey: pick.manifest.models?.detection?.key,
+      detectionModelName: pick.manifest.models?.detection?.name,
+      preferences: pick.manifest.preferences,
+    });
+    writeInferenceSessionIndex(speciesId, {
+      version: 1,
+      canonicalSessionId,
+      migratedFromSessionId: pick.id,
+      updatedAt: new Date().toISOString(),
+    });
+    return {
+      inferenceSessionId: canonicalSessionId,
+      manifest: migrated,
+      migratedFrom: pick.id,
+    };
+  }
+
+  if (!options?.createIfMissing) {
+    return { inferenceSessionId: null, manifest: null };
+  }
+
+  const created = ensureInferenceSessionManifest({
+    speciesId,
+    inferenceSessionId: canonicalSessionId,
+    displayName: "Inference Session",
+    detectionModelKey: "session_detection_default",
+    detectionModelName: "Session Detection Model",
+  });
+  writeInferenceSessionIndex(speciesId, {
+    version: 1,
+    canonicalSessionId,
+    updatedAt: new Date().toISOString(),
+  });
+  return { inferenceSessionId: canonicalSessionId, manifest: created };
 }
 
 function migrateLegacyInferenceArtifactsToSession(speciesId: string, inferenceSessionId: string): void {
@@ -3213,6 +3513,16 @@ function sanitizeDraftSpecimens(specimens: unknown): InferenceDraftSpecimen[] {
           s.box.orientation_override === "uncertain"
             ? s.box.orientation_override
             : undefined,
+        obbCorners: Array.isArray(s.box.obbCorners) && s.box.obbCorners.length === 4
+          ? (s.box.obbCorners as any[]).map((p: any) =>
+              Array.isArray(p) && p.length >= 2
+                ? [Number(p[0]), Number(p[1])] as [number, number]
+                : [0, 0] as [number, number]
+            )
+          : undefined,
+        angle: typeof s.box.angle === "number" && Number.isFinite(s.box.angle)
+          ? s.box.angle
+          : undefined,
         orientation_hint: s.box.orientation_hint
           ? {
               orientation:
@@ -3975,6 +4285,260 @@ ipcMain.handle(
   }
 );
 
+function inferImageDimensionsForDetection(
+  imagePath: string,
+  boxes: { left: number; top: number; width: number; height: number }[]
+): { width: number; height: number } {
+  try {
+    const size = nativeImage.createFromPath(imagePath).getSize();
+    const width = Math.max(1, Math.round(Number(size?.width) || 0));
+    const height = Math.max(1, Math.round(Number(size?.height) || 0));
+    if (width > 1 && height > 1) return { width, height };
+  } catch {
+    // fallback to box extent
+  }
+  const width = Math.max(
+    1,
+    boxes.reduce((max, b) => Math.max(max, Math.round((b.left || 0) + (b.width || 0))), 0)
+  );
+  const height = Math.max(
+    1,
+    boxes.reduce((max, b) => Math.max(max, Math.round((b.top || 0) + (b.height || 0))), 0)
+  );
+  return { width, height };
+}
+
+function persistInferenceCorrectionToSession(args: {
+  speciesId: string;
+  imagePath: string;
+  box?: { left: number; top: number; width: number; height: number };
+  landmarks?: { id: number; x: number; y: number }[];
+  specimens?: {
+    box: {
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+      orientation_override?: "left" | "right" | "uncertain";
+    };
+    landmarks: { id: number; x: number; y: number }[];
+  }[];
+  rejectedDetections?: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    confidence?: number;
+    className?: string;
+    detectionMethod?: string;
+  }[];
+  allowEmpty?: boolean;
+  filename?: string;
+}): { ok: boolean; savedPath?: string; error?: string; imageName?: string } {
+  try {
+    const sessionDir = getSessionDir(args.speciesId);
+    const imagesDir = path.join(sessionDir, "images");
+    const labelsDir = path.join(sessionDir, "labels");
+    fs.mkdirSync(imagesDir, { recursive: true });
+    fs.mkdirSync(labelsDir, { recursive: true });
+
+    const imgName = args.filename ?? path.basename(args.imagePath);
+    const imgDest = path.join(imagesDir, imgName);
+    const lblDest = path.join(labelsDir, imgName.replace(/\.\w+$/, ".json"));
+
+    if (!fs.existsSync(imgDest) && fs.existsSync(args.imagePath)) {
+      fs.copyFileSync(args.imagePath, imgDest);
+    }
+
+    let boxesPayload: any[] = [];
+    if (Array.isArray(args.specimens) && args.specimens.length > 0) {
+      boxesPayload = args.specimens
+        .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0)
+        .map((s) => ({
+          left: Math.round(s.box.left),
+          top: Math.round(s.box.top),
+          width: Math.round(s.box.width),
+          height: Math.round(s.box.height),
+          ...(s.box.orientation_override === "left" ||
+          s.box.orientation_override === "right" ||
+          s.box.orientation_override === "uncertain"
+            ? { orientation_override: s.box.orientation_override }
+            : {}),
+          landmarks: (s.landmarks || []).map((lm) => ({
+            id: Number(lm.id),
+            x: Number(lm.x),
+            y: Number(lm.y),
+            isSkipped: false,
+          })),
+        }));
+    } else if (args.box && Array.isArray(args.landmarks)) {
+      boxesPayload = [
+        {
+          left: Math.round(args.box.left),
+          top: Math.round(args.box.top),
+          width: Math.round(args.box.width),
+          height: Math.round(args.box.height),
+          landmarks: args.landmarks.map((lm) => ({
+            id: Number(lm.id),
+            x: Number(lm.x),
+            y: Number(lm.y),
+            isSkipped: false,
+          })),
+        },
+      ];
+    }
+
+    if (boxesPayload.length === 0 && !args.allowEmpty) {
+      return { ok: false, error: "No valid corrected specimens to save." };
+    }
+
+    let existingRejectedDetections: any[] = [];
+    if (fs.existsSync(lblDest)) {
+      try {
+        const prev = JSON.parse(fs.readFileSync(lblDest, "utf-8"));
+        if (Array.isArray(prev?.rejectedDetections)) {
+          existingRejectedDetections = prev.rejectedDetections;
+        }
+      } catch {
+        // ignore malformed existing file
+      }
+    }
+    const incomingRejectedDetections = Array.isArray(args.rejectedDetections)
+      ? args.rejectedDetections
+          .filter((d) => d && Number(d.width) > 0 && Number(d.height) > 0)
+          .map((d) => ({
+            left: Math.round(Number(d.left) || 0),
+            top: Math.round(Number(d.top) || 0),
+            width: Math.round(Number(d.width) || 0),
+            height: Math.round(Number(d.height) || 0),
+            ...(Number.isFinite(Number(d.confidence))
+              ? { confidence: Number(d.confidence) }
+              : {}),
+            ...(d.className ? { className: String(d.className) } : {}),
+            ...(d.detectionMethod ? { detectionMethod: String(d.detectionMethod) } : {}),
+            rejectedAt: new Date().toISOString(),
+          }))
+      : [];
+    const mergedRejectedMap = new Map<string, any>();
+    [...existingRejectedDetections, ...incomingRejectedDetections].forEach((d) => {
+      const left = Math.round(Number(d?.left) || 0);
+      const top = Math.round(Number(d?.top) || 0);
+      const width = Math.round(Number(d?.width) || 0);
+      const height = Math.round(Number(d?.height) || 0);
+      if (width <= 0 || height <= 0) return;
+      const key = `${left}:${top}:${width}:${height}`;
+      if (!mergedRejectedMap.has(key)) {
+        mergedRejectedMap.set(key, { ...d, left, top, width, height });
+      }
+    });
+    const mergedRejectedDetections = Array.from(mergedRejectedMap.values());
+
+    const acceptedBoxes = normalizeFinalizedAcceptedBoxes(
+      boxesPayload.map((b) => ({
+        left: b.left,
+        top: b.top,
+        width: b.width,
+        height: b.height,
+        orientation_override:
+          b.orientation_override === "left" ||
+          b.orientation_override === "right" ||
+          b.orientation_override === "uncertain"
+            ? b.orientation_override
+            : undefined,
+        landmarks: b.landmarks,
+      }))
+    );
+    const boxSignature = buildAcceptedBoxesSignature(acceptedBoxes);
+
+    const label: any = {
+      imageFilename: imgName,
+      speciesId: args.speciesId,
+      boxes: boxesPayload,
+      rejectedDetections: mergedRejectedDetections,
+      finalizedDetection: {
+        isFinalized: true,
+        finalizedAt: new Date().toISOString(),
+        acceptedBoxes,
+        boxSignature,
+      },
+    };
+    fs.writeFileSync(lblDest, JSON.stringify(label, null, 2));
+
+    const finalizedListPath = path.join(sessionDir, "finalized_images.json");
+    try {
+      const existing: string[] = fs.existsSync(finalizedListPath)
+        ? JSON.parse(fs.readFileSync(finalizedListPath, "utf-8"))
+        : [];
+      if (!existing.includes(imgName)) {
+        existing.push(imgName);
+        fs.writeFileSync(finalizedListPath, JSON.stringify(existing));
+      }
+    } catch {
+      // non-fatal
+    }
+
+    const sessionJsonPath = path.join(sessionDir, "session.json");
+    if (fs.existsSync(sessionJsonPath)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+        meta.imageCount = fs.readdirSync(imagesDir).filter((f) => IMAGE_EXTS.test(f)).length;
+        meta.lastModified = new Date().toISOString();
+        fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+      } catch {
+        // non-fatal
+      }
+    }
+
+    return { ok: true, savedPath: lblDest, imageName: imgName };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+function persistDetectionCorrectionToSession(args: {
+  speciesId: string;
+  imagePath: string;
+  boxes: { left: number; top: number; width: number; height: number }[];
+  imageWidth: number;
+  imageHeight: number;
+  filename?: string;
+}): { ok: boolean; savedPath?: string; error?: string; imageName?: string } {
+  try {
+    const sessionDir = getSessionDir(args.speciesId);
+    const imagesDir = path.join(sessionDir, "images");
+    const detLblDir = path.join(sessionDir, "detection_labels");
+    fs.mkdirSync(imagesDir, { recursive: true });
+    fs.mkdirSync(detLblDir, { recursive: true });
+
+    const imgName = args.filename ?? path.basename(args.imagePath);
+    const imgDest = path.join(imagesDir, imgName);
+
+    if (!fs.existsSync(imgDest) && fs.existsSync(args.imagePath)) {
+      fs.copyFileSync(args.imagePath, imgDest);
+    }
+
+    const iw = Math.max(args.imageWidth, 1);
+    const ih = Math.max(args.imageHeight, 1);
+    const lines = (args.boxes || [])
+      .filter((b) => b.width > 0 && b.height > 0)
+      .map((b) => {
+        const cx = ((b.left + b.width / 2) / iw).toFixed(6);
+        const cy = ((b.top + b.height / 2) / ih).toFixed(6);
+        const w = (b.width / iw).toFixed(6);
+        const h = (b.height / ih).toFixed(6);
+        return `0 ${cx} ${cy} ${w} ${h}`;
+      });
+
+    const lblDest = path.join(detLblDir, imgName.replace(/\.\w+$/, ".txt"));
+    fs.writeFileSync(lblDest, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
+    return { ok: true, savedPath: lblDest, imageName: imgName };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+// Legacy IPC handler kept for backward compatibility with older renderer builds.
+// Current renderer persists review edits through session:save-inference-review-draft.
 ipcMain.handle(
   "session:save-inference-correction",
   async (
@@ -4008,168 +4572,11 @@ ipcMain.handle(
     }
   ) => {
     try {
-      const sessionDir = getSessionDir(args.speciesId);
-      const imagesDir = path.join(sessionDir, "images");
-      const labelsDir = path.join(sessionDir, "labels");
-      fs.mkdirSync(imagesDir, { recursive: true });
-      fs.mkdirSync(labelsDir, { recursive: true });
-
-      const imgName = args.filename ?? path.basename(args.imagePath);
-      const imgDest = path.join(imagesDir, imgName);
-      const lblDest = path.join(labelsDir, imgName.replace(/\.\w+$/, ".json"));
-
-      // Copy image into session if not already there
-      if (!fs.existsSync(imgDest)) {
-        fs.copyFileSync(args.imagePath, imgDest);
+      const result = persistInferenceCorrectionToSession(args);
+      if (!result.ok) {
+        return { ok: false, error: result.error || "Failed to save inference correction." };
       }
-
-      let boxesPayload: any[] = [];
-      if (Array.isArray(args.specimens) && args.specimens.length > 0) {
-        boxesPayload = args.specimens
-          .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0)
-          .map((s) => ({
-            left: Math.round(s.box.left),
-            top: Math.round(s.box.top),
-            width: Math.round(s.box.width),
-            height: Math.round(s.box.height),
-            ...(s.box.orientation_override === "left" ||
-            s.box.orientation_override === "right" ||
-            s.box.orientation_override === "uncertain"
-              ? { orientation_override: s.box.orientation_override }
-              : {}),
-            landmarks: (s.landmarks || []).map((lm) => ({
-              id: Number(lm.id),
-              x: Number(lm.x),
-              y: Number(lm.y),
-              isSkipped: false,
-            })),
-          }));
-      } else if (args.box && Array.isArray(args.landmarks)) {
-        boxesPayload = [
-          {
-            left: Math.round(args.box.left),
-            top: Math.round(args.box.top),
-            width: Math.round(args.box.width),
-            height: Math.round(args.box.height),
-            landmarks: args.landmarks.map((lm) => ({
-              id: Number(lm.id),
-              x: Number(lm.x),
-              y: Number(lm.y),
-              isSkipped: false,
-            })),
-          },
-        ];
-      }
-
-      if (boxesPayload.length === 0 && !args.allowEmpty) {
-        return { ok: false, error: "No valid corrected specimens to save." };
-      }
-
-      let existingRejectedDetections: any[] = [];
-      if (fs.existsSync(lblDest)) {
-        try {
-          const prev = JSON.parse(fs.readFileSync(lblDest, "utf-8"));
-          if (Array.isArray(prev?.rejectedDetections)) {
-            existingRejectedDetections = prev.rejectedDetections;
-          }
-        } catch (_) {
-          // ignore malformed existing file
-        }
-      }
-      const incomingRejectedDetections = Array.isArray(args.rejectedDetections)
-        ? args.rejectedDetections
-            .filter((d) => d && Number(d.width) > 0 && Number(d.height) > 0)
-            .map((d) => ({
-              left: Math.round(Number(d.left) || 0),
-              top: Math.round(Number(d.top) || 0),
-              width: Math.round(Number(d.width) || 0),
-              height: Math.round(Number(d.height) || 0),
-              ...(Number.isFinite(Number(d.confidence))
-                ? { confidence: Number(d.confidence) }
-                : {}),
-              ...(d.className ? { className: String(d.className) } : {}),
-              ...(d.detectionMethod ? { detectionMethod: String(d.detectionMethod) } : {}),
-              rejectedAt: new Date().toISOString(),
-            }))
-        : [];
-      const mergedRejectedMap = new Map<string, any>();
-      [...existingRejectedDetections, ...incomingRejectedDetections].forEach((d) => {
-        const left = Math.round(Number(d?.left) || 0);
-        const top = Math.round(Number(d?.top) || 0);
-        const width = Math.round(Number(d?.width) || 0);
-        const height = Math.round(Number(d?.height) || 0);
-        if (width <= 0 || height <= 0) return;
-        const key = `${left}:${top}:${width}:${height}`;
-        if (!mergedRejectedMap.has(key)) {
-          mergedRejectedMap.set(key, {
-            ...d,
-            left,
-            top,
-            width,
-            height,
-          });
-        }
-      });
-      const mergedRejectedDetections = Array.from(mergedRejectedMap.values());
-
-      const acceptedBoxes = normalizeFinalizedAcceptedBoxes(
-        boxesPayload.map((b) => ({
-          left: b.left,
-          top: b.top,
-          width: b.width,
-          height: b.height,
-          orientation_override:
-            b.orientation_override === "left" ||
-            b.orientation_override === "right" ||
-            b.orientation_override === "uncertain"
-              ? b.orientation_override
-              : undefined,
-          landmarks: b.landmarks,
-        }))
-      );
-      const boxSignature = buildAcceptedBoxesSignature(acceptedBoxes);
-
-      // Write label JSON in BioVision format (+ finalized snapshot for YOLO export)
-      const label: any = {
-        imageFilename: imgName,
-        speciesId: args.speciesId,
-        boxes: boxesPayload,
-        rejectedDetections: mergedRejectedDetections,
-        finalizedDetection: {
-          isFinalized: true,
-          finalizedAt: new Date().toISOString(),
-          acceptedBoxes,
-          boxSignature,
-        },
-      };
-      fs.writeFileSync(lblDest, JSON.stringify(label, null, 2));
-
-      // Persist finalized filename for finalized-only YOLO export.
-      const finalizedListPath = path.join(sessionDir, "finalized_images.json");
-      try {
-        const existing: string[] = fs.existsSync(finalizedListPath)
-          ? JSON.parse(fs.readFileSync(finalizedListPath, "utf-8"))
-          : [];
-        if (!existing.includes(imgName)) {
-          existing.push(imgName);
-          fs.writeFileSync(finalizedListPath, JSON.stringify(existing));
-        }
-      } catch (_) {
-        // non-fatal
-      }
-
-      // Update session.json imageCount
-      const sessionJsonPath = path.join(sessionDir, "session.json");
-      if (fs.existsSync(sessionJsonPath)) {
-        try {
-          const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
-          meta.imageCount = fs.readdirSync(imagesDir).filter((f) => IMAGE_EXTS.test(f)).length;
-          meta.lastModified = new Date().toISOString();
-          fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
-        } catch (_) {}
-      }
-
-      return { ok: true, savedPath: lblDest };
+      return { ok: true, savedPath: result.savedPath };
     } catch (e: any) {
       console.error("session:save-inference-correction failed:", e);
       return { ok: false, error: e.message };
@@ -4177,6 +4584,8 @@ ipcMain.handle(
   }
 );
 
+// Legacy IPC handler kept for backward compatibility with older renderer builds.
+// Current renderer workflow uses inference review drafts + commit-inference-review.
 ipcMain.handle(
   "session:open-inference-session",
   async (
@@ -4220,6 +4629,340 @@ ipcMain.handle(
   }
 );
 
+ipcMain.handle("session:list-inference-sessions", async () => {
+  try {
+    const sessionsRoot = path.join(projectRoot, "sessions");
+    if (!fs.existsSync(sessionsRoot)) {
+      return { ok: true, sessions: [] };
+    }
+
+    const schemas = fs
+      .readdirSync(sessionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory());
+
+    const sessions = schemas
+      .map((entry) => {
+        const speciesId = entry.name;
+        const sessionJsonPath = path.join(sessionsRoot, speciesId, "session.json");
+        if (!fs.existsSync(sessionJsonPath)) return null;
+        let schemaName = speciesId;
+        let schemaImageCount = 0;
+        let schemaUpdatedAt = "";
+        try {
+          const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+          schemaName = String(meta?.name || speciesId);
+          schemaImageCount = Math.max(0, Number(meta?.imageCount || 0));
+          schemaUpdatedAt = String(meta?.lastModified || meta?.createdAt || "");
+        } catch {
+          // keep defaults
+        }
+        const resolved = resolveCanonicalInferenceSession(speciesId, { createIfMissing: false });
+        return {
+          speciesId,
+          schemaName,
+          schemaImageCount,
+          schemaUpdatedAt,
+          exists: Boolean(resolved.inferenceSessionId && resolved.manifest),
+          inferenceSessionId: resolved.inferenceSessionId ?? undefined,
+          displayName: resolved.manifest?.displayName,
+          createdAt: resolved.manifest?.createdAt,
+          updatedAt: resolved.manifest?.updatedAt,
+          migratedFrom: resolved.migratedFrom,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null)
+      .sort((a, b) => {
+        const aTime = Date.parse(a.updatedAt || a.schemaUpdatedAt || "");
+        const bTime = Date.parse(b.updatedAt || b.schemaUpdatedAt || "");
+        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+      });
+
+    return { ok: true, sessions };
+  } catch (e: any) {
+    console.error("session:list-inference-sessions failed:", e);
+    return { ok: false, error: e.message, sessions: [] };
+  }
+});
+
+ipcMain.handle(
+  "session:create-inference-session",
+  async (_event, args: { speciesId: string; displayName?: string }) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required." };
+      }
+      const schemaSessionJson = path.join(getSessionDir(args.speciesId), "session.json");
+      if (!fs.existsSync(schemaSessionJson)) {
+        return { ok: false, error: `Schema session not found: ${args.speciesId}` };
+      }
+
+      const existing = resolveCanonicalInferenceSession(args.speciesId, {
+        createIfMissing: false,
+      });
+      if (existing.inferenceSessionId && existing.manifest) {
+        return {
+          ok: false,
+          error: `Inference session already exists for schema ${args.speciesId}.`,
+          inferenceSessionId: existing.inferenceSessionId,
+          manifest: existing.manifest,
+        };
+      }
+
+      const displayName =
+        typeof args.displayName === "string" && args.displayName.trim()
+          ? args.displayName.trim()
+          : "Inference Session";
+      const manifest = ensureInferenceSessionManifest({
+        speciesId: args.speciesId,
+        inferenceSessionId: CANONICAL_INFERENCE_SESSION_ID,
+        displayName,
+        detectionModelKey: "session_detection_default",
+        detectionModelName: "Session Detection Model",
+      });
+      writeInferenceSessionIndex(args.speciesId, {
+        version: 1,
+        canonicalSessionId: CANONICAL_INFERENCE_SESSION_ID,
+        updatedAt: new Date().toISOString(),
+      });
+      return {
+        ok: true,
+        inferenceSessionId: CANONICAL_INFERENCE_SESSION_ID,
+        manifest,
+      };
+    } catch (e: any) {
+      console.error("session:create-inference-session failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:get-inference-session",
+  async (_event, args: { speciesId: string }) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required." };
+      }
+      const resolved = resolveCanonicalInferenceSession(args.speciesId, { createIfMissing: false });
+      if (!resolved.inferenceSessionId || !resolved.manifest) {
+        return { ok: true, exists: false };
+      }
+      return {
+        ok: true,
+        exists: true,
+        inferenceSessionId: resolved.inferenceSessionId,
+        manifest: resolved.manifest,
+        migratedFrom: resolved.migratedFrom,
+      };
+    } catch (e: any) {
+      console.error("session:get-inference-session failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:update-inference-session-preferences",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      inferenceSessionId?: string;
+      displayName?: string;
+      preferences?: {
+        lastUsedLandmarkModelKey?: string;
+        lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+        detectionModelKey?: string;
+        detectionModelName?: string;
+      };
+    }
+  ) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required." };
+      }
+      const resolved = resolveCanonicalInferenceSession(args.speciesId, { createIfMissing: false });
+      if (!resolved.inferenceSessionId || !resolved.manifest) {
+        return { ok: false, error: "Inference session does not exist for this schema." };
+      }
+      const manifest = ensureInferenceSessionManifest({
+        speciesId: args.speciesId,
+        inferenceSessionId: resolved.inferenceSessionId,
+        displayName: args.displayName || resolved.manifest.displayName,
+        landmarkModelKey:
+          args.preferences?.lastUsedLandmarkModelKey ||
+          resolved.manifest.models?.landmark?.key,
+        landmarkPredictorType:
+          args.preferences?.lastUsedPredictorType ||
+          resolved.manifest.models?.landmark?.predictorType,
+        detectionModelKey:
+          args.preferences?.detectionModelKey ||
+          resolved.manifest.models?.detection?.key,
+        detectionModelName:
+          args.preferences?.detectionModelName ||
+          resolved.manifest.models?.detection?.name,
+        preferences: {
+          lastUsedLandmarkModelKey:
+            args.preferences?.lastUsedLandmarkModelKey ??
+            resolved.manifest.preferences?.lastUsedLandmarkModelKey,
+          lastUsedPredictorType:
+            args.preferences?.lastUsedPredictorType ??
+            resolved.manifest.preferences?.lastUsedPredictorType,
+          detectionModelKey:
+            args.preferences?.detectionModelKey ??
+            resolved.manifest.preferences?.detectionModelKey,
+          detectionModelName:
+            args.preferences?.detectionModelName ??
+            resolved.manifest.preferences?.detectionModelName,
+        },
+      });
+      return { ok: true, inferenceSessionId: resolved.inferenceSessionId, manifest };
+    } catch (e: any) {
+      console.error("session:update-inference-session-preferences failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:commit-inference-review",
+  async (
+    _event,
+    args: { speciesId: string; inferenceSessionId?: string; onlyReviewComplete?: boolean }
+  ) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required." };
+      }
+
+      const resolved = resolveCanonicalInferenceSession(args.speciesId, { createIfMissing: false });
+      if (!resolved.inferenceSessionId || !resolved.manifest) {
+        return { ok: false, error: "Inference session does not exist for this schema." };
+      }
+
+      const drafts = readInferenceReviewDrafts(args.speciesId, resolved.inferenceSessionId);
+      const items = Object.values(drafts.items);
+      const onlyReviewComplete = args.onlyReviewComplete !== false;
+      let committed = 0;
+      let skipped = 0;
+      let failed = 0;
+      const failures: Array<{ filename: string; error: string }> = [];
+      const now = new Date().toISOString();
+
+      for (const item of items) {
+        if (!item) continue;
+        if (onlyReviewComplete && !item.reviewComplete) {
+          skipped += 1;
+          continue;
+        }
+        const updatedAtMs = Date.parse(String(item.updatedAt || ""));
+        const committedAtMs = Date.parse(String(item.committedAt || ""));
+        if (
+          item.committedAt &&
+          Number.isFinite(updatedAtMs) &&
+          Number.isFinite(committedAtMs) &&
+          committedAtMs >= updatedAtMs
+        ) {
+          skipped += 1;
+          continue;
+        }
+
+        const filename = path.basename(String(item.filename || "").trim());
+        const imagePathCandidate = item.imagePath
+          ? path.resolve(item.imagePath)
+          : path.join(getSessionDir(args.speciesId), "images", filename);
+        const imagePath = fs.existsSync(imagePathCandidate)
+          ? imagePathCandidate
+          : path.join(getSessionDir(args.speciesId), "images", filename);
+        if (!filename || !fs.existsSync(imagePath)) {
+          failed += 1;
+          failures.push({
+            filename: filename || "(unknown)",
+            error: "Image source not found for committed draft.",
+          });
+          continue;
+        }
+
+        const normalizedSpecimens = sanitizeDraftSpecimens(item.specimens || []);
+        const commitSpecimens = normalizedSpecimens.map((s) => ({
+          box: {
+            left: s.box.left,
+            top: s.box.top,
+            width: s.box.width,
+            height: s.box.height,
+            orientation_override: s.box.orientation_override,
+          },
+          landmarks: s.landmarks.map((lm) => ({
+            id: lm.id,
+            x: lm.x,
+            y: lm.y,
+          })),
+        }));
+
+        const landmarkSave = persistInferenceCorrectionToSession({
+          speciesId: args.speciesId,
+          imagePath,
+          filename,
+          specimens: commitSpecimens,
+          allowEmpty: true,
+        });
+        if (!landmarkSave.ok) {
+          failed += 1;
+          failures.push({
+            filename,
+            error: landmarkSave.error || "Failed to save landmark corrections.",
+          });
+          continue;
+        }
+
+        const boxes = commitSpecimens.map((s) => ({
+          left: s.box.left,
+          top: s.box.top,
+          width: s.box.width,
+          height: s.box.height,
+        }));
+        const dims = inferImageDimensionsForDetection(imagePath, boxes);
+        const detectionSave = persistDetectionCorrectionToSession({
+          speciesId: args.speciesId,
+          imagePath,
+          filename,
+          boxes,
+          imageWidth: dims.width,
+          imageHeight: dims.height,
+        });
+        if (!detectionSave.ok) {
+          failed += 1;
+          failures.push({
+            filename,
+            error: detectionSave.error || "Failed to save detection labels.",
+          });
+          continue;
+        }
+
+        item.saved = true;
+        item.edited = false;
+        item.committedAt = now;
+        committed += 1;
+      }
+
+      drafts.updatedAt = new Date().toISOString();
+      writeInferenceReviewDrafts(args.speciesId, drafts, resolved.inferenceSessionId);
+
+      return {
+        ok: true,
+        inferenceSessionId: resolved.inferenceSessionId,
+        committed,
+        skipped,
+        failed,
+        failures,
+      };
+    } catch (e: any) {
+      console.error("session:commit-inference-review failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
 ipcMain.handle(
   "session:save-inference-review-draft",
   async (
@@ -4232,6 +4975,8 @@ ipcMain.handle(
       specimens?: InferenceDraftSpecimen[];
       edited?: boolean;
       saved?: boolean;
+      reviewComplete?: boolean;
+      committedAt?: string | null;
       clear?: boolean;
     }
   ) => {
@@ -4262,6 +5007,16 @@ ipcMain.handle(
           specimens: sanitizeDraftSpecimens(args.specimens),
           edited: Boolean(args.edited),
           saved: Boolean(args.saved),
+          reviewComplete:
+            typeof args.reviewComplete === "boolean"
+              ? args.reviewComplete
+              : Boolean(drafts.items[key]?.reviewComplete),
+          committedAt:
+            args.committedAt === null
+              ? null
+              : typeof args.committedAt === "string"
+              ? args.committedAt
+              : drafts.items[key]?.committedAt ?? null,
           updatedAt: new Date().toISOString(),
         };
       }
@@ -4369,6 +5124,57 @@ ipcMain.handle(
   }
 );
 
+ipcMain.handle(
+  "session:save-inference-image-paths",
+  async (_event, args: { speciesId: string; inferenceSessionId: string; imagePaths: { path: string; name: string }[] }) => {
+    try {
+      if (!args.speciesId || !args.inferenceSessionId) return { ok: false, error: "speciesId and inferenceSessionId are required." };
+      const sessionDir = getInferenceSessionDir(args.speciesId, args.inferenceSessionId);
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "image_paths.json"),
+        JSON.stringify({ version: 1, imagePaths: args.imagePaths }, null, 2),
+        "utf-8"
+      );
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:save-inference-image-paths failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:load-inference-image-paths",
+  async (_event, args: { speciesId: string; inferenceSessionId: string }) => {
+    try {
+      if (!args.speciesId || !args.inferenceSessionId) return { ok: true, images: [] };
+      const listPath = path.join(
+        getInferenceSessionDir(args.speciesId, args.inferenceSessionId),
+        "image_paths.json"
+      );
+      if (!fs.existsSync(listPath)) return { ok: true, images: [] };
+      const { imagePaths } = JSON.parse(fs.readFileSync(listPath, "utf-8")) as {
+        imagePaths: { path: string; name: string }[];
+      };
+      const images = imagePaths
+        .filter((p) => fs.existsSync(p.path))
+        .map((p) => {
+          const data = fs.readFileSync(p.path).toString("base64");
+          const ext = path.extname(p.name).toLowerCase().slice(1);
+          const mimeType = ext === "png" ? "image/png" : (ext === "jpg" || ext === "jpeg") ? "image/jpeg" : "image/png";
+          return { path: p.path, name: p.name, data, mimeType };
+        });
+      return { ok: true, images };
+    } catch (e: any) {
+      console.error("session:load-inference-image-paths failed:", e);
+      return { ok: true, images: [] };
+    }
+  }
+);
+
+// Legacy retrain-queue IPC handlers are intentionally retained for compatibility.
+// Current renderer workflow commits review-complete items directly to training data.
 ipcMain.handle(
   "session:queue-retrain-item",
   async (
@@ -4498,6 +5304,8 @@ ipcMain.handle(
   }
 );
 
+// Legacy IPC handler kept for backward compatibility with older renderer builds.
+// Current renderer commits detection updates through session:commit-inference-review.
 ipcMain.handle(
   "session:save-detection-correction",
   async (
@@ -4512,37 +5320,11 @@ ipcMain.handle(
     }
   ) => {
     try {
-      const sessionDir = getSessionDir(args.speciesId);
-      const imagesDir = path.join(sessionDir, "images");
-      const detLblDir = path.join(sessionDir, "detection_labels");
-      fs.mkdirSync(imagesDir, { recursive: true });
-      fs.mkdirSync(detLblDir, { recursive: true });
-
-      const imgName = args.filename ?? path.basename(args.imagePath);
-      const imgDest = path.join(imagesDir, imgName);
-
-      // Copy image into session if not already there
-      if (!fs.existsSync(imgDest)) {
-        fs.copyFileSync(args.imagePath, imgDest);
+      const result = persistDetectionCorrectionToSession(args);
+      if (!result.ok) {
+        return { ok: false, error: result.error || "Failed to save detection correction." };
       }
-
-      // Write YOLO-format detection label (normalized coords)
-      const iw = Math.max(args.imageWidth, 1);
-      const ih = Math.max(args.imageHeight, 1);
-      const lines = args.boxes
-        .filter((b) => b.width > 0 && b.height > 0)
-        .map((b) => {
-          const cx = ((b.left + b.width / 2) / iw).toFixed(6);
-          const cy = ((b.top + b.height / 2) / ih).toFixed(6);
-          const w  = (b.width  / iw).toFixed(6);
-          const h  = (b.height / ih).toFixed(6);
-          return `0 ${cx} ${cy} ${w} ${h}`;
-        });
-
-      const lblDest = path.join(detLblDir, imgName.replace(/\.\w+$/, ".txt"));
-      fs.writeFileSync(lblDest, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
-
-      return { ok: true, savedPath: lblDest };
+      return { ok: true, savedPath: result.savedPath };
     } catch (e: any) {
       console.error("session:save-detection-correction failed:", e);
       return { ok: false, error: e.message };
@@ -4966,7 +5748,7 @@ ipcMain.handle("ml:init-super-annotator", async () => {
   }
 });
 
-ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small" }) => {
+ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small"; iou?: number; cls?: number; box?: number }) => {
   try {
     if (!superAnnotator.isRunning) {
       await superAnnotator.send({ cmd: "init" });
@@ -4993,6 +5775,16 @@ ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, option
       console.warn("Hardware probe failed during OBB training — defaulting to cpu");
     }
 
+    // Read orientation schema from session.json
+    let orientationSchema = "invariant";
+    const sessionJsonPath = path.join(sessionDir, "session.json");
+    if (fs.existsSync(sessionJsonPath)) {
+      try {
+        const session = safeReadJson(sessionJsonPath) ?? {};
+        orientationSchema = (session as any).orientationPolicy?.mode ?? "invariant";
+      } catch (_) { /* non-fatal */ }
+    }
+
     const result = await superAnnotator.send({
       cmd: "train_yolo_obb",
       session_dir: sessionDir,
@@ -5000,6 +5792,10 @@ ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, option
       model_tier: modelTier,
       device: hwDevice,
       sam2_enabled: hwSam2Enabled,
+      iou_loss: options?.iou ?? 0.3,
+      cls_loss: options?.cls ?? 1.5,
+      box_loss: options?.box ?? 5.0,
+      orientation_schema: orientationSchema,
     });
 
     if (result?.status === "error") {
@@ -5007,7 +5803,6 @@ ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, option
     }
 
     // Mark session as obb_detector_ready
-    const sessionJsonPath = path.join(sessionDir, "session.json");
     if (fs.existsSync(sessionJsonPath)) {
       try {
         const session = safeReadJson(sessionJsonPath) ?? {};
@@ -5077,8 +5872,6 @@ ipcMain.handle(
         maxObjects?: number;
         detectionMode?: string;
         detectionPreset?: string;
-        pcaMode?: "off" | "on" | "auto";
-        useOrientationHint?: boolean;
       };
     }
   ) => {
@@ -5095,6 +5888,16 @@ ipcMain.handle(
       const effectiveRoot = args.speciesId
         ? path.join(projectRoot, "sessions", args.speciesId)
         : projectRoot;
+
+      // Read session orientationPolicy for schema-aware canonicalization
+      let sessionOrientationPolicy: Record<string, unknown> | null = null;
+      const sessionJsonPath = path.join(effectiveRoot, "session.json");
+      if (fs.existsSync(sessionJsonPath)) {
+        try {
+          const sess = safeReadJson(sessionJsonPath) ?? {};
+          sessionOrientationPolicy = (sess as any).orientationPolicy ?? null;
+        } catch (_) { /* non-fatal */ }
+      }
 
       // Resolve dlib model path if tag provided
       let dlibModel: string | undefined;
@@ -5190,11 +5993,10 @@ ipcMain.handle(
           max_objects: args.options?.maxObjects ?? 20,
           detection_mode: args.options?.detectionMode ?? "auto",
           detection_preset: args.options?.detectionPreset ?? "balanced",
-          pca_mode: args.options?.pcaMode ?? "auto",
-          use_orientation_hint: args.options?.useOrientationHint ?? true,
           finetuned_model: finetunedModel,
           // Pass session_dir so SAM2 segments are auto-saved for synthetic augmentation
           session_dir: samEnabled ? effectiveRoot : undefined,
+          orientation_policy: sessionOrientationPolicy,
         },
       });
 

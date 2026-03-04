@@ -40,14 +40,8 @@ export const { setHardwareCapabilities } = hardwareSlice.actions;
 
 // Selectors — typed with `any` to avoid circular dep with store.tsx
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const selectHardware = (state: any): HardwareState => state.hardware;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const selectSam2Enabled = (state: any): boolean => state.hardware.sam2Enabled;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const selectCnnTier = (state: any): CnnTier => state.hardware.cnnTier;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const selectDevice = (state: any): Device => state.hardware.device;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const selectHardwareProbed = (state: any): boolean => state.hardware.probed;
 
 export default hardwareSlice.reducer;

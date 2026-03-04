@@ -73,7 +73,7 @@ export interface LandmarkDefinition {
   category?: string; // "forewing", "head", "body", etc.
 }
 
-type OrientationMode = "directional" | "bilateral" | "axial" | "invariant";
+export type OrientationMode = "directional" | "bilateral" | "axial" | "invariant";
 
 export interface OrientationPolicy {
   mode: OrientationMode;

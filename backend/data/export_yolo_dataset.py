@@ -149,103 +149,6 @@ def _load_head_tail_ids(session_dir):
     return head_id, tail_id
 
 
-def _load_landmark_ids(session_dir):
-    """
-    Read session.json and return sorted landmark indices used for pose export.
-    """
-    session_path = os.path.join(session_dir, "session.json")
-    if not os.path.exists(session_path):
-        return []
-    try:
-        with open(session_path, "r", encoding="utf-8") as f:
-            session = json.load(f)
-    except Exception:
-        return []
-    template = session.get("landmarkTemplate", [])
-    if not isinstance(template, list):
-        return []
-    ids = []
-    for lm in template:
-        try:
-            ids.append(int(lm.get("index")))
-        except Exception:
-            continue
-    return sorted(set(ids))
-
-
-def _compute_box_keypoints(box_dict, img_w, img_h, head_id, tail_id):
-    """
-    Compute normalized head and tail keypoints from box landmarks.
-    Returns (hx, hy, tx, ty) or None.
-    """
-    landmarks = [
-        lm for lm in box_dict.get("landmarks", [])
-        if not lm.get("isSkipped")
-        and lm.get("x", -1) >= 0
-        and lm.get("y", -1) >= 0
-    ]
-    if len(landmarks) < 2:
-        return None
-
-    head_lm = None
-    if head_id is not None:
-        head_lm = next((lm for lm in landmarks if lm.get("id") == head_id), None)
-    if head_lm is None:
-        head_lm = min(landmarks, key=lambda lm: lm.get("id", 0))
-
-    tail_lm = None
-    if tail_id is not None:
-        tail_lm = next((lm for lm in landmarks if lm.get("id") == tail_id), None)
-    if tail_lm is None:
-        others = [lm for lm in landmarks if lm.get("id") != head_lm.get("id")]
-        if not others:
-            return None
-        hx, hy = float(head_lm["x"]), float(head_lm["y"])
-        tail_lm = max(others, key=lambda lm: math.hypot(lm["x"] - hx, lm["y"] - hy))
-
-    hx = _clamp(float(head_lm["x"]) / img_w, 0.0, 1.0)
-    hy = _clamp(float(head_lm["y"]) / img_h, 0.0, 1.0)
-    tx = _clamp(float(tail_lm["x"]) / img_w, 0.0, 1.0)
-    ty = _clamp(float(tail_lm["y"]) / img_h, 0.0, 1.0)
-    return hx, hy, tx, ty
-
-
-def _compute_box_keypoints_full(box_dict, img_w, img_h, landmark_ids):
-    """
-    Compute normalized keypoints for all landmark_ids in session template order.
-    Returns (flat_triplets, visible_count).
-    flat_triplets format: [x1, y1, v1, x2, y2, v2, ...] where v in {0,2}.
-    """
-    if not landmark_ids:
-        return [], 0
-    landmarks = [
-        lm for lm in box_dict.get("landmarks", [])
-        if not lm.get("isSkipped")
-        and lm.get("x", -1) >= 0
-        and lm.get("y", -1) >= 0
-    ]
-    by_id = {}
-    for lm in landmarks:
-        try:
-            lm_id = int(lm.get("id"))
-            by_id[lm_id] = lm
-        except Exception:
-            continue
-
-    values = []
-    visible = 0
-    for lm_id in landmark_ids:
-        lm = by_id.get(int(lm_id))
-        if lm is None:
-            values.extend([0.0, 0.0, 0])
-            continue
-        x = _clamp(float(lm["x"]) / img_w, 0.0, 1.0)
-        y = _clamp(float(lm["y"]) / img_h, 0.0, 1.0)
-        values.extend([x, y, 2])
-        visible += 1
-    return values, visible
-
-
 def _compute_box_orientation(box_dict, head_id, tail_id):
     """
     Determine left/right specimen orientation from box landmarks.
@@ -941,80 +844,128 @@ def _augment_segment_chip(chip_rgba, rng,
 
 def _random_canvas_background(width, height, rng):
     """
-    Create synthetic background (no original-image pixels).
-    """
-    mode = rng.choice(["solid", "gradient", "noise"])
-    if mode == "solid":
-        c = rng.randint(35, 220)
-        bg = np.full((height, width, 3), c, dtype=np.uint8)
-        return bg
+    Create a synthetic background canvas with no real-image pixels.
+    Seven modes weighted toward spatial complexity so the OBB detector must
+    learn to distinguish objects by shape and texture rather than exploiting
+    low-entropy contrast between a studio specimen and a flat field.
 
-    if mode == "gradient":
-        c1 = np.array([rng.randint(20, 200) for _ in range(3)], dtype=np.float32)
-        c2 = np.array([rng.randint(20, 200) for _ in range(3)], dtype=np.float32)
-        horizontal = rng.random() < 0.5
-        if horizontal:
-            t = np.linspace(0.0, 1.0, width, dtype=np.float32)[None, :, None]
-            bg = c1 * (1.0 - t) + c2 * t
+    Weights: solid=1, linear_gradient=3, radial_gradient=2, multi_gradient=2,
+             perlin_noise=3, coarse_noise=2, vignette=1  (total=14)
+    """
+    # Derive a numpy Generator from the Python rng so array-generation calls work.
+    np_rng = np.random.default_rng(rng.randint(0, 2**31 - 1))
+
+    _MODES = [
+        "solid", "linear_gradient", "radial_gradient",
+        "multi_gradient", "perlin_noise", "coarse_noise", "vignette",
+    ]
+    _WEIGHTS = [1, 3, 2, 2, 3, 2, 1]
+    _CUMULATIVE = []
+    _s = 0
+    for w in _WEIGHTS:
+        _s += w
+        _CUMULATIVE.append(_s)
+    r_draw = int(np_rng.integers(0, _s))
+    mode = next(m for m, thresh in zip(_MODES, _CUMULATIVE) if r_draw < thresh)
+
+    def _rand_color():
+        return np.array([int(np_rng.integers(15, 221)) for _ in range(3)], dtype=np.float32)
+
+    if mode == "solid":
+        c = _rand_color()
+        return np.full((height, width, 3), c.astype(np.uint8), dtype=np.uint8)
+
+    if mode == "linear_gradient":
+        c1, c2 = _rand_color(), _rand_color()
+        direction = int(np_rng.integers(0, 4))   # 0=H  1=V  2=diag TL→BR  3=diag TR→BL
+        if direction == 0:
+            t = np.linspace(0, 1, width, dtype=np.float32)[None, :, None]
+            bg = c1 * (1 - t) + c2 * t
             bg = np.repeat(bg, height, axis=0)
-        else:
-            t = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None, None]
-            bg = c1 * (1.0 - t) + c2 * t
+        elif direction == 1:
+            t = np.linspace(0, 1, height, dtype=np.float32)[:, None, None]
+            bg = c1 * (1 - t) + c2 * t
             bg = np.repeat(bg, width, axis=1)
+        elif direction == 2:
+            tx = np.linspace(0, 1, width, dtype=np.float32)
+            ty = np.linspace(0, 1, height, dtype=np.float32)
+            t = ((tx[None, :] + ty[:, None]) / 2.0)[:, :, None]
+            bg = c1 * (1 - t) + c2 * t
+        else:
+            tx = np.linspace(1, 0, width, dtype=np.float32)
+            ty = np.linspace(0, 1, height, dtype=np.float32)
+            t = ((tx[None, :] + ty[:, None]) / 2.0)[:, :, None]
+            bg = c1 * (1 - t) + c2 * t
         return np.clip(bg, 0, 255).astype(np.uint8)
 
-    # noise
-    base = np.full((height, width, 3), rng.randint(30, 200), dtype=np.uint8)
-    noise = np.random.default_rng(rng.randint(0, 10_000_000)).integers(
-        -25, 26, size=(height, width, 3), dtype=np.int16
-    )
-    bg = np.clip(base.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-    return cv2.GaussianBlur(bg, (5, 5), 0)
+    if mode == "radial_gradient":
+        c1, c2 = _rand_color(), _rand_color()
+        cx = float(np_rng.uniform(0.2, 0.8)) * width
+        cy = float(np_rng.uniform(0.2, 0.8)) * height
+        xs = np.arange(width, dtype=np.float32) - cx
+        ys = np.arange(height, dtype=np.float32) - cy
+        dist = np.sqrt(xs[None, :] ** 2 + ys[:, None] ** 2)
+        t = np.clip(dist / (np.sqrt(width ** 2 + height ** 2) / 2.0), 0, 1)[:, :, None]
+        bg = c1 * (1 - t) + c2 * t
+        return np.clip(bg, 0, 255).astype(np.uint8)
 
+    if mode == "multi_gradient":
+        n_stops = int(np_rng.integers(3, 5))
+        stops = [_rand_color() for _ in range(n_stops)]
+        horizontal = bool(np_rng.random() < 0.5)
+        size = width if horizontal else height
+        positions = [min(int(i * size / (n_stops - 1)), size - 1) for i in range(n_stops)]
+        line = np.zeros((size, 3), dtype=np.float32)
+        for i in range(n_stops - 1):
+            s, e = positions[i], positions[i + 1]
+            span = max(1, e - s)
+            t = np.linspace(0, 1, span, dtype=np.float32)[:, None]
+            line[s:e] = stops[i] * (1 - t) + stops[i + 1] * t
+        line[positions[-1]] = stops[-1]
+        if horizontal:
+            bg = np.repeat(line[None, :, :], height, axis=0)
+        else:
+            bg = np.repeat(line[:, None, :], width, axis=1)
+        return np.clip(bg, 0, 255).astype(np.uint8)
 
-def _sample_real_background(positives, canvas_size, rng, max_attempts=30):
-    """
-    Sample a canvas_size×canvas_size crop from a real source image,
-    choosing a region that does not overlap any annotated bounding box.
-    Returns an (H, W, 3) uint8 array, or None if no clean crop is found.
-    """
-    if not positives:
-        return None
-    pool = list(positives)
-    rng.shuffle(pool)
-    for sample in pool[:max_attempts]:
-        img_path = sample.get("image_path") or sample.get("path")
-        if not img_path or not os.path.exists(img_path):
-            continue
-        img = safe_imread(img_path)
-        if img is None:
-            continue
-        ih, iw = img.shape[:2]
-        if iw < canvas_size or ih < canvas_size:
-            scale = canvas_size / min(iw, ih) * 1.05
-            img = cv2.resize(img, (int(iw * scale), int(ih * scale)), interpolation=cv2.INTER_LINEAR)
-            ih, iw = img.shape[:2]
-        occupied = []
-        for box in (sample.get("boxes") or []):
-            x1 = _safe_int(box.get("x", 0))
-            y1 = _safe_int(box.get("y", 0))
-            x2 = x1 + _safe_int(box.get("width", 0))
-            y2 = y1 + _safe_int(box.get("height", 0))
-            if x2 > x1 and y2 > y1:
-                occupied.append((x1, y1, x2, y2))
-        for _ in range(20):
-            cx = rng.randint(0, max(0, iw - canvas_size))
-            cy = rng.randint(0, max(0, ih - canvas_size))
-            if not any(
-                cx < ox2 and (cx + canvas_size) > ox1 and
-                cy < oy2 and (cy + canvas_size) > oy1
-                for (ox1, oy1, ox2, oy2) in occupied
-            ):
-                crop = img[cy:cy + canvas_size, cx:cx + canvas_size]
-                if crop.shape[2] == 4:
-                    crop = crop[:, :, :3]
-                return crop
-    return None
+    if mode == "perlin_noise":
+        # Multi-octave fractal noise: sum 4 octaves of bilinearly-upsampled
+        # random patches (no scipy required).
+        base = _rand_color()
+        acc = np.zeros((height, width, 3), dtype=np.float32)
+        amplitude = 55.0
+        for octave in range(4):
+            divisor = 2 ** (octave + 3)
+            h_s = max(2, height // divisor)
+            w_s = max(2, width // divisor)
+            patch = np_rng.integers(-64, 65, size=(h_s, w_s, 3)).astype(np.float32)
+            up = cv2.resize(patch, (width, height), interpolation=cv2.INTER_LINEAR)
+            acc += up * (amplitude / (2 ** octave))
+        acc = acc / (amplitude * 2.0) + base[None, None, :]
+        return np.clip(acc, 0, 255).astype(np.uint8)
+
+    if mode == "coarse_noise":
+        # Large random patches resized and blurred → blotchy low-frequency texture.
+        base = int(np_rng.integers(30, 201))
+        patch_px = int(np_rng.integers(16, 65))
+        hp = max(2, (height + patch_px - 1) // patch_px)
+        wp = max(2, (width + patch_px - 1) // patch_px)
+        lo, hi = max(0, base - 60), min(255, base + 60)
+        patches = np_rng.integers(lo, hi + 1, size=(hp, wp, 3)).astype(np.uint8)
+        up = cv2.resize(patches, (width, height), interpolation=cv2.INTER_LINEAR)
+        ksize = (patch_px | 1, patch_px | 1)
+        return cv2.GaussianBlur(up, ksize, patch_px / 3.0)
+
+    # vignette — bright centre fading to dark edge with variable gamma falloff
+    c_center = _rand_color()
+    c_edge = _rand_color() * float(np_rng.uniform(0.05, 0.45))
+    xs = np.linspace(-1, 1, width, dtype=np.float32)
+    ys = np.linspace(-1, 1, height, dtype=np.float32)
+    dist = np.clip(np.sqrt(xs[None, :] ** 2 + ys[:, None] ** 2), 0, 1)
+    t = (dist ** float(np_rng.uniform(0.6, 2.2)))[:, :, None]
+    bg = c_center * (1 - t) + c_edge * t
+    return np.clip(bg, 0, 255).astype(np.uint8)
+
 
 
 def _overlaps_with_gap(candidate, placed, min_gap_px=8):
@@ -1102,7 +1053,6 @@ def export_dataset(
         raise FileNotFoundError(f"Images directory not found: {images_dir}")
 
     head_id, tail_id = _load_head_tail_ids(session_dir)
-    landmark_ids = _load_landmark_ids(session_dir)
     finalized_set = _load_finalized_filenames(session_dir) if finalized_only else set()
 
     positives = []
@@ -1217,14 +1167,15 @@ def export_dataset(
         if total_box_count > 0
         else 0.0
     )
+    _is_vector_schema = str(orientation_schema or "").lower() in ("directional", "bilateral")
     orientation_class_enabled = bool(
-        head_id is not None
+        _is_vector_schema
+        and head_id is not None
         and tail_id is not None
         and total_box_count > 0
         and orientation_labeled_ratio >= 0.60
     )
     num_detection_classes = 2 if orientation_class_enabled else 1
-    use_pose = False
     orientation_preflight_warnings = []
     if orientation_class_enabled:
         oriented_total = real_orientation_left_boxes + real_orientation_right_boxes
@@ -1310,9 +1261,7 @@ def export_dataset(
 
                 class_id = 0
                 if orientation_class_enabled:
-                    orientation = _compute_box_orientation(box, head_id, tail_id)
-                    if orientation == "right":
-                        class_id = 1
+                    class_id = int(box.get("class_id", 0))
                 lines.append(
                     f"{class_id} {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}"
                 )
@@ -1462,12 +1411,8 @@ def export_dataset(
         "real_orientation_right_boxes": real_orientation_right_boxes,
         "real_orientation_unknown_boxes": real_orientation_unknown_boxes,
         "orientation_preflight_warnings": orientation_preflight_warnings,
-        "use_pose": use_pose,
         "head_id": head_id,
         "tail_id": tail_id,
-        "landmark_ids": landmark_ids,
-        "pose_keypoint_count": len(landmark_ids),
-        "pose_boxes_with_kp": 0,
         "total_boxes": total_box_count,
     }
     if return_details:
@@ -1494,10 +1439,6 @@ def _load_orientation_config(session_dir):
         return mode, gravity_aligned
     except Exception:
         return "invariant", True
-
-
-def _load_orientation_mode(session_dir):
-    return _load_orientation_config(session_dir)[0]
 
 
 def _compute_base_class_id(head_tail_chip, orientation_schema):
@@ -1620,11 +1561,7 @@ def _generate_synthetic_obb_images(
             break
 
         canvas_size = rng.choice([768, 896, 1024])
-        if rng.random() < 0.65:
-            bg = _sample_real_background(positives, canvas_size, rng) \
-                 or _random_canvas_background(canvas_size, canvas_size, rng)
-        else:
-            bg = _random_canvas_background(canvas_size, canvas_size, rng)
+        bg = _random_canvas_background(canvas_size, canvas_size, rng)
         labels = []
         placed = []
         object_manifest = []
@@ -1725,6 +1662,7 @@ def export_obb_dataset(
     val_ratio=0.2,
     seed=42,
     generate_synthetic=True,
+    orientation_schema="invariant",
 ):
     """
     Export session annotations to YOLOv8-OBB format.
@@ -1796,16 +1734,33 @@ def export_obb_dataset(
     if not samples:
         return {"ok": False, "error": "No finalized samples with OBB annotations found"}
 
-    # Split train/val
+    orientation_class_enabled = head_id is not None and tail_id is not None
+
+    # Split train/val — stratified when multiple orientation classes are present so that
+    # val always contains at least one sample from each class.
     rng = random.Random(seed)
     indices = list(range(len(samples)))
     rng.shuffle(indices)
     n_val = max(1, int(len(indices) * val_ratio)) if len(indices) > 1 else 0
-    val_set = set(indices[:n_val])
+
+    if orientation_class_enabled and n_val > 0:
+        # Separate indices by whether the sample contains any class-1 (right-facing) box.
+        right_indices = [i for i in indices
+                         if 1 in _sample_orientation_classes(samples[i], head_id, tail_id)]
+        other_indices = [i for i in indices if i not in set(right_indices)]
+
+        if right_indices and other_indices:
+            # Reserve one slot from each class, then fill the rest from the shuffled pool.
+            guaranteed = [right_indices[0], other_indices[0]]
+            remaining_pool = [i for i in indices if i not in set(guaranteed)]
+            val_set = set(guaranteed + remaining_pool[: max(0, n_val - len(guaranteed))])
+        else:
+            val_set = set(indices[:n_val])
+    else:
+        val_set = set(indices[:n_val])
 
     num_boxes = 0
     num_images = 0
-    orientation_class_enabled = head_id is not None and tail_id is not None
 
     for i, sample in enumerate(samples):
         split = "val" if i in val_set else "train"
@@ -1826,12 +1781,10 @@ def export_obb_dataset(
 
         lines = []
         for box in sample["boxes"]:
-            # Determine class_id from orientation
+            # Determine class_id from orientation (set by frontend toggle)
             class_id = 0
             if orientation_class_enabled:
-                orientation = _compute_box_orientation(box, head_id, tail_id)
-                if orientation == "right":
-                    class_id = 1
+                class_id = int(box.get("class_id", 0))
 
             obb_corners = box.get("obbCorners") or box.get("obb_corners")
             if obb_corners and len(obb_corners) == 4:

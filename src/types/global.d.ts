@@ -46,28 +46,6 @@ interface TrainModelResult {
   auditReport?: Record<string, unknown>;  // Dataset audit results from audit_dataset.py
 }
 
-interface TestModelResult {
-  ok: boolean;
-  error?: string;
-  results?: {
-    dlib_error: number;
-    num_images: number;
-    num_landmarks: number;
-    total_predictions: number;
-    mean_pixel_error?: number;
-    median_pixel_error?: number;
-    min_pixel_error?: number;
-    max_pixel_error?: number;
-    per_landmark_stats?: Record<number, {
-      mean: number;
-      max: number;
-      min: number;
-      count: number;
-    }>;
-  };
-  output?: string;
-}
-
 interface PredictImageResult {
   ok: boolean;
   data?: {
@@ -228,24 +206,6 @@ interface DetectSpecimensResult {
   fallback?: boolean;
 }
 
-interface CheckYoloResult {
-  available: boolean;
-  primary_method?: string;
-  error?: string;
-}
-
-interface ImportPreAnnotatedDatasetResult {
-  ok: boolean;
-  canceled?: boolean;
-  sourceDir?: string;
-  importedImages?: number;
-  importedLabels?: number;
-  overwrittenImages?: number;
-  overwrittenLabels?: number;
-  warnings?: string[];
-  error?: string;
-}
-
 interface LoadAnnotatedFolderResult {
   ok: boolean;
   images?: Array<{
@@ -255,17 +215,6 @@ interface LoadAnnotatedFolderResult {
     boxes: import("./Image").BoundingBox[];
   }>;
   unmatched?: string[];
-  warnings?: string[];
-  error?: string;
-}
-
-interface ImportDlibXmlResult {
-  ok: boolean;
-  canceled?: boolean;
-  trainXmlPath?: string;
-  testXmlPath?: string;
-  trainStats?: { num_images: number; num_boxes: number; num_parts: number };
-  testStats?: { num_images: number; num_boxes: number; num_parts: number } | null;
   warnings?: string[];
   error?: string;
 }
@@ -346,16 +295,6 @@ interface CheckSuperAnnotatorResult {
   obbModelTier?: "none" | "nano" | "small" | "medium";
 }
 
-interface InitSuperAnnotatorResult {
-  ok: boolean;
-  status?: "ready";
-  mode?: "auto_high_performance" | "auto_lite" | "classic_fallback";
-  gpu?: boolean;
-  yolo_loaded?: boolean;
-  sam2_loaded?: boolean;
-  error?: string;
-}
-
 interface SuperAnnotateProgress {
   message: string;
   percent: number;
@@ -391,143 +330,6 @@ interface TrainProgressEvent {
   };
 }
 
-interface TrainYoloResult {
-  ok: boolean;
-  modelPath?: string;
-  candidateModelPath?: string;
-  version?: number;
-  promoted?: boolean;
-  evaluationMetricType?: "box" | "pose" | string;
-  candidateMap50?: number | null;
-  candidateMap50_95?: number | null;
-  incumbentMap50?: number | null;
-  incumbentMap50_95?: number | null;
-  candidatePoseMap50?: number | null;
-  candidatePoseMap50_95?: number | null;
-  candidateBoxMap50?: number | null;
-  candidateBoxMap50_95?: number | null;
-  incumbentPoseMap50?: number | null;
-  incumbentPoseMap50_95?: number | null;
-  incumbentBoxMap50?: number | null;
-  incumbentBoxMap50_95?: number | null;
-  candidateMetrics?: {
-    box_map50?: number | null;
-    box_map50_95?: number | null;
-    pose_map50?: number | null;
-    pose_map50_95?: number | null;
-  };
-  incumbentMetrics?: {
-    box_map50?: number | null;
-    box_map50_95?: number | null;
-    pose_map50?: number | null;
-    pose_map50_95?: number | null;
-  };
-  detectionPreset?: "balanced" | "precision" | "recall" | "single_object" | string;
-  autoTune?: boolean;
-  datasetSizeEffective?: number;
-  datasetSizeSource?: "user" | "export" | string;
-  resolvedTrainParams?: {
-    size_bucket?: string;
-    epochs?: number;
-    batch?: number;
-    freeze?: number;
-    lr0?: number;
-    mosaic?: number;
-    close_mosaic?: number;
-    degrees?: number;
-    translate?: number;
-    scale?: number;
-    fliplr?: number;
-    patience?: number;
-    augment?: boolean;
-    imgsz?: number;
-    dataset_size?: number;
-    detection_preset?: string;
-  };
-  preflightWarnings?: string[];
-  dataset?: {
-    yaml_path: string;
-    total_records: number;
-    val_records: number;
-    train_records: number;
-    positive_images: number;
-    negative_crops: number;
-    orientation_class_enabled?: boolean;
-    real_orientation_left_boxes?: number;
-    real_orientation_right_boxes?: number;
-    real_orientation_unknown_boxes?: number;
-    orientation_preflight_warnings?: string[];
-    synthetic_mode?: "standard" | "supplement" | string;
-    synthetic_max_images?: number | null;
-    synthetic_max_instances?: number | null;
-    synthetic_instances_generated?: number;
-    synthetic_left_instances?: number;
-    synthetic_right_instances?: number;
-  };
-  registryPath?: string;
-  error?: string;
-}
-
-interface YoloTrainPlanResult {
-  ok: boolean;
-  dataset?: {
-    yaml_path: string;
-    finalized_only?: boolean;
-    skipped_unfinalized_images?: number;
-    finalized_label_files?: number;
-    finalized_fallback_to_boxes?: number;
-    total_records: number;
-    val_records: number;
-    train_records: number;
-    positive_images: number;
-    negative_crops: number;
-    head_id?: number | null;
-    tail_id?: number | null;
-    pose_boxes_with_kp?: number;
-    total_boxes?: number;
-    num_synthetic?: number;
-    synthetic_enabled?: boolean;
-    synthetic_disabled_reason?: string | null;
-    orientation_class_enabled?: boolean;
-    real_orientation_left_boxes?: number;
-    real_orientation_right_boxes?: number;
-    real_orientation_unknown_boxes?: number;
-    orientation_preflight_warnings?: string[];
-    synthetic_mode?: "standard" | "supplement" | string;
-    synthetic_max_images?: number | null;
-    synthetic_max_instances?: number | null;
-    synthetic_instances_generated?: number;
-    synthetic_left_instances?: number;
-    synthetic_right_instances?: number;
-    use_pose?: boolean;
-  };
-  preflightWarnings?: string[];
-  usePose?: boolean;
-  detectionPreset?: "balanced" | "precision" | "recall" | "single_object" | string;
-  autoTune?: boolean;
-  datasetSizeEffective?: number;
-  datasetSizeSource?: "user" | "export" | string;
-  resolvedTrainParams?: {
-    size_bucket?: string;
-    epochs?: number;
-    batch?: number;
-    freeze?: number;
-    lr0?: number;
-    mosaic?: number;
-    close_mosaic?: number;
-    degrees?: number;
-    translate?: number;
-    scale?: number;
-    fliplr?: number;
-    patience?: number;
-    augment?: boolean;
-    imgsz?: number;
-    dataset_size?: number;
-    detection_preset?: string;
-  };
-  error?: string;
-}
-
 interface InferenceReviewDraftSpecimen {
   box: {
     left: number;
@@ -537,6 +339,8 @@ interface InferenceReviewDraftSpecimen {
     confidence?: number;
     class_id?: number;
     class_name?: string;
+    obbCorners?: [number, number][];
+    angle?: number;
     orientation_override?: "left" | "right" | "uncertain";
     orientation_hint?: {
       orientation?: "left" | "right";
@@ -556,6 +360,8 @@ interface InferenceReviewDraftItem {
   specimens: InferenceReviewDraftSpecimen[];
   edited: boolean;
   saved: boolean;
+  reviewComplete?: boolean;
+  committedAt?: string | null;
   updatedAt: string;
 }
 
@@ -563,6 +369,7 @@ interface InferenceSessionManifest {
   version: 1;
   sessionId: string;
   speciesId: string;
+  displayName?: string;
   models: {
     landmark: {
       key: string;
@@ -574,26 +381,27 @@ interface InferenceSessionManifest {
       name?: string;
     };
   };
+  preferences?: {
+    lastUsedLandmarkModelKey?: string;
+    lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+    detectionModelKey?: string;
+    detectionModelName?: string;
+  };
   createdAt: string;
   updatedAt: string;
 }
 
-interface RetrainQueueItem {
-  key: string;
+interface InferenceSessionSummary {
   speciesId: string;
+  schemaName: string;
+  schemaImageCount: number;
+  schemaUpdatedAt: string;
+  exists: boolean;
   inferenceSessionId?: string;
-  landmarkModelKey?: string;
-  landmarkModelName?: string;
-  landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
-  detectionModelKey?: string;
-  detectionModelName?: string;
-  filename: string;
-  imagePath?: string;
-  source: string;
-  boxesCount: number;
-  landmarksCount: number;
-  queuedAt: string;
-  updatedAt: string;
+  displayName?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  migratedFrom?: string;
 }
 
 declare global {
@@ -633,8 +441,6 @@ interface SessionMeta {
       saveLabels: (fileArray: AnnotatedImage []) => Promise<SaveLabelsResult>;
       trainModel: (modelName: string, options?: TrainOptions) => Promise<TrainModelResult>;
       getCnnVariants: () => Promise<GetCnnVariantsResult>;
-      importPreAnnotatedDataset: (options?: { speciesId?: string }) => Promise<ImportPreAnnotatedDatasetResult>;
-      importDlibXml: (args: { modelName: string; speciesId?: string }) => Promise<ImportDlibXmlResult>;
       trainingPreflight: (args: {
         speciesId?: string;
         modelName: string;
@@ -669,7 +475,6 @@ interface SessionMeta {
         speciesId?: string,
         predictorType?: "dlib" | "cnn" | "yolo_pose"
       ) => Promise<{ ok: boolean; error?: string }>;
-      getModelInfo: (modelName: string, speciesId?: string) => Promise<{ ok: boolean; model?: TrainedModel; error?: string }>;
       selectImages: () => Promise<{ canceled: boolean; files?: { path: string; name: string; data: string; mimeType: string }[] }>;
       selectFolderPath: () => Promise<{ canceled: boolean; folderPath?: string }>;
       selectAnnotationFile: () => Promise<{ canceled: boolean; filePath?: string }>;
@@ -678,10 +483,8 @@ interface SessionMeta {
         annotationFilePath: string;
         speciesId: string;
       }) => Promise<LoadAnnotatedFolderResult>;
-      testModel: (modelName: string, speciesId?: string) => Promise<TestModelResult>;
       // Classic CV detection
       detectSpecimens: (imagePath: string, options?: DetectionOptions) => Promise<DetectSpecimensResult>;
-      checkYolo: () => Promise<CheckYoloResult>;
       // Session management
       sessionCreate: (
         speciesId: string,
@@ -760,18 +563,8 @@ interface SessionMeta {
       // SuperAnnotator pipeline
       superAnnotate: (imagePath: string, className: string, modelTag?: string, options?: SuperAnnotateOptions, speciesId?: string) => Promise<SuperAnnotateResult>;
       checkSuperAnnotator: () => Promise<CheckSuperAnnotatorResult>;
-      initSuperAnnotator: () => Promise<InitSuperAnnotatorResult>;
-      refineSam: (imagePath: string, objectIndex: number, clickPoint: [number, number], clickLabel: number) => Promise<{ ok: boolean; mask_outline?: [number, number][]; error?: string }>;
       resegmentBox: (imagePath: string, boxXyxy: [number, number, number, number]) => Promise<{ ok: boolean; maskOutline?: [number, number][]; score?: number; error?: string }>;
-      trainYolo: (
-        speciesId: string,
-        className: string,
-        epochs?: number,
-        detectionPreset?: "balanced" | "precision" | "recall" | "single_object",
-        datasetSize?: number,
-        autoTune?: boolean
-      ) => Promise<TrainYoloResult>;
-      trainObbDetector: (speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small" }) => Promise<{
+      trainObbDetector: (speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small"; iou?: number; cls?: number; box?: number }) => Promise<{
         ok: boolean;
         modelPath?: string;
         map50?: number | null;
@@ -782,73 +575,60 @@ interface SessionMeta {
         taggedBoxes?: { id: number; class_id: number }[];
         error?: string;
       }>;
-      getYoloTrainPlan: (
-        speciesId: string,
-        className: string,
-        epochs?: number,
-        detectionPreset?: "balanced" | "precision" | "recall" | "single_object",
-        datasetSize?: number,
-        autoTune?: boolean
-      ) => Promise<YoloTrainPlanResult>;
       onSuperAnnotateProgress: (callback: (data: SuperAnnotateProgress) => void) => () => void;
       onPredictProgress: (callback: (data: { percent: number; stage: string }) => void) => () => void;
       onTrainProgress: (callback: (data: TrainProgressEvent) => void) => () => void;
-      sessionSaveInferenceCorrection: (
+      sessionListInferenceSessions: () => Promise<{
+        ok: boolean;
+        sessions: InferenceSessionSummary[];
+        error?: string;
+      }>;
+      sessionCreateInferenceSession: (
         speciesId: string,
-        imagePath: string,
-        box?: { left: number; top: number; width: number; height: number },
-        landmarks?: { id: number; x: number; y: number }[],
-        filename?: string,
-        specimens?: {
-          box: {
-            left: number;
-            top: number;
-            width: number;
-            height: number;
-            confidence?: number;
-            class_id?: number;
-            class_name?: string;
-            orientation_override?: "left" | "right" | "uncertain";
-            orientation_hint?: {
-              orientation?: "left" | "right";
-              confidence?: number;
-              source?: string;
-              head_point?: [number, number];
-              tail_point?: [number, number];
-            };
-          };
-          landmarks: { id: number; x: number; y: number }[];
-        }[],
-        rejectedDetections?: {
-          left: number;
-          top: number;
-          width: number;
-          height: number;
-          confidence?: number;
-          className?: string;
-          detectionMethod?: string;
-        }[],
-        options?: { allowEmpty?: boolean }
-      ) => Promise<{ ok: boolean; savedPath?: string; error?: string }>;
-      sessionSaveDetectionCorrection: (
-        speciesId: string,
-        imagePath: string,
-        boxes: { left: number; top: number; width: number; height: number }[],
-        imageWidth: number,
-        imageHeight: number,
-        filename?: string
-      ) => Promise<{ ok: boolean; savedPath?: string; error?: string }>;
-      sessionOpenInferenceSession: (args: {
-        speciesId: string;
-        landmarkModelKey: string;
-        landmarkModelName?: string;
-        landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
-        detectionModelKey?: string;
-        detectionModelName?: string;
-      }) => Promise<{
+        displayName?: string
+      ) => Promise<{
         ok: boolean;
         inferenceSessionId?: string;
         manifest?: InferenceSessionManifest;
+        error?: string;
+      }>;
+      sessionGetInferenceSession: (speciesId: string) => Promise<{
+        ok: boolean;
+        exists?: boolean;
+        inferenceSessionId?: string;
+        manifest?: InferenceSessionManifest;
+        migratedFrom?: string;
+        error?: string;
+      }>;
+      sessionUpdateInferenceSessionPreferences: (
+        speciesId: string,
+        inferenceSessionId?: string,
+        options?: {
+          displayName?: string;
+          preferences?: {
+            lastUsedLandmarkModelKey?: string;
+            lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+            detectionModelKey?: string;
+            detectionModelName?: string;
+          };
+        }
+      ) => Promise<{
+        ok: boolean;
+        inferenceSessionId?: string;
+        manifest?: InferenceSessionManifest;
+        error?: string;
+      }>;
+      sessionCommitInferenceReview: (
+        speciesId: string,
+        inferenceSessionId?: string,
+        options?: { onlyReviewComplete?: boolean }
+      ) => Promise<{
+        ok: boolean;
+        inferenceSessionId?: string;
+        committed?: number;
+        skipped?: number;
+        failed?: number;
+        failures?: { filename: string; error: string }[];
         error?: string;
       }>;
       sessionSaveInferenceReviewDraft: (
@@ -856,37 +636,28 @@ interface SessionMeta {
         inferenceSessionId?: string,
         imagePath: string,
         specimens: InferenceReviewDraftSpecimen[],
-        options?: { filename?: string; edited?: boolean; saved?: boolean; clear?: boolean }
+        options?: {
+          filename?: string;
+          edited?: boolean;
+          saved?: boolean;
+          reviewComplete?: boolean;
+          committedAt?: string | null;
+          clear?: boolean;
+        }
       ) => Promise<{ ok: boolean; error?: string }>;
       sessionLoadInferenceReviewDrafts: (
         speciesId: string,
         inferenceSessionId?: string
       ) => Promise<{ ok: boolean; drafts?: InferenceReviewDraftItem[]; error?: string }>;
-      sessionQueueRetrainItem: (
+      sessionSaveInferenceImagePaths: (
         speciesId: string,
-        inferenceSessionId?: string,
-        filename: string,
-        options?: {
-          imagePath?: string;
-          source?: string;
-          boxesCount?: number;
-          landmarksCount?: number;
-          landmarkModelKey?: string;
-          landmarkModelName?: string;
-          landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
-          detectionModelKey?: string;
-          detectionModelName?: string;
-        }
-      ) => Promise<{ ok: boolean; item?: RetrainQueueItem; queuedCount?: number; error?: string }>;
-      sessionGetRetrainQueue: (
+        inferenceSessionId: string,
+        imagePaths: { path: string; name: string }[]
+      ) => Promise<{ ok: boolean; error?: string }>;
+      sessionLoadInferenceImagePaths: (
         speciesId: string,
-        inferenceSessionId?: string
-      ) => Promise<{ ok: boolean; items?: RetrainQueueItem[]; count?: number; error?: string }>;
-      sessionClearRetrainQueue: (
-        speciesId: string,
-        inferenceSessionId?: string,
-        filenames?: string[]
-      ) => Promise<{ ok: boolean; count?: number; error?: string }>;
+        inferenceSessionId: string
+      ) => Promise<{ ok: boolean; images?: { path: string; name: string; data: string; mimeType: string }[] }>;
       /** Lightweight hardware probe — called once at startup to populate Redux hardwareSlice */
       probeHardware: () => Promise<HardwareCapabilities>;
     };

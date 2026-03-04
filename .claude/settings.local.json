@@ -15,7 +15,8 @@
       "Bash(cd \"C:/Users/yupin/Downloads/BioVision\" && python -c \"import ast; ast.parse\\(open\\('backend/bv_utils/orientation_utils.py'\\).read\\(\\)\\); print\\('OK'\\)\" 2>&1)",
       "Bash(/Users/juntianzhong/BioVision/venv/bin/python3 -c \"import torch; print\\(''torch:'', torch.__version__\\); print\\(''mps built:'', torch.backends.mps.is_built\\(\\)\\); print\\(''mps available:'', torch.backends.mps.is_available\\(\\)\\); print\\(''cuda available:'', torch.cuda.is_available\\(\\)\\)\")",
       "Bash(/Users/juntianzhong/BioVision/venv/bin/python3 -c \"from ultralytics import YOLOWorld; m = YOLOWorld\\(''yolov8s-worldv2.pt''\\); print\\(''loaded OK''\\)\")",
-      "Bash(/Users/juntianzhong/BioVision/venv/bin/python3 /Users/juntianzhong/BioVision/backend/hardware_probe.py)"
+      "Bash(/Users/juntianzhong/BioVision/venv/bin/python3 /Users/juntianzhong/BioVision/backend/hardware_probe.py)",
+      "Read(//c/Users/yupin/.claude/projects/c--Users-yupin-Downloads-BioVision/ff7dc567-3a86-4f0a-aac5-e944e2d542ad/tool-results/**)"
     ]
   }
 }

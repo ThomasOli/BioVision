@@ -4,7 +4,12 @@
       "Bash(git -C:*)",
       "Bash(powershell.exe -Command:*)",
       "Bash(powershell.exe -NoProfile -Command:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(wc -l \"c:/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics/obb_dataset/images/train\"/*)",
+      "Read(//c/Users/yupin/.claude/projects/c--Users-yupin-Downloads-BioVision/memory/**)",
+      "Bash(for f in *.txt)",
+      "Bash(do head -1 \"$f\")",
+      "Bash(done)"
     ]
   }
 }

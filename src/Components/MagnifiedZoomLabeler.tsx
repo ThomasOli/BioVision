@@ -1,7 +1,7 @@
 import React, { useRef, useCallback, useEffect, useContext, useState, useMemo } from "react";
 import { motion } from "framer-motion";
 import { X, Info } from "lucide-react";
-import { Stage, Layer, Image as KonvaImage, Circle, Text, Rect, Line, Transformer } from "react-konva";
+import { Stage, Layer, Image as KonvaImage, Circle, Text, Rect, Line, Transformer, Arrow } from "react-konva";
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
@@ -89,6 +89,7 @@ interface MagnifiedImageLabelerProps {
   samEnabled?: boolean;
   hideSegmentOutlines?: boolean;
   lockBoxes?: boolean;
+  orientationMode?: "directional" | "bilateral" | "axial" | "invariant";
 }
 
 const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
@@ -105,6 +106,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   samEnabled = false,
   hideSegmentOutlines = false,
   lockBoxes = false,
+  orientationMode,
 }) => {
   const {
     addLandmark,
@@ -158,6 +160,9 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(null);
   const [drawCurrent, setDrawCurrent] = useState<{ x: number; y: number } | null>(null);
   const [isRedrawingSelected, setIsRedrawingSelected] = useState(false);
+  const [drawDefaultOrientation, setDrawDefaultOrientation] = useState<"left" | "right">(() =>
+    ((typeof window !== "undefined" && window.localStorage.getItem("bv_draw_default_orientation")) as "left" | "right") ?? "left"
+  );
 
   // Show/hide landmark guide
   const [showGuide, setShowGuide] = useState(true);
@@ -314,6 +319,20 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   // Check if point is inside a box
   const findBoxAtPoint = useCallback(
     (x: number, y: number): BoundingBox | null => {
+      // Give priority to the currently selected box so that clicking near
+      // the edge of a selected box doesn't accidentally activate an adjacent one
+      if (selectedBoxId !== null) {
+        const selectedBox = visibleBoxes.find(b => b.id === selectedBoxId);
+        if (
+          selectedBox &&
+          x >= selectedBox.left &&
+          x <= selectedBox.left + selectedBox.width &&
+          y >= selectedBox.top &&
+          y <= selectedBox.top + selectedBox.height
+        ) {
+          return selectedBox;
+        }
+      }
       for (let i = visibleBoxes.length - 1; i >= 0; i--) {
         const box = visibleBoxes[i];
         if (
@@ -327,7 +346,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
       }
       return null;
     },
-    [visibleBoxes]
+    [visibleBoxes, selectedBoxId]
   );
 
   // Click to add landmark - supports both manual and auto mode
@@ -486,11 +505,16 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
       const minSize = imageDimensions ? Math.max(20, imageDimensions.width * 0.02) : 20;
       if (width >= minSize && height >= minSize) {
         if (detectionMode === "manual") {
+          const bLeft = Math.round(left), bTop = Math.round(top);
+          const bRight = bLeft + Math.round(width), bBottom = bTop + Math.round(height);
           addBox({
-            left: Math.round(left),
-            top: Math.round(top),
+            left: bLeft,
+            top: bTop,
             width: Math.round(width),
             height: Math.round(height),
+            obbCorners: [[bLeft, bTop], [bRight, bTop], [bRight, bBottom], [bLeft, bBottom]],
+            angle: 0,
+            class_id: drawDefaultOrientation === "left" ? 0 : 1,
             source: "manual",
           });
           pendingSelectRef.current = true;
@@ -523,7 +547,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     setIsRedrawingSelected(false);
     setDrawStart(null);
     setDrawCurrent(null);
-  }, [isDragging, isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox, triggerResegment]);
+  }, [isDragging, isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox, triggerResegment, drawDefaultOrientation]);
 
   // Draw preview rect
   const drawPreview = useMemo(() => {
@@ -581,6 +605,10 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     return <div className="text-destructive">Error loading image.</div>;
   }
 
+  // Gate orientation arrows on vector schemas (directional + bilateral)
+  const showOrientationArrow = !orientationMode || orientationMode === "directional" || orientationMode === "bilateral";
+  const isVectorSchema = showOrientationArrow; // same condition
+
   // Colors for boxes
   const getBoxColor = (isSelected: boolean) => {
     if (isSelected) return "#3b82f6"; // blue-500
@@ -629,6 +657,30 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                   </TooltipTrigger>
                   <TooltipContent>Toggle landmark placement guide</TooltipContent>
                 </Tooltip>
+                {!mode && !lockBoxes && detectionMode === "manual" && isVectorSchema && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          const next = drawDefaultOrientation === "left" ? "right" : "left";
+                          setDrawDefaultOrientation(next);
+                          window.localStorage.setItem("bv_draw_default_orientation", next);
+                          if (selectedBoxId !== null) {
+                            const sel = boxes.find(b => b.id === selectedBoxId);
+                            if (sel && sel.class_id !== undefined) {
+                              updateBox(selectedBoxId, { class_id: sel.class_id === 0 ? 1 : 0 });
+                            }
+                          }
+                        }}
+                      >
+                        {drawDefaultOrientation === "left" ? "\u2190 Head" : "Head \u2192"}
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Toggle default head direction for new boxes</TooltipContent>
+                  </Tooltip>
+                )}
               </div>
               <DialogClose asChild>
                 <Button variant="ghost" size="icon" aria-label="Close Magnified View">
@@ -666,18 +718,39 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                 />
 
                 {/* Draw preview rectangle during drag */}
-                {drawPreview && (
-                  <Rect
-                    x={drawPreview.x}
-                    y={drawPreview.y}
-                    width={drawPreview.width}
-                    height={drawPreview.height}
-                    stroke="#3b82f6"
-                    strokeWidth={boxStrokeWidth}
-                    dash={[8, 4]}
-                    fill="rgba(59, 130, 246, 0.08)"
-                  />
-                )}
+                {drawPreview && (() => {
+                  const { x: px, y: py, width: pw, height: ph } = drawPreview;
+                  const arrowIsLeft = drawDefaultOrientation === "left";
+                  const maxDim = Math.max(pw, ph);
+                  const arrowLen = Math.min(Math.max(maxDim * 0.25, 14), 32);
+                  const midY = py + ph / 2;
+                  const tipX  = arrowIsLeft ? px : px + pw;
+                  const tailX = arrowIsLeft ? px + arrowLen : px + pw - arrowLen;
+                  return (
+                    <>
+                      <Rect
+                        x={px} y={py}
+                        width={pw} height={ph}
+                        stroke="#3b82f6"
+                        strokeWidth={boxStrokeWidth}
+                        dash={[8, 4]}
+                        fill="rgba(59, 130, 246, 0.08)"
+                      />
+                      {maxDim >= 24 && (
+                        <Arrow
+                          points={[tailX, midY, tipX, midY]}
+                          pointerLength={Math.min(Math.max(maxDim * 0.10, 6), 10)}
+                          pointerWidth={Math.min(Math.max(maxDim * 0.07, 5), 8)}
+                          fill="#3b82f6"
+                          stroke="#3b82f6"
+                          strokeWidth={Math.max(1.5, boxStrokeWidth * 0.85)}
+                          opacity={0.9}
+                          listening={false}
+                        />
+                      )}
+                    </>
+                  );
+                })()}
 
                 {/* Render bounding boxes */}
                 {visibleBoxes.map((box, index) => {
@@ -820,6 +893,73 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                           fontStyle="bold"
                         />
                       )}
+                      {/* Orientation arrow + tilt angle */}
+                      {(() => {
+                        const corners = box.obbCorners && box.obbCorners.length === 4
+                          ? box.obbCorners as [number,number][]
+                          : null;
+                        if (!corners) return null;
+                        if (orientationMode === "invariant") return null;
+                        const [cp0, cp1, cp2, cp3] = corners;
+                        // Tilt angle (schema-independent, only needs corners)
+                        const adx1 = cp1[0]-cp0[0], ady1 = cp1[1]-cp0[1];
+                        const adx3 = cp3[0]-cp0[0], ady3 = cp3[1]-cp0[1];
+                        const [aldx, aldy] = Math.hypot(adx1,ady1) >= Math.hypot(adx3,ady3) ? [adx1,ady1] : [adx3,ady3];
+                        let adeg = Math.atan2(aldy, aldx) * 180 / Math.PI;
+                        adeg = ((adeg % 180) + 180) % 180;
+                        if (adeg > 90) adeg = 180 - adeg;
+                        // Arrow (vector schemas only)
+                        const hasOrientation = box.class_id !== undefined;
+                        let arrowEl = null;
+                        if (showOrientationArrow && hasOrientation) {
+                          const isLeft = box.class_id === 0;
+                          const isRight = box.class_id === 1;
+                          const cLen01 = Math.hypot(cp1[0]-cp0[0], cp1[1]-cp0[1]);
+                          const cLen12 = Math.hypot(cp2[0]-cp1[0], cp2[1]-cp1[1]);
+                          let cMidA: [number,number], cMidB: [number,number];
+                          if (cLen01 >= cLen12) {
+                            cMidA = [(cp0[0]+cp3[0])/2, (cp0[1]+cp3[1])/2];
+                            cMidB = [(cp1[0]+cp2[0])/2, (cp1[1]+cp2[1])/2];
+                          } else {
+                            cMidA = [(cp0[0]+cp1[0])/2, (cp0[1]+cp1[1])/2];
+                            cMidB = [(cp2[0]+cp3[0])/2, (cp2[1]+cp3[1])/2];
+                          }
+                          const [cLeftEnd, cRightEnd] = cMidA[0] <= cMidB[0] ? [cMidA, cMidB] : [cMidB, cMidA];
+                          const cHead = (isLeft || !isRight) ? cLeftEnd : cRightEnd;
+                          const cTail = (isLeft || !isRight) ? cRightEnd : cLeftEnd;
+                          const cAxisLen = Math.hypot(cHead[0]-cTail[0], cHead[1]-cTail[1]) || 1;
+                          if (cAxisLen >= 24) {
+                            const cNx = (cHead[0]-cTail[0])/cAxisLen, cNy = (cHead[1]-cTail[1])/cAxisLen;
+                            const arrowLen  = Math.min(Math.max(cAxisLen * 0.25, 14), 32);
+                            const cHSizeLen = Math.min(Math.max(cAxisLen * 0.10, 6), 10);
+                            const cHSizeW   = Math.min(Math.max(cAxisLen * 0.07, 5), 8);
+                            arrowEl = (
+                              <Arrow
+                                points={[cHead[0] - cNx*arrowLen, cHead[1] - cNy*arrowLen, cHead[0], cHead[1]]}
+                                pointerLength={cHSizeLen}
+                                pointerWidth={cHSizeW}
+                                fill={boxColor}
+                                stroke={boxColor}
+                                strokeWidth={Math.max(1.5, boxStrokeWidth * 0.85)}
+                                opacity={isSelected ? 0.95 : 0.85}
+                                listening={false}
+                              />
+                            );
+                          }
+                        }
+                        return (
+                          <>
+                            {arrowEl}
+                            <Text
+                              x={box.left + 5}
+                              y={box.top + 5 + getTextConfig().fontSize * 1.5 * (box.confidence !== undefined ? 2 : 1)}
+                              text={`${Math.round(adeg)}\u00B0`}
+                              fontSize={getTextConfig().fontSize * 0.9}
+                              fill={boxColor}
+                            />
+                          </>
+                        );
+                      })()}
                     </React.Fragment>
                   );
                 })}

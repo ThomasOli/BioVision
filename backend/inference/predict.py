@@ -133,28 +133,6 @@ def _resolve_landmark_id_by_category(project_root, category_name):
     return min(candidates)
 
 
-def _resolve_template_landmark_order(project_root):
-    """Return landmark IDs sorted by session template index."""
-    session_path = os.path.join(project_root, "session.json")
-    if not os.path.exists(session_path):
-        return []
-    try:
-        with open(session_path, "r", encoding="utf-8") as f:
-            session = json.load(f)
-        template = session.get("landmarkTemplate", [])
-    except Exception:
-        return []
-    if not isinstance(template, list):
-        return []
-    out = []
-    for lm in template:
-        try:
-            out.append(int(lm.get("index")))
-        except Exception:
-            continue
-    return sorted(set(out))
-
-
 def _resolve_head_landmark_id(project_root, id_mapping_data=None):
     """
     Resolve the landmark ID used as "head" for orientation checks.

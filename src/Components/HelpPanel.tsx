@@ -101,7 +101,6 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
     <AnimatePresence>
       {open && (
         <>
-          {/* Backdrop */}
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -110,7 +109,6 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
             onClick={() => onOpenChange(false)}
           />
 
-          {/* Panel */}
           <motion.div
             initial={{ x: "100%" }}
             animate={{ x: 0 }}
@@ -118,7 +116,6 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
             transition={{ type: "spring", damping: 30, stiffness: 300 }}
             className="fixed right-0 top-0 z-50 h-full w-full max-w-md border-l bg-background shadow-xl"
           >
-            {/* Header */}
             <div className="flex items-center justify-between border-b p-4">
               <h2 className="text-lg font-bold">Help & Documentation</h2>
               <motion.div {...buttonHover} {...buttonTap}>
@@ -132,10 +129,8 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
               </motion.div>
             </div>
 
-            {/* Content */}
             <ScrollArea className="h-[calc(100vh-65px)]">
               <div className="space-y-4 p-4">
-                {/* Getting Started */}
                 <AccordionItem
                   title="Getting Started"
                   icon={<Rocket className="h-4 w-4" />}
@@ -143,8 +138,9 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      BioVision supports a full loop: detection, correction, landmarking,
-                      training, inference review, and retraining from accepted edits.
+                      BioVision uses a commit-now, train-later loop: annotate and train inside a schema
+                      session, review predictions in inference, then commit reviewed images back to schema
+                      training data.
                     </p>
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Install:</p>
@@ -157,56 +153,77 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <p className="font-medium text-foreground">Quick Start:</p>
                       <ol className="ml-4 list-decimal space-y-1">
                         <li>Create or resume a schema session</li>
-                        <li>Set orientation policy (Directional/Bilateral/Axial/Invariant)</li>
-                        <li>Upload images and optionally import pre-annotated labels/XML</li>
-                        <li>Detect boxes (manual/auto), correct, then annotate landmarks</li>
-                        <li>Train landmark model (dlib or CNN) and optionally fine-tune detector</li>
-                        <li>Run inference, review edits, then save/queue retrain</li>
+                        <li>Choose orientation policy (Directional/Bilateral/Axial/Invariant)</li>
+                        <li>Upload images and annotate using Manual OBB or Auto detection</li>
+                        <li>Finalize accepted boxes and landmarks</li>
+                        <li>Train OBB detector (when applicable), then train dlib or CNN</li>
+                        <li>Open Inference hub and create the schema-bound inference session</li>
+                        <li>Run detection and landmark inference, review, then mark images complete</li>
+                        <li>Commit review-complete images to training data, then retrain later from Annotate/Train</li>
                       </ol>
                     </div>
                   </div>
                 </AccordionItem>
 
-                {/* Annotation Workflow */}
                 <AccordionItem
                   title="Annotation Workflow"
                   icon={<Pencil className="h-4 w-4" />}
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Bounding Boxes</p>
+                      <p className="font-medium text-foreground">Auto Detection</p>
                       <p>
-                        Manual mode: no auto boxes are shown; draw boxes yourself.
-                        Auto mode: click Auto-detect, then accept/correct/delete detected boxes.
+                        Auto mode runs YOLO-World first and falls back to OpenCV if YOLO is unavailable.
+                        Use Auto-Detect, then correct or delete bad boxes before finalizing.
                       </p>
                     </div>
                     <Separator />
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Landmarks</p>
+                      <p className="font-medium text-foreground">Manual OBB Drawing</p>
                       <p>
-                        Place landmarks consistently inside each accepted box.
-                        Landmark order/ID consistency is critical for reliable landmark model training.
+                        Manual mode draws boxes directly. Select a box to move, resize, and rotate it
+                        into an oriented bounding box (OBB). In directional schemas, use the head-direction
+                        toggle so new boxes start with the intended default orientation.
                       </p>
                     </div>
                     <Separator />
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Correction Loop</p>
+                      <p className="font-medium text-foreground">SAM2 Segmentation (Optional)</p>
                       <p>
-                        In Auto mode, correction mode lets you redraw/resize selected boxes.
-                        Deleting bad auto boxes records hard negatives for future YOLO fine-tuning.
+                        SAM2 refinement requires GPU acceleration (CUDA or Apple MPS) and at least 8 GB RAM,
+                        and is only available in high-performance mode. Lite mode still supports detection
+                        without SAM2.
+                      </p>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Landmark Placement</p>
+                      <p>
+                        Place landmarks consistently inside each accepted box. Landmark order and landmark ID
+                        consistency are critical for stable training.
+                      </p>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Correction and Finalization</p>
+                      <p>
+                        In Auto mode, correction mode lets you redraw and resize selected detections.
+                        Deleting bad auto detections records hard negatives for future detector fine-tuning.
+                        Finalize only when boxes and landmarks are accepted.
                       </p>
                     </div>
                     <Separator />
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Orientation Schemas</p>
                       <p>
-                        Directional is for strict head/tail objects; Mirrored/Bilateral is for paired left-right structures;
-                        Axial is for elongated rotating specimens; Invariant is for radial/no-stable-direction objects.
+                        Directional is for strict head/tail objects. Bilateral is for paired left-right
+                        structures. Axial is for elongated rotating specimens. Invariant is for objects with
+                        no stable directional axis.
                       </p>
                       <p>
                         The OBB detector levels specimen crops to a canonical orientation before landmark
                         prediction. class_id (0 = canonical, 1 = mirrored) is tagged at annotation time and
-                        corrects orientation automatically during both training and inference.
+                        applied again during training and inference.
                       </p>
                     </div>
                   </div>
@@ -218,23 +235,23 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      You can import pre-annotated datasets into a session before continuing annotation.
+                      You can import pre-annotated data into a schema session before continuing manual
+                      annotation and review.
                     </p>
                     <ul className="ml-4 list-disc space-y-1">
-                      <li>Supported: JSON with boxes + landmarks</li>
+                      <li>Supported: JSON with boxes and landmarks</li>
                       <li>Supported: landmarks-only JSON (box is auto-derived and validated)</li>
-                      <li>Advanced: import dlib XML for direct XML-based training</li>
+                      <li>Supported: annotated image folder import with matched label files</li>
                     </ul>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
-                        Imported labels and in-app edits are merged in the same session labels.
-                        For dlib, training consumes XML; for YOLO detection, training consumes session label JSON.
+                        Imported labels and in-app edits are merged into one session label store,
+                        so training uses one consistent schema-scoped dataset.
                       </p>
                     </div>
                   </div>
                 </AccordionItem>
 
-                {/* Training */}
                 <AccordionItem
                   title="Training Models"
                   icon={<Target className="h-4 w-4" />}
@@ -242,48 +259,68 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
                       Landmark training supports <span className="font-medium text-foreground">dlib</span> and{" "}
-                      <span className="font-medium text-foreground">CNN</span> (SimpleBaseline default, with
-                      system-gated variants). Detection fine-tuning uses session-scoped YOLO checkpoints.
+                      <span className="font-medium text-foreground">CNN</span> (SimpleBaseline default with
+                      system-gated variants). Detection fine-tuning uses schema-scoped YOLO OBB checkpoints.
                     </p>
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Best Practices:</p>
+                      <p className="font-medium text-foreground">Training Order</p>
+                      <ol className="ml-4 list-decimal space-y-1">
+                        <li>Train OBB detector first when OBB annotations are present</li>
+                        <li>Train landmark predictor second (dlib or CNN)</li>
+                        <li>Use inference commits to expand data, then retrain later</li>
+                      </ol>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Predictor Guidance</p>
                       <ul className="ml-4 list-disc space-y-1">
-                        <li>Annotate at least 30+ images for stable first models</li>
-                        <li>Include diverse examples (angles, lighting, sizes)</li>
-                        <li>Be consistent with landmark placement order</li>
-                        <li>Use SAM2 consistently between training and inference when possible</li>
-                        <li>Review preflight warnings before starting long training runs</li>
+                        <li>dlib: faster training, strongest on standardized imaging</li>
+                        <li>CNN: slower training, stronger under higher image variation</li>
+                        <li>CNN variant and augmentation controls are in the training dialog</li>
+                        <li>Review preflight and parity options before long runs</li>
                       </ul>
                     </div>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
-                        Training progress is staged (dataset prep, fit, parity evaluation, finalize).
-                        Session models remain scoped to the current schema session.
+                        Training is staged (dataset prep, fit, parity evaluation, finalize). Models and
+                        detector artifacts remain scoped to the current schema session.
                       </p>
                     </div>
                   </div>
                 </AccordionItem>
 
-                {/* Inference */}
                 <AccordionItem
                   title="Running Inference"
                   icon={<Microscope className="h-4 w-4" />}
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      Inference is a review workflow: detect, correct, segment (optional), landmark, then persist.
+                      Inference is a schema-bound review workflow. Open a session from the card hub,
+                      run detection and landmark prediction, then commit reviewed results back to
+                      schema training data.
                     </p>
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Steps:</p>
+                      <p className="font-medium text-foreground">Steps</p>
                       <ol className="ml-4 list-decimal space-y-1">
-                        <li>Select a trained model tied to the current schema session</li>
-                        <li>Upload images and run detection</li>
-                        <li>Edit/add/delete boxes and set orientation overrides when needed</li>
-                        <li>Optionally run SAM2 segmentation and mask overlay review</li>
+                        <li>Open Inference hub and enter the schema session card</li>
+                        <li>Select any available landmark model for that schema (dlib or CNN)</li>
+                        <li>Add images (saved image paths auto-reload when files still exist)</li>
+                        <li>Run detection, then correct boxes and orientation when needed</li>
                         <li>Run landmark inference on accepted boxes</li>
-                        <li>Use <span className="font-medium text-foreground">Save all changes</span> to persist edits</li>
-                        <li>Use <span className="font-medium text-foreground">Queue retrain</span> to stage finalized images for next training run</li>
+                        <li>Use <span className="font-medium text-foreground">Save All Changes</span> to persist drafts</li>
+                        <li>Use <span className="font-medium text-foreground">Mark Review Complete</span> or <span className="font-medium text-foreground">Mark In Progress</span></li>
+                        <li>Use <span className="font-medium text-foreground">Commit to Training Data</span> to commit only review-complete images</li>
                       </ol>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Session Rules</p>
+                      <ul className="ml-4 list-disc space-y-1">
+                        <li>One inference session exists per schema</li>
+                        <li>Inference hub is unlocked after opening or resuming Annotate in this app run</li>
+                        <li>Draft edits and landmark corrections are autosaved in-session</li>
+                        <li>Retraining is manual from Annotate/Train after commits</li>
+                      </ul>
                     </div>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
@@ -301,27 +338,26 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p className="font-medium text-foreground">Session QA Checklist</p>
                     <ol className="ml-4 list-decimal space-y-1">
-                      <li>Create a fresh session and upload 10-20 images</li>
-                      <li>Import pre-annotated JSON (include one landmarks-only sample)</li>
-                      <li>Verify imported images/boxes/landmarks appear in workspace</li>
-                      <li>Auto-detect on 3-5 images using each preset (Balanced/Precision/Recall/Single)</li>
-                      <li>Correct and delete some auto boxes, then annotate landmarks</li>
-                      <li>Train YOLO detection once, then annotate more images and train again</li>
-                      <li>Confirm second YOLO run creates a new version and reports promoted/not promoted</li>
-                      <li>Run training preflight, then train dlib or CNN model</li>
-                      <li>Open Inference page, run model on unseen images, export CSV and JSON</li>
-                      <li>Spot-check outputs: landmark IDs, coordinates, and image filenames</li>
+                      <li>Create a fresh schema session and upload 10-20 images</li>
+                      <li>Set orientation policy and run Auto detection on 3-5 images</li>
+                      <li>Correct and rotate OBB boxes, then finalize accepted boxes</li>
+                      <li>Annotate landmarks and verify landmark ID consistency</li>
+                      <li>Train OBB detector (if OBB labels exist), then train dlib or CNN</li>
+                      <li>Open inference hub and create or open the schema inference session</li>
+                      <li>Run detection plus landmark inference on unseen images</li>
+                      <li>Mark some images Review Complete and keep some In Progress</li>
+                      <li>Commit review-complete images to training data</li>
+                      <li>Return to Annotate/Train and confirm retraining uses committed additions</li>
                     </ol>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
-                        Minimum acceptance: no import validation errors, no training crash,
-                        inference exports complete, and qualitative landmark placement is stable.
+                        Minimum acceptance: no import or validation errors, no training crash, inference review
+                        persists across reopen, and only review-complete images are committed.
                       </p>
                     </div>
                   </div>
                 </AccordionItem>
 
-                {/* Keyboard Shortcuts */}
                 <AccordionItem
                   title="Keyboard Shortcuts"
                   icon={<Keyboard className="h-4 w-4" />}
@@ -340,7 +376,6 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                   </div>
                 </AccordionItem>
 
-                {/* Tips for Biologists */}
                 <AccordionItem
                   title="Tips for Biologists"
                   icon={<Lightbulb className="h-4 w-4" />}
@@ -370,7 +405,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <p className="font-medium text-foreground">Data Management</p>
                       <ul className="ml-4 list-disc space-y-1">
                         <li>Back up your project directory regularly</li>
-                        <li>Version your trained models (e.g., species_v1, species_v2)</li>
+                        <li>Version your trained models (for example, species_v1, species_v2)</li>
                         <li>Export landmark data for statistical analysis</li>
                       </ul>
                     </div>

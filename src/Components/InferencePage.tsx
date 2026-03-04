@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useState, useRef, useCallback } from "react";
+import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { motion } from "framer-motion";
 import {
   ArrowLeft,
@@ -6,6 +6,7 @@ import {
   Upload,
   Play,
   Save,
+  Plus,
   Download,
   Trash2,
   ChevronLeft,
@@ -18,22 +19,31 @@ import {
   Square,
 } from "lucide-react";
 import { toast } from "sonner";
-import { useSelector } from "react-redux";
+import { useDispatch, useSelector } from "react-redux";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
+import { Input } from "@/Components/ui/input";
 import { Label } from "@/Components/ui/label";
-import { Switch } from "@/Components/ui/switch";
 import { ScrollArea } from "@/Components/ui/scroll-area";
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@/Components/ui/popover";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/Components/ui/dialog";
 import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
 import { TrainedModel, AppView } from "@/types/Image";
-import type { RootState } from "@/state/store";
+import { setActiveSpecies } from "@/state/speciesState/speciesSlice";
+import type { AppDispatch, RootState } from "@/state/store";
 
 const STAGE_LABELS: Record<string, string> = {
   loading_model: "Loading model...",
@@ -47,14 +57,11 @@ const SIDEBAR_MIN_WIDTH = 240;
 const SIDEBAR_MAX_WIDTH = 560;
 const SIDEBAR_DEFAULT_WIDTH = 288;
 const SIDEBAR_WIDTH_STORAGE_KEY = "biovision.inference.sidebarWidth";
-const AUTO_RETRAIN_TOGGLE_STORAGE_KEY = "biovision.inference.autoRetrainEnabled";
-const AUTO_RETRAIN_LAST_AT_STORAGE_KEY = "biovision.inference.lastAutoRetrainAt";
-const AUTO_RETRAIN_MIN_QUEUE = 10;
-const AUTO_RETRAIN_COOLDOWN_MS = 20 * 60 * 1000;
 
 interface InferencePageProps {
   onNavigate: (view: AppView) => void;
   initialModel?: string;
+  hasActivatedSchemaThisRun?: boolean;
 }
 
 interface PredictionLandmark {
@@ -70,6 +77,8 @@ interface DetectedBox {
   bottom: number;
   width: number;
   height: number;
+  obbCorners?: [number, number][];
+  angle?: number;
   confidence?: number;
   class_id?: number;
   class_name?: string;
@@ -114,16 +123,6 @@ interface PredictedSpecimen {
   };
 }
 
-interface RejectedDetection {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-  confidence?: number;
-  className?: string;
-  detectionMethod?: string;
-}
-
 interface InferenceResult {
   image: string;
   landmarks?: PredictionLandmark[];
@@ -154,6 +153,8 @@ interface InferenceReviewDraft {
       confidence?: number;
       class_id?: number;
       class_name?: string;
+      obbCorners?: [number, number][];
+      angle?: number;
       orientation_override?: "left" | "right" | "uncertain";
       orientation_hint?: {
         orientation?: "left" | "right";
@@ -167,6 +168,8 @@ interface InferenceReviewDraft {
   }[];
   edited: boolean;
   saved: boolean;
+  reviewComplete?: boolean;
+  committedAt?: string | null;
   updatedAt: string;
 }
 
@@ -174,6 +177,7 @@ interface LocalInferenceSessionManifest {
   version: 1;
   sessionId: string;
   speciesId: string;
+  displayName?: string;
   models: {
     landmark: {
       key: string;
@@ -185,15 +189,51 @@ interface LocalInferenceSessionManifest {
       name?: string;
     };
   };
+  preferences?: {
+    lastUsedLandmarkModelKey?: string;
+    lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+    detectionModelKey?: string;
+    detectionModelName?: string;
+  };
   createdAt: string;
   updatedAt: string;
+}
+
+interface InferenceSessionCard {
+  speciesId: string;
+  schemaName: string;
+  schemaImageCount: number;
+  schemaUpdatedAt: string;
+  exists: boolean;
+  inferenceSessionId?: string;
+  displayName?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  migratedFrom?: string;
+}
+
+interface SchemaOption {
+  id: string;
+  name: string;
 }
 
 export const InferencePage: React.FC<InferencePageProps> = ({
   onNavigate,
   initialModel,
+  hasActivatedSchemaThisRun = false,
 }) => {
+  const dispatch = useDispatch<AppDispatch>();
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
+  const allSpecies = useSelector((state: RootState) => state.species.species);
+  const [selectedInferenceSpeciesId, setSelectedInferenceSpeciesId] = useState<string | null>(null);
+  const [showInferenceHub, setShowInferenceHub] = useState(true);
+  // effectiveSessionId: use the user-selected inference session, or fall back to the globally active one
+  const effectiveSessionId = showInferenceHub
+    ? null
+    : (selectedInferenceSpeciesId ?? activeSpeciesId);
+  const activeOrientationMode = useSelector((state: RootState) =>
+    state.species.species.find(s => s.id === (selectedInferenceSpeciesId ?? state.species.activeSpeciesId))?.orientationPolicy?.mode
+  );
   const [models, setModels] = useState<TrainedModel[]>([]);
   const [selectedModelKey, setSelectedModelKey] = useState<string>("");
   const [images, setImages] = useState<InferenceImage[]>([]);
@@ -223,30 +263,48 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const [editedImageIndices, setEditedImageIndices] = useState<Set<number>>(new Set());
   const [savedImageIndices, setSavedImageIndices] = useState<Set<number>>(new Set());
   const [reviewFinalizedImageIndices, setReviewFinalizedImageIndices] = useState<Set<number>>(new Set());
-  const [queuedImageIndices, setQueuedImageIndices] = useState<Set<number>>(new Set());
+  const [committedImageIndices, setCommittedImageIndices] = useState<Set<number>>(new Set());
   const [selectedSpecimenIndex, setSelectedSpecimenIndex] = useState<number | null>(null);
   const draggingRef = useRef<{ specIdx: number; lmIdx: number } | null>(null);
   const liveSpecimensRef = useRef<PredictedSpecimen[]>([]); // mutable during drag
-  const [isQueueingRetrain, setIsQueueingRetrain] = useState(false);
-  const [retrainQueueCount, setRetrainQueueCount] = useState(0);
+  const [isCommittingReview, setIsCommittingReview] = useState(false);
   const [inferenceSessionId, setInferenceSessionId] = useState<string>("");
   const [inferenceSessionManifest, setInferenceSessionManifest] = useState<LocalInferenceSessionManifest | null>(null);
-  const [autoRetrainEnabled, setAutoRetrainEnabled] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
-    return window.localStorage.getItem(AUTO_RETRAIN_TOGGLE_STORAGE_KEY) === "1";
-  });
-  const [lastAutoRetrainAt, setLastAutoRetrainAt] = useState<number>(() => {
-    if (typeof window === "undefined") return 0;
-    const parsed = Number(window.localStorage.getItem(AUTO_RETRAIN_LAST_AT_STORAGE_KEY));
-    return Number.isFinite(parsed) ? parsed : 0;
-  });
-  const [isAutoRetraining, setIsAutoRetraining] = useState(false);
-  const [autoRetrainProgress, setAutoRetrainProgress] = useState<{
-    percent: number;
-    stage: string;
-    message: string;
-  } | null>(null);
+  const [sessionPreferredModelKey, setSessionPreferredModelKey] = useState<string>("");
+  const [hubSessions, setHubSessions] = useState<InferenceSessionCard[]>([]);
+  const [loadingHubSessions, setLoadingHubSessions] = useState(false);
+  const [openingInferenceSessionSpeciesId, setOpeningInferenceSessionSpeciesId] = useState<string | null>(null);
+  const [createSessionDialogOpen, setCreateSessionDialogOpen] = useState(false);
+  const [createSessionSpeciesId, setCreateSessionSpeciesId] = useState<string>("");
+  const [createSessionName, setCreateSessionName] = useState("");
   const [obbDetectorReady, setObbDetectorReady] = useState<boolean | null>(null);
+
+  const schemaOptions = useMemo<SchemaOption[]>(() => {
+    const merged = new Map<string, SchemaOption>();
+
+    hubSessions.forEach((session) => {
+      if (!session?.speciesId) return;
+      merged.set(session.speciesId, {
+        id: session.speciesId,
+        name: session.schemaName || session.speciesId,
+      });
+    });
+
+    allSpecies.forEach((species) => {
+      if (!species?.id) return;
+      const existing = merged.get(species.id);
+      merged.set(species.id, {
+        id: species.id,
+        name: species.name || existing?.name || species.id,
+      });
+    });
+
+    return Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [allSpecies, hubSessions]);
+
+  const hasKnownSchemas =
+    hubSessions.length > 0 || allSpecies.length > 0 || hasActivatedSchemaThisRun;
+  const isFirstTimeLocked = !loadingHubSessions && !hasKnownSchemas;
 
   const markImageEdited = useCallback((index: number) => {
     setEditedImageIndices((prev) => {
@@ -259,23 +317,27 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       next.delete(index);
       return next;
     });
+    setCommittedImageIndices((prev) => {
+      const next = new Set(prev);
+      next.delete(index);
+      return next;
+    });
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(
-      AUTO_RETRAIN_TOGGLE_STORAGE_KEY,
-      autoRetrainEnabled ? "1" : "0"
-    );
-  }, [autoRetrainEnabled]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(
-      AUTO_RETRAIN_LAST_AT_STORAGE_KEY,
-      String(lastAutoRetrainAt || 0)
-    );
-  }, [lastAutoRetrainAt]);
+    if (!createSessionDialogOpen) return;
+    const existing = schemaOptions.some((schema) => schema.id === createSessionSpeciesId);
+    if (existing) return;
+    if (activeSpeciesId && schemaOptions.some((schema) => schema.id === activeSpeciesId)) {
+      setCreateSessionSpeciesId(activeSpeciesId);
+      return;
+    }
+    if (schemaOptions.length > 0) {
+      setCreateSessionSpeciesId(schemaOptions[0].id);
+    } else {
+      setCreateSessionSpeciesId("");
+    }
+  }, [activeSpeciesId, createSessionDialogOpen, createSessionSpeciesId, schemaOptions]);
 
   const shiftIndicesInSet = useCallback((source: Set<number>, removedIndex: number): Set<number> => {
     const next = new Set<number>();
@@ -313,6 +375,10 @@ export const InferencePage: React.FC<InferencePageProps> = ({
 
   const resolveInitialModelKey = useCallback((available: TrainedModel[]): string => {
     if (!available.length) return "";
+    if (sessionPreferredModelKey) {
+      const exactPreferred = available.find((m) => modelToKey(m) === sessionPreferredModelKey);
+      if (exactPreferred) return modelToKey(exactPreferred);
+    }
     if (!initialModel) return modelToKey(available[0]);
     const exact = available.find((m) => modelToKey(m) === initialModel);
     if (exact) return modelToKey(exact);
@@ -322,17 +388,146 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       return modelToKey(preferred);
     }
     return modelToKey(available[0]);
-  }, [initialModel, modelToKey]);
+  }, [initialModel, modelToKey, sessionPreferredModelKey]);
+
+  const resetInferenceWorkspaceState = useCallback(() => {
+    setImages((prev) => {
+      prev.forEach((img) => {
+        if (img?.url) URL.revokeObjectURL(img.url);
+      });
+      return [];
+    });
+    setCurrentIndex(0);
+    setCorrectedSpecimensMap(new Map());
+    setEditedImageIndices(new Set());
+    setSavedImageIndices(new Set());
+    setReviewFinalizedImageIndices(new Set());
+    setCommittedImageIndices(new Set());
+    setSelectedSpecimenIndex(null);
+    setInferProgress(null);
+    setIsRunning(false);
+    setShowMaskOverlay(false);
+    setIsDrawBoxMode(false);
+    drawBoxRef.current = null;
+  }, []);
+
+  const refreshInferenceHubSessions = useCallback(async () => {
+    setLoadingHubSessions(true);
+    try {
+      const result = await window.api.sessionListInferenceSessions();
+      if (!result.ok || !Array.isArray(result.sessions)) {
+        setHubSessions([]);
+        if (result.error) toast.error(result.error);
+        return;
+      }
+      setHubSessions(result.sessions as InferenceSessionCard[]);
+    } catch (err) {
+      console.error("Failed to load inference sessions:", err);
+      setHubSessions([]);
+      toast.error("Failed to load inference sessions.");
+    } finally {
+      setLoadingHubSessions(false);
+    }
+  }, []);
+
+  const openInferenceSessionForSchema = useCallback(
+    async (speciesId: string) => {
+      if (!speciesId) return;
+      if (isFirstTimeLocked) {
+        toast.error("Create or resume your first schema session in Annotate first.");
+        return;
+      }
+      setOpeningInferenceSessionSpeciesId(speciesId);
+      try {
+        const res = await window.api.sessionGetInferenceSession(speciesId);
+        if (!res.ok) {
+          toast.error(res.error || "Failed to open inference session.");
+          return;
+        }
+        if (!res.exists || !res.inferenceSessionId || !res.manifest) {
+          toast.error("Create an inference session for this schema first.");
+          return;
+        }
+        dispatch(setActiveSpecies(speciesId));
+        setSelectedInferenceSpeciesId(speciesId);
+        setInferenceSessionId(res.inferenceSessionId);
+        setInferenceSessionManifest(res.manifest as LocalInferenceSessionManifest);
+        const preferredModel =
+          res.manifest.preferences?.lastUsedLandmarkModelKey ||
+          res.manifest.models?.landmark?.key ||
+          "";
+        setSessionPreferredModelKey(preferredModel);
+        setSelectedModelKey("");
+        resetInferenceWorkspaceState();
+        setShowInferenceHub(false);
+      } catch (err) {
+        console.error("Failed to open inference session:", err);
+        toast.error("Failed to open inference session.");
+      } finally {
+        setOpeningInferenceSessionSpeciesId(null);
+      }
+    },
+    [dispatch, isFirstTimeLocked, resetInferenceWorkspaceState]
+  );
+
+  const handleCreateInferenceSession = useCallback(async () => {
+    if (isFirstTimeLocked) {
+      toast.error("Create or resume your first schema session in Annotate first.");
+      return;
+    }
+    const speciesId = createSessionSpeciesId.trim();
+    const displayName = createSessionName.trim();
+    if (!speciesId) {
+      toast.error("Select a schema session.");
+      return;
+    }
+    if (!displayName) {
+      toast.error("Enter an inference session name.");
+      return;
+    }
+    try {
+      const res = await window.api.sessionCreateInferenceSession(speciesId, displayName);
+      if (!res.ok) {
+        toast.error(res.error || "Failed to create inference session.");
+        return;
+      }
+      toast.success("Inference session created.");
+      setCreateSessionDialogOpen(false);
+      await refreshInferenceHubSessions();
+      await openInferenceSessionForSchema(speciesId);
+    } catch (err) {
+      console.error("Failed to create inference session:", err);
+      toast.error("Failed to create inference session.");
+    }
+  }, [
+    createSessionName,
+    createSessionSpeciesId,
+    isFirstTimeLocked,
+    openInferenceSessionForSchema,
+    refreshInferenceHubSessions,
+  ]);
+
+  useEffect(() => {
+    if (!showInferenceHub) return;
+    void refreshInferenceHubSessions();
+  }, [refreshInferenceHubSessions, showInferenceHub]);
 
   // Bounding-box drag/resize state
-  type BoxDragMode = "move" | "resize-tl" | "resize-tr" | "resize-bl" | "resize-br";
+  type BoxDragMode = "move" | "resize-tl" | "resize-tr" | "resize-bl" | "resize-br" | "rotate";
   const boxDraggingRef = useRef<{
     specIdx: number;
     mode: BoxDragMode;
     startMouse: { x: number; y: number };
-    startBox: { left: number; top: number; width: number; height: number };
+    startBox: {
+      left: number; top: number; width: number; height: number;
+      obbCorners?: [number, number][];
+      cx?: number; cy?: number;
+    };
   } | null>(null);
   const [isDrawBoxMode, setIsDrawBoxMode] = useState(false);
+  const [drawDefaultOrientation, setDrawDefaultOrientation] = useState<"left" | "right">(() =>
+    ((typeof window !== "undefined" && window.localStorage.getItem("bv_draw_default_orientation")) as "left" | "right") ?? "left"
+  );
   const drawBoxRef = useRef<{
     start: { x: number; y: number };
     current: { x: number; y: number };
@@ -439,6 +634,8 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             ? Number(s.box.class_id)
             : undefined,
           class_name: s.box.class_name,
+          obbCorners: Array.isArray(s.box.obbCorners) ? s.box.obbCorners : undefined,
+          angle: typeof s.box.angle === "number" ? s.box.angle : undefined,
           orientation_override: s.box.orientation_override,
           orientation_hint: s.box.orientation_hint,
         },
@@ -545,46 +742,16 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     }
   }, [activeSpeciesId]);
 
-  const loadPersistedQueuedSummary = useCallback(async (): Promise<{ filenames: Set<string>; count: number }> => {
-    if (!activeSpeciesId || !inferenceSessionId) {
-      setRetrainQueueCount(0);
-      return { filenames: new Set<string>(), count: 0 };
-    }
-    try {
-      const res = await window.api.sessionGetRetrainQueue(activeSpeciesId, inferenceSessionId);
-      if (!res.ok || !Array.isArray(res.items)) {
-        setRetrainQueueCount(0);
-        return { filenames: new Set<string>(), count: 0 };
-      }
-      const filenames = new Set(
-        res.items.map((item) => (item.filename || "").toLowerCase())
-      );
-      const count = Number.isFinite(Number(res.count)) ? Number(res.count) : res.items.length;
-      setRetrainQueueCount(count);
-      return { filenames, count };
-    } catch {
-      setRetrainQueueCount(0);
-      return { filenames: new Set<string>(), count: 0 };
-    }
-  }, [activeSpeciesId, inferenceSessionId]);
-
-  const refreshRetrainQueueSummary = useCallback(async (): Promise<number> => {
-    const summary = await loadPersistedQueuedSummary();
-    return summary.count;
-  }, [loadPersistedQueuedSummary]);
-
   const hydratePersistedReviewDrafts = useCallback(
     async (targetImages?: InferenceImage[]) => {
       if (!activeSpeciesId || !inferenceSessionId) return;
       const sourceImages = targetImages ?? images;
       if (!sourceImages.length) return;
 
-      const [draftResult, finalizedFilenames, queuedSummary] = await Promise.all([
+      const [draftResult, finalizedFilenames] = await Promise.all([
         window.api.sessionLoadInferenceReviewDrafts(activeSpeciesId, inferenceSessionId),
         loadPersistedFinalizedFilenames(),
-        loadPersistedQueuedSummary(),
       ]);
-      const queuedFilenames = queuedSummary.filenames;
       const drafts = draftResult.ok && Array.isArray(draftResult.drafts) ? draftResult.drafts : [];
 
       const byPath = new Map<string, InferenceReviewDraft>();
@@ -602,21 +769,21 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       const nextEdited = new Set<number>();
       const nextSaved = new Set<number>();
       const nextReviewFinalized = new Set<number>();
-      const nextQueued = new Set<number>();
+      const nextCommitted = new Set<number>();
 
-      sourceImages.forEach((img, idx) => {
+      // Mutable copy so we can inject synthetic results for images that have drafts but no live results
+      const mutableImages = [...sourceImages];
+      let syntheticResultsInjected = false;
+
+      mutableImages.forEach((img, idx) => {
         const draft =
           byPath.get(normalizePathForMatch(img.path)) ??
           byName.get((img.name || "").toLowerCase());
         const finalizedBySession = finalizedFilenames.has((img.name || "").toLowerCase());
-        const queuedBySession = queuedFilenames.has((img.name || "").toLowerCase());
 
         if (!draft) {
           if (finalizedBySession) {
             nextSaved.add(idx);
-          }
-          if (queuedBySession) {
-            nextQueued.add(idx);
           }
           return;
         }
@@ -642,6 +809,8 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               confidence: Number.isFinite(Number(s.box.confidence)) ? Number(s.box.confidence) : undefined,
               class_id: Number.isFinite(Number(s.box.class_id)) ? Number(s.box.class_id) : undefined,
               class_name: s.box.class_name,
+              obbCorners: s.box.obbCorners,
+              angle: s.box.angle,
               orientation_override: s.box.orientation_override,
               orientation_hint: s.box.orientation_hint,
             },
@@ -657,23 +826,47 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         );
         nextCorrected.set(idx, mergedSpecimens);
         if (finalizedBySession || draft.saved) nextSaved.add(idx);
-        if (draft.saved) nextReviewFinalized.add(idx);
+        if (draft.reviewComplete || draft.saved) nextReviewFinalized.add(idx);
         else if (draft.edited) nextEdited.add(idx);
-        if (queuedBySession) nextQueued.add(idx);
+        const updatedAtMs = Date.parse(String(draft.updatedAt || ""));
+        const committedAtMs = Date.parse(String(draft.committedAt || ""));
+        if (
+          draft.committedAt &&
+          Number.isFinite(updatedAtMs) &&
+          Number.isFinite(committedAtMs) &&
+          committedAtMs >= updatedAtMs
+        ) {
+          nextCommitted.add(idx);
+        }
+
+        // Synthesize an InferenceResult so the canvas renders saved boxes/landmarks
+        // immediately without requiring a new backend call
+        if (!img.results && mergedSpecimens.length > 0) {
+          const syntheticResult = {
+            specimens: mergedSpecimens,
+            image: img.path,
+            image_dimensions: { width: 0, height: 0 },
+            num_landmarks: mergedSpecimens.reduce((s: number, sp: PredictedSpecimen) => s + sp.landmarks.length, 0),
+          };
+          mutableImages[idx] = { ...img, results: syntheticResult as InferenceResult };
+          syntheticResultsInjected = true;
+        }
       });
 
+      if (syntheticResultsInjected) {
+        setImages(mutableImages);
+      }
       setCorrectedSpecimensMap(nextCorrected);
       setEditedImageIndices(nextEdited);
       setSavedImageIndices(nextSaved);
       setReviewFinalizedImageIndices(nextReviewFinalized);
-      setQueuedImageIndices(nextQueued);
+      setCommittedImageIndices(nextCommitted);
     },
     [
       activeSpeciesId,
       inferenceSessionId,
       images,
       loadPersistedFinalizedFilenames,
-      loadPersistedQueuedSummary,
       mergeDraftLandmarksWithInference,
       normalizePathForMatch,
     ]
@@ -686,6 +879,8 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         specimens?: PredictedSpecimen[];
         edited?: boolean;
         saved?: boolean;
+        reviewComplete?: boolean;
+        committedAt?: string | null;
         clear?: boolean;
       }
     ) => {
@@ -706,6 +901,9 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           filename: image.name,
           edited: options?.edited ?? editedImageIndices.has(index),
           saved: options?.saved ?? savedImageIndices.has(index),
+          reviewComplete:
+            options?.reviewComplete ?? reviewFinalizedImageIndices.has(index),
+          committedAt: options?.committedAt,
           clear: options?.clear,
         }
       );
@@ -723,160 +921,29 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       editedImageIndices,
       getSpecimensForImageIndex,
       images,
+      reviewFinalizedImageIndices,
       savedImageIndices,
       toDraftSpecimens,
     ]
   );
 
   const saveCorrectionsForImage = useCallback(async (index: number): Promise<boolean> => {
-    if (!activeSpeciesId) {
-      toast.error("Select an active session/species before saving corrections.");
+    if (!activeSpeciesId || !inferenceSessionId) {
+      toast.error("Inference session is not ready yet.");
       return false;
     }
     const image = images[index];
     if (!image?.results) return false;
 
-    const specimens = getSpecimensForImageIndex(index)
-      .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0)
-      .map((s) => ({
-        box: {
-          left: Math.round(s.box.left),
-          top: Math.round(s.box.top),
-          width: Math.round(s.box.width),
-          height: Math.round(s.box.height),
-          orientation_override: s.box.orientation_override,
-        },
-        landmarks: (s.landmarks || []).map((lm) => ({
-          id: Number(lm.id),
-          x: Math.round(lm.x),
-          y: Math.round(lm.y),
-        })),
-      }));
-    const acceptedBoxes = specimens.map((s) => s.box);
-
-    const originalSpecimens = getSpecimensFromResult(image.results).filter(
-      (s) => s?.box && s.box.width > 0 && s.box.height > 0
-    );
-    const originalBoxes = originalSpecimens.map((s) => ({
-      left: Math.round(s.box.left),
-      top: Math.round(s.box.top),
-      width: Math.round(s.box.width),
-      height: Math.round(s.box.height),
-      confidence: Number.isFinite(Number(s.box.confidence))
-        ? Number(s.box.confidence)
-        : undefined,
-      className: s.box.class_name,
-    }));
-    const rejectedDetections: RejectedDetection[] = originalBoxes
-      .filter((orig) => {
-        if (acceptedBoxes.length === 0) return true;
-        return !acceptedBoxes.some((acc) => intersectionOverUnion(orig, acc) >= 0.5);
-      })
-      .map((orig) => ({
-        left: orig.left,
-        top: orig.top,
-        width: orig.width,
-        height: orig.height,
-        ...(orig.confidence !== undefined ? { confidence: orig.confidence } : {}),
-        ...(orig.className ? { className: orig.className } : {}),
-        detectionMethod: "inference_deleted_or_rejected",
-      }));
-
-    const dims = image.results.image_dimensions;
-    const imageWidth = Math.max(1, Math.round(dims?.width ?? 0));
-    const imageHeight = Math.max(1, Math.round(dims?.height ?? 0));
-
-    if (specimens.length === 0) {
-      const [landmarkClearSave, detectionOnlySave] = await Promise.all([
-        window.api.sessionSaveInferenceCorrection(
-          activeSpeciesId,
-          image.path,
-          undefined,
-          undefined,
-          image.name,
-          [],
-          rejectedDetections,
-          { allowEmpty: true }
-        ),
-        window.api.sessionSaveDetectionCorrection(
-          activeSpeciesId,
-          image.path,
-          [],
-          imageWidth,
-          imageHeight,
-          image.name
-        ),
-      ]);
-      if (!landmarkClearSave.ok) {
-        toast.error(
-          landmarkClearSave.error ||
-            `Failed to clear inference landmarks for ${image.name}.`
-        );
-        return false;
-      }
-      if (!detectionOnlySave.ok) {
-        toast.error(
-          detectionOnlySave.error ||
-            `Failed to save detection-only correction for ${image.name}.`
-        );
-        return false;
-      }
-      setSavedImageIndices((prev) => {
-        const next = new Set(prev);
-        next.add(index);
-        return next;
-      });
-      setReviewFinalizedImageIndices((prev) => {
-        const next = new Set(prev);
-        next.add(index);
-        return next;
-      });
-      setEditedImageIndices((prev) => {
-        const next = new Set(prev);
-        next.delete(index);
-        return next;
-      });
-      await persistReviewDraft(index, { edited: false, saved: true, specimens: [] });
-      return true;
-    }
-
-    const first = specimens[0];
-
-    const [landmarkSave, detectionSave] = await Promise.all([
-      window.api.sessionSaveInferenceCorrection(
-        activeSpeciesId,
-        image.path,
-        first.box,
-        first.landmarks,
-        image.name,
-        specimens,
-        rejectedDetections
-      ),
-      window.api.sessionSaveDetectionCorrection(
-        activeSpeciesId,
-        image.path,
-        specimens.map((s) => s.box),
-        imageWidth,
-        imageHeight,
-        image.name
-      ),
-    ]);
-
-    if (!landmarkSave.ok) {
-      toast.error(landmarkSave.error || `Failed to save landmark corrections for ${image.name}.`);
-      return false;
-    }
-    if (!detectionSave.ok) {
-      toast.error(detectionSave.error || `Failed to save detection corrections for ${image.name}.`);
-      return false;
-    }
-
-    setSavedImageIndices((prev) => {
-      const next = new Set(prev);
-      next.add(index);
-      return next;
+    const specimensToSave = getSpecimensForImageIndex(index)
+      .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0);
+    await persistReviewDraft(index, {
+      specimens: specimensToSave,
+      edited: false,
+      saved: true,
+      reviewComplete: reviewFinalizedImageIndices.has(index),
     });
-    setReviewFinalizedImageIndices((prev) => {
+    setSavedImageIndices((prev) => {
       const next = new Set(prev);
       next.add(index);
       return next;
@@ -886,9 +953,15 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       next.delete(index);
       return next;
     });
-    await persistReviewDraft(index, { edited: false, saved: true, specimens: getSpecimensForImageIndex(index) });
     return true;
-  }, [activeSpeciesId, images, getSpecimensForImageIndex, intersectionOverUnion, persistReviewDraft]);
+  }, [
+    activeSpeciesId,
+    inferenceSessionId,
+    images,
+    getSpecimensForImageIndex,
+    persistReviewDraft,
+    reviewFinalizedImageIndices,
+  ]);
 
   const resolveOrientationLabelFromBox = useCallback((box?: DetectedBox): "left" | "right" | "uncertain" => {
     if (!box) return "uncertain";
@@ -961,167 +1034,20 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         return next;
       });
       markImageEdited(currentIndex);
-      void persistReviewDraft(currentIndex, { specimens: updated, edited: true, saved: false });
+      void persistReviewDraft(currentIndex, {
+        specimens: updated,
+        edited: true,
+        saved: false,
+        committedAt: null,
+      });
     },
     [currentIndex, getSpecimensForImageIndex, markImageEdited, persistReviewDraft]
   );
-
-  const queueRetrainForImage = useCallback(async (index: number): Promise<boolean> => {
-    if (!activeSpeciesId || !inferenceSessionId) {
-      toast.error("Select an active session/species before queueing retrain.");
-      return false;
-    }
-    const image = images[index];
-    if (!image) return false;
-    const specimens = getSpecimensForImageIndex(index);
-    const boxesCount = specimens.filter((s) => s?.box && s.box.width > 0 && s.box.height > 0).length;
-    const landmarksCount = specimens.reduce((sum, s) => sum + (s.landmarks?.length || 0), 0);
-    const selectedModel = getSelectedModel();
-    const result = await window.api.sessionQueueRetrainItem(activeSpeciesId, inferenceSessionId, image.name, {
-      imagePath: image.path,
-      source: "inference_review",
-      boxesCount,
-      landmarksCount,
-      landmarkModelKey: selectedModelKey,
-      landmarkModelName: selectedModel?.name,
-      landmarkPredictorType: selectedModel?.predictorType ?? "dlib",
-      detectionModelKey: "session_detection_default",
-      detectionModelName: "Session Detection Model",
-    });
-    if (!result.ok) {
-      toast.error(result.error || `Failed to queue ${image.name} for retraining.`);
-      return false;
-    }
-    setQueuedImageIndices((prev) => {
-      const next = new Set(prev);
-      next.add(index);
-      return next;
-    });
-    if (typeof result.queuedCount === "number") {
-      setRetrainQueueCount(result.queuedCount);
-    } else {
-      void refreshRetrainQueueSummary();
-    }
-    return true;
-  }, [
-    activeSpeciesId,
-    inferenceSessionId,
-    getSelectedModel,
-    getSpecimensForImageIndex,
-    images,
-    refreshRetrainQueueSummary,
-    selectedModelKey,
-  ]);
-
-  const attemptAutoRetrainIfReady = useCallback(async (): Promise<boolean> => {
-    if (!autoRetrainEnabled || !activeSpeciesId || isAutoRetraining) return false;
-
-    const selectedModel = models.find((m) => modelToKey(m) === selectedModelKey);
-    if (!selectedModel) return false;
-    const selectedPredictor = selectedModel.predictorType ?? "dlib";
-    if (selectedPredictor === "yolo_pose") {
-      return false;
-    }
-
-    if (!inferenceSessionId) return false;
-    const queueRes = await window.api.sessionGetRetrainQueue(activeSpeciesId, inferenceSessionId);
-    if (!queueRes.ok) {
-      toast.error(queueRes.error || "Failed to read retrain queue.");
-      return false;
-    }
-
-    const queuedCount = Number.isFinite(Number(queueRes.count))
-      ? Number(queueRes.count)
-      : Array.isArray(queueRes.items)
-      ? queueRes.items.length
-      : 0;
-    setRetrainQueueCount(queuedCount);
-
-    if (queuedCount < AUTO_RETRAIN_MIN_QUEUE) {
-      return false;
-    }
-
-    const now = Date.now();
-    if (lastAutoRetrainAt > 0 && now - lastAutoRetrainAt < AUTO_RETRAIN_COOLDOWN_MS) {
-      return false;
-    }
-
-    setIsAutoRetraining(true);
-    setAutoRetrainProgress({
-      percent: 0,
-      stage: "starting",
-      message: `Preparing auto-retrain for ${selectedModel.name}...`,
-    });
-
-    const expectedPredictor: "dlib" | "cnn" = selectedPredictor;
-    const unsubscribe = window.api.onTrainProgress((data) => {
-      if (data.modelName !== selectedModel.name) return;
-      if (data.predictorType !== expectedPredictor) return;
-      setAutoRetrainProgress({
-        percent: Math.max(0, Math.min(100, Math.round(data.percent ?? 0))),
-        stage: data.stage,
-        message: data.message || data.stage,
-      });
-    });
-
-    try {
-      const result = await window.api.trainModel(selectedModel.name, {
-        speciesId: activeSpeciesId,
-        predictorType: expectedPredictor,
-      });
-
-      if (!result.ok) {
-        toast.error(
-          result.error ||
-            `Auto-retrain failed for ${selectedModel.name}. Corrections remain queued.`
-        );
-        return false;
-      }
-
-      const clearRes = await window.api.sessionClearRetrainQueue(activeSpeciesId, inferenceSessionId);
-      if (!clearRes.ok) {
-        toast.warning(
-          clearRes.error ||
-            "Auto-retrain finished, but retrain queue could not be cleared."
-        );
-      } else {
-        setRetrainQueueCount(0);
-        setQueuedImageIndices(new Set());
-      }
-
-      setLastAutoRetrainAt(now);
-      toast.success(
-        `Auto-retrained ${selectedModel.name} (${expectedPredictor.toUpperCase()}).`
-      );
-      return true;
-    } finally {
-      unsubscribe();
-      setIsAutoRetraining(false);
-      setAutoRetrainProgress(null);
-    }
-  }, [
-    autoRetrainEnabled,
-    activeSpeciesId,
-    inferenceSessionId,
-    isAutoRetraining,
-    models,
-    modelToKey,
-    selectedModelKey,
-    lastAutoRetrainAt,
-  ]);
 
   useEffect(() => {
     if (!activeSpeciesId || !inferenceSessionId || images.length === 0) return;
     void hydratePersistedReviewDrafts(images);
   }, [activeSpeciesId, inferenceSessionId, images, hydratePersistedReviewDrafts]);
-
-  useEffect(() => {
-    if (!activeSpeciesId || !inferenceSessionId) {
-      setRetrainQueueCount(0);
-      return;
-    }
-    void refreshRetrainQueueSummary();
-  }, [activeSpeciesId, inferenceSessionId, refreshRetrainQueueSummary]);
 
   useEffect(() => {
     const handleMouseMove = (event: MouseEvent) => {
@@ -1152,7 +1078,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     };
   }, [clampSidebarWidth, sidebarWidth]);
 
-  // Extracted draw function Ã¢â‚¬â€ callable from both useEffect and mouse handlers
+  // Extracted draw function â€” callable from both useEffect and mouse handlers
   const drawToCanvas = useCallback((specimens: PredictedSpecimen[]) => {
     const canvas = canvasRef.current;
     const img = imageRef.current;
@@ -1210,24 +1136,94 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         ctx.strokeStyle = color;
         ctx.lineWidth = idx === selectedSpecimenIndex ? lineWidth * 3 : lineWidth * 2;
         ctx.setLineDash([10, 5]);
-        ctx.strokeRect(box.left, box.top, box.width, box.height);
+        const obbPts = Array.isArray(box.obbCorners) ? box.obbCorners : undefined;
+        if (obbPts && obbPts.length === 4) {
+          ctx.beginPath();
+          ctx.moveTo(obbPts[0][0], obbPts[0][1]);
+          for (let k = 1; k < 4; k++) ctx.lineTo(obbPts[k][0], obbPts[k][1]);
+          ctx.closePath();
+          ctx.stroke();
+        } else {
+          ctx.strokeRect(box.left, box.top, box.width, box.height);
+        }
         ctx.setLineDash([]);
+
+        // Orientation arrow inside OBB (when orientation is known)
+        if (obbPts && obbPts.length === 4 && box.orientation_hint?.orientation) {
+          const [op0, op1, op2, op3] = obbPts;
+          const oLen01 = Math.hypot(op1[0]-op0[0], op1[1]-op0[1]);
+          const oLen12 = Math.hypot(op2[0]-op1[0], op2[1]-op1[1]);
+          let oMidA: [number,number], oMidB: [number,number];
+          if (oLen01 >= oLen12) {
+            oMidA = [(op0[0]+op3[0])/2, (op0[1]+op3[1])/2];
+            oMidB = [(op1[0]+op2[0])/2, (op1[1]+op2[1])/2];
+          } else {
+            oMidA = [(op0[0]+op1[0])/2, (op0[1]+op1[1])/2];
+            oMidB = [(op2[0]+op3[0])/2, (op2[1]+op3[1])/2];
+          }
+          const oIsLeft = box.orientation_hint.orientation === "left";
+          const [oLeftEnd, oRightEnd] = oMidA[0] <= oMidB[0] ? [oMidA, oMidB] : [oMidB, oMidA];
+          const [oHead] = oIsLeft ? [oLeftEnd, oRightEnd] : [oRightEnd, oLeftEnd];
+          const oTail = oIsLeft ? oRightEnd : oLeftEnd;
+          const oAxisLen = Math.hypot(oHead[0]-oTail[0], oHead[1]-oTail[1]) || 1;
+          if (oAxisLen >= 24) {
+            const oNx = (oHead[0]-oTail[0])/oAxisLen, oNy = (oHead[1]-oTail[1])/oAxisLen;
+            const arrowLen  = Math.min(Math.max(oAxisLen * 0.25, 14), 32);
+            const oHSizeLen = Math.min(Math.max(oAxisLen * 0.10, 6), 10);
+            const oHSizeW   = Math.min(Math.max(oAxisLen * 0.07, 5), 8);
+            const tipX = oHead[0], tipY = oHead[1];
+            const tailX = oHead[0] - oNx * arrowLen, tailY = oHead[1] - oNy * arrowLen;
+            ctx.save();
+            ctx.globalAlpha = 0.85;
+            ctx.strokeStyle = color; ctx.fillStyle = color;
+            ctx.lineWidth = Math.max(1.5, lineWidth * 0.85);
+            ctx.beginPath();
+            ctx.moveTo(tailX, tailY);
+            ctx.lineTo(tipX - oNx*oHSizeLen, tipY - oNy*oHSizeLen);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(tipX, tipY);
+            ctx.lineTo(tipX - oNx*oHSizeLen + (-oNy)*oHSizeW*0.5, tipY - oNy*oHSizeLen + oNx*oHSizeW*0.5);
+            ctx.lineTo(tipX - oNx*oHSizeLen - (-oNy)*oHSizeW*0.5, tipY - oNy*oHSizeLen - oNx*oHSizeW*0.5);
+            ctx.closePath(); ctx.fill();
+            ctx.restore();
+          }
+        }
+
         ctx.fillStyle = color;
         ctx.font = `bold ${fontSize}px sans-serif`;
         const orientationLabel = resolveOrientationLabelFromBox(specimen?.box);
-        const orientationSuffix = ` Â· ${orientationLabel}`;
+        // Compute tilt angle from OBB long axis, folded to [0�, 90�]
+        let angleSuffix = "";
+        const isInvariant = activeOrientationMode === "invariant";
+        if (!isInvariant && obbPts && obbPts.length === 4) {
+          const [ap0, ap1, , ap3] = obbPts;
+          const adx1 = ap1[0]-ap0[0], ady1 = ap1[1]-ap0[1];
+          const adx3 = ap3[0]-ap0[0], ady3 = ap3[1]-ap0[1];
+          const [aldx, aldy] = Math.hypot(adx1,ady1) >= Math.hypot(adx3,ady3) ? [adx1,ady1] : [adx3,ady3];
+          let adeg = Math.atan2(aldy, aldx) * 180 / Math.PI;
+          adeg = ((adeg % 180) + 180) % 180;
+          if (adeg > 90) adeg = 180 - adeg;
+          angleSuffix = ` \u00B7 ${Math.round(adeg)}\u00B0`;
+        }
+        const isVectorOrUnset = !activeOrientationMode || activeOrientationMode === "directional" || activeOrientationMode === "bilateral";
+        const orientationSuffix = isVectorOrUnset
+          ? ` \u00B7 ${orientationLabel}${angleSuffix}`
+          : angleSuffix; // axial: angle only; invariant: empty (angleSuffix is "")
         const label = idx === selectedSpecimenIndex
           ? `Specimen ${idx + 1} (selected)${orientationSuffix}`
           : `Specimen ${idx + 1}${orientationSuffix}`;
         ctx.fillText(label, box.left + 5, box.top - 5);
 
         // Corner resize handles
-        const corners = [
-          { x: box.left,               y: box.top },
-          { x: box.left + box.width,   y: box.top },
-          { x: box.left,               y: box.top + box.height },
-          { x: box.left + box.width,   y: box.top + box.height },
-        ];
+        const corners = obbPts && obbPts.length === 4
+          ? obbPts.map(([x, y]) => ({ x, y }))
+          : [
+              { x: box.left,               y: box.top },
+              { x: box.left + box.width,   y: box.top },
+              { x: box.left,               y: box.top + box.height },
+              { x: box.left + box.width,   y: box.top + box.height },
+            ];
         corners.forEach(({ x, y }) => {
           ctx.fillStyle = "white";
           ctx.strokeStyle = color;
@@ -1237,6 +1233,28 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           ctx.fill();
           ctx.stroke();
         });
+
+        // Rotation handle � circle above box top-center
+        const rotHandleR = Math.max(7, diagonal * 0.009);
+        const rotHandleX = box.left + box.width / 2;
+        const rotHandleY = Math.max(box.top - 30, rotHandleR + 4);
+        ctx.save();
+        ctx.setLineDash([4, 3]);
+        ctx.lineWidth = lineWidth;
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(rotHandleX, box.top);
+        ctx.lineTo(rotHandleX, rotHandleY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(rotHandleX, rotHandleY, rotHandleR, 0, Math.PI * 2);
+        ctx.fillStyle = "white";
+        ctx.fill();
+        ctx.lineWidth = lineWidth * 1.5;
+        ctx.strokeStyle = color;
+        ctx.stroke();
+        ctx.restore();
       });
     }
 
@@ -1281,22 +1299,68 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         ctx.fillStyle = "rgba(34, 197, 94, 0.95)";
         ctx.font = `bold ${fontSize}px sans-serif`;
         ctx.fillText("New Box", x + 6, Math.max(fontSize + 2, y - 4));
+        // Real-time orientation arrow in the preview box
+        const previewObbPts: [number,number][] = [[x,y],[x+w,y],[x+w,y+h],[x,y+h]];
+        const [dp0,dp1,dp2,dp3] = previewObbPts;
+        const dLen01 = Math.hypot(dp1[0]-dp0[0], dp1[1]-dp0[1]);
+        const dLen12 = Math.hypot(dp2[0]-dp1[0], dp2[1]-dp1[1]);
+        let dMidA: [number,number], dMidB: [number,number];
+        if (dLen01 >= dLen12) {
+          dMidA = [(dp0[0]+dp3[0])/2, (dp0[1]+dp3[1])/2];
+          dMidB = [(dp1[0]+dp2[0])/2, (dp1[1]+dp2[1])/2];
+        } else {
+          dMidA = [(dp0[0]+dp1[0])/2, (dp0[1]+dp1[1])/2];
+          dMidB = [(dp2[0]+dp3[0])/2, (dp2[1]+dp3[1])/2];
+        }
+        const dIsLeft = drawDefaultOrientation === "left";
+        const [dLeftEnd, dRightEnd] = dMidA[0] <= dMidB[0] ? [dMidA, dMidB] : [dMidB, dMidA];
+        const dHead = dIsLeft ? dLeftEnd : dRightEnd;
+        const dTail = dIsLeft ? dRightEnd : dLeftEnd;
+        const dAxisLen = Math.hypot(dHead[0]-dTail[0], dHead[1]-dTail[1]) || 1;
+        if (dAxisLen >= 24) {
+          const dNx = (dHead[0]-dTail[0])/dAxisLen, dNy = (dHead[1]-dTail[1])/dAxisLen;
+          const arrowLen  = Math.min(Math.max(dAxisLen * 0.25, 14), 32);
+          const dHSizeLen = Math.min(Math.max(dAxisLen * 0.10, 6), 10);
+          const dHSizeW   = Math.min(Math.max(dAxisLen * 0.07, 5), 8);
+          const tipX = dHead[0], tipY = dHead[1];
+          const tailX = dHead[0] - dNx * arrowLen, tailY = dHead[1] - dNy * arrowLen;
+          ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
+          ctx.fillStyle = "rgba(34, 197, 94, 0.95)";
+          ctx.lineWidth = Math.max(1.5, lineWidth * 0.85);
+          ctx.beginPath();
+          ctx.moveTo(tailX, tailY);
+          ctx.lineTo(tipX - dNx*dHSizeLen, tipY - dNy*dHSizeLen);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(tipX, tipY);
+          ctx.lineTo(tipX - dNx*dHSizeLen + (-dNy)*dHSizeW*0.5, tipY - dNy*dHSizeLen + dNx*dHSizeW*0.5);
+          ctx.lineTo(tipX - dNx*dHSizeLen - (-dNy)*dHSizeW*0.5, tipY - dNy*dHSizeLen - dNx*dHSizeW*0.5);
+          ctx.closePath(); ctx.fill();
+        }
         ctx.restore();
       }
     }
-  }, [showBoundingBox, showMaskOverlay, selectedSpecimenIndex, resolveOrientationLabelFromBox]);
+  }, [showBoundingBox, showMaskOverlay, selectedSpecimenIndex, resolveOrientationLabelFromBox, drawDefaultOrientation, activeOrientationMode]);
 
-  // Load models on mount (or when active session changes)
+  // Sync effectiveSessionId with the globally active species on first mount
+  useEffect(() => {
+    if (activeSpeciesId && selectedInferenceSpeciesId === null) {
+      setSelectedInferenceSpeciesId(activeSpeciesId);
+    }
+  }, [activeSpeciesId, selectedInferenceSpeciesId]);
+
+  // Load models on mount (or when effective session changes)
   useEffect(() => {
     const loadModels = async () => {
-      if (!activeSpeciesId) {
+      setLoadingModels(true);
+      if (!effectiveSessionId) {
         setModels([]);
         setSelectedModelKey("");
         setLoadingModels(false);
         return;
       }
       try {
-        const result = await window.api.listModels(activeSpeciesId);
+        const result = await window.api.listModels(effectiveSessionId);
         if (result.ok && result.models) {
           const available = result.models.filter(
             (m) => (m.predictorType ?? "dlib") === "dlib" || m.predictorType === "cnn"
@@ -1317,7 +1381,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       }
     };
     loadModels();
-  }, [activeSpeciesId, modelToKey, resolveInitialModelKey]);
+  }, [effectiveSessionId, modelToKey, resolveInitialModelKey]);
 
   useEffect(() => {
     if (!initialModel || models.length === 0) return;
@@ -1334,43 +1398,37 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   }, [initialModel, models, modelToKey]);
 
   useEffect(() => {
-    let cancelled = false;
-    const openInferenceSession = async () => {
-      if (!activeSpeciesId) {
-        setInferenceSessionId("");
-        setInferenceSessionManifest(null);
-        return;
+    if (!activeSpeciesId || !inferenceSessionId || !selectedModelKey) return;
+    const selectedModel = getSelectedModel();
+    if (!selectedModel) return;
+    void window.api.sessionUpdateInferenceSessionPreferences(
+      activeSpeciesId,
+      inferenceSessionId,
+      {
+        preferences: {
+          lastUsedLandmarkModelKey: selectedModelKey,
+          lastUsedPredictorType: selectedModel.predictorType ?? "dlib",
+        },
       }
-      const selectedModel = getSelectedModel();
-      if (!selectedModel) {
-        setInferenceSessionId("");
-        setInferenceSessionManifest(null);
-        return;
-      }
+    );
+  }, [activeSpeciesId, getSelectedModel, inferenceSessionId, selectedModelKey]);
 
-      const res = await window.api.sessionOpenInferenceSession({
-        speciesId: activeSpeciesId,
-        landmarkModelKey: selectedModelKey,
-        landmarkModelName: selectedModel.name,
-        landmarkPredictorType: selectedModel.predictorType ?? "dlib",
-        detectionModelKey: "session_detection_default",
-        detectionModelName: "Session Detection Model",
+  // Auto-load persisted image list when session opens and no images are loaded yet
+  useEffect(() => {
+    if (!activeSpeciesId || !inferenceSessionId || images.length > 0) return;
+    (async () => {
+      const res = await window.api.sessionLoadInferenceImagePaths(activeSpeciesId, inferenceSessionId);
+      if (!res.ok || !res.images || res.images.length === 0) return;
+      const loaded: InferenceImage[] = res.images.map((f) => {
+        const bytes = Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0));
+        const url = URL.createObjectURL(new Blob([bytes], { type: f.mimeType }));
+        return { path: f.path, name: f.name, url };
       });
-      if (cancelled) return;
-      if (!res.ok || !res.inferenceSessionId) {
-        setInferenceSessionId("");
-        setInferenceSessionManifest(null);
-        toast.error(res.error || "Failed to open inference session context.");
-        return;
-      }
-      setInferenceSessionId(res.inferenceSessionId);
-      setInferenceSessionManifest(res.manifest ?? null);
-    };
-    void openInferenceSession();
-    return () => {
-      cancelled = true;
-    };
-  }, [activeSpeciesId, getSelectedModel, selectedModelKey]);
+      setImages(loaded);
+      await hydratePersistedReviewDrafts(loaded);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSpeciesId, inferenceSessionId]);
 
   // Fetch OBB detector readiness whenever species or selected model changes
   useEffect(() => {
@@ -1413,6 +1471,13 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         const combinedImages = [...images, ...newImages];
         setImages(combinedImages);
         await hydratePersistedReviewDrafts(combinedImages);
+        if (inferenceSessionId) {
+          void window.api.sessionSaveInferenceImagePaths(
+            activeSpeciesId,
+            inferenceSessionId,
+            combinedImages.map((img) => ({ path: img.path, name: img.name }))
+          );
+        }
         toast.success(`Added ${result.files.length} image(s)`);
       }
     } catch (err) {
@@ -1435,13 +1500,20 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       } else if (index < currentIndex) {
         setCurrentIndex((c) => Math.max(0, c - 1));
       }
+      if (activeSpeciesId && inferenceSessionId) {
+        void window.api.sessionSaveInferenceImagePaths(
+          activeSpeciesId,
+          inferenceSessionId,
+          next.map((img) => ({ path: img.path, name: img.name }))
+        );
+      }
       return next;
     });
     setCorrectedSpecimensMap((prev) => shiftIndicesInMap(prev, index));
     setEditedImageIndices((prev) => shiftIndicesInSet(prev, index));
     setSavedImageIndices((prev) => shiftIndicesInSet(prev, index));
     setReviewFinalizedImageIndices((prev) => shiftIndicesInSet(prev, index));
-    setQueuedImageIndices((prev) => shiftIndicesInSet(prev, index));
+    setCommittedImageIndices((prev) => shiftIndicesInSet(prev, index));
   };
 
   const handleRunDetection = async () => {
@@ -1462,7 +1534,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     setEditedImageIndices(new Set());
     setSavedImageIndices(new Set());
     setReviewFinalizedImageIndices(new Set());
-    setQueuedImageIndices(new Set());
+    setCommittedImageIndices(new Set());
     setSelectedSpecimenIndex(null);
     setInferProgress({ percent: 0, stage: "detecting" });
 
@@ -1481,7 +1553,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           speciesId: activeSpeciesId,
         });
         if (detectResult.ok && Array.isArray(detectResult.boxes)) {
-          const boxes = detectResult.boxes
+          const boxes = (detectResult.boxes as Array<DetectedBox & { obbCorners?: [number, number][]; angle?: number }>)
             .filter((b) => Number(b.width) > 0 && Number(b.height) > 0)
             .map((b) => ({
               left: Number(b.left),
@@ -1494,6 +1566,8 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               class_id: Number.isFinite(Number(b.class_id)) ? Number(b.class_id) : undefined,
               class_name: b.class_name,
               orientation_hint: b.orientation_hint,
+              obbCorners: Array.isArray(b.obbCorners) ? b.obbCorners as [number, number][] : undefined,
+              angle: typeof b.angle === "number" ? b.angle : undefined,
             }));
 
           const inferredWidth = detectResult.image_width && detectResult.image_width > 0
@@ -1518,6 +1592,13 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           };
           updatedImages[i] = { ...updatedImages[i], results: detectionResult, error: undefined };
           successCount++;
+          // Auto-save detected boxes as draft so they persist across sessions
+          void persistReviewDraft(i, {
+            specimens: detectionResult.specimens as PredictedSpecimen[],
+            edited: false,
+            saved: false,
+            committedAt: null,
+          });
         } else {
           updatedImages[i] = { ...updatedImages[i], error: detectResult.error || "Detection failed" };
           errorCount++;
@@ -1622,24 +1703,29 @@ export const InferencePage: React.FC<InferencePageProps> = ({
 
     for (let i = 0; i < images.length; i++) {
       const img = images[i];
-      const acceptedBoxes = getSpecimensForImageIndex(i)
-        .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0)
-        .map((s) => ({
-          left: Math.round(s.box.left),
-          top: Math.round(s.box.top),
-          width: Math.round(s.box.width),
-          height: Math.round(s.box.height),
-          right: Math.round(s.box.left + s.box.width),
-          bottom: Math.round(s.box.top + s.box.height),
-          orientation_hint:
-            s.box.orientation_override === "left" || s.box.orientation_override === "right"
-              ? {
-                  orientation: s.box.orientation_override,
-                  confidence: 1.0,
-                  source: "user_review",
-                }
-              : s.box.orientation_hint,
-        }));
+      // Snapshot OBB geometry before inference � backend returns AABB-only boxes
+      const preInferenceSpecs = getSpecimensForImageIndex(i)
+        .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0);
+      const obbSnapshot = preInferenceSpecs.map((s) => ({
+        obbCorners: s.box.obbCorners,
+        angle: s.box.angle,
+      }));
+      const acceptedBoxes = preInferenceSpecs.map((s) => ({
+        left: Math.round(s.box.left),
+        top: Math.round(s.box.top),
+        width: Math.round(s.box.width),
+        height: Math.round(s.box.height),
+        right: Math.round(s.box.left + s.box.width),
+        bottom: Math.round(s.box.top + s.box.height),
+        orientation_hint:
+          s.box.orientation_override === "left" || s.box.orientation_override === "right"
+            ? {
+                orientation: s.box.orientation_override,
+                confidence: 1.0,
+                source: "user_review",
+              }
+            : s.box.orientation_hint,
+      }));
       if (acceptedBoxes.length === 0) {
         updatedImages[i] = {
           ...updatedImages[i],
@@ -1662,8 +1748,24 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           }
         );
         if (result.ok && result.data) {
+          // Re-inject OBB geometry � backend only uses/returns AABB; obbCorners are display-only
+          (result.data.specimens ?? []).forEach((spec, idx) => {
+            if (spec?.box && obbSnapshot[idx]) {
+              const mutableBox = spec.box as Record<string, unknown>;
+              if (obbSnapshot[idx].obbCorners) mutableBox.obbCorners = obbSnapshot[idx].obbCorners;
+              if (typeof obbSnapshot[idx].angle === "number") mutableBox.angle = obbSnapshot[idx].angle;
+            }
+          });
           updatedImages[i] = { ...updatedImages[i], results: result.data, error: undefined };
           successCount++;
+          // Auto-save inference results as draft so they persist across sessions
+          const specsToSave = (result.data.specimens ?? []) as unknown as PredictedSpecimen[];
+          void persistReviewDraft(i, {
+            specimens: specsToSave,
+            edited: false,
+            saved: false,
+            committedAt: null,
+          });
         } else {
           updatedImages[i] = { ...updatedImages[i], error: result.error || "Landmark inference failed" };
           errorCount++;
@@ -1731,61 +1833,72 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     saveCorrectionsForImage,
   ]);
 
-  const handleQueueFinalizedForRetrain = useCallback(async () => {
+  const handleCommitReviewComplete = useCallback(async () => {
     if (!activeSpeciesId || !inferenceSessionId) {
       toast.error("Inference session is not ready yet.");
       return;
     }
-    const targets = images
+    const reviewCompleteTargets = images
       .map((img, idx) => ({ img, idx }))
-      .filter(
-        ({ img, idx }) =>
-          Boolean(img.results) &&
-          savedImageIndices.has(idx) &&
-          reviewFinalizedImageIndices.has(idx) &&
-          !queuedImageIndices.has(idx)
-      )
+      .filter(({ img, idx }) => Boolean(img.results) && reviewFinalizedImageIndices.has(idx))
       .map(({ idx }) => idx);
-    if (targets.length === 0) {
-      toast.message("No finalized images available to queue.");
+    if (reviewCompleteTargets.length === 0) {
+      toast.message("No review-complete images available to commit.");
       return;
     }
 
-    setIsQueueingRetrain(true);
-    let queued = 0;
-    let failed = 0;
+    setIsCommittingReview(true);
     try {
-      for (const idx of targets) {
-        const ok = await queueRetrainForImage(idx);
-        if (ok) queued += 1;
-        else failed += 1;
+      // Flush only edited targets; untouched drafts must keep their original updatedAt
+      // so commit idempotency can skip already-committed unchanged items.
+      const editedTargets = reviewCompleteTargets.filter((idx) =>
+        editedImageIndices.has(idx)
+      );
+      for (const idx of editedTargets) {
+        await persistReviewDraft(idx, {
+          specimens: getSpecimensForImageIndex(idx),
+          edited: true,
+          saved: savedImageIndices.has(idx),
+          reviewComplete: true,
+        });
+      }
+      const commitRes = await window.api.sessionCommitInferenceReview(
+        activeSpeciesId,
+        inferenceSessionId,
+        { onlyReviewComplete: true }
+      );
+      if (!commitRes.ok) {
+        toast.error(commitRes.error || "Failed to commit review-complete data.");
+        return;
+      }
+      const committed = Number(commitRes.committed || 0);
+      const skipped = Number(commitRes.skipped || 0);
+      const failed = Number(commitRes.failed || 0);
+      await hydratePersistedReviewDrafts(images);
+      if (committed > 0) {
+        toast.success(
+          failed > 0
+            ? `Committed ${committed} image(s), ${failed} failed, ${skipped} skipped.`
+            : `Committed ${committed} image(s) to training data.`
+        );
+      } else if (skipped > 0) {
+        toast.message(`No new changes to commit (${skipped} already up-to-date).`);
+      } else {
+        toast.error("No review data was committed.");
       }
     } finally {
-      setIsQueueingRetrain(false);
-    }
-
-    if (queued > 0) {
-      toast.success(
-        failed > 0
-          ? `Queued ${queued} finalized image(s), ${failed} failed.`
-          : `Queued ${queued} finalized image(s) for retraining.`
-      );
-      if (autoRetrainEnabled) {
-        void attemptAutoRetrainIfReady();
-      }
-    } else {
-      toast.error("No finalized images were queued.");
+      setIsCommittingReview(false);
     }
   }, [
     activeSpeciesId,
     inferenceSessionId,
+    editedImageIndices,
+    getSpecimensForImageIndex,
+    hydratePersistedReviewDrafts,
     images,
-    savedImageIndices,
+    persistReviewDraft,
     reviewFinalizedImageIndices,
-    queuedImageIndices,
-    queueRetrainForImage,
-    autoRetrainEnabled,
-    attemptAutoRetrainIfReady,
+    savedImageIndices,
   ]);
 
   const handleRemoveSpecimen = useCallback((specimenIndex: number) => {
@@ -1811,7 +1924,12 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     });
     markImageEdited(currentIndex);
     drawToCanvas(cloned);
-    void persistReviewDraft(currentIndex, { specimens: cloned, edited: true, saved: false });
+    void persistReviewDraft(currentIndex, {
+      specimens: cloned,
+      edited: true,
+      saved: false,
+      committedAt: null,
+    });
     toast.success(`Removed specimen ${specimenIndex + 1}.`);
   }, [currentIndex, drawToCanvas, getSpecimensForImageIndex, markImageEdited, persistReviewDraft]);
 
@@ -1895,7 +2013,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     toast.success(`Exported to ${filename}`);
   };
 
-  // Canvas coordinate mapping: CSS coords Ã¢â€ â€™ canvas pixel coords
+  // Canvas coordinate mapping: CSS coordinates -> canvas pixel coordinates
   const toCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
@@ -1937,18 +2055,56 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       }
     }
 
-    // 2) Box interactions: corner handles (resize), then box interior (move)
+    // 2) Box interactions: rotation handle, corner handles (resize), then box interior (move)
     if (showBoundingBox) {
+      const rotHandleR = Math.max(7, diagonal * 0.009);
+
+      // 2a) Rotation handle detection (priority over corner handles)
+      for (let si = 0; si < specs.length; si++) {
+        const box = specs[si].box;
+        if (!box || box.width <= 0 || box.height <= 0) continue;
+        const rhx = box.left + box.width / 2;
+        const rhy = Math.max(box.top - 30, rotHandleR + 4);
+        if (Math.sqrt((x - rhx) ** 2 + (y - rhy) ** 2) <= rotHandleR + 4) {
+          setSelectedSpecimenIndex(si);
+          const rawObb = Array.isArray(box.obbCorners) && box.obbCorners.length === 4
+            ? box.obbCorners as [number, number][]
+            : [[box.left, box.top], [box.left + box.width, box.top],
+               [box.left + box.width, box.top + box.height], [box.left, box.top + box.height]] as [number, number][];
+          const cx = rawObb.reduce((s, p) => s + p[0], 0) / 4;
+          const cy = rawObb.reduce((s, p) => s + p[1], 0) / 4;
+          boxDraggingRef.current = {
+            specIdx: si,
+            mode: "rotate",
+            startMouse: { x, y },
+            startBox: {
+              left: box.left, top: box.top, width: box.width, height: box.height,
+              obbCorners: rawObb.map(p => [...p] as [number, number]),
+              cx, cy,
+            },
+          };
+          e.currentTarget.style.cursor = "grab";
+          return;
+        }
+      }
+
       for (let si = 0; si < specs.length; si++) {
         const box = specs[si].box;
         if (!box || box.width <= 0 || box.height <= 0) continue;
 
-        const corners: { cx: number; cy: number; mode: BoxDragMode }[] = [
-          { cx: box.left,             cy: box.top,             mode: "resize-tl" },
-          { cx: box.left + box.width, cy: box.top,             mode: "resize-tr" },
-          { cx: box.left,             cy: box.top + box.height, mode: "resize-bl" },
-          { cx: box.left + box.width, cy: box.top + box.height, mode: "resize-br" },
-        ];
+        // Use OBB corner positions when available (matching drawToCanvas)
+        const obbPts = Array.isArray(box.obbCorners) && box.obbCorners.length === 4
+          ? box.obbCorners as [number, number][]
+          : null;
+        const cornerModes: BoxDragMode[] = ["resize-tl", "resize-tr", "resize-br", "resize-bl"];
+        const corners: { cx: number; cy: number; mode: BoxDragMode }[] = obbPts
+          ? obbPts.map(([px, py], i) => ({ cx: px, cy: py, mode: cornerModes[i] }))
+          : [
+              { cx: box.left,             cy: box.top,              mode: "resize-tl" },
+              { cx: box.left + box.width, cy: box.top,              mode: "resize-tr" },
+              { cx: box.left + box.width, cy: box.top + box.height, mode: "resize-br" },
+              { cx: box.left,             cy: box.top + box.height, mode: "resize-bl" },
+            ];
 
         for (const corner of corners) {
           if (Math.abs(x - corner.cx) <= boxHitRadius && Math.abs(y - corner.cy) <= boxHitRadius) {
@@ -1957,19 +2113,22 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               specIdx: si,
               mode: corner.mode,
               startMouse: { x, y },
-              startBox: { left: box.left, top: box.top, width: box.width, height: box.height },
+              startBox: {
+                left: box.left, top: box.top, width: box.width, height: box.height,
+                obbCorners: obbPts ? obbPts.map(p => [...p] as [number, number]) : undefined,
+              },
             };
             const cursors: Record<BoxDragMode, string> = {
               "resize-tl": "nw-resize", "resize-tr": "ne-resize",
               "resize-bl": "sw-resize", "resize-br": "se-resize",
-              move: "move",
+              move: "move", rotate: "grab",
             };
             e.currentTarget.style.cursor = cursors[corner.mode];
             return;
           }
         }
 
-        // Box interior Ã¢â€ â€™ move
+        // Box interior -> move
         if (
           x >= box.left && x <= box.left + box.width &&
           y >= box.top  && y <= box.top  + box.height
@@ -1979,7 +2138,10 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             specIdx: si,
             mode: "move",
             startMouse: { x, y },
-            startBox: { left: box.left, top: box.top, width: box.width, height: box.height },
+            startBox: {
+              left: box.left, top: box.top, width: box.width, height: box.height,
+              obbCorners: obbPts ? obbPts.map(p => [...p] as [number, number]) : undefined,
+            },
           };
           e.currentTarget.style.cursor = "move";
           return;
@@ -2009,28 +2171,89 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       const box = liveSpecimensRef.current[specIdx].box;
       const MIN_SIZE = 10;
 
-      if (mode === "move") {
+      if (mode === "rotate") {
+        const { cx = 0, cy = 0, obbCorners: initCorners } = startBox;
+        if (initCorners && initCorners.length === 4) {
+          const startAngle = Math.atan2(startMouse.y - cy, startMouse.x - cx);
+          const currentAngle = Math.atan2(y - cy, x - cx);
+          const delta = currentAngle - startAngle;
+          const cos = Math.cos(delta);
+          const sin = Math.sin(delta);
+          const newCorners: [number, number][] = initCorners.map(([px, py]) => {
+            const ddx = px - cx;
+            const ddy = py - cy;
+            return [cx + ddx * cos - ddy * sin, cy + ddx * sin + ddy * cos];
+          });
+          box.obbCorners = newCorners;
+          const xs = newCorners.map(p => p[0]);
+          const ys = newCorners.map(p => p[1]);
+          box.left = Math.min(...xs);  box.top = Math.min(...ys);
+          box.right = Math.max(...xs); box.bottom = Math.max(...ys);
+          box.width = box.right - box.left; box.height = box.bottom - box.top;
+        }
+      } else if (mode === "move") {
         box.left  = startBox.left  + dx;
         box.top   = startBox.top   + dy;
-      } else if (mode === "resize-tl") {
-        const newW = Math.max(MIN_SIZE, startBox.width  - dx);
-        const newH = Math.max(MIN_SIZE, startBox.height - dy);
-        box.left  = startBox.left  + (startBox.width  - newW);
-        box.top   = startBox.top   + (startBox.height - newH);
-        box.width  = newW;
-        box.height = newH;
-      } else if (mode === "resize-tr") {
-        box.top    = startBox.top + dy;
-        box.width  = Math.max(MIN_SIZE, startBox.width  + dx);
-        box.height = Math.max(MIN_SIZE, startBox.height - dy);
-        box.top    = startBox.top + (startBox.height - box.height);
-      } else if (mode === "resize-bl") {
-        box.left   = startBox.left + dx;
-        box.width  = Math.max(MIN_SIZE, startBox.width  - dx);
-        box.height = Math.max(MIN_SIZE, startBox.height + dy);
-      } else if (mode === "resize-br") {
-        box.width  = Math.max(MIN_SIZE, startBox.width  + dx);
-        box.height = Math.max(MIN_SIZE, startBox.height + dy);
+        if (startBox.obbCorners) {
+          box.obbCorners = startBox.obbCorners.map(([px, py]) => [px + dx, py + dy] as [number, number]);
+        }
+      } else if (mode === "resize-tl" || mode === "resize-tr" || mode === "resize-bl" || mode === "resize-br") {
+        const modeToIdx: Record<string, number> = { "resize-tl": 0, "resize-tr": 1, "resize-br": 2, "resize-bl": 3 };
+        const dragIdx = modeToIdx[mode];
+        if (startBox.obbCorners && startBox.obbCorners.length === 4) {
+          // OBB-preserving resize: keep opposite corner fixed, project mouse onto local axes
+          const corners: [number, number][] = startBox.obbCorners.map(p => [p[0], p[1]]);
+          const fixedIdx = (dragIdx + 2) % 4;
+          const adj1Idx  = (dragIdx + 1) % 4;
+          const adj2Idx  = (dragIdx + 3) % 4;
+          const [fx, fy] = corners[fixedIdx];
+          // Local axis vectors (from fixed corner to each adjacent corner)
+          const [a1x, a1y] = corners[adj1Idx];
+          const [a2x, a2y] = corners[adj2Idx];
+          const u1x = a1x - fx, u1y = a1y - fy;
+          const u2x = a2x - fx, u2y = a2y - fy;
+          const len1 = Math.sqrt(u1x * u1x + u1y * u1y) || 1;
+          const len2 = Math.sqrt(u2x * u2x + u2y * u2y) || 1;
+          const n1x = u1x / len1, n1y = u1y / len1;
+          const n2x = u2x / len2, n2y = u2y / len2;
+          // Project mouse position onto each axis (relative to fixed corner)
+          const mx = x - fx, my = y - fy;
+          const proj1 = Math.max(MIN_SIZE, mx * n1x + my * n1y);
+          const proj2 = Math.max(MIN_SIZE, mx * n2x + my * n2y);
+          const newCorners: [number, number][] = [...corners];
+          newCorners[adj1Idx] = [fx + n1x * proj1, fy + n1y * proj1];
+          newCorners[adj2Idx] = [fx + n2x * proj2, fy + n2y * proj2];
+          newCorners[dragIdx] = [fx + n1x * proj1 + n2x * proj2, fy + n1y * proj1 + n2y * proj2];
+          newCorners[fixedIdx] = [fx, fy];
+          box.obbCorners = newCorners;
+          const xs = newCorners.map(p => p[0]);
+          const ys = newCorners.map(p => p[1]);
+          box.left = Math.min(...xs);  box.top = Math.min(...ys);
+          box.right = Math.max(...xs); box.bottom = Math.max(...ys);
+          box.width = box.right - box.left; box.height = box.bottom - box.top;
+        } else {
+          // AABB fallback
+          box.obbCorners = undefined; box.angle = undefined;
+          if (mode === "resize-tl") {
+            const newW = Math.max(MIN_SIZE, startBox.width  - dx);
+            const newH = Math.max(MIN_SIZE, startBox.height - dy);
+            box.left  = startBox.left  + (startBox.width  - newW);
+            box.top   = startBox.top   + (startBox.height - newH);
+            box.width  = newW;
+            box.height = newH;
+          } else if (mode === "resize-tr") {
+            box.width  = Math.max(MIN_SIZE, startBox.width  + dx);
+            box.height = Math.max(MIN_SIZE, startBox.height - dy);
+            box.top    = startBox.top + (startBox.height - box.height);
+          } else if (mode === "resize-bl") {
+            box.left   = startBox.left + dx;
+            box.width  = Math.max(MIN_SIZE, startBox.width  - dx);
+            box.height = Math.max(MIN_SIZE, startBox.height + dy);
+          } else if (mode === "resize-br") {
+            box.width  = Math.max(MIN_SIZE, startBox.width  + dx);
+            box.height = Math.max(MIN_SIZE, startBox.height + dy);
+          }
+        }
       }
       // Sync right/bottom fields
       box.right  = box.left + box.width;
@@ -2077,6 +2300,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             height,
             right: x1 + width,
             bottom: y1 + height,
+            obbCorners: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            angle: 0,
+            orientation_override: drawDefaultOrientation,
+            orientation_hint: {
+              orientation: drawDefaultOrientation,
+              confidence: 1.0,
+              source: "user_draw_default",
+            },
           },
           landmarks: [],
           num_landmarks: 0,
@@ -2090,7 +2321,12 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           return next;
         });
         markImageEdited(currentIndex);
-        void persistReviewDraft(currentIndex, { specimens: updated, edited: true, saved: false });
+        void persistReviewDraft(currentIndex, {
+          specimens: updated,
+          edited: true,
+          saved: false,
+          committedAt: null,
+        });
         drawToCanvas(updated);
         toast.success("Added manual detection box.");
       } else {
@@ -2110,7 +2346,12 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     });
     if (wasLmDragging || wasBoxDragging) {
       markImageEdited(currentIndex);
-      void persistReviewDraft(currentIndex, { specimens: updated, edited: true, saved: false });
+      void persistReviewDraft(currentIndex, {
+        specimens: updated,
+        edited: true,
+        saved: false,
+        committedAt: null,
+      });
     }
   };
 
@@ -2166,12 +2407,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const hasInferenceResults = images.some((img) => Boolean(img.results));
   const currentEdited = editedImageIndices.has(currentIndex);
   const currentSaved = savedImageIndices.has(currentIndex);
-  const currentQueued = queuedImageIndices.has(currentIndex);
+  const currentCommitted = committedImageIndices.has(currentIndex);
   const reviewActionsDisabled =
     isRunning ||
     isSavingCorrections ||
-    isQueueingRetrain ||
-    isAutoRetraining ||
+    isCommittingReview ||
     !currentImage?.results ||
     !inferenceSessionId;
   const selectedSpecimenResolvedIndex =
@@ -2186,6 +2426,209 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       ? currentSpecimens[selectedSpecimenResolvedIndex]
       : null;
   const selectedOrientation = resolveOrientationLabelFromBox(selectedSpecimen?.box);
+  const hasWorkspaceData =
+    images.length > 0 ||
+    editedImageIndices.size > 0 ||
+    savedImageIndices.size > 0 ||
+    correctedSpecimensMap.size > 0;
+  const handleReturnToInferenceHub = () => {
+    if (
+      hasWorkspaceData &&
+      !window.confirm(
+        "Return to Inference Sessions? Unsaved in-memory canvas state for this view will be reset."
+      )
+    ) {
+      return;
+    }
+    setShowInferenceHub(true);
+    setSelectedInferenceSpeciesId(null);
+    setInferenceSessionId("");
+    setInferenceSessionManifest(null);
+    setSessionPreferredModelKey("");
+    setSelectedModelKey("");
+    resetInferenceWorkspaceState();
+    void refreshInferenceHubSessions();
+  };
+
+  if (showInferenceHub) {
+    return (
+      <div className="flex h-screen w-screen flex-col bg-background">
+        <div className="flex items-center justify-between border-b p-4">
+          <div className="flex items-center gap-4">
+            <motion.div {...buttonHover} {...buttonTap}>
+              <Button variant="ghost" size="icon" onClick={() => onNavigate("landing")}>
+                <ArrowLeft className="h-5 w-5" />
+              </Button>
+            </motion.div>
+            <div className="flex items-center gap-2">
+              <Microscope className="h-5 w-5 text-primary" />
+              <h1 className="text-lg font-bold">Inference Sessions</h1>
+            </div>
+          </div>
+          <Button
+            onClick={() => {
+              if (isFirstTimeLocked) {
+                toast.error("Create or resume your first schema session in Annotate first.");
+                return;
+              }
+              if (schemaOptions.length === 0) {
+                toast.error("No schema sessions available. Create one in Annotate first.");
+                return;
+              }
+              const fallbackSpeciesId =
+                (activeSpeciesId && schemaOptions.some((schema) => schema.id === activeSpeciesId)
+                  ? activeSpeciesId
+                  : schemaOptions[0]?.id) || "";
+              setCreateSessionSpeciesId(fallbackSpeciesId);
+              setCreateSessionName("");
+              setCreateSessionDialogOpen(true);
+            }}
+            disabled={isFirstTimeLocked || schemaOptions.length === 0}
+          >
+            <Plus className="mr-2 h-4 w-4" />
+            Create Inference Session
+          </Button>
+        </div>
+
+        <div className="flex-1 overflow-auto p-6">
+          {isFirstTimeLocked && (
+            <Card className="mx-auto mb-6 max-w-2xl border-amber-500/40 bg-amber-500/5">
+              <CardHeader>
+                <CardTitle className="text-base">Annotate First</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm text-muted-foreground">
+                <p>
+                  Inference is available after you create or resume your first schema session in Annotate.
+                </p>
+                <Button onClick={() => onNavigate("workspace")} variant="outline">
+                  Go to Annotate
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
+          {loadingHubSessions ? (
+            <div className="flex items-center justify-center py-16 text-sm text-muted-foreground">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Loading inference sessions...
+            </div>
+          ) : hubSessions.length === 0 ? (
+            <Card className="mx-auto max-w-xl border-dashed">
+              <CardContent className="py-10 text-center text-sm text-muted-foreground">
+                No schema sessions found. Create and open a schema in Annotate first.
+              </CardContent>
+            </Card>
+          ) : (
+            <motion.div
+              variants={staggerContainer}
+              initial="initial"
+              animate="animate"
+              className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+            >
+              {hubSessions.map((session) => {
+                const opening = openingInferenceSessionSpeciesId === session.speciesId;
+                return (
+                  <motion.div key={session.speciesId} variants={staggerItem}>
+                    <motion.div variants={cardHover} initial="initial" whileHover="hover" className="h-full">
+                      <Card className="h-full border-border/50 bg-card/50 backdrop-blur-sm">
+                        <CardHeader className="pb-2">
+                          <CardTitle className="truncate text-sm font-semibold">
+                            {session.schemaName}
+                          </CardTitle>
+                        </CardHeader>
+                        <CardContent className="space-y-3">
+                          <p className="text-xs text-muted-foreground">
+                            Schema ID: <span className="font-mono">{session.speciesId}</span>
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            Images: {session.schemaImageCount}
+                          </p>
+                          <p className="truncate text-xs text-muted-foreground">
+                            Inference Session: {session.exists ? session.displayName || "default" : "Not created"}
+                          </p>
+                          <Button
+                            className="w-full"
+                            variant={session.exists ? "default" : "outline"}
+                            disabled={opening || isFirstTimeLocked}
+                            onClick={() => {
+                              if (session.exists) {
+                                void openInferenceSessionForSchema(session.speciesId);
+                              } else {
+                                setCreateSessionSpeciesId(session.speciesId);
+                                setCreateSessionName(session.schemaName);
+                                setCreateSessionDialogOpen(true);
+                              }
+                            }}
+                          >
+                            {opening ? (
+                              <>
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                Opening...
+                              </>
+                            ) : session.exists ? (
+                              "Open Session"
+                            ) : (
+                              "Create Session"
+                            )}
+                          </Button>
+                        </CardContent>
+                      </Card>
+                    </motion.div>
+                  </motion.div>
+                );
+              })}
+            </motion.div>
+          )}
+        </div>
+
+        <Dialog open={createSessionDialogOpen} onOpenChange={setCreateSessionDialogOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Create Inference Session</DialogTitle>
+              <DialogDescription>
+                Create the single inference session for a schema. This session stores draft review state and commit history.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <div className="space-y-1">
+                <Label htmlFor="inference-schema-select">Schema Session</Label>
+                <select
+                  id="inference-schema-select"
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  value={createSessionSpeciesId}
+                  onChange={(e) => setCreateSessionSpeciesId(e.target.value)}
+                >
+                  {schemaOptions.map((schema) => (
+                    <option key={schema.id} value={schema.id}>
+                      {schema.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="inference-session-name">Session Name</Label>
+                <Input
+                  id="inference-session-name"
+                  value={createSessionName}
+                  onChange={(e) => setCreateSessionName(e.target.value)}
+                  placeholder="e.g. Fish Morphometrics Review"
+                />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setCreateSessionDialogOpen(false)}>
+                Cancel
+              </Button>
+              <Button onClick={() => void handleCreateInferenceSession()}>
+                Create
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen w-screen flex-col bg-background">
       {/* Header */}
@@ -2206,9 +2649,9 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               <h1 className="text-lg font-bold">Run Inference</h1>
             </div>
             <div className="flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
-              {activeSpeciesId && (
+              {effectiveSessionId && (
                 <span className="rounded bg-muted px-1.5 py-0.5">
-                  Schema: {activeSpeciesId}
+                  Schema: {effectiveSessionId}
                 </span>
               )}
               {selectedModelKey && (
@@ -2231,6 +2674,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
+          <motion.div {...buttonHover} {...buttonTap}>
+            <Button
+              variant="outline"
+              onClick={handleReturnToInferenceHub}
+            >
+              Switch Session
+            </Button>
+          </motion.div>
           {hasInferenceResults && (
             <div className="hidden items-center gap-2 lg:flex">
               <Button
@@ -2256,13 +2707,13 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                 <ImageIcon className="mr-2 h-4 w-4" />
                 {showMaskOverlay ? "Masks On" : "Masks Off"}
               </Button>
-              {currentQueued ? (
+              {currentCommitted ? (
                 <span className="rounded bg-indigo-500/15 px-2 py-1 text-xs font-semibold text-indigo-600">
-                  Queued
+                  Committed
                 </span>
               ) : currentSaved ? (
                 <span className="rounded bg-emerald-500/15 px-2 py-1 text-xs font-semibold text-emerald-600">
-                  Finalized
+                  Saved
                 </span>
               ) : currentEdited ? (
                 <span className="rounded bg-amber-500/15 px-2 py-1 text-xs font-semibold text-amber-600">
@@ -2275,7 +2726,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             <Button
               variant="outline"
               onClick={handleRunDetection}
-              disabled={isRunning || isAutoRetraining || !activeSpeciesId || images.length === 0}
+              disabled={isRunning || !effectiveSessionId || images.length === 0}
             >
               {isRunning ? (
                 <>
@@ -2293,17 +2744,12 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           <motion.div {...buttonHover} {...buttonTap}>
             <Button
               onClick={handleRunInference}
-              disabled={isRunning || isAutoRetraining || !activeSpeciesId || !selectedModelKey || images.length === 0}
+              disabled={isRunning || !effectiveSessionId || !selectedModelKey || images.length === 0}
             >
               {isRunning ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                   Running...
-                </>
-              ) : isAutoRetraining ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Auto-retraining...
                 </>
               ) : (
                 <>
@@ -2327,19 +2773,6 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           </div>
           <p className="mt-1 text-center text-xs text-muted-foreground">
             {STAGE_LABELS[inferProgress.stage] ?? inferProgress.stage}
-          </p>
-        </div>
-      )}
-      {isAutoRetraining && autoRetrainProgress && (
-        <div className="border-b px-4 py-2">
-          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-            <div
-              className="h-full rounded-full bg-emerald-500 transition-all duration-300"
-              style={{ width: `${autoRetrainProgress.percent}%` }}
-            />
-          </div>
-          <p className="mt-1 text-center text-xs text-muted-foreground">
-            Auto-retrain: {autoRetrainProgress.message}
           </p>
         </div>
       )}
@@ -2370,9 +2803,9 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                         <Loader2 className="h-4 w-4 animate-spin" />
                         Loading...
                       </div>
-                    ) : !activeSpeciesId ? (
+                    ) : !effectiveSessionId ? (
                       <p className="text-xs text-muted-foreground">
-                        Select an active session to load session-scoped models.
+                        Select a session to load session-scoped models.
                       </p>
                     ) : models.length === 0 ? (
                       <p className="text-xs text-muted-foreground">
@@ -2398,13 +2831,13 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                         {obbDetectorReady === false && (
                           <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 mt-1">
                             <p className="text-[11px] font-semibold text-amber-700 dark:text-amber-400">
-                              No OBB detector trained — orientation accuracy may be reduced. Train an OBB detector in the Training dialog.
+                              No OBB detector trained � orientation accuracy may be reduced. Train an OBB detector in the Training dialog.
                             </p>
                           </div>
                         )}
                         {obbDetectorReady === true && (
                           <p className="text-[11px] text-green-600 dark:text-green-400 mt-1">
-                            ✓ OBB detector active — orientation from detector geometry.
+                            ? OBB detector active � orientation from detector geometry.
                           </p>
                         )}
                       </div>
@@ -2429,30 +2862,82 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                     <CardContent className="space-y-3">
                       <div className="flex items-center justify-between rounded-md border border-border/70 px-2 py-1.5">
                         <span className="text-[11px] font-medium text-muted-foreground">
-                          Auto-retrain
+                          Current Image Review
                         </span>
-                        <div className="flex items-center gap-2">
-                          <Switch
-                            checked={autoRetrainEnabled}
-                            onCheckedChange={setAutoRetrainEnabled}
-                            disabled={reviewActionsDisabled || !selectedModelKey}
-                          />
-                          <span className="text-[10px] text-muted-foreground">
-                            {retrainQueueCount}/{AUTO_RETRAIN_MIN_QUEUE}
-                          </span>
-                        </div>
+                        <span
+                          className={cn(
+                            "rounded px-1.5 py-0.5 text-[10px] font-semibold",
+                            reviewFinalizedImageIndices.has(currentIndex)
+                              ? "bg-emerald-500/15 text-emerald-600"
+                              : "bg-amber-500/15 text-amber-600"
+                          )}
+                        >
+                          {reviewFinalizedImageIndices.has(currentIndex)
+                            ? "Complete"
+                            : "In Progress"}
+                        </span>
                       </div>
 
                       <div className="grid grid-cols-1 gap-2">
                         <Button
                           variant="outline"
                           size="sm"
+                          disabled={reviewActionsDisabled || !currentImage?.results}
+                          className="justify-start"
+                          onClick={() => {
+                            if (reviewFinalizedImageIndices.has(currentIndex)) return;
+                            setReviewFinalizedImageIndices((prev) => {
+                              const next = new Set(prev);
+                              next.add(currentIndex);
+                              return next;
+                            });
+                            void persistReviewDraft(currentIndex, {
+                              specimens: getSpecimensForImageIndex(currentIndex),
+                              edited: editedImageIndices.has(currentIndex),
+                              saved: savedImageIndices.has(currentIndex),
+                              reviewComplete: true,
+                            });
+                          }}
+                        >
+                          Mark Review Complete
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={reviewActionsDisabled || !currentImage?.results}
+                          className="justify-start"
+                          onClick={() => {
+                            if (!reviewFinalizedImageIndices.has(currentIndex)) return;
+                            setReviewFinalizedImageIndices((prev) => {
+                              const next = new Set(prev);
+                              next.delete(currentIndex);
+                              return next;
+                            });
+                            setCommittedImageIndices((prev) => {
+                              const next = new Set(prev);
+                              next.delete(currentIndex);
+                              return next;
+                            });
+                            void persistReviewDraft(currentIndex, {
+                              specimens: getSpecimensForImageIndex(currentIndex),
+                              edited: editedImageIndices.has(currentIndex),
+                              saved: savedImageIndices.has(currentIndex),
+                              reviewComplete: false,
+                              committedAt: null,
+                            });
+                          }}
+                        >
+                          Mark In Progress
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
                           onClick={handleSaveAllCorrections}
                           disabled={reviewActionsDisabled}
-                          title="Persist all edited inference corrections across this page"
+                          title="Persist edited review drafts in this inference session"
                           className="justify-start"
                         >
-                          {isSavingCorrections && !isQueueingRetrain ? (
+                          {isSavingCorrections && !isCommittingReview ? (
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                           ) : (
                             <Save className="mr-2 h-4 w-4" />
@@ -2462,17 +2947,17 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={handleQueueFinalizedForRetrain}
+                          onClick={handleCommitReviewComplete}
                           disabled={reviewActionsDisabled}
-                          title="Queue all finalized images in this inference session for retraining"
+                          title="Commit review-complete images into schema training data"
                           className="justify-start"
                         >
-                          {isQueueingRetrain || isAutoRetraining ? (
+                          {isCommittingReview ? (
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                           ) : (
                             <Save className="mr-2 h-4 w-4" />
                           )}
-                          Queue Finalized for Retrain
+                          Commit to Training Data
                         </Button>
                       </div>
 
@@ -2492,6 +2977,21 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                           <Square className="mr-2 h-4 w-4" />
                           {isDrawBoxMode ? "Drawing" : "Draw Box"}
                         </Button>
+                        {isDrawBoxMode && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              const next = drawDefaultOrientation === "left" ? "right" : "left";
+                              setDrawDefaultOrientation(next);
+                              window.localStorage.setItem("bv_draw_default_orientation", next);
+                            }}
+                            title="Toggle head direction for new boxes"
+                            className="justify-start text-xs"
+                          >
+                            {drawDefaultOrientation === "left" ? "\u2190 Head" : "Head \u2192"}
+                          </Button>
+                        )}
                         <Button
                           variant="outline"
                           size="sm"
@@ -2684,14 +3184,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                                 {getTotalLandmarks(img.results)} pts
                               </span>
                             )}
-                            {img.results && queuedImageIndices.has(idx) && (
+                            {img.results && committedImageIndices.has(idx) && (
                               <span className="shrink-0 rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-600">
-                                Queued
+                                Committed
                               </span>
                             )}
-                            {img.results && !queuedImageIndices.has(idx) && savedImageIndices.has(idx) && (
+                            {img.results && !committedImageIndices.has(idx) && savedImageIndices.has(idx) && (
                               <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-600">
-                                Finalized
+                                Saved
                               </span>
                             )}
                             {img.results && !savedImageIndices.has(idx) && editedImageIndices.has(idx) && (
@@ -2753,7 +3253,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             </div>
           ) : (
             <>
-              {/* Canvas Ã¢â‚¬â€ drag landmarks to correct them */}
+              {/* Canvas â€” drag landmarks to correct them */}
               <div className="relative flex-1 overflow-hidden">
                 <canvas
                   ref={canvasRef}
@@ -2834,7 +3334,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                       </div>
                       {currentSpecimenCount > 0 && (
                         <p className="text-muted-foreground/70">
-                          Drag landmarks and bounding box corners, then save review to include this image in retraining.
+                          Drag landmarks and bounding box corners, then save review to include this image in training-data commit.
                         </p>
                       )}
                       {isDrawBoxMode && (
@@ -2847,16 +3347,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                           Use the Review panel in the sidebar to set orientation, add/delete boxes, and save corrections.
                         </p>
                       )}
-                      {currentQueued && (
-                        <p className="font-medium text-indigo-600">Queued for retraining. Run training when ready.</p>
+                      {currentCommitted && (
+                        <p className="font-medium text-indigo-600">Committed to schema training data.</p>
                       )}
-                      {!autoRetrainEnabled && retrainQueueCount > 0 && (
-                        <p className="text-muted-foreground/70">
-                          Auto-retrain is off. Queued corrections will be used in your next manual training run.
-                        </p>
-                      )}
-                      {!currentQueued && currentSaved && (
-                        <p className="font-medium text-emerald-600">Finalized in session for retraining.</p>
+                      {!currentCommitted && currentSaved && (
+                        <p className="font-medium text-emerald-600">Saved in inference session.</p>
                       )}
                       {!currentSaved && currentEdited && (
                         <p className="font-medium text-amber-600">Edited locally. Save to persist corrections.</p>
@@ -2902,7 +3397,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                               return (
                                 <p key={`inference-meta-${idx}`}>
                                   #{idx + 1}: hint {detectorHint} ({detectorHintSource}) | mask {meta.mask_source ?? "none"} | pca{" "}
-                                  {typeof pcaAngle === "number" ? `${pcaAngle.toFixed(1)}°` : "n/a"} | canonical-flip {canonicalFlip} | dir{" "}
+                                  {typeof pcaAngle === "number" ? `${pcaAngle.toFixed(1)}�` : "n/a"} | canonical-flip {canonicalFlip} | dir{" "}
                                   {meta.direction_source ?? "n/a"}
                                   {typeof dirConf === "number" ? ` (${dirConf.toFixed(2)})` : ""} | flip{" "}
                                   {meta.was_flipped ? "yes" : "no"}
@@ -2926,5 +3421,3 @@ export const InferencePage: React.FC<InferencePageProps> = ({
 };
 
 export default InferencePage;
-
-

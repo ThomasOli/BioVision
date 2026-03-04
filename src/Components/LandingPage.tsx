@@ -257,7 +257,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       setSchemaDialogOpen(true);
       onSchemaDialogOpened?.();
     }
-  }, [openSchemaDialogOnMount]);
+  }, [openSchemaDialogOnMount, onSchemaDialogOpened]);
 
   const openOrientationDialogForLaunch = (launch: PendingSessionLaunch) => {
     const suggested = inferDefaultOrientationPolicy(launch.landmarkTemplate).mode;
