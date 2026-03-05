@@ -1,25 +1,51 @@
 import React, { ChangeEvent, useState, DragEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Upload, Folder, Trash2, X, ImageIcon, Loader2 } from "lucide-react";
-import { useDispatch } from "react-redux";
+import { Upload, Folder, Trash2, X, ImageIcon, Loader2, FileText, FolderOpen, Tag } from "lucide-react";
+import { useDispatch, useSelector } from "react-redux";
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Progress } from "@/Components/ui/progress";
 import { ScrollArea } from "@/Components/ui/scroll-area";
-import { addFiles } from "../state/filesState/fileSlice";
+import { addFilesWithSpecies } from "../state/filesState/fileSlice";
+import type { RootState } from "../state/store";
+import type { AnnotatedImage, BoundingBox } from "../types/Image";
 import { staggerContainer, staggerItem, dropzoneActive, buttonHover, buttonTap } from "@/lib/animations";
 import { toast } from "sonner";
 
 const fileKey = (f: File) => `${f.name}__${f.size}__${f.lastModified}`;
 
+// Convert a File to base64 string
+async function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Strip the data URL prefix (e.g. "data:image/jpeg;base64,")
+      const base64 = result.split(",")[1];
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 const UploadImages: React.FC = () => {
   const dispatch = useDispatch();
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
 
+  const [activeTab, setActiveTab] = useState<"upload" | "preannotated">("upload");
+
+  // Manual upload state
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
   const [progress, setProgress] = useState(0);
   const [isUploading, setIsUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+
+  // Pre-annotated import state
+  const [paFolderPath, setPaFolderPath] = useState<string | null>(null);
+  const [paAnnotationPath, setPaAnnotationPath] = useState<string | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
 
   const appendToQueue = (incomingFiles: File[], incomingPreviews: string[]) => {
     const existingKeys = new Set(selectedFiles.map(fileKey));
@@ -48,14 +74,39 @@ const UploadImages: React.FC = () => {
 
   const handleSelectFolder = async () => {
     const result = await window.api.selectImageFolder();
-    if (result.canceled) return;
+    if (result.canceled || !result.images?.length) return;
 
-    const incomingFiles: File[] = result.image ?? [];
-    const incomingPreviews: string[] = (result.images ?? []).map(
-      (img: { path: string }) => `file://${img.path}`
-    );
+    const incomingFiles: File[] = [];
+    const incomingPreviews: string[] = [];
 
-    appendToQueue(incomingFiles, incomingPreviews);
+    // Convert base64 data to File objects
+    for (const img of result.images) {
+      try {
+        // Decode base64 to binary
+        const binaryString = atob(img.data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const blob = new Blob([bytes], { type: img.mimeType });
+
+        // Create File object with the original filename
+        const file = new File([blob], img.filename, { type: img.mimeType });
+        // Attach the original path for later use (e.g., training)
+        Object.defineProperty(file, 'path', { value: img.path, writable: false });
+
+        incomingFiles.push(file);
+        incomingPreviews.push(URL.createObjectURL(blob));
+      } catch (err) {
+        console.error(`Failed to process image: ${img.filename}`, err);
+      }
+    }
+
+    if (incomingFiles.length > 0) {
+      appendToQueue(incomingFiles, incomingPreviews);
+    } else {
+      toast.error("No valid images found in the folder.");
+    }
 
     const fileInput = document.getElementById("btn-upload") as HTMLInputElement;
     if (fileInput) fileInput.value = "";
@@ -73,33 +124,140 @@ const UploadImages: React.FC = () => {
     }
   };
 
-  const handleUpload = () => {
+  const handleUpload = async () => {
     if (selectedFiles.length === 0) {
       toast.error("No files to upload.");
       return;
     }
+    if (!activeSpeciesId) {
+      toast.error("No active session. Please select a schema first.");
+      return;
+    }
 
     setIsUploading(true);
-    dispatch(addFiles(selectedFiles));
+    setProgress(0);
 
-    let currentProgress = 0;
-    const interval = setInterval(() => {
-      currentProgress += 50;
-      setProgress(currentProgress);
+    try {
+      const newImages: AnnotatedImage[] = [];
+      const total = selectedFiles.length;
 
-      if (currentProgress >= 100) {
-        clearInterval(interval);
+      for (let i = 0; i < total; i++) {
+        const file = selectedFiles[i];
+        const base64 = await fileToBase64(file);
+        const result = await window.api.sessionSaveImage(
+          activeSpeciesId,
+          base64,
+          file.name,
+          file.type || "image/jpeg"
+        );
 
-        previews.forEach((p) => {
-          if (p.startsWith("blob:")) URL.revokeObjectURL(p);
+        if (!result.ok) {
+          console.error(`Failed to save image ${file.name}:`, result.error);
+          toast.error(`Failed to save ${file.name}: ${result.error || "unknown error"}`);
+          continue;
+        }
+
+        const url = URL.createObjectURL(file);
+        // Electron attaches `path` to File objects via Object.defineProperty
+        const filePath = (file as File & { path?: string }).path || file.name;
+        newImages.push({
+          id: Date.now() + Math.random(),
+          path: filePath,
+          diskPath: result.diskPath,
+          url,
+          filename: file.name,
+          boxes: [] as BoundingBox[],
+          selectedBoxId: null,
+          history: [] as BoundingBox[][],
+          future: [] as BoundingBox[][],
+          speciesId: activeSpeciesId,
         });
 
-        setSelectedFiles([]);
-        setPreviews([]);
-        setIsUploading(false);
-        toast.success("Upload completed!");
+        setProgress(Math.round(((i + 1) / total) * 100));
       }
-    }, 500);
+
+      dispatch(addFilesWithSpecies({ files: newImages, speciesId: activeSpeciesId }));
+
+      previews.forEach((p) => {
+        if (p.startsWith("blob:")) URL.revokeObjectURL(p);
+      });
+
+      setSelectedFiles([]);
+      setPreviews([]);
+      toast.success("Upload completed!");
+    } catch (err) {
+      console.error("Upload failed:", err);
+      toast.error("Upload failed. Please try again.");
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  // ── Pre-annotated import handlers ──
+
+  const handleSelectPaFolder = async () => {
+    const result = await window.api.selectFolderPath();
+    if (!result.canceled && result.folderPath) {
+      setPaFolderPath(result.folderPath);
+    }
+  };
+
+  const handleSelectAnnotationFile = async () => {
+    const result = await window.api.selectAnnotationFile();
+    if (!result.canceled && result.filePath) {
+      setPaAnnotationPath(result.filePath);
+    }
+  };
+
+  const handleImportAnnotated = async () => {
+    if (!paFolderPath || !paAnnotationPath || !activeSpeciesId) return;
+    setIsImporting(true);
+    try {
+      const result = await window.api.loadAnnotatedFolder({
+        imageFolderPath: paFolderPath,
+        annotationFilePath: paAnnotationPath,
+        speciesId: activeSpeciesId,
+      });
+
+      if (!result.ok || !result.images?.length) {
+        toast.error(result.error ?? "No images could be imported.");
+        return;
+      }
+
+      const newImages: AnnotatedImage[] = result.images.map((img) => {
+        // Use localfile:// protocol registered in main.ts to serve images
+        // directly from disk — no base64 encoding/decoding needed.
+        const safePath = img.diskPath.replace(/\\/g, "/");
+        const url = `localfile:///${safePath.replace(/^\//, "")}`;
+        return {
+          id: Date.now() + Math.random(),
+          path: img.diskPath,
+          diskPath: img.diskPath,
+          url,
+          filename: img.filename,
+          boxes: img.boxes as BoundingBox[],
+          selectedBoxId: null,
+          history: [] as BoundingBox[][],
+          future: [] as BoundingBox[][],
+          speciesId: activeSpeciesId,
+        };
+      });
+
+      dispatch(addFilesWithSpecies({ files: newImages, speciesId: activeSpeciesId }));
+
+      const unmatchedMsg = result.unmatched?.length
+        ? ` ${result.unmatched.length} image(s) had no matching annotation.`
+        : "";
+      toast.success(`Imported ${result.images.length} images with landmarks.${unmatchedMsg}`);
+
+      setPaFolderPath(null);
+      setPaAnnotationPath(null);
+    } catch (err) {
+      console.error("Pre-annotated import failed:", err);
+      toast.error("Import failed. Please try again.");
+    } finally {
+      setIsImporting(false);
+    }
   };
 
   const handleRemoveImage = (index: number) => {
@@ -222,8 +380,121 @@ const UploadImages: React.FC = () => {
     });
   };
 
+  // Split on separators and filter empties so trailing slashes don't produce ""
+  const paAnnotationParts = paAnnotationPath ? paAnnotationPath.split(/[\\/]/).filter(Boolean) : [];
+  const paAnnotationFilename = paAnnotationParts.length > 0 ? paAnnotationParts[paAnnotationParts.length - 1] : null;
+  const paAnnotationExt = paAnnotationFilename ? paAnnotationFilename.split(".").pop()?.toUpperCase() : null;
+  const paFolderParts = paFolderPath ? paFolderPath.split(/[\\/]/).filter(Boolean) : [];
+  const paFolderName = paFolderParts.length > 0 ? paFolderParts[paFolderParts.length - 1] : null;
+
   return (
     <div className="flex w-full flex-col items-center gap-3">
+      {/* Tab switcher */}
+      <div className="flex w-full max-w-[320px] rounded-lg border bg-muted/30 p-1">
+        <button
+          onClick={() => setActiveTab("upload")}
+          className={cn(
+            "flex-1 rounded-md py-1 text-xs font-semibold transition-all",
+            activeTab === "upload"
+              ? "bg-card text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          )}
+        >
+          Upload
+        </button>
+        <button
+          onClick={() => setActiveTab("preannotated")}
+          className={cn(
+            "flex-1 rounded-md py-1 text-xs font-semibold transition-all",
+            activeTab === "preannotated"
+              ? "bg-card text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          )}
+        >
+          Pre-annotated
+        </button>
+      </div>
+
+      {/* Pre-annotated import panel */}
+      {activeTab === "preannotated" && (
+        <div className="flex w-full max-w-[320px] flex-col gap-2.5">
+          <p className="text-xs text-muted-foreground">
+            Select an image folder and an annotation file (.xml or .json). Landmarks will be auto-applied in the carousel.
+          </p>
+
+          {/* Image folder picker */}
+          <motion.div {...buttonHover} {...buttonTap}>
+            <Button
+              variant="outline"
+              className="w-full justify-start font-bold"
+              onClick={handleSelectPaFolder}
+            >
+              <FolderOpen className="mr-2 h-4 w-4 shrink-0" />
+              <span className="truncate">
+                {paFolderName ? paFolderName : "Select Image Folder"}
+              </span>
+            </Button>
+          </motion.div>
+
+          {/* Annotation file picker */}
+          <motion.div {...buttonHover} {...buttonTap}>
+            <Button
+              variant="outline"
+              className="w-full justify-start font-bold"
+              onClick={handleSelectAnnotationFile}
+            >
+              <FileText className="mr-2 h-4 w-4 shrink-0" />
+              <span className="truncate flex-1 text-left">
+                {paAnnotationFilename ? paAnnotationFilename : "Select Annotation File (.xml / .json)"}
+              </span>
+              {paAnnotationExt && (
+                <span className="ml-2 shrink-0 rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-primary">
+                  {paAnnotationExt}
+                </span>
+              )}
+            </Button>
+          </motion.div>
+
+          {/* Summary row */}
+          {(paFolderPath || paAnnotationPath) && (
+            <div className="rounded-lg border bg-muted/30 p-2.5 text-xs text-muted-foreground space-y-1">
+              <div className="flex items-center gap-1.5">
+                <FolderOpen className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">{paFolderName ?? "—"}</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Tag className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">{paAnnotationFilename ?? "—"}</span>
+              </div>
+            </div>
+          )}
+
+          {/* Import button */}
+          <motion.div {...buttonHover} {...buttonTap}>
+            <Button
+              className="w-full font-bold"
+              disabled={!paFolderPath || !paAnnotationPath || !activeSpeciesId || isImporting}
+              onClick={handleImportAnnotated}
+            >
+              {isImporting ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Upload className="mr-2 h-4 w-4" />
+              )}
+              {isImporting ? "Importing..." : "Import & Auto-label"}
+            </Button>
+          </motion.div>
+
+          {!activeSpeciesId && (
+            <p className="text-center text-xs text-destructive">
+              No active session — select a schema first.
+            </p>
+          )}
+        </div>
+      )}
+
+      {activeTab === "upload" && (
+        <>
       {/* Dropzone */}
       <motion.div
         variants={dropzoneActive}
@@ -419,6 +690,8 @@ const UploadImages: React.FC = () => {
           </motion.div>
         )}
       </AnimatePresence>
+        </>
+      )}
     </div>
   );
 };

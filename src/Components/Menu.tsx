@@ -1,14 +1,16 @@
-import React, { useEffect, useMemo, useState } from "react";
+﻿import React, { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { useSelector } from "react-redux";
-import { Copy, FolderOpen, Loader2, Home } from "lucide-react";
+import { useDispatch, useSelector } from "react-redux";
+import { Copy, FolderOpen, Loader2, Home, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
+import { clearFiles } from "../state/filesState/fileSlice";
+import { selectCnnTier } from "../state/hardwareSlice";
 import Landmark from "./Landmark";
-import { AnnotatedImage, ToolMode } from "../types/Image";
 import { TrainModelDialog } from "./PopUp";
+import { DetectionModeSelector, DetectionMode, DetectionPreset } from "./DetectionModeSelector";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
@@ -27,27 +29,52 @@ interface MenuProps {
   onOpacityChange: (selectedOpacity: number) => void;
   onColorChange: (selectedColor: string) => void;
   onSwitchChange: () => void;
-  toolMode: ToolMode;
-  onToolModeChange: (mode: ToolMode) => void;
   onNavigateToLanding?: () => void;
   openTrainDialogOnMount?: boolean;
   onTrainDialogOpened?: () => void;
+  // Detection mode
+  detectionMode?: DetectionMode;
+  onDetectionModeChange?: (mode: DetectionMode) => void;
+  autoConfidence?: number;
+  onAutoConfidenceChange?: (value: number) => void;
+  detectionPreset?: DetectionPreset;
+  onDetectionPresetChange?: (preset: DetectionPreset) => void;
+  // Auto mode class name
+  className?: string;
+  onClassNameChange?: (name: string) => void;
+  // SAM2 refinement toggle
+  samEnabled?: boolean;
+  onSamEnabledChange?: (enabled: boolean) => void;
 }
 
-async function saveLabels(fileArray: AnnotatedImage[]) {
-  await window.api.saveLabels(fileArray);
-}
+type CnnVariantOption = {
+  id: string;
+  label: string;
+  description: string;
+  selectable: boolean;
+  recommended?: boolean;
+  reason?: string | null;
+};
 
 const Menu: React.FC<MenuProps> = ({
   onColorChange,
   onOpacityChange,
   onSwitchChange,
-  toolMode,
-  onToolModeChange,
   onNavigateToLanding,
   openTrainDialogOnMount,
   onTrainDialogOpened,
+  detectionMode = "manual",
+  onDetectionModeChange,
+  autoConfidence = 0.5,
+  onAutoConfidenceChange,
+  detectionPreset = "balanced",
+  onDetectionPresetChange,
+  className = "",
+  onClassNameChange,
+  samEnabled = false,
+  onSamEnabledChange,
 }) => {
+  const dispatch = useDispatch();
   const [openTrainDialog, setOpenTrainDialog] = useState(false);
 
   // Handle opening train dialog from navigation
@@ -59,13 +86,61 @@ const Menu: React.FC<MenuProps> = ({
   }, [openTrainDialogOnMount, onTrainDialogOpened]);
   const [modelName, setModelName] = useState("");
   const [isTraining, setIsTraining] = useState(false);
+  const [trainingProgress, setTrainingProgress] = useState<{
+    percent: number;
+    stage: string;
+    message: string;
+    predictorType: "dlib" | "cnn";
+    modelName: string;
+    details?: {
+      substage?: string;
+      epoch?: number;
+      epochs?: number;
+      loss?: number;
+      lr?: number;
+      elapsed_sec?: number;
+      eta_sec?: number;
+      samples_per_sec?: number;
+      split?: string;
+      eval_mode?: string;
+      records_total?: number;
+      records_done?: number;
+      batch_size?: number;
+      workers?: number;
+      amp_enabled?: boolean;
+      device?: string;
+    };
+  } | null>(null);
   const [modelPath, setModelPath] = useState("");
+  const [preflightSummary, setPreflightSummary] = useState("");
+  const [preflightWarning, setPreflightWarning] = useState("");
+  const [predictorType, setPredictorType] = useState<"dlib" | "cnn">("dlib");
+  const [skipParity, setSkipParity] = useState(false);
+  const [cnnVariants, setCnnVariants] = useState<CnnVariantOption[]>([]);
+  const [cnnVariant, setCnnVariant] = useState<string>("simplebaseline");
+  const [cnnVariantWarning, setCnnVariantWarning] = useState<string>("");
+  const [obbDetectorReady, setObbDetectorReady] = useState(false);
+  const [isTrainingObb, setIsTrainingObb] = useState(false);
+  const [obbTrainingMessage, setObbTrainingMessage] = useState<string>("");
+  const [obbHyperparams, setObbHyperparams] = useState({ iou: 0.3, cls: 1.5, box: 5.0 });
+  const [augmentationPolicy, setAugmentationPolicy] = useState<AugmentationPolicy | undefined>(undefined);
+  const [orientationMode, setOrientationMode] = useState<string | undefined>(undefined);
 
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
-  const canTrain = useMemo(
-    () => (fileArray?.length ?? 0) > 0 && !isTraining,
-    [fileArray, isTraining]
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
+  const cnnTier = useSelector(selectCnnTier); // "fast" (gpu/mps) | "slow" (cpu)
+  const hasWorkspaceData = (fileArray?.length ?? 0) > 0;
+
+  // Derive OBB readiness for the training dialog:
+  // - hasFinalizedBoxes: user has locked at least one detection box (flat AABB or OBB)
+  // - hasObbAnnotations: user has at least one box with explicit OBB corners
+  // Either condition unlocks the "Train OBB Detector" step in PopUp
+  const hasFinalizedBoxes = (fileArray ?? []).some((img) => img.isFinalized === true);
+  const canTrain = hasFinalizedBoxes && !isTraining;
+  const hasObbAnnotations = (fileArray ?? []).some((img) =>
+    img.boxes?.some((b) => Array.isArray(b.obbCorners) && b.obbCorners.length === 4)
   );
+  const showObbStep = hasFinalizedBoxes || hasObbAnnotations;
 
   useEffect(() => {
     const fetchProjectRoot = async () => {
@@ -79,6 +154,120 @@ const Menu: React.FC<MenuProps> = ({
     };
     fetchProjectRoot();
   }, []);
+
+  // Load augmentationPolicy and orientationMode from session when the train dialog opens
+  useEffect(() => {
+    if (!openTrainDialog || !activeSpeciesId) return;
+    window.api.sessionLoad(activeSpeciesId).then((result) => {
+      if (result?.ok) {
+        if (result.meta?.augmentationPolicy) {
+          setAugmentationPolicy(result.meta.augmentationPolicy as AugmentationPolicy);
+        }
+        const mode = result.meta?.orientationPolicy?.mode;
+        if (typeof mode === "string") setOrientationMode(mode);
+      }
+    }).catch(() => {/* ignore */});
+  }, [openTrainDialog, activeSpeciesId]);
+
+  useEffect(() => {
+    const loadCnnVariants = async () => {
+      try {
+        const result = await window.api.getCnnVariants();
+        if (!result?.ok || !Array.isArray(result.variants) || result.variants.length === 0) {
+          return;
+        }
+        const parsed = result.variants as CnnVariantOption[];
+        setCnnVariants(parsed);
+        const selectable = parsed.filter((v) => v.selectable);
+        const requestedDefault = result.defaultVariant;
+        const hasRequested =
+          !!requestedDefault &&
+          selectable.some((v) => v.id === requestedDefault);
+
+        // Python-recommended default (or first selectable as fallback)
+        const resolvedDefault = hasRequested
+          ? String(requestedDefault)
+          : selectable[0]?.id ?? parsed[0]?.id ?? "simplebaseline";
+        setCnnVariant(resolvedDefault);
+        const warningParts: string[] = [];
+        if (result.warning) warningParts.push(String(result.warning));
+        if (!result.torchAvailable) {
+          warningParts.push("PyTorch is not available.");
+        } else if (!result.torchvisionAvailable) {
+          warningParts.push("torchvision is not available.");
+        } else if (result.device && result.device !== "cuda") {
+          warningParts.push(
+            `Detected ${String(result.device).toUpperCase()} runtime; heavy CNN variants are system-gated.`
+          );
+        } else if (
+          result.device === "cuda" &&
+          typeof result.gpuMemoryGb === "number" &&
+          result.gpuMemoryGb < 6
+        ) {
+          warningParts.push(
+            `GPU memory (${result.gpuMemoryGb.toFixed(1)} GB) is below the recommended threshold for high-capacity variants.`
+          );
+        }
+        setCnnVariantWarning(warningParts.join(" "));
+      } catch (err) {
+        console.warn("Failed to fetch CNN variants:", err);
+      }
+    };
+    void loadCnnVariants();
+  }, []);
+
+  useEffect(() => {
+    if (predictorType !== "cnn" || cnnVariants.length === 0) return;
+    const current = cnnVariants.find((v) => v.id === cnnVariant);
+    if (current?.selectable) return;
+    // Prefer tier-appropriate backbone, then Python-recommended, then first selectable
+    const tierPreferred = cnnTier === "slow" ? "mobilenet_v3_large" : cnnTier === "fast" ? "resnet50" : null;
+    const tierMatch = tierPreferred
+      ? cnnVariants.find((v) => v.id === tierPreferred && v.selectable)?.id
+      : undefined;
+    const fallback =
+      tierMatch ??
+      cnnVariants.find((v) => v.recommended && v.selectable)?.id ??
+      cnnVariants.find((v) => v.selectable)?.id;
+    if (fallback) setCnnVariant(fallback);
+  }, [predictorType, cnnVariants, cnnVariant, cnnTier]);
+
+  // Check OBB detector readiness when species or train dialog opens
+  useEffect(() => {
+    if (!activeSpeciesId) {
+      setObbDetectorReady(false);
+      return;
+    }
+    window.api
+      .checkModelCompatibility({ speciesId: activeSpeciesId, modelName: modelName || "_preflight" })
+      .then((r) => setObbDetectorReady(r?.obbDetectorReady ?? false))
+      .catch(() => setObbDetectorReady(false));
+  }, [activeSpeciesId, openTrainDialog, modelName]);
+
+  const handleTrainObbDetector = async () => {
+    if (!activeSpeciesId || isTrainingObb) return;
+    setIsTrainingObb(true);
+    setObbTrainingMessage("Exporting OBB dataset and starting training…");
+    try {
+      const result = await window.api.trainObbDetector(activeSpeciesId, {
+        iou: obbHyperparams.iou,
+        cls: obbHyperparams.cls,
+        box: obbHyperparams.box,
+      });
+      if (result?.ok) {
+        setObbDetectorReady(true);
+        const mapStr = typeof result.map50 === "number" ? ` (mAP50: ${result.map50.toFixed(3)})` : "";
+        setObbTrainingMessage(`OBB detector trained${mapStr} — ready.`);
+      } else {
+        setObbTrainingMessage(`OBB training failed: ${result?.error ?? "unknown error"}`);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setObbTrainingMessage(`OBB training error: ${message}`);
+    } finally {
+      setIsTrainingObb(false);
+    }
+  };
 
   const handleSelectModelPath = async () => {
     try {
@@ -116,33 +305,102 @@ const Menu: React.FC<MenuProps> = ({
     }
   };
 
+  const runPreflight = async (autosaveWorkspace: boolean) => {
+    const name = modelName.trim();
+    if (!name) {
+      setPreflightSummary("Enter a model name to run preflight.");
+      setPreflightWarning("");
+      return null;
+    }
+
+    if (autosaveWorkspace && !activeSpeciesId && hasWorkspaceData) {
+      await window.api.saveLabels(fileArray);
+    }
+
+    const preflight = await window.api.trainingPreflight({
+      speciesId: activeSpeciesId ?? undefined,
+      modelName: name,
+      workspaceImages: fileArray.length,
+    });
+
+    if (!preflight.ok) {
+      throw new Error(preflight.error || "Preflight failed.");
+    }
+
+    setPreflightSummary(
+      `Preflight: ${preflight.totalTrainableImages ?? 0} trainable image(s) - Landmarks: ${preflight.landmarkMessage}`
+    );
+
+    const warningText = (preflight.warnings || []).join(" | ");
+    setPreflightWarning(warningText);
+    return preflight;
+  };
   const handleTrainConfirm = async () => {
     const name = modelName.trim();
     if (!name) return;
 
+    let unsubscribeTrainProgress: (() => void) | null = null;
     try {
       setIsTraining(true);
-      toast.info("Saving labels...");
+      setTrainingProgress({
+        percent: 0,
+        stage: "preflight",
+        message: "Starting training...",
+        predictorType,
+        modelName: name,
+      });
 
-      await saveLabels(fileArray);
+      unsubscribeTrainProgress = window.api.onTrainProgress((data) => {
+        if (data.modelName !== name) return;
+        if (data.predictorType !== predictorType) return;
+        setTrainingProgress((prev) => {
+          const prevPct = Number(prev?.percent ?? 0);
+          const nextPct = Number(data?.percent ?? 0);
+          const monotonicPct = Math.max(
+            0,
+            Math.min(100, Math.max(prevPct, nextPct))
+          );
+          return {
+            ...data,
+            percent: monotonicPct,
+          };
+        });
+      });
 
-      toast.info("Training model...");
-      const result = await window.api.trainModel(name);
+      const preflight = await runPreflight(true);
+      if (!preflight) return;
 
+      toast.info("Training from session data...");
+      const result = await window.api.trainModel(name, {
+        speciesId: activeSpeciesId ?? undefined,
+        predictorType,
+        cnnVariant: predictorType === "cnn" ? cnnVariant : undefined,
+        customOptions: {
+          skip_parity: skipParity,
+        },
+      });
       if (!result.ok) throw new Error(result.error);
-
       console.log("Training output:", result.output);
+      toast.success("Training complete.");
 
       setOpenTrainDialog(false);
-      setModelName("");
-      toast.success("Training complete.");
     } catch (err) {
       console.error(err);
       toast.error(`Training failed. ${String(err)}`);
     } finally {
+      unsubscribeTrainProgress?.();
       setIsTraining(false);
+      setTrainingProgress(null);
     }
   };
+  useEffect(() => {
+    if (!openTrainDialog) return;
+    runPreflight(false).catch((err) => {
+      setPreflightWarning(String(err));
+    });
+    // runPreflight is recreated on render but captures the same vars already listed as deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openTrainDialog, modelName, activeSpeciesId, hasWorkspaceData, predictorType]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -175,6 +433,33 @@ const Menu: React.FC<MenuProps> = ({
           modelName={modelName}
           isTraining={isTraining}
           setModelName={setModelName}
+          preflightSummary={preflightSummary}
+          preflightWarning={preflightWarning}
+          predictorType={predictorType}
+          setPredictorType={setPredictorType}
+          cnnVariants={cnnVariants}
+          cnnVariant={cnnVariant}
+          setCnnVariant={setCnnVariant}
+          cnnVariantWarning={cnnVariantWarning}
+          skipParity={skipParity}
+          setSkipParity={setSkipParity}
+          trainingProgress={trainingProgress}
+          obbDetectorReady={obbDetectorReady}
+          showObbStep={showObbStep}
+          isTrainingObb={isTrainingObb}
+          handleTrainObbDetector={handleTrainObbDetector}
+          obbTrainingMessage={obbTrainingMessage}
+          obbHyperparams={obbHyperparams}
+          onObbHyperparamsChange={setObbHyperparams}
+          speciesId={activeSpeciesId ?? undefined}
+          augmentationPolicy={augmentationPolicy}
+          onAugmentationPolicyChange={(policy) => {
+            setAugmentationPolicy(policy);
+            if (activeSpeciesId) {
+              window.api.sessionUpdateAugmentation(activeSpeciesId, policy).catch(() => {/* ignore */});
+            }
+          }}
+          orientationMode={orientationMode}
         />
 
         <ScrollArea className="flex-1">
@@ -211,7 +496,7 @@ const Menu: React.FC<MenuProps> = ({
                     Auto Landmarking
                   </h1>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Select Model • Import • Annotate
+                    Select Model - Import - Annotate
                   </p>
                 </div>
               </div>
@@ -298,11 +583,32 @@ const Menu: React.FC<MenuProps> = ({
                   <CardContent className="space-y-3">
                     <UploadImages />
                     <Separator />
-                    <p className="text-xs text-muted-foreground">
-                      {fileArray?.length
-                        ? `${fileArray.length} image(s) loaded`
-                        : "No images loaded"}
-                    </p>
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs text-muted-foreground">
+                        {fileArray?.length
+                          ? `${fileArray.length} image(s) loaded`
+                          : "No images loaded"}
+                      </p>
+                      {(fileArray?.length ?? 0) > 0 && (
+                        <motion.div {...buttonHover} {...buttonTap}>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={async () => {
+                              if (activeSpeciesId) {
+                                await window.api.sessionDeleteAllImages(activeSpeciesId);
+                              }
+                              dispatch(clearFiles());
+                              toast.success("All images removed.");
+                            }}
+                            className="h-7 text-xs font-bold text-destructive hover:bg-destructive/10 hover:text-destructive"
+                          >
+                            <Trash2 className="mr-1 h-3 w-3" />
+                            Delete all
+                          </Button>
+                        </motion.div>
+                      )}
+                    </div>
                   </CardContent>
                 </Card>
               </motion.div>
@@ -314,10 +620,37 @@ const Menu: React.FC<MenuProps> = ({
                 onOpacityChange={onOpacityChange}
                 onColorChange={onColorChange}
                 onSwitchChange={onSwitchChange}
-                toolMode={toolMode}
-                onToolModeChange={onToolModeChange}
               />
             </motion.div>
+
+            {/* Detection Mode */}
+            {onDetectionModeChange && onAutoConfidenceChange && (
+              <motion.div variants={sidebarItem}>
+                <motion.div variants={cardHover} initial="initial" whileHover="hover">
+                  <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
+                    <CardHeader className="pb-3">
+                      <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                        Detection Mode
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <DetectionModeSelector
+                        mode={detectionMode}
+                        onModeChange={onDetectionModeChange}
+                        autoConfidence={autoConfidence}
+                        onAutoConfidenceChange={onAutoConfidenceChange}
+                        detectionPreset={detectionPreset}
+                        onDetectionPresetChange={onDetectionPresetChange}
+                        className={className}
+                        onClassNameChange={onClassNameChange}
+                        samEnabled={samEnabled}
+                        onSamEnabledChange={onSamEnabledChange}
+                      />
+                    </CardContent>
+                  </Card>
+                </motion.div>
+              </motion.div>
+            )}
 
             {/* Training Card */}
             <motion.div variants={sidebarItem}>
@@ -332,12 +665,12 @@ const Menu: React.FC<MenuProps> = ({
                     <p
                       className={cn(
                         "text-xs",
-                        canTrain ? "text-muted-foreground" : "text-destructive"
+                        "text-muted-foreground"
                       )}
                     >
                       {canTrain
-                        ? "Ready to train."
-                        : "Add images to enable training."}
+                        ? "Ready to train from current session data."
+                        : "Annotate images or import a pre-annotated folder to enable training."}
                     </p>
                   </CardContent>
                 </Card>
@@ -374,3 +707,5 @@ const Menu: React.FC<MenuProps> = ({
 };
 
 export default Menu;
+
+

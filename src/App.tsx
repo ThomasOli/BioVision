@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react"
+import { useDispatch, useSelector } from "react-redux"
 import { motion } from "framer-motion"
 
 import { cn } from "@/lib/utils"
@@ -12,15 +13,87 @@ import { UndoRedoClearContextProvider } from "./Components/UndoRedoClearContext"
 import { LandingPage } from "./Components/LandingPage"
 import { MyModelsPage } from "./Components/MyModelsPage"
 import { InferencePage } from "./Components/InferencePage"
-import { ToolMode, AppView } from "./types/Image"
+import { AppView, AnnotatedImage } from "./types/Image"
+import { DetectionMode, DetectionPreset } from "./Components/DetectionModeSelector"
+import { AppDispatch, RootState } from "./state/store"
+import { setSessionImages } from "./state/filesState/fileSlice"
+import { setHardwareCapabilities } from "./state/hardwareSlice"
+
+/** Restores session images+annotations from disk whenever the active species changes. */
+function SessionRestorer() {
+  const dispatch = useDispatch<AppDispatch>()
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId)
+
+  useEffect(() => {
+    if (!activeSpeciesId) return
+    let cancelled = false
+
+    window.api.sessionLoad(activeSpeciesId).then((result) => {
+      if (cancelled || !result.ok || !result.images?.length) return
+
+      const restored: AnnotatedImage[] = result.images.map((img, i) => {
+        const safePath = img.diskPath.replace(/\\/g, "/")
+        const url = `localfile:///${safePath.replace(/^\//, "")}`
+
+        return {
+          id: Date.now() + i,
+          path: img.diskPath,
+          url,
+          filename: img.filename,
+          boxes: img.boxes || [],
+          selectedBoxId: null,
+          history: [],
+          future: [],
+          speciesId: activeSpeciesId,
+          diskPath: img.diskPath,
+          isFinalized: img.finalized ?? false,
+          hasBoxes: img.hasBoxes ?? false,
+        }
+      })
+
+      dispatch(setSessionImages(restored))
+    }).catch((err) => {
+      console.error("Session restore failed:", err)
+    })
+
+    return () => { cancelled = true }
+  }, [activeSpeciesId, dispatch])
+
+  return null
+}
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
 const App: React.FC = () => {
+  const dispatch = useDispatch<AppDispatch>()
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId)
+
+  // Probe hardware capabilities once at startup and populate Redux
+  useEffect(() => {
+    window.api.probeHardware()
+      .then((caps) => {
+        const sam2Enabled = caps.device !== "cpu" && (caps.ramGb ?? 0) >= 8
+        dispatch(setHardwareCapabilities({
+          probed: true,
+          device: caps.device,
+          ramGb: caps.ramGb,
+          gpuName: caps.gpuName,
+          sam2Enabled,
+          yoloWorldEnabled: true,
+          cnnTier: caps.device === "cpu" ? "slow" : "fast",
+        }))
+      })
+      .catch(() => {
+        // Probe failed — stay at conservative defaults (all false/null)
+      })
+  }, [dispatch])
+
   // Navigation state
   const [currentView, setCurrentView] = useState<AppView>("landing")
   const [openTrainDialogOnMount, setOpenTrainDialogOnMount] = useState(false)
+  const [openSchemaDialogOnMount, setOpenSchemaDialogOnMount] = useState(false)
   const [selectedModelForInference, setSelectedModelForInference] = useState<string>("")
+  const [hasActivatedSchemaThisRun, setHasActivatedSchemaThisRun] = useState(false)
 
   // Workspace state
   const [color, setColor] = useState<string>(() =>
@@ -31,20 +104,32 @@ const App: React.FC = () => {
     const saved = localStorage.getItem("biovision-default-opacity")
     return saved ? parseInt(saved, 10) : 100
   })
-  const [toolMode, setToolMode] = useState<ToolMode>("box")
+  // Detection state
+  const [detectionMode, setDetectionMode] = useState<DetectionMode>("manual")
+  const [autoConfidence, setAutoConfidence] = useState(0.3)
+  const [detectionPreset, setDetectionPreset] = useState<DetectionPreset>("balanced")
+  const [objectClassName, setObjectClassName] = useState("")
+  const [samEnabled, setSamEnabled] = useState(false)
 
   const handleColorChange = (selectedColor: string) => setColor(selectedColor)
   const handleSwitchChange = () => setIsSwitchOn((prev) => !prev)
   const handleOpacityChange = (selectedOpacity: number) => setOpacity(selectedOpacity)
-  const handleToolModeChange = (mode: ToolMode) => setToolMode(mode)
 
-  // Responsive bounds for menu
-  const [isXs, setIsXs] = useState(window.innerWidth < 600)
-  const MIN_MENU = isXs ? 200 : 305
-  const MAX_MENU = isXs ? 360 : 680
+  // Adaptive sidebar bounds — scale with viewport width
+  // 13" (~1280px): min 375, max 480 | 15" (~1600px): min 420, max 600
+  // 24" (~1920px): min 480, max 720 | 27"+ (>1920px): min 545, max 860
+  const getMenuBounds = (vw: number) => {
+    if (vw < 1280) return { min: 375, max: 480, def: 380 }
+    if (vw < 1600) return { min: 420, max: 600, def: 440 }
+    if (vw < 1920) return { min: 480, max: 720, def: 500 }
+    return           { min: 545, max: 860, def: 580 }
+  }
+
+  const [vw, setVw] = useState(window.innerWidth)
+  const { min: MIN_MENU, max: MAX_MENU } = getMenuBounds(vw)
 
   useEffect(() => {
-    const handleResize = () => setIsXs(window.innerWidth < 600)
+    const handleResize = () => setVw(window.innerWidth)
     window.addEventListener("resize", handleResize)
     return () => window.removeEventListener("resize", handleResize)
   }, [])
@@ -57,7 +142,10 @@ const App: React.FC = () => {
 
   const [menuWidth, setMenuWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem("menuWidth"))
-    return Number.isFinite(saved) && saved > 0 ? saved : isXs ? 300 : 380
+    const initBounds = getMenuBounds(window.innerWidth)
+    return Number.isFinite(saved) && saved > 0
+      ? clamp(saved, initBounds.min, initBounds.max)
+      : initBounds.def
   })
 
   useEffect(() => {
@@ -118,6 +206,20 @@ const App: React.FC = () => {
     }
   }, [MIN_MENU, MAX_MENU])
 
+  useLayoutEffect(() => {
+    if (!menuWrapRef.current) return
+
+    const el = menuWrapRef.current
+    const overflowX = el.scrollWidth - el.clientWidth
+
+    if (overflowX > 0) {
+      const requiredWidth = clamp(Math.ceil(menuWidth + overflowX), MIN_MENU, MAX_MENU)
+      if (requiredWidth > menuWidth) {
+        setMenuWidth(requiredWidth)
+      }
+    }
+  }, [menuWidth, MIN_MENU, MAX_MENU])
+
   const startDrag = () => {
     userResizedRef.current = true
     draggingRef.current = true
@@ -134,26 +236,37 @@ const App: React.FC = () => {
     if (view !== "inference") {
       setSelectedModelForInference("")
     }
+    if (view !== "landing") {
+      setOpenSchemaDialogOnMount(false)
+    }
   }
 
-  const handleOpenTrainDialog = () => {
-    setOpenTrainDialogOnMount(true)
+  const handleStartAnnotating = () => {
+    setOpenSchemaDialogOnMount(true)
+    setCurrentView("landing")
   }
 
   const handleSelectModelForInference = (modelName: string) => {
     setSelectedModelForInference(modelName)
   }
 
+  useEffect(() => {
+    if (currentView === "workspace" && activeSpeciesId) {
+      setHasActivatedSchemaThisRun(true)
+    }
+  }, [activeSpeciesId, currentView])
+
   // Render workspace (annotation view)
   const renderWorkspace = () => (
     <div
       ref={pageRef}
-      className="w-screen h-screen min-w-[880px] min-h-[500px] bg-background flex overflow-auto"
+      className="w-screen h-screen min-w-0 min-h-0 bg-background flex overflow-hidden"
     >
       {/* Left: menu container */}
       <motion.div
         animate={{ width: menuWidth }}
         transition={{ duration: 0.15, ease: "easeOut" }}
+        style={{ minWidth: MIN_MENU }}
         className="shrink-0 h-full overflow-hidden border-r bg-card"
       >
         <div
@@ -164,11 +277,19 @@ const App: React.FC = () => {
             onOpacityChange={handleOpacityChange}
             onColorChange={handleColorChange}
             onSwitchChange={handleSwitchChange}
-            toolMode={toolMode}
-            onToolModeChange={handleToolModeChange}
             onNavigateToLanding={() => handleNavigate("landing")}
             openTrainDialogOnMount={openTrainDialogOnMount}
             onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
+            detectionMode={detectionMode}
+            onDetectionModeChange={setDetectionMode}
+            autoConfidence={autoConfidence}
+            onAutoConfidenceChange={setAutoConfidence}
+            detectionPreset={detectionPreset}
+            onDetectionPresetChange={setDetectionPreset}
+            className={objectClassName}
+            onClassNameChange={setObjectClassName}
+            samEnabled={samEnabled}
+            onSamEnabledChange={setSamEnabled}
           />
         </div>
       </motion.div>
@@ -195,7 +316,11 @@ const App: React.FC = () => {
               color={color}
               opacity={opacity}
               isSwitchOn={isSwitchOn}
-              toolMode={toolMode}
+              detectionMode={detectionMode}
+              confThreshold={autoConfidence}
+              detectionPreset={detectionPreset}
+              className={objectClassName}
+              samEnabled={samEnabled}
             />
           </div>
         </div>
@@ -210,7 +335,8 @@ const App: React.FC = () => {
         return (
           <LandingPage
             onNavigate={handleNavigate}
-            onOpenTrainDialog={handleOpenTrainDialog}
+            openSchemaDialogOnMount={openSchemaDialogOnMount}
+            onSchemaDialogOpened={() => setOpenSchemaDialogOnMount(false)}
           />
         )
       case "models":
@@ -218,6 +344,7 @@ const App: React.FC = () => {
           <MyModelsPage
             onNavigate={handleNavigate}
             onSelectModelForInference={handleSelectModelForInference}
+            onStartAnnotating={handleStartAnnotating}
           />
         )
       case "inference":
@@ -225,6 +352,7 @@ const App: React.FC = () => {
           <InferencePage
             onNavigate={handleNavigate}
             initialModel={selectedModelForInference}
+            hasActivatedSchemaThisRun={hasActivatedSchemaThisRun}
           />
         )
       case "workspace":
@@ -237,6 +365,7 @@ const App: React.FC = () => {
     <ThemeProvider defaultTheme="system" storageKey="biovision-ui-theme">
       <TooltipProvider>
         <UndoRedoClearContextProvider>
+          <SessionRestorer />
           {renderContent()}
           <Toaster position="bottom-center" />
         </UndoRedoClearContextProvider>
