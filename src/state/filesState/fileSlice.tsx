@@ -6,7 +6,7 @@ interface FilesState {
   fileArray: AnnotatedImage[];
 }
 
-export const initialState: FilesState = {
+const initialState: FilesState = {
   fileArray: [],
 };
 
@@ -14,26 +14,14 @@ const fileSlice = createSlice({
   name: "files",
   initialState,
   reducers: {
-    addFiles: (state, action: PayloadAction<File[]>) => {
-      const newImages = action.payload.map((file) => ({
-        id: Date.now() + Math.random(),
-        path: file.path,
-        url: URL.createObjectURL(file),
-        filename: file.name,
-        boxes: [] as BoundingBox[],
-        selectedBoxId: null,
-        history: [] as BoundingBox[][],
-        future: [] as BoundingBox[][],
-      }));
-      state.fileArray = [...state.fileArray, ...newImages];
-      console.log(state.fileArray);
-    },
     removeFile: (state, action: PayloadAction<number>) => {
       const imageToRemove = state.fileArray.find(
         (img) => img.id === action.payload
       );
       if (imageToRemove) {
-        URL.revokeObjectURL(imageToRemove.url);
+        // Defer revocation to allow animations and state sync to complete
+        const urlToRevoke = imageToRemove.url;
+        setTimeout(() => URL.revokeObjectURL(urlToRevoke), 1000);
       }
       state.fileArray = state.fileArray.filter(
         (image) => image.id !== action.payload
@@ -55,10 +43,35 @@ const fileSlice = createSlice({
       });
       state.fileArray = [];
     },
+    // Replace entire fileArray when loading a session from disk
+    setSessionImages: (state, action: PayloadAction<AnnotatedImage[]>) => {
+      state.fileArray.forEach((image) => {
+        URL.revokeObjectURL(image.url);
+      });
+      state.fileArray = action.payload;
+    },
+    // Add files tagged with a speciesId
+    addFilesWithSpecies: (
+      state,
+      action: PayloadAction<{ files: AnnotatedImage[]; speciesId: string }>
+    ) => {
+      const tagged = action.payload.files.map((f) => ({
+        ...f,
+        speciesId: action.payload.speciesId,
+      }));
+      state.fileArray = [...state.fileArray, ...tagged];
+    },
+    // Mark a single image as finalized (detection locked, landmark-only)
+    setImageFinalized: (state, action: PayloadAction<{ id: number }>) => {
+      const image = state.fileArray.find((img) => img.id === action.payload.id);
+      if (image) {
+        image.isFinalized = true;
+      }
+    },
   },
 });
 
-export const { addFiles, removeFile, updateBoxes, clearFiles } =
+export const { removeFile, updateBoxes, clearFiles, setSessionImages, addFilesWithSpecies, setImageFinalized } =
   fileSlice.actions;
 
 export default fileSlice.reducer;

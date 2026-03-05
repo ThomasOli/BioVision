@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import {
   ArrowLeft,
@@ -14,6 +14,8 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
+import { useSelector } from "react-redux";
+import type { RootState } from "@/state/store";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
@@ -32,12 +34,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/Components/ui/dialog";
-import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover, modalContent } from "@/lib/animations";
+import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
 import { TrainedModel, AppView } from "@/types/Image";
 
 interface MyModelsPageProps {
   onNavigate: (view: AppView) => void;
   onSelectModelForInference: (modelName: string) => void;
+  onStartAnnotating: () => void;
 }
 
 function formatFileSize(bytes: number): string {
@@ -126,7 +129,28 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
                 </div>
               ) : (
                 <>
-                  <CardTitle className="text-sm font-semibold">{model.name}</CardTitle>
+                  <div className="flex flex-col min-w-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <CardTitle className="text-sm font-semibold truncate">{model.name}</CardTitle>
+                      {model.predictorType === "cnn" ? (
+                        <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-purple-500/15 text-purple-400 border border-purple-500/30">
+                          CNN
+                        </span>
+                      ) : (
+                        <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-blue-500/15 text-blue-400 border border-blue-500/30">
+                          dlib
+                        </span>
+                      )}
+                    </div>
+                    {model.path && (
+                      <p
+                        className="mt-0.5 text-[10px] text-muted-foreground font-mono truncate"
+                        title={model.path}
+                      >
+                        {model.path}
+                      </p>
+                    )}
+                  </div>
                   <Popover open={menuOpen} onOpenChange={setMenuOpen}>
                     <PopoverTrigger asChild>
                       <Button variant="ghost" size="icon" className="h-8 w-8">
@@ -195,7 +219,9 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
 export const MyModelsPage: React.FC<MyModelsPageProps> = ({
   onNavigate,
   onSelectModelForInference,
+  onStartAnnotating,
 }) => {
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
   const [models, setModels] = useState<TrainedModel[]>([]);
   const [loading, setLoading] = useState(true);
   const [deleteDialog, setDeleteDialog] = useState<{ open: boolean; model: TrainedModel | null }>({
@@ -203,10 +229,10 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     model: null,
   });
 
-  const loadModels = async () => {
+  const loadModels = useCallback(async () => {
     setLoading(true);
     try {
-      const result = await window.api.listModels();
+      const result = await window.api.listModels(activeSpeciesId ?? undefined);
       if (result.ok && result.models) {
         setModels(result.models);
       } else {
@@ -218,14 +244,14 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     } finally {
       setLoading(false);
     }
-  };
+  }, [activeSpeciesId]);
 
   useEffect(() => {
     loadModels();
-  }, []);
+  }, [loadModels]);
 
   const handleUseModel = (model: TrainedModel) => {
-    onSelectModelForInference(model.name);
+    onSelectModelForInference(`${model.name}::${model.predictorType ?? "dlib"}`);
     onNavigate("inference");
   };
 
@@ -233,7 +259,11 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     if (!deleteDialog.model) return;
 
     try {
-      const result = await window.api.deleteModel(deleteDialog.model.name);
+      const result = await window.api.deleteModel(
+        deleteDialog.model.name,
+        activeSpeciesId ?? undefined,
+        deleteDialog.model.predictorType
+      );
       if (result.ok) {
         toast.success("Model deleted");
         loadModels();
@@ -248,9 +278,18 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     }
   };
 
-  const handleRenameModel = async (oldName: string, newName: string) => {
+  const handleRenameModel = async (
+    oldName: string,
+    newName: string,
+    predictorType?: "dlib" | "cnn" | "yolo_pose"
+  ) => {
     try {
-      const result = await window.api.renameModel(oldName, newName);
+      const result = await window.api.renameModel(
+        oldName,
+        newName,
+        activeSpeciesId ?? undefined,
+        predictorType
+      );
       if (result.ok) {
         toast.success("Model renamed");
         loadModels();
@@ -311,7 +350,7 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
                 annotation workspace.
               </p>
               <motion.div {...buttonHover} {...buttonTap} className="mt-6">
-                <Button onClick={() => onNavigate("workspace")}>
+                <Button onClick={onStartAnnotating}>
                   Start Annotating
                 </Button>
               </motion.div>
@@ -325,11 +364,13 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
             >
               {models.map((model) => (
                 <ModelCard
-                  key={model.name}
+                  key={`${model.name}::${model.predictorType ?? "dlib"}`}
                   model={model}
                   onUse={() => handleUseModel(model)}
                   onDelete={() => setDeleteDialog({ open: true, model })}
-                  onRename={(newName) => handleRenameModel(model.name, newName)}
+                  onRename={(newName) =>
+                    handleRenameModel(model.name, newName, model.predictorType)
+                  }
                 />
               ))}
             </motion.div>
@@ -342,38 +383,28 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
         open={deleteDialog.open}
         onOpenChange={(open) => setDeleteDialog({ open, model: open ? deleteDialog.model : null })}
       >
-        <DialogContent asChild>
-          <motion.div
-            variants={modalContent}
-            initial="initial"
-            animate="animate"
-            exit="exit"
-            className="sm:max-w-md"
-          >
-            <DialogHeader>
-              <DialogTitle className="text-sm font-bold">Delete Model</DialogTitle>
-              <DialogDescription className="text-xs">
-                Are you sure you want to delete "{deleteDialog.model?.name}"? This action
-                cannot be undone.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter className="gap-2 sm:gap-0">
-              <motion.div {...buttonHover} {...buttonTap}>
-                <Button
-                  variant="outline"
-                  onClick={() => setDeleteDialog({ open: false, model: null })}
-                >
-                  Cancel
-                </Button>
-              </motion.div>
-              <motion.div {...buttonHover} {...buttonTap}>
-                <Button variant="destructive" onClick={handleDeleteModel}>
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  Delete
-                </Button>
-              </motion.div>
-            </DialogFooter>
-          </motion.div>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-sm font-bold">Delete Model</DialogTitle>
+            <DialogDescription className="text-xs">
+              Are you sure you want to delete "{deleteDialog.model?.name}"
+              {deleteDialog.model?.predictorType ? ` (${deleteDialog.model.predictorType.toUpperCase()})` : ""}?
+              This action
+              cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button
+              variant="outline"
+              onClick={() => setDeleteDialog({ open: false, model: null })}
+            >
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteModel}>
+              <Trash2 className="mr-2 h-4 w-4" />
+              Delete
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </>

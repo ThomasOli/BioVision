@@ -1,5 +1,5 @@
 // src/Components/UndoRedoClearContext.tsx
-import React, { createContext, useCallback, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSelector } from "react-redux";
 import { RootState } from "../state/store";
 import { Point, BoundingBox, AnnotatedImage } from "../types/Image";
@@ -10,6 +10,52 @@ const cloneBoxes = (boxes: BoundingBox[]): BoundingBox[] =>
     ...box,
     landmarks: box.landmarks.map((lm) => ({ ...lm })),
   }));
+
+// Preserve any user-owned boxes when refreshing model detections.
+// Only raw model predictions are replaceable.
+const isReplaceablePredictedBox = (box: BoundingBox): boolean => box.source === "predicted";
+
+// Detected box from multi-specimen detection
+interface DetectedBoxData {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  confidence?: number;
+  class_name?: string;
+}
+
+// SuperAnnotator result object (from pipeline)
+interface SuperAnnotateObjectData {
+  box: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+    width: number;
+    height: number;
+    confidence: number;
+    class_name: string;
+  };
+  mask_outline: [number, number][];
+  landmarks: { id: number; x: number; y: number }[];
+  confidence: number;
+  class_name: string;
+  instance_metadata: {
+    center: [number, number];
+    crop_origin: [number, number];
+    crop_size: [number, number];
+    rotation: number;
+    scale: number;
+  };
+  detection_method: string;
+  obb?: {
+    angle: number;
+    corners: [number, number][];
+    center: [number, number];
+    size: [number, number];
+  } | null;
+}
 
 interface UndoRedoClearContextProps {
   images: AnnotatedImage[];
@@ -24,9 +70,12 @@ interface UndoRedoClearContextProps {
   deleteBox: (boxId: number) => void;
   selectBox: (boxId: number | null) => void;
   updateBox: (boxId: number, updates: Partial<Omit<BoundingBox, "id" | "landmarks">>) => void;
+  setBoxesFromDetection: (detectedBoxes: DetectedBoxData[]) => void;
+  setBoxesFromSuperAnnotation: (objects: SuperAnnotateObjectData[]) => void;
   // Landmark operations (now takes boxId)
   addLandmark: (boxId: number, point: Omit<Point, "id">) => void;
   deleteLandmark: (boxId: number, pointId: number) => void;
+  skipLandmark: (boxId: number) => void; // Skip the next landmark in sequence
   setSelectedImage: React.Dispatch<React.SetStateAction<number>>;
   // Legacy points (all landmarks from all boxes, for backward compat)
   points: Point[];
@@ -36,30 +85,78 @@ export const UndoRedoClearContext = createContext<UndoRedoClearContextProps>({} 
 
 export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildren<object>) => {
   const fileArray = useSelector((state: RootState) => state.files.fileArray);
+  const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
+  const speciesList = useSelector((state: RootState) => state.species.species);
 
   const [images, setImages] = useState<AnnotatedImage[]>([]);
   const [selectedImage, setSelectedImage] = useState<number>(0);
+  const dirtyImageIds = useRef<Set<number>>(new Set());
+  const autoSaveTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
 
-  // Keep images in sync with Redux fileArray
+  // Minimum landmark index for the active schema (0 for 0-based schemas, 1 for 1-based)
+  const schemaMinIndex = useMemo(() => {
+    if (!activeSpeciesId) return 0;
+    const activeSpecies = speciesList.find((s) => s.id === activeSpeciesId);
+    const template = activeSpecies?.landmarkTemplate;
+    if (!template?.length) return 0;
+    return Math.min(...template.map((lm) => lm.index));
+  }, [activeSpeciesId, speciesList]);
+
+  // Keep images in sync with Redux fileArray, filtered by activeSpeciesId
   useEffect(() => {
     setImages((prevImages) => {
+      const relevantFiles = activeSpeciesId
+        ? fileArray.filter((f) => f.speciesId === activeSpeciesId)
+        : fileArray;
+
       const existingIds = new Set(prevImages.map((img) => img.id));
 
-      const newImages: AnnotatedImage[] = fileArray
+      const newImages: AnnotatedImage[] = relevantFiles
         .filter((file) => !existingIds.has(file.id))
         .map((file) => ({
           ...file,
-          boxes: [],
+          boxes: file.boxes?.length ? file.boxes : [],
           selectedBoxId: null,
           history: [],
           future: [],
         }));
 
-      const updatedImages = prevImages.filter((img) => fileArray.some((file) => file.id === img.id));
+      const relevantIds = new Set(relevantFiles.map((f) => f.id));
+      // Propagate field updates (e.g. isFinalized) from Redux into existing context images
+      const updatedImages = prevImages
+        .filter((img) => relevantIds.has(img.id))
+        .map((img) => {
+          const fromRedux = relevantFiles.find((f) => f.id === img.id);
+          if (!fromRedux) return img;
+
+          const next = { ...img };
+          let changed = false;
+
+          if (fromRedux.isFinalized && !img.isFinalized) {
+            next.isFinalized = true;
+            changed = true;
+          }
+          if (fromRedux.hasBoxes && !img.hasBoxes) {
+            next.hasBoxes = true;
+            changed = true;
+          }
+
+          // Sync lazy-loaded annotations from Redux into context images.
+          // Limit this to empty-context -> populated-redux to avoid clobbering
+          // in-context edits that have not been persisted yet.
+          const reduxBoxes = fromRedux.boxes || [];
+          const contextBoxes = img.boxes || [];
+          if (contextBoxes.length === 0 && reduxBoxes.length > 0) {
+            next.boxes = reduxBoxes;
+            changed = true;
+          }
+
+          return changed ? next : img;
+        });
 
       return [...updatedImages, ...newImages];
     });
-  }, [fileArray]);
+  }, [fileArray, activeSpeciesId]);
 
   // Clamp selectedImage whenever images length changes
   useEffect(() => {
@@ -74,6 +171,38 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     if (images.length === 0) return 0;
     return Math.min(Math.max(selectedImage, 0), images.length - 1);
   }, [selectedImage, images.length]);
+
+  // Mark the current image as dirty (needs auto-save)
+  const markDirty = useCallback((imageId: number) => {
+    dirtyImageIds.current.add(imageId);
+  }, []);
+
+  // Debounced auto-save: persist dirty images' annotations to disk
+  useEffect(() => {
+    if (!activeSpeciesId || images.length === 0 || dirtyImageIds.current.size === 0) return;
+
+    clearTimeout(autoSaveTimeoutRef.current);
+    autoSaveTimeoutRef.current = setTimeout(async () => {
+      const idsToSave = new Set(dirtyImageIds.current);
+      dirtyImageIds.current.clear();
+
+      for (const img of images) {
+        if (!idsToSave.has(img.id)) continue;
+        if (!img.speciesId) continue;
+        try {
+          await window.api.sessionSaveAnnotations(
+            img.speciesId,
+            img.filename,
+            img.boxes
+          );
+        } catch (err) {
+          console.error(`Auto-save failed for ${img.filename}:`, err);
+        }
+      }
+    }, 1000);
+
+    return () => clearTimeout(autoSaveTimeoutRef.current);
+  }, [images, activeSpeciesId]);
 
   // Current boxes for the active image
   const boxes = useMemo<BoundingBox[]>(() => {
@@ -94,16 +223,17 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     return boxes.flatMap((box) => box.landmarks);
   }, [boxes]);
 
-  // Helper to save snapshot before change
+  // Helper to save snapshot before change (also marks image dirty for auto-save)
   const saveSnapshot = useCallback(
     (activeImage: AnnotatedImage): AnnotatedImage => {
+      markDirty(activeImage.id);
       return {
         ...activeImage,
         history: [...(activeImage.history ?? []), cloneBoxes(activeImage.boxes)],
         future: [],
       };
     },
-    []
+    [markDirty]
   );
 
   const undo = useCallback(() => {
@@ -116,6 +246,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
 
       if (!currentImg.history || currentImg.history.length === 0) return prevImages;
 
+      markDirty(currentImg.id);
       const newImages = [...prevImages];
       const activeImage = { ...currentImg };
 
@@ -144,7 +275,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       newImages[idx] = activeImage;
       return newImages;
     });
-  }, [selectedImage]);
+  }, [selectedImage, markDirty]);
 
   const redo = useCallback(() => {
     setImages((prevImages) => {
@@ -156,6 +287,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
 
       if (!currentImg.future || currentImg.future.length === 0) return prevImages;
 
+      markDirty(currentImg.id);
       const newImages = [...prevImages];
       const activeImage = { ...currentImg };
 
@@ -183,7 +315,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       newImages[idx] = activeImage;
       return newImages;
     });
-  }, [selectedImage]);
+  }, [selectedImage, markDirty]);
 
   const clear = useCallback(() => {
     setImages((prevImages) => {
@@ -193,6 +325,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       const currentImg = prevImages[idx];
       if (!currentImg) return prevImages;
 
+      markDirty(currentImg.id);
       const newImages = [...prevImages];
       const activeImage = { ...currentImg };
 
@@ -208,7 +341,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       newImages[idx] = activeImage;
       return newImages;
     });
-  }, [selectedImage]);
+  }, [selectedImage, markDirty]);
 
   const addBox = useCallback(
     (boxData: Omit<BoundingBox, "id" | "landmarks">) => {
@@ -323,19 +456,31 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         const newImages = [...prevImages];
         const activeImage = saveSnapshot(currentImg);
 
+        // Find the box we're adding to
+        const box = activeImage.boxes.find((b) => b.id === boxId);
+        if (!box) return prevImages;
+
+        // Find next sequential index based on what's already placed,
+        // starting from the schema's minimum index (0 for 0-based, 1 for 1-based schemas)
+        const existingIndices = new Set(box.landmarks.map((lm) => lm.id));
+        let nextIndex = schemaMinIndex;
+        while (existingIndices.has(nextIndex)) {
+          nextIndex++;
+        }
+
         const newPoint: Point = {
           ...pointData,
-          id: Date.now(),
+          id: nextIndex, // ✅ Sequential index aligned to schema
         };
 
-        activeImage.boxes = activeImage.boxes.map((box) => {
-          if (box.id === boxId) {
+        activeImage.boxes = activeImage.boxes.map((b) => {
+          if (b.id === boxId) {
             return {
-              ...box,
-              landmarks: [...box.landmarks, newPoint],
+              ...b,
+              landmarks: [...b.landmarks, newPoint],
             };
           }
-          return box;
+          return b;
         });
 
         // Auto-select the box where landmark was added
@@ -345,7 +490,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         return newImages;
       });
     },
-    [selectedImage, saveSnapshot]
+    [selectedImage, saveSnapshot, schemaMinIndex]
   );
 
   const deleteLandmark = useCallback(
@@ -377,6 +522,182 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     [selectedImage, saveSnapshot]
   );
 
+  // Skip a landmark (marks it as skipped so it doesn't need to be placed)
+  const skipLandmark = useCallback(
+    (boxId: number) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        // Find the box we're adding to
+        const box = activeImage.boxes.find((b) => b.id === boxId);
+        if (!box) return prevImages;
+
+        // Find next sequential index aligned to the schema's min index
+        const existingIndices = new Set(box.landmarks.map((lm) => lm.id));
+        let nextIndex = schemaMinIndex;
+        while (existingIndices.has(nextIndex)) {
+          nextIndex++;
+        }
+
+        // Create a skipped landmark placeholder (coordinates don't matter)
+        const skippedPoint: Point = {
+          x: -1,
+          y: -1,
+          id: nextIndex,
+          isSkipped: true,
+        };
+
+        activeImage.boxes = activeImage.boxes.map((b) => {
+          if (b.id === boxId) {
+            return {
+              ...b,
+              landmarks: [...b.landmarks, skippedPoint],
+            };
+          }
+          return b;
+        });
+
+        // Auto-select the box
+        activeImage.selectedBoxId = boxId;
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot, schemaMinIndex]
+  );
+
+  // Bulk set boxes from detection
+  const setBoxesFromDetection = useCallback(
+    (detectedBoxes: DetectedBoxData[]) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        // Keep user/manual/corrected boxes; refresh only replaceable predicted boxes.
+        const preservedBoxes = cloneBoxes(
+          activeImage.boxes.filter((b) => !isReplaceablePredictedBox(b))
+        );
+        const usedIds = new Set<number>(preservedBoxes.map((b) => b.id));
+        let idCursor = Date.now();
+
+        // Convert fresh detections to BoundingBox format with collision-safe IDs.
+        const newBoxes: BoundingBox[] = detectedBoxes.map((det) => {
+          while (usedIds.has(idCursor)) idCursor += 1;
+          const id = idCursor;
+          usedIds.add(id);
+          idCursor += 1;
+          return {
+            id,
+            left: det.left,
+            top: det.top,
+            width: det.width,
+            height: det.height,
+            landmarks: [],
+            confidence: det.confidence,
+            source: "predicted" as const,
+          };
+        });
+
+        activeImage.boxes = [...preservedBoxes, ...newBoxes];
+        const preferredSelectedId =
+          newBoxes[0]?.id ??
+          (activeImage.selectedBoxId !== null &&
+          activeImage.boxes.some((b) => b.id === activeImage.selectedBoxId)
+            ? activeImage.selectedBoxId
+            : null) ??
+          activeImage.boxes[0]?.id ??
+          null;
+        activeImage.selectedBoxId = preferredSelectedId;
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
+  // Bulk set boxes from SuperAnnotator pipeline (with landmarks, masks, metadata)
+  const setBoxesFromSuperAnnotation = useCallback(
+    (objects: SuperAnnotateObjectData[]) => {
+      setImages((prevImages) => {
+        if (prevImages.length === 0) return prevImages;
+
+        const idx = Math.min(Math.max(selectedImage, 0), prevImages.length - 1);
+        const currentImg = prevImages[idx];
+        if (!currentImg) return prevImages;
+
+        const newImages = [...prevImages];
+        const activeImage = saveSnapshot(currentImg);
+
+        // Keep user/manual/corrected boxes; refresh only replaceable predicted boxes.
+        const preservedBoxes = cloneBoxes(
+          activeImage.boxes.filter((b) => !isReplaceablePredictedBox(b))
+        );
+        const usedIds = new Set<number>(preservedBoxes.map((b) => b.id));
+        let idCursor = Date.now();
+
+        const newBoxes: BoundingBox[] = objects.map((obj) => {
+          while (usedIds.has(idCursor)) idCursor += 1;
+          const id = idCursor;
+          usedIds.add(id);
+          idCursor += 1;
+          return {
+            id,
+            left: obj.box.left,
+            top: obj.box.top,
+            width: obj.box.width,
+            height: obj.box.height,
+            landmarks: obj.landmarks.map((lm) => ({
+              x: lm.x,
+              y: lm.y,
+              id: lm.id,
+              isPredicted: true,
+            })),
+            confidence: obj.confidence,
+            source: "predicted" as const,
+            maskOutline: obj.mask_outline,
+            className: obj.class_name,
+            instanceMetadata: obj.instance_metadata,
+            detectionMethod: obj.detection_method,
+            ...(obj.obb ? {
+              angle: obj.obb.angle,
+              obbCorners: obj.obb.corners as [number, number][],
+            } : {}),
+          };
+        });
+
+        activeImage.boxes = [...preservedBoxes, ...newBoxes];
+        const preferredSelectedId =
+          newBoxes[0]?.id ??
+          (activeImage.selectedBoxId !== null &&
+          activeImage.boxes.some((b) => b.id === activeImage.selectedBoxId)
+            ? activeImage.selectedBoxId
+            : null) ??
+          activeImage.boxes[0]?.id ??
+          null;
+        activeImage.selectedBoxId = preferredSelectedId;
+
+        newImages[idx] = activeImage;
+        return newImages;
+      });
+    },
+    [selectedImage, saveSnapshot]
+  );
+
   return (
     <UndoRedoClearContext.Provider
       value={{
@@ -391,8 +712,11 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
         deleteBox,
         selectBox,
         updateBox,
+        setBoxesFromDetection,
+        setBoxesFromSuperAnnotation,
         addLandmark,
         deleteLandmark,
+        skipLandmark,
         setSelectedImage,
         points,
       }}
