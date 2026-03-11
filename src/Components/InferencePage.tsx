@@ -323,6 +323,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const [isSavingCorrections, setIsSavingCorrections] = useState(false);
   const [loadingModels, setLoadingModels] = useState(true);
   const [showBoundingBox, setShowBoundingBox] = useState(true);
+  const [showMaskOverlay, setShowMaskOverlay] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     if (typeof window === "undefined") return SIDEBAR_DEFAULT_WIDTH;
     const raw = window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);
@@ -793,19 +794,6 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   );
 
   useEffect(() => {
-    if (!selectedModelKey) {
-      lastSelectedModelKeyRef.current = "";
-      return;
-    }
-    if (
-      lastSelectedModelKeyRef.current &&
-      lastSelectedModelKeyRef.current !== selectedModelKey
-    ) {
-      setSelectedSpecimenIndex(null);
-      setShowMaskOverlay(false);
-      setDetectionRerunModelKey(selectedModelKey);
-      setInferenceRerunModelKey(selectedModelKey);
-    }
     lastSelectedModelKeyRef.current = selectedModelKey;
   }, [selectedModelKey]);
 
@@ -3267,7 +3255,16 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                         <Label className="text-sm">Select Model</Label>
                         <select
                           value={selectedModelKey}
-                          onChange={(e) => setSelectedModelKey(e.target.value)}
+                          onChange={(e) => {
+                            const newKey = e.target.value;
+                            if (newKey !== selectedModelKey) {
+                              setSelectedSpecimenIndex(null);
+                              setShowMaskOverlay(false);
+                              setDetectionRerunModelKey(newKey);
+                              setInferenceRerunModelKey(newKey);
+                            }
+                            setSelectedModelKey(newKey);
+                          }}
                           className="w-full rounded-md border bg-background px-3 py-2 text-sm"
                         >
                           {models.map((model) => (
