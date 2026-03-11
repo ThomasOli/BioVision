@@ -27,6 +27,8 @@ interface CustomSchemaEditorProps {
 export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({ open, onSave, onCancel }) => {
   const [schemaName, setSchemaName] = useState("");
   const [landmarks, setLandmarks] = useState<LandmarkDefinition[]>([]);
+  // Tracks custom "other" label text per landmark index
+  const [otherLabels, setOtherLabels] = useState<Record<number, string>>({});
 
   const addLandmark = () => {
     const newIndex = landmarks.length;
@@ -45,6 +47,13 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({ open, on
     // Re-index remaining landmarks
     const reindexed = filtered.map((lm, i) => ({ ...lm, index: i }));
     setLandmarks(reindexed);
+    // Clean up otherLabels for removed/shifted indices
+    const newOther: Record<number, string> = {};
+    reindexed.forEach((_, i) => {
+      const oldIdx = i >= index ? i + 1 : i;
+      if (otherLabels[oldIdx] !== undefined) newOther[i] = otherLabels[oldIdx];
+    });
+    setOtherLabels(newOther);
   };
 
   const handleSave = () => {
@@ -58,26 +67,36 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({ open, on
       return;
     }
 
+    // Resolve "other" categories: replace with user-typed label if provided
+    const resolvedLandmarks = landmarks.map((lm, i) => {
+      if (lm.category === "other") {
+        const custom = (otherLabels[i] || "").trim();
+        return { ...lm, category: custom || "other" };
+      }
+      return lm;
+    });
+
     onSave({
       id: `custom-${Date.now()}`,
       name: schemaName,
-      description: `Custom schema with ${landmarks.length} landmarks`,
-      landmarks,
+      description: `Custom schema with ${resolvedLandmarks.length} landmarks`,
+      landmarks: resolvedLandmarks,
     });
 
     // Reset form
     setSchemaName("");
     setLandmarks([]);
+    setOtherLabels({});
   };
 
   return (
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onCancel()}>
-      <DialogContent className="max-w-3xl max-h-[80vh] overflow-hidden flex flex-col">
+      <DialogContent className="max-w-3xl flex flex-col">
         <DialogHeader>
           <DialogTitle>Create Custom Landmark Schema</DialogTitle>
         </DialogHeader>
 
-        <div className="flex-1 overflow-hidden flex flex-col space-y-4">
+        <div className="flex flex-col space-y-4">
           {/* Schema Name */}
           <div>
             <Label>Schema Name</Label>
@@ -90,7 +109,7 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({ open, on
           </div>
 
           {/* Landmarks List */}
-          <div className="flex-1 overflow-hidden flex flex-col">
+          <div className="flex flex-col">
             <div className="flex items-center justify-between mb-2">
               <Label>Landmarks ({landmarks.length})</Label>
               <motion.div {...buttonHover} {...buttonTap}>
@@ -101,7 +120,8 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({ open, on
               </motion.div>
             </div>
 
-            <ScrollArea className="flex-1 border rounded-md p-2">
+            {/* Fixed height so Radix ScrollArea viewport has a concrete constraint */}
+            <ScrollArea className="h-[50vh] border rounded-md p-2">
               <div className="space-y-2">
                 {landmarks.length === 0 ? (
                   <div className="flex flex-col items-center justify-center py-8 text-center">
@@ -135,7 +155,17 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({ open, on
                           />
                           <select
                             value={lm.category}
-                            onChange={(e) => updateLandmark(idx, { category: e.target.value })}
+                            onChange={(e) => {
+                              updateLandmark(idx, { category: e.target.value });
+                              // Clear stored other label when switching away from "other"
+                              if (e.target.value !== "other") {
+                                setOtherLabels((prev) => {
+                                  const next = { ...prev };
+                                  delete next[idx];
+                                  return next;
+                                });
+                              }
+                            }}
                             className="w-full rounded-md border bg-background px-2 py-1 text-xs"
                           >
                             <option value="head">Head</option>
@@ -149,6 +179,17 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({ open, on
                             <option value="hindwing">Hindwing</option>
                             <option value="other">Other</option>
                           </select>
+                          {lm.category === "other" && (
+                            <Input
+                              value={otherLabels[idx] ?? ""}
+                              onChange={(e) =>
+                                setOtherLabels((prev) => ({ ...prev, [idx]: e.target.value }))
+                              }
+                              placeholder="Specify category (e.g. scales, gills)"
+                              className="text-xs"
+                              autoFocus
+                            />
+                          )}
                         </div>
                         <motion.div {...buttonHover} {...buttonTap}>
                           <Button

@@ -106,7 +106,6 @@ const App: React.FC = () => {
   })
   // Detection state
   const [detectionMode, setDetectionMode] = useState<DetectionMode>("manual")
-  const [autoConfidence, setAutoConfidence] = useState(0.3)
   const [detectionPreset, setDetectionPreset] = useState<DetectionPreset>("balanced")
   const [objectClassName, setObjectClassName] = useState("")
   const [samEnabled, setSamEnabled] = useState(false)
@@ -282,8 +281,6 @@ const App: React.FC = () => {
             onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
             detectionMode={detectionMode}
             onDetectionModeChange={setDetectionMode}
-            autoConfidence={autoConfidence}
-            onAutoConfidenceChange={setAutoConfidence}
             detectionPreset={detectionPreset}
             onDetectionPresetChange={setDetectionPreset}
             className={objectClassName}
@@ -317,7 +314,6 @@ const App: React.FC = () => {
               opacity={opacity}
               isSwitchOn={isSwitchOn}
               detectionMode={detectionMode}
-              confThreshold={autoConfidence}
               detectionPreset={detectionPreset}
               className={objectClassName}
               samEnabled={samEnabled}

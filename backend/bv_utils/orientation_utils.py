@@ -8,6 +8,8 @@ import numpy as np
 
 
 STANDARD_SIZE = 512
+STANDARDIZED_OBB_PAD_RATIO = 0.05
+STANDARDIZED_OBB_INTERPOLATION = cv2.INTER_LINEAR
 ORIENTATION_MODES = {"directional", "bilateral", "axial", "invariant"}
 
 
@@ -412,28 +414,28 @@ def get_schema_augmentation_profile(
             "directional": {
                 "flip_prob": 0.5,
                 "vertical_flip_prob": 0.0,
-                "rotation_range": (-15.0, 15.0),
+                "rotation_range": (-12.0, 12.0),
                 "rotate_180_prob": 0.0,
-                "scale_range": (0.92, 1.08),
-                "translate_ratio": 0.06,
+                "scale_range": (0.95, 1.05),
+                "translate_ratio": 0.03,
             },
             "bilateral": {
                 "flip_prob": 0.5,
                 "vertical_flip_prob": 0.0,
-                "rotation_range": (-15.0, 15.0),
+                "rotation_range": (-12.0, 12.0),
                 "rotate_180_prob": 0.0,
-                "scale_range": (0.90, 1.10),
-                "translate_ratio": 0.08,
+                "scale_range": (0.95, 1.05),
+                "translate_ratio": 0.03,
             },
             # Axial: 180° augmentation retained for CNN (class_id-based flip is primary
             # but CNN benefits from rotate_180 augmentation for axial variation).
             "axial": {
                 "flip_prob": 0.5,
                 "vertical_flip_prob": 0.0,
-                "rotation_range": (-15.0, 15.0),
+                "rotation_range": (-10.0, 10.0),
                 "rotate_180_prob": 0.5,
-                "scale_range": (0.90, 1.10),
-                "translate_ratio": 0.08,
+                "scale_range": (0.94, 1.06),
+                "translate_ratio": 0.03,
             },
             # Invariant schemas rely on strong augmentation (no OBB leveling concept).
             "invariant": {
@@ -441,8 +443,8 @@ def get_schema_augmentation_profile(
                 "vertical_flip_prob": 0.25,
                 "rotation_range": (-180.0, 180.0),
                 "rotate_180_prob": 0.0,
-                "scale_range": (0.85, 1.15),
-                "translate_ratio": 0.10,
+                "scale_range": (0.88, 1.12),
+                "translate_ratio": 0.06,
             },
         }
         profile = dict(profiles.get(resolved_mode, profiles["invariant"]))
@@ -461,18 +463,78 @@ def get_schema_augmentation_profile(
     raise ValueError(f"Unsupported engine '{engine}' for schema augmentation profile.")
 
 
+def resolve_session_augmentation_profile(
+    session_dir: str,
+    *,
+    engine: str,
+    fallback_mode: str | None = None,
+) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """
+    Resolve the effective schema-aware augmentation profile for a session.
+
+    Returns:
+        (mode, orientation_policy, augmentation_policy, resolved_profile)
+    """
+    orientation_policy = load_orientation_policy(session_dir)
+    augmentation_policy = load_augmentation_policy(session_dir)
+    mode = _safe_orientation_mode(
+        orientation_policy.get("mode") if isinstance(orientation_policy, Mapping) else fallback_mode
+    )
+    if mode not in ORIENTATION_MODES:
+        mode = _safe_orientation_mode(fallback_mode)
+    profile = get_schema_augmentation_profile(
+        mode,
+        engine=engine,
+        augmentation_override=augmentation_policy,
+    )
+    return mode, orientation_policy, augmentation_policy, profile
+
+
 def get_box_jitter_profile(mode: str | None, *, engine: str) -> dict[str, Any]:
     """
     Return schema-specific box-jitter defaults.
 
     The jitter is intended to simulate detector crop variability.
-    - dlib: conservative defaults to protect mean-shape stability.
+    - dlib: scale-only source-box variance to protect mean-shape stability.
     - cnn: stronger defaults for detector-noise robustness.
     """
     resolved_mode = _safe_orientation_mode(mode)
     eng = str(engine or "").strip().lower()
 
     if eng == "dlib":
+        profiles = {
+            "directional": {
+                "enabled": True,
+                "copies_per_sample": 1,
+                "translate_ratio": 0.0,
+                "scale_range": (0.98, 1.02),
+                "strategy": "scale_only_pre_standardize",
+            },
+            "bilateral": {
+                "enabled": True,
+                "copies_per_sample": 1,
+                "translate_ratio": 0.0,
+                "scale_range": (0.97, 1.03),
+                "strategy": "scale_only_pre_standardize",
+            },
+            "axial": {
+                "enabled": True,
+                "copies_per_sample": 1,
+                "translate_ratio": 0.0,
+                "scale_range": (0.96, 1.04),
+                "strategy": "scale_only_pre_standardize",
+            },
+            "invariant": {
+                "enabled": True,
+                "copies_per_sample": 2,
+                "translate_ratio": 0.0,
+                "scale_range": (0.95, 1.05),
+                "strategy": "scale_only_pre_standardize",
+            },
+        }
+        return dict(profiles.get(resolved_mode, profiles["invariant"]))
+
+    if False and eng == "dlib":
         # Geometric lock: OBB-leveled crops occupy the canvas tightly.
         # Cap translate at ±3% and scale at ±5% max to avoid wasting model
         # capacity on a spatially wandering specimen.
@@ -480,18 +542,20 @@ def get_box_jitter_profile(mode: str | None, *, engine: str) -> dict[str, Any]:
             "directional": {
                 "enabled": True,
                 "copies_per_sample": 1,
-                "translate_ratio": 0.02,
+                "translate_ratio": 0.0,
                 "scale_range": (0.98, 1.02),
+                "strategy": "scale_only_pre_standardize",
             },
             "bilateral": {
                 "enabled": True,
-                "copies_per_sample": 2,
-                "translate_ratio": 0.03,
-                "scale_range": (0.96, 1.04),
+                "copies_per_sample": 1,
+                "translate_ratio": 0.0,
+                "scale_range": (0.97, 1.03),
+                "strategy": "scale_only_pre_standardize",
             },
             "axial": {
                 "enabled": True,
-                "copies_per_sample": 2,
+                "copies_per_sample": 1,
                 "translate_ratio": 0.03,   # tightened from 0.035 (±3% max)
                 "scale_range": (0.95, 1.05),
             },
@@ -543,6 +607,16 @@ def _mirror_x(x: float, width: int) -> float:
     max_x = float(width - 1)
     if mirrored > max_x:
         return max_x
+    return mirrored
+
+
+def _mirror_y(y: float, height: int) -> float:
+    mirrored = (height - 1) - float(y)
+    if mirrored < 0:
+        return 0.0
+    max_y = float(height - 1)
+    if mirrored > max_y:
+        return max_y
     return mirrored
 
 
@@ -603,42 +677,56 @@ def base_standardize(
     crop_w = max(1, int(crop_w))
     crop_h = max(1, int(crop_h))
 
-    sq = max(crop_w, crop_h)
-    pad_left = (sq - crop_w) // 2
-    pad_top  = (sq - crop_h) // 2
-    pad_right  = sq - crop_w - pad_left
-    pad_bottom = sq - crop_h - pad_top
-   # 1. Sample the outermost pixels of the crop
-    perimeter = np.concatenate([
-        crop[0, :],    # Top edge
-        crop[-1, :],   # Bottom edge
-        crop[:, 0],    # Left edge
-        crop[:, -1]    # Right edge
-    ], axis=0)
-    
-    # 2. Find the median background color (avoids outlier specimen pixels)
-    bg_color = [int(x) for x in np.median(perimeter, axis=0)]
-
-    # 3. Pad with the exact background color
-    padded = cv2.copyMakeBorder(
-        crop, pad_top, pad_bottom, pad_left, pad_right,
-        cv2.BORDER_CONSTANT, value=bg_color
+    crop_512, letterbox_meta = _letterbox_to_square(
+        crop,
+        target_size=STANDARD_SIZE,
+        fill_color=_median_perimeter_color(crop),
     )
-    scale = float(STANDARD_SIZE) / float(sq)
-    crop_512 = cv2.resize(padded, (STANDARD_SIZE, STANDARD_SIZE), interpolation=cv2.INTER_LINEAR)
 
     meta = {
         "center":      [int((x1 + x2) / 2), int((y1 + y2) / 2)],
         "crop_origin": [int(cx1), int(cy1)],
         "crop_size":   [int(crop_w), int(crop_h)],
         "rotation":    0.0,
-        "scale_x":     scale,
-        "scale_y":     scale,
-        "scale":       scale,
-        "pad_left":    pad_left,
-        "pad_top":     pad_top,
+        "scale_x":     float(letterbox_meta["scale"]),
+        "scale_y":     float(letterbox_meta["scale"]),
+        "scale":       float(letterbox_meta["scale"]),
+        "pad_left":    float(letterbox_meta["pad_left"]),
+        "pad_top":     float(letterbox_meta["pad_top"]),
+        "pad_right":   float(letterbox_meta["pad_right"]),
+        "pad_bottom":  float(letterbox_meta["pad_bottom"]),
+        "fill_color":  _median_perimeter_color(crop),
+        "fill_strategy": "median_perimeter",
+        "padding_coordinate_space": "standardized",
+        "obb_deskewed": False,
     }
     return crop_512, meta
+
+
+def _get_standardized_padding(
+    metadata: Mapping[str, Any],
+    *,
+    sx: float | None = None,
+    sy: float | None = None,
+) -> tuple[float, float, float, float]:
+    scale_x = float(sx if sx is not None else metadata.get("scale_x", metadata.get("scale", 1.0))) or 1.0
+    scale_y = float(sy if sy is not None else metadata.get("scale_y", metadata.get("scale", 1.0))) or 1.0
+    pad_left = float(metadata.get("pad_left", 0.0))
+    pad_top = float(metadata.get("pad_top", 0.0))
+    pad_right = float(metadata.get("pad_right", 0.0))
+    pad_bottom = float(metadata.get("pad_bottom", 0.0))
+
+    coordinate_space = str(metadata.get("padding_coordinate_space", "")).strip().lower()
+    if coordinate_space in ("", "legacy"):
+        coordinate_space = "standardized" if bool(metadata.get("obb_deskewed")) else "crop"
+
+    if coordinate_space == "crop":
+        pad_left *= scale_x
+        pad_top *= scale_y
+        pad_right *= scale_x
+        pad_bottom *= scale_y
+
+    return pad_left, pad_top, pad_right, pad_bottom
 
 
 def remap_landmarks_to_standard(
@@ -650,13 +738,16 @@ def remap_landmarks_to_standard(
     ox, oy = metadata["crop_origin"]
     sx = float(metadata.get("scale_x", metadata.get("scale", 1.0)))
     sy = float(metadata.get("scale_y", metadata.get("scale", 1.0)))
-    pad_left = float(metadata.get("pad_left", 0.0))
-    pad_top  = float(metadata.get("pad_top",  0.0))
+    pad_left, pad_top, _pad_right, _pad_bottom = _get_standardized_padding(
+        metadata,
+        sx=sx,
+        sy=sy,
+    )
 
     remapped: list[dict[str, Any]] = []
     for lm in landmarks:
-        x = (float(lm["x"]) - float(ox) + pad_left) * sx
-        y = (float(lm["y"]) - float(oy) + pad_top)  * sy
+        x = ((float(lm["x"]) - float(ox)) * sx) + pad_left
+        y = ((float(lm["y"]) - float(oy)) * sy) + pad_top
         if mirror:
             x = _mirror_x(x, STANDARD_SIZE)
         # Keep standardized coordinates within the 512x512 crop frame.
@@ -875,7 +966,8 @@ def should_lock_orientation_from_canonicalization(
     if mode != "directional":
         return False
     source = str(canonical_meta.get("direction_source", "")).strip().lower()
-    return source == "detector_hint"
+    canonical_source = str(canonical_meta.get("source", "")).strip().lower()
+    return source == "detector_hint" or canonical_source == "obb_geometry"
 
 
 def detect_orientation(
@@ -908,6 +1000,321 @@ def detect_orientation(
         return None
     centroid_x = sum(float(lm["x"]) for lm in others) / float(len(others))
     return "left" if float(head["x"]) < centroid_x else "right"
+
+
+def obb_corners_to_aabb(
+    obb_corners: Sequence[Sequence[float]],
+    *,
+    image_shape: tuple[int, int] | None = None,
+) -> dict[str, float]:
+    pts = np.array(obb_corners, dtype=np.float32).reshape(-1, 2)
+    if pts.shape != (4, 2):
+        raise ValueError("obb_corners_to_aabb expects 4 OBB corners")
+
+    left = float(np.min(pts[:, 0]))
+    top = float(np.min(pts[:, 1]))
+    right = float(np.max(pts[:, 0]))
+    bottom = float(np.max(pts[:, 1]))
+
+    if image_shape is not None:
+        img_h, img_w = image_shape[:2]
+        left = max(0.0, min(float(img_w - 1), left))
+        top = max(0.0, min(float(img_h - 1), top))
+        right = max(left + 1.0, min(float(img_w), right))
+        bottom = max(top + 1.0, min(float(img_h), bottom))
+
+    width = right - left
+    height = bottom - top
+    if width <= 1.0 or height <= 1.0:
+        raise ValueError("derived AABB envelope is too small")
+
+    return {
+        "left": float(left),
+        "top": float(top),
+        "right": float(right),
+        "bottom": float(bottom),
+        "width": float(width),
+        "height": float(height),
+    }
+
+
+def _normalize_angle_360(angle_deg: float) -> float:
+    angle = float(angle_deg) % 360.0
+    if angle < 0.0:
+        angle += 360.0
+    return angle
+
+
+def _normalize_angle_signed(angle_deg: float) -> float:
+    angle = _normalize_angle_360(angle_deg)
+    if angle > 180.0:
+        angle -= 360.0
+    if angle <= -180.0:
+        angle += 360.0
+    if abs(angle + 180.0) <= 1e-6:
+        return 180.0
+    return angle
+
+
+def _angular_distance_deg(a: float, b: float) -> float:
+    return abs(((float(a) - float(b) + 180.0) % 360.0) - 180.0)
+
+
+def _snap_import_angle(angle_deg: float, *, mode: str, tolerance_deg: float = 5.0) -> float:
+    resolved_mode = _safe_orientation_mode(mode)
+    if resolved_mode == "invariant":
+        return 0.0
+
+    angle_360 = _normalize_angle_360(angle_deg)
+    targets: list[float]
+    if resolved_mode == "directional":
+        targets = [0.0, 180.0]
+    elif resolved_mode == "bilateral":
+        targets = [90.0, 270.0]
+    elif resolved_mode == "axial":
+        targets = [0.0, 90.0, 180.0, 270.0]
+    else:
+        targets = []
+
+    best_target = None
+    best_distance = None
+    for target in targets:
+        distance = _angular_distance_deg(angle_360, target)
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_target = target
+
+    if best_target is not None and best_distance is not None and best_distance <= float(tolerance_deg):
+        return _normalize_angle_signed(best_target)
+    return _normalize_angle_signed(angle_360)
+
+
+def _centroid(points: Sequence[Mapping[str, float]]) -> tuple[float, float]:
+    if not points:
+        raise ValueError("cannot compute centroid of empty point set")
+    cx = sum(float(p["x"]) for p in points) / float(len(points))
+    cy = sum(float(p["y"]) for p in points) / float(len(points))
+    return float(cx), float(cy)
+
+
+def _bi_centroid_axis(
+    valid: Sequence[Mapping[str, float | int]],
+    *,
+    axis: str,
+) -> tuple[float, float, float]:
+    if len(valid) < 2:
+        raise ValueError("need at least two landmarks for bi-centroid axis")
+    key = "x" if axis == "horizontal" else "y"
+    sorted_points = sorted(valid, key=lambda lm: float(lm[key]))
+    bucket_size = max(1, int(math.ceil(len(sorted_points) * 0.25)))
+    start_bucket = sorted_points[:bucket_size]
+    end_bucket = sorted_points[-bucket_size:]
+    start_x, start_y = _centroid(start_bucket)
+    end_x, end_y = _centroid(end_bucket)
+    dx = float(end_x - start_x)
+    dy = float(end_y - start_y)
+    norm = float(math.hypot(dx, dy))
+    if norm <= 1e-6:
+        raise ValueError("bi-centroid buckets collapse to the same centroid")
+    return dx / norm, dy / norm, norm
+
+
+def _resolve_landmark_axis(
+    valid: Sequence[Mapping[str, float | int]],
+    *,
+    mode: str,
+    head: Mapping[str, float | int] | None = None,
+    tail: Mapping[str, float | int] | None = None,
+) -> tuple[float, float, str]:
+    resolved_mode = _safe_orientation_mode(mode)
+    if resolved_mode == "invariant":
+        return 1.0, 0.0, "invariant_axis_aligned"
+
+    if head is not None and tail is not None:
+        dx = float(tail["x"]) - float(head["x"])
+        dy = float(tail["y"]) - float(head["y"])
+        norm = float(math.hypot(dx, dy))
+        if norm > 1e-6:
+            return dx / norm, dy / norm, "head_tail"
+
+    if resolved_mode == "directional":
+        try:
+            ux, uy, _ = _bi_centroid_axis(valid, axis="horizontal")
+            return ux, uy, "directional_bi_centroid"
+        except ValueError:
+            return 1.0, 0.0, "fallback"
+    if resolved_mode == "bilateral":
+        try:
+            ux, uy, _ = _bi_centroid_axis(valid, axis="vertical")
+            return ux, uy, "bilateral_bi_centroid"
+        except ValueError:
+            return 1.0, 0.0, "fallback"
+    if resolved_mode == "axial":
+        candidates: list[tuple[float, float, float]] = []
+        for axis in ("horizontal", "vertical"):
+            try:
+                candidates.append(_bi_centroid_axis(valid, axis=axis))
+            except ValueError:
+                continue
+        if candidates:
+            horiz_or_best = max(candidates, key=lambda item: item[2])
+            return horiz_or_best[0], horiz_or_best[1], "axial_axis_snapped"
+        return 1.0, 0.0, "fallback"
+    return 1.0, 0.0, "fallback"
+
+
+def derive_obb_from_landmarks(
+    landmarks: Sequence[Mapping[str, Any]],
+    *,
+    image_shape: tuple[int, int] | None = None,
+    head_id: int | None = None,
+    tail_id: int | None = None,
+    mode: str = "invariant",
+    pad_ratio: float = 0.10,
+    min_pad_px: float = 4.0,
+) -> dict[str, Any]:
+    valid: list[dict[str, float | int]] = []
+    for lm in landmarks:
+        try:
+            if bool(lm.get("isSkipped")):
+                continue
+            x = float(lm.get("x", -1))
+            y = float(lm.get("y", -1))
+            lid = int(lm.get("id", -1))
+        except Exception:
+            continue
+        if x < 0 or y < 0:
+            continue
+        valid.append({"id": lid, "x": x, "y": y})
+
+    if len(valid) == 0:
+        raise ValueError("cannot derive OBB from landmarks: no valid non-skipped landmarks")
+
+    unique_points = {(round(float(lm["x"]), 3), round(float(lm["y"]), 3)) for lm in valid}
+    if len(unique_points) < 2:
+        x = float(valid[0]["x"])
+        y = float(valid[0]["y"])
+        width = max(2.0, float(min_pad_px) * 2.0)
+        height = max(2.0, float(min_pad_px) * 2.0)
+        corners = np.array(
+            [
+                [x - width / 2.0, y - height / 2.0],
+                [x + width / 2.0, y - height / 2.0],
+                [x + width / 2.0, y + height / 2.0],
+                [x - width / 2.0, y + height / 2.0],
+            ],
+            dtype=np.float32,
+        )
+        if image_shape is not None:
+            img_h, img_w = image_shape[:2]
+            corners[:, 0] = np.clip(corners[:, 0], 0.0, float(img_w - 1))
+            corners[:, 1] = np.clip(corners[:, 1], 0.0, float(img_h - 1))
+        corners_list = corners.tolist()
+        return {
+            **obb_corners_to_aabb(corners_list, image_shape=image_shape),
+            "obbCorners": corners_list,
+            "angle": 0.0,
+            "derivation": "fallback",
+        }
+
+    head = None
+    tail = None
+    if head_id is not None:
+        head = next((lm for lm in valid if int(lm["id"]) == int(head_id)), None)
+    if tail_id is not None:
+        tail = next((lm for lm in valid if int(lm["id"]) == int(tail_id)), None)
+
+    resolved_mode = _safe_orientation_mode(mode)
+    ux, uy, derivation = _resolve_landmark_axis(
+        valid,
+        mode=resolved_mode,
+        head=head,
+        tail=tail,
+    )
+
+    vx = -uy
+    vy = ux
+    u_values = [float(lm["x"]) * ux + float(lm["y"]) * uy for lm in valid]
+    v_values = [float(lm["x"]) * vx + float(lm["y"]) * vy for lm in valid]
+    min_u = min(u_values)
+    max_u = max(u_values)
+    min_v = min(v_values)
+    max_v = max(v_values)
+
+    raw_width = max(2.0, max_u - min_u)
+    raw_height = max(2.0, max_v - min_v)
+    pad_u = max(float(min_pad_px), raw_width * float(pad_ratio))
+    pad_v = max(float(min_pad_px), raw_height * float(pad_ratio))
+    center_u = (min_u + max_u) / 2.0
+    center_v = (min_v + max_v) / 2.0
+    center_x = center_u * ux + center_v * vx
+    center_y = center_u * uy + center_v * vy
+    width = raw_width + pad_u * 2.0
+    height = raw_height + pad_v * 2.0
+    angle = float(math.degrees(math.atan2(uy, ux)))
+    angle = _snap_import_angle(angle, mode=resolved_mode)
+
+    r = math.radians(angle)
+    cos_a = math.cos(r)
+    sin_a = math.sin(r)
+    hw = width / 2.0
+    hh = height / 2.0
+    corners = np.array(
+        [
+            [center_x + cos_a * (-hw) - sin_a * (-hh), center_y + sin_a * (-hw) + cos_a * (-hh)],
+            [center_x + cos_a * ( hw) - sin_a * (-hh), center_y + sin_a * ( hw) + cos_a * (-hh)],
+            [center_x + cos_a * ( hw) - sin_a * ( hh), center_y + sin_a * ( hw) + cos_a * ( hh)],
+            [center_x + cos_a * (-hw) - sin_a * ( hh), center_y + sin_a * (-hw) + cos_a * ( hh)],
+        ],
+        dtype=np.float32,
+    )
+    if image_shape is not None:
+        img_h, img_w = image_shape[:2]
+        corners[:, 0] = np.clip(corners[:, 0], 0.0, float(img_w - 1))
+        corners[:, 1] = np.clip(corners[:, 1], 0.0, float(img_h - 1))
+
+    corners_list = corners.tolist()
+    return {
+        **obb_corners_to_aabb(corners_list, image_shape=image_shape),
+        "obbCorners": corners_list,
+        "angle": angle,
+        "derivation": derivation,
+    }
+
+
+def derive_class_id_from_landmarks(
+    landmarks: Sequence[Mapping[str, Any]],
+    *,
+    mode: str,
+    head_id: int | None = None,
+    tail_id: int | None = None,
+) -> int:
+    resolved_mode = _safe_orientation_mode(mode)
+    if resolved_mode == "invariant":
+        return 0
+
+    valid = [
+        lm for lm in landmarks
+        if not bool(lm.get("isSkipped"))
+        and float(lm.get("x", -1)) >= 0
+        and float(lm.get("y", -1)) >= 0
+    ]
+    if len(valid) < 2:
+        return 0
+
+    head = None
+    tail = None
+    if head_id is not None:
+        head = next((lm for lm in valid if int(lm.get("id", -99999)) == int(head_id)), None)
+    if tail_id is not None:
+        tail = next((lm for lm in valid if int(lm.get("id", -99999)) == int(tail_id)), None)
+    if head is None or tail is None:
+        return 0
+
+    if resolved_mode == "axial":
+        return 0 if float(head["y"]) < float(tail["y"]) else 1
+
+    return 0 if float(head["x"]) < float(tail["x"]) else 1
 
 
 def resolve_orientation_hint(
@@ -1169,31 +1576,97 @@ def map_to_original(
 ) -> list[dict[str, Any]]:
     """
     Map STANDARD_SIZE landmarks back to original image coordinates.
-    Transform order (inverse):
-      1) un-flip (if needed)
-      2) un-rotate in STANDARD_SIZE space
-      3) un-resize to crop space
-      4) offset by crop origin
-      5) un-scale to original image size
-      6) optional bounds clamp
+
+    For OBB-deskewed crops (metadata["obb_deskewed"] == True and affine_M present):
+      Transform order (inverse):
+        1) un-flip in STANDARD_SIZE space (if needed)
+        2) un-resize to crop space
+        3) offset to rotated-image space (add crop_origin)
+        4) apply exact inverse affine (cv2.invertAffineTransform) to un-rotate
+        5) un-scale to original image size
+        6) optional bounds clamp
+      This uses the stored affine_M to invert the exact warpAffine applied during
+      crop extraction, correcting for crops where the OBB center was clamped near
+      the image border (center ≠ 256 in 512-space).
+
+    For non-OBB crops (affine_M absent or obb_deskewed=False):
+      Transform order (inverse):
+        1) un-flip (if needed)
+        2) un-rotate in STANDARD_SIZE space around center (256, 256)
+        3) un-resize to crop space
+        4) offset by crop origin
+        5) un-scale to original image size
+        6) optional bounds clamp
     """
     sx = float(metadata.get("scale_x", metadata.get("scale", 1.0))) or 1.0
     sy = float(metadata.get("scale_y", metadata.get("scale", 1.0))) or 1.0
     ox, oy = metadata["crop_origin"]
     angle = float(metadata.get("rotation", 0.0))
+    pad_left, pad_top, _pad_right, _pad_bottom = _get_standardized_padding(
+        metadata,
+        sx=sx,
+        sy=sy,
+    )
 
     img_h = image_shape[0] if image_shape is not None else None
     img_w = image_shape[1] if image_shape is not None else None
 
+    mapped: list[dict[str, Any]] = []
+    canonical_flip_applied = bool(metadata.get("canonical_flip_applied", False))
+    effective_flip = bool(was_flipped) ^ canonical_flip_applied
+    rotated_180 = bool(metadata.get("rotated_180", False))
+
+    # Use exact inverse affine when available (OBB-deskewed crops).
+    affine_M_raw = metadata.get("affine_M")
+    use_exact_affine = bool(metadata.get("obb_deskewed")) and affine_M_raw is not None
+
+    if use_exact_affine:
+        M = np.array(affine_M_raw, dtype=np.float64)
+        M_inv = cv2.invertAffineTransform(M)  # exact inverse of the warpAffine used during extraction
+
+        for lm in landmarks_512:
+            x_s = max(0.0, min(float(STANDARD_SIZE - 1), float(lm["x"])))
+            y_s = max(0.0, min(float(STANDARD_SIZE - 1), float(lm["y"])))
+
+            if effective_flip:
+                x_s = _mirror_x(x_s, STANDARD_SIZE)
+            if rotated_180:
+                x_s = _mirror_x(x_s, STANDARD_SIZE)
+                y_s = _mirror_y(y_s, STANDARD_SIZE)
+
+            # Un-resize: 512 → crop space
+            x_crop = (x_s - pad_left) / sx
+            y_crop = (y_s - pad_top) / sy
+
+            # Offset to rotated-image space
+            x_rot = x_crop + float(ox)
+            y_rot = y_crop + float(oy)
+
+            # Un-rotate using exact inverse affine
+            x_orig = M_inv[0, 0] * x_rot + M_inv[0, 1] * y_rot + M_inv[0, 2]
+            y_orig = M_inv[1, 0] * x_rot + M_inv[1, 1] * y_rot + M_inv[1, 2]
+
+            if image_scale and image_scale != 1.0:
+                x_orig = x_orig / float(image_scale)
+                y_orig = y_orig / float(image_scale)
+
+            if img_w is not None and img_h is not None:
+                x_orig = max(0.0, min(float(img_w - 1), x_orig))
+                y_orig = max(0.0, min(float(img_h - 1), y_orig))
+
+            mapped.append({
+                "id": int(lm["id"]),
+                "x": round(x_orig, 1),
+                "y": round(y_orig, 1),
+            })
+        return mapped
+
+    # Fallback: center-based rotation in 512-space (non-OBB or legacy crops).
     angle_rad = np.radians(-angle)
     cos_a = float(np.cos(angle_rad))
     sin_a = float(np.sin(angle_rad))
     cx_s = STANDARD_SIZE / 2.0
     cy_s = STANDARD_SIZE / 2.0
-
-    mapped: list[dict[str, Any]] = []
-    canonical_flip_applied = bool(metadata.get("canonical_flip_applied", False))
-    effective_flip = bool(was_flipped) ^ canonical_flip_applied
 
     for lm in landmarks_512:
         x_s = max(0.0, min(float(STANDARD_SIZE - 1), float(lm["x"])))
@@ -1201,6 +1674,9 @@ def map_to_original(
 
         if effective_flip:
             x_s = _mirror_x(x_s, STANDARD_SIZE)
+        if rotated_180:
+            x_s = _mirror_x(x_s, STANDARD_SIZE)
+            y_s = _mirror_y(y_s, STANDARD_SIZE)
 
         if abs(angle) > 1e-9:
             x_u = cx_s + (x_s - cx_s) * cos_a - (y_s - cy_s) * sin_a
@@ -1208,13 +1684,8 @@ def map_to_original(
         else:
             x_u, y_u = x_s, y_s
 
-        pad_left = float(metadata.get("pad_left", 0.0))
-        pad_top  = float(metadata.get("pad_top",  0.0))
-
-        x_padded = x_u / sx
-        y_padded = y_u / sy
-        x_crop = x_padded - pad_left
-        y_crop = y_padded - pad_top
+        x_crop = (x_u - pad_left) / sx
+        y_crop = (y_u - pad_top) / sy
         x_orig = x_crop + float(ox)
         y_orig = y_crop + float(oy)
 
@@ -1238,20 +1709,86 @@ def map_to_original(
 # OBB Universal Geometry Engine
 # ===========================================================================
 
+def _median_perimeter_color(image: np.ndarray) -> list[int]:
+    if image is None or image.size == 0 or image.ndim != 3 or image.shape[2] != 3:
+        return [0, 0, 0]
+    h, w = image.shape[:2]
+    if h <= 0 or w <= 0:
+        return [0, 0, 0]
+    perimeter = np.concatenate(
+        [
+            image[0, :],
+            image[h - 1, :],
+            image[:, 0],
+            image[:, w - 1],
+        ],
+        axis=0,
+    )
+    if perimeter.size == 0:
+        return [0, 0, 0]
+    return [int(v) for v in np.median(perimeter, axis=0)]
+
+
+def _letterbox_to_square(
+    crop: np.ndarray,
+    *,
+    target_size: int,
+    fill_color: list[int],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if crop is None or crop.size == 0:
+        raise ValueError("cannot letterbox an empty crop")
+
+    crop_h, crop_w = crop.shape[:2]
+    crop_h = max(1, int(crop_h))
+    crop_w = max(1, int(crop_w))
+    longest = max(crop_w, crop_h)
+    scale = float(target_size) / float(longest)
+
+    resized_w = max(1, int(round(crop_w * scale)))
+    resized_h = max(1, int(round(crop_h * scale)))
+    resized = cv2.resize(
+        crop,
+        (resized_w, resized_h),
+        interpolation=STANDARDIZED_OBB_INTERPOLATION,
+    )
+
+    pad_left = (target_size - resized_w) // 2
+    pad_top = (target_size - resized_h) // 2
+    pad_right = target_size - resized_w - pad_left
+    pad_bottom = target_size - resized_h - pad_top
+    canvas = cv2.copyMakeBorder(
+        resized,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        cv2.BORDER_CONSTANT,
+        value=fill_color,
+    )
+    return canvas, {
+        "scale": float(scale),
+        "pad_left": int(pad_left),
+        "pad_top": int(pad_top),
+        "pad_right": int(pad_right),
+        "pad_bottom": int(pad_bottom),
+        "resized_width": int(resized_w),
+        "resized_height": int(resized_h),
+    }
+
 def extract_obb_crop(
     image: np.ndarray,
     obb_corners: list,
-    pad_ratio: float = 0.15,
+    pad_ratio: float = STANDARDIZED_OBB_PAD_RATIO,
     target_size: int = STANDARD_SIZE,
     apply_leveling: bool = True,
 ) -> tuple:
     """
-    Extract a square crop deskewed to the OBB angle using BORDER_REFLECT_101.
+    Extract a tight deskewed OBB crop, then letterbox it into a square canvas.
 
     Args:
         image: Full-resolution BGR image.
         obb_corners: 4-corner list [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in image pixels.
-        pad_ratio: Fraction of max side added as padding.
+        pad_ratio: Fraction of each OBB side added as padding.
         target_size: Output crop size (default 512).
         apply_leveling: If True (default), rotate the image to deskew the OBB. If False,
             pixels are untouched (AABB-like crop), but affine_M is still stored so
@@ -1272,10 +1809,6 @@ def extract_obb_crop(
     # OBBs where both sides are almost equal and the wrong side wins by a pixel.
     if angle < -45.0:    # long axis is steep; add 90° to bring it near-horizontal
         angle += 90.0
-
-    # Square side = max of OBB dims + padding
-    sq = float(max(rw, rh)) * (1.0 + 2.0 * pad_ratio)
-    half = int(sq / 2)
 
     img_h, img_w = image.shape[:2]
     cx_i, cy_i = int(round(center[0])), int(round(center[1]))
@@ -1299,38 +1832,140 @@ def extract_obb_crop(
         # Pixels untouched; M is still stored for coordinate transforms
         rotated = image
 
-    # Crop a square region centered at the OBB center
-    x1 = max(0, cx_i - half)
-    y1 = max(0, cy_i - half)
-    x2 = min(img_w, cx_i + half)
-    y2 = min(img_h, cy_i + half)
+    transformed_pts = cv2.transform(pts.reshape(1, -1, 2), M).reshape(-1, 2)
+    min_x = float(np.min(transformed_pts[:, 0]))
+    max_x = float(np.max(transformed_pts[:, 0]))
+    min_y = float(np.min(transformed_pts[:, 1]))
+    max_y = float(np.max(transformed_pts[:, 1]))
+    pad_x = float(max(max_x - min_x, 1.0)) * float(max(0.0, pad_ratio))
+    pad_y = float(max(max_y - min_y, 1.0)) * float(max(0.0, pad_ratio))
+
+    # Crop the exact transformed OBB envelope plus a small biological margin.
+    x1 = max(0, int(math.floor(min_x - pad_x)))
+    y1 = max(0, int(math.floor(min_y - pad_y)))
+    x2 = min(img_w, int(math.ceil(max_x + pad_x)))
+    y2 = min(img_h, int(math.ceil(max_y + pad_y)))
     crop = rotated[y1:y2, x1:x2]
 
     ch, cw = crop.shape[:2]
-    if cw != ch:
-        s = max(cw, ch)
-        crop = cv2.copyMakeBorder(crop, 0, s - ch, 0, s - cw,
-                                  cv2.BORDER_CONSTANT, value=0)
-        cw = ch = s
+    if crop.size == 0 or cw <= 0 or ch <= 0:
+        raise ValueError("extract_obb_crop produced an empty crop")
 
-    scale = float(target_size) / float(max(1, cw))
-    crop_512 = cv2.resize(crop, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+    fill_color = _median_perimeter_color(crop)
+    crop_512, letterbox_meta = _letterbox_to_square(
+        crop,
+        target_size=target_size,
+        fill_color=fill_color,
+    )
 
     meta = {
         "center": [cx_i, cy_i],
         "crop_origin": [x1, y1],
         "crop_size": [cw, ch],
         "rotation": float(angle),
-        "scale_x": scale,
-        "scale_y": scale,
-        "scale": scale,
-        "pad_left": 0,
-        "pad_top": 0,
+        "scale_x": float(letterbox_meta["scale"]),
+        "scale_y": float(letterbox_meta["scale"]),
+        "scale": float(letterbox_meta["scale"]),
+        "pad_left": int(letterbox_meta["pad_left"]),
+        "pad_top": int(letterbox_meta["pad_top"]),
+        "pad_right": int(letterbox_meta["pad_right"]),
+        "pad_bottom": int(letterbox_meta["pad_bottom"]),
+        "padding_coordinate_space": "standardized",
+        "fill_color": list(fill_color),
+        "fill_strategy": "median_perimeter",
         "obb_deskewed": True,
         "affine_M": M.tolist(),       # 2×3 matrix for downstream landmark remapping
         "leveling_applied": bool(apply_leveling),
     }
     return crop_512, meta
+
+
+def extract_standardized_obb_crop(
+    image: np.ndarray,
+    obb_corners: list,
+    *,
+    apply_leveling: bool = True,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Shared public OBB crop contract used by both training prep and inference.
+
+    Geometry defaults are intentionally fixed here so the two paths cannot drift.
+    """
+    return extract_obb_crop(
+        image,
+        obb_corners,
+        pad_ratio=STANDARDIZED_OBB_PAD_RATIO,
+        target_size=STANDARD_SIZE,
+        apply_leveling=apply_leveling,
+    )
+
+
+def project_point_to_segment(
+    point: Sequence[float],
+    a: Sequence[float],
+    b: Sequence[float],
+) -> tuple[float, float]:
+    px, py = float(point[0]), float(point[1])
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    abx = bx - ax
+    aby = by - ay
+    denom = (abx * abx) + (aby * aby)
+    if denom <= 1e-12:
+        return ax, ay
+    t = ((px - ax) * abx + (py - ay) * aby) / denom
+    t = max(0.0, min(1.0, t))
+    return ax + (abx * t), ay + (aby * t)
+
+
+def point_in_convex_quad(
+    point: Sequence[float],
+    corners: Sequence[Sequence[float]],
+    *,
+    epsilon: float = 1e-6,
+) -> bool:
+    if len(corners) != 4:
+        return False
+    px, py = float(point[0]), float(point[1])
+    sign = 0
+    for idx in range(4):
+        ax, ay = float(corners[idx][0]), float(corners[idx][1])
+        bx, by = float(corners[(idx + 1) % 4][0]), float(corners[(idx + 1) % 4][1])
+        cross = ((bx - ax) * (py - ay)) - ((by - ay) * (px - ax))
+        if abs(cross) <= epsilon:
+            continue
+        current_sign = 1 if cross > 0 else -1
+        if sign == 0:
+            sign = current_sign
+        elif current_sign != sign:
+            return False
+    return True
+
+
+def project_point_to_obb_perimeter(
+    point: Sequence[float],
+    obb_corners: Sequence[Sequence[float]],
+) -> tuple[float, float]:
+    if len(obb_corners) != 4:
+        return float(point[0]), float(point[1])
+
+    best_point: tuple[float, float] | None = None
+    best_dist_sq = float("inf")
+    px, py = float(point[0]), float(point[1])
+    for idx in range(4):
+        projected = project_point_to_segment(
+            point,
+            obb_corners[idx],
+            obb_corners[(idx + 1) % 4],
+        )
+        dx = projected[0] - px
+        dy = projected[1] - py
+        dist_sq = (dx * dx) + (dy * dy)
+        if dist_sq < best_dist_sq:
+            best_dist_sq = dist_sq
+            best_point = projected
+
+    return best_point if best_point is not None else (px, py)
 
 
 def apply_obb_geometry(
@@ -1357,6 +1992,7 @@ def apply_obb_geometry(
 
     mode = str(orientation_policy.get("mode", "invariant")).lower()
     debug = {"mode": mode, "class_id": class_id, "flip_applied": False}
+    metadata = {**metadata, "rotated_180": bool(metadata.get("rotated_180", False))}
 
     if mode == "directional":
         target = str(orientation_policy.get("targetOrientation", "left")).lower()
@@ -1380,6 +2016,7 @@ def apply_obb_geometry(
         obb_angle = float(metadata.get("rotation", 0.0))
         if abs(obb_angle) > 45:
             crop_512 = cv2.rotate(crop_512, cv2.ROTATE_180)
+            metadata = {**metadata, "rotated_180": True}
             debug["rotated_180"] = True
 
     # invariant: deskew was applied by extract_obb_crop; no flip needed

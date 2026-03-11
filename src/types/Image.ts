@@ -37,11 +37,16 @@ export interface BoundingBox {
     rotation: number;
     scale: number;
   };
-  detectionMethod?: string; // "yolo_world+sam2", "opencv", etc.
-  // OBB fields (set when annotated via YOLO-World+SAM2 or manual OBB tool)
+  detectionMethod?: string; // "yolo_obb", "yolo_obb+sam2", etc.
+  // OBB fields (set when annotated via the session OBB detector or manual OBB tool)
   angle?: number;                  // OBB rotation angle in degrees
   obbCorners?: [number, number][]; // 4 corners [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
   class_id?: number;               // 0=canonical (left/up), 1=mirror (right/down), from OBB orientation
+  orientation_hint?: {
+    orientation?: "left" | "right";
+    confidence?: number;
+    source?: string;
+  };
 }
 
 export interface AnnotatedImage {
@@ -83,6 +88,21 @@ export interface OrientationPolicy {
   bilateralPairs?: [number, number][];
   pcaLevelingMode?: "off" | "on" | "auto";
   obbLevelingMode?: "on" | "off";  // Controls whether OBB rotation is applied during crop extraction
+}
+
+export interface GeometryMappingConfig {
+  axisMode: "auto" | "manual_anchors";
+  anchorLandmarkIds?: {
+    anteriorId: number;
+    posteriorId: number;
+  };
+  paddingMode: "tight" | "asymmetric";
+  paddingProfile?: {
+    forwardPct: number;
+    backwardPct: number;
+    topPct: number;
+    bottomPct: number;
+  };
 }
 
 export interface LandmarkSchema {
@@ -131,4 +151,7 @@ export interface TrainedModel {
   size: number;
   createdAt: Date;
   predictorType?: "dlib" | "cnn" | "yolo_pose";
+  status?: "active" | "deprecated";
+  compatible?: boolean;
+  reason?: string;
 }

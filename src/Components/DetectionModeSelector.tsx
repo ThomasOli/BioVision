@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSelector } from "react-redux";
 import { Label } from "./ui/label";
-import { Slider } from "./ui/slider";
 import { Input } from "./ui/input";
 import { Switch } from "./ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
@@ -13,8 +12,6 @@ export type DetectionPreset = "balanced" | "precision" | "recall" | "single_obje
 interface DetectionModeSelectorProps {
   mode: DetectionMode;
   onModeChange: (mode: DetectionMode) => void;
-  autoConfidence: number;
-  onAutoConfidenceChange: (value: number) => void;
   detectionPreset?: DetectionPreset;
   onDetectionPresetChange?: (preset: DetectionPreset) => void;
   disabled?: boolean;
@@ -27,8 +24,6 @@ interface DetectionModeSelectorProps {
 export function DetectionModeSelector({
   mode,
   onModeChange,
-  autoConfidence,
-  onAutoConfidenceChange,
   detectionPreset = "balanced",
   onDetectionPresetChange,
   disabled = false,
@@ -50,9 +45,35 @@ export function DetectionModeSelector({
     yolo_error?: string | null;
   } | null>(null);
 
+  const setCapabilityInfoIfChanged = useCallback((next: {
+    mode: string;
+    gpu: boolean;
+    yolo_ready: boolean;
+    sam2_ready: boolean;
+    yolo_failed: boolean;
+    sam2_failed: boolean;
+    yolo_error?: string | null;
+  }) => {
+    setCapabilityInfo((prev) => {
+      if (
+        prev &&
+        prev.mode === next.mode &&
+        prev.gpu === next.gpu &&
+        prev.yolo_ready === next.yolo_ready &&
+        prev.sam2_ready === next.sam2_ready &&
+        prev.yolo_failed === next.yolo_failed &&
+        prev.sam2_failed === next.sam2_failed &&
+        (prev.yolo_error ?? null) === (next.yolo_error ?? null)
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, []);
+
   const refreshCapabilities = useCallback(() => {
     window.api.checkSuperAnnotator().then((result) => {
-      setCapabilityInfo({
+      setCapabilityInfoIfChanged({
         mode: result.mode,
         gpu: result.gpu,
         yolo_ready: result.yolo_ready,
@@ -62,7 +83,7 @@ export function DetectionModeSelector({
         yolo_error: result.yolo_error,
       });
     }).catch(() => {
-      setCapabilityInfo({
+      setCapabilityInfoIfChanged({
         mode: "classic_fallback",
         gpu: false,
         yolo_ready: false,
@@ -71,7 +92,7 @@ export function DetectionModeSelector({
         sam2_failed: false,
       });
     });
-  }, []);
+  }, [setCapabilityInfoIfChanged]);
 
   useEffect(() => {
     refreshCapabilities();
@@ -91,7 +112,7 @@ export function DetectionModeSelector({
 
   const modeOptions: { value: DetectionMode; label: string; desc: string }[] = [
     { value: "manual", label: "Manual", desc: "Draw bounding boxes manually" },
-    { value: "auto", label: "Auto (AI)", desc: "AI detection (YOLO-World, or OpenCV fallback if unavailable)" },
+    { value: "auto", label: "Auto (AI)", desc: "AI detection with YOLO-World zero-shot fallback or the session OBB detector" },
   ];
 
   const sam2Available = capabilityInfo?.mode === "auto_high_performance";
@@ -171,23 +192,6 @@ export function DetectionModeSelector({
             />
           </div>
 
-          <div className="flex flex-col gap-1.5">
-            <div className="flex items-center justify-between">
-              <Label className="text-xs text-zinc-400">
-                Confidence: {(autoConfidence * 100).toFixed(0)}%
-              </Label>
-            </div>
-            <Slider
-              value={[autoConfidence]}
-              onValueChange={([value]) => onAutoConfidenceChange(value)}
-              min={0.2}
-              max={0.9}
-              step={0.05}
-              disabled={disabled}
-              className="w-full"
-            />
-          </div>
-
           {/* SAM2 refinement toggle — gated by both hardware probe and runtime capability */}
           <div className="flex items-center justify-between pt-1">
             <div className="flex flex-col gap-0.5">
@@ -247,7 +251,7 @@ export function DetectionModeSelector({
               )}
               {isClassicFallback && (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-500/20 text-blue-400">
-                  OpenCV fallback
+                  Zero-shot only
                 </span>
               )}
               {capabilityInfo.yolo_failed && (
@@ -265,7 +269,7 @@ export function DetectionModeSelector({
           {/* Classic fallback info */}
           {isClassicFallback && classicFallbackReason && (
             <p className="text-[10px] text-zinc-500">
-              {classicFallbackReason}. Auto-detect will use OpenCV.
+              {classicFallbackReason}. Auto-detect will use YOLO-World zero-shot until a session OBB detector is trained.
             </p>
           )}
         </div>

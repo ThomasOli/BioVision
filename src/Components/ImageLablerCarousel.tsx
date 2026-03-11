@@ -1,7 +1,7 @@
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { motion } from "framer-motion";
-import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Loader2, Sparkles, PencilRuler, XCircle, Save, CheckCircle2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Loader2, Sparkles, PencilRuler, XCircle, Save, CheckCircle2, LockOpen } from "lucide-react";
 import { toast } from "sonner";
 
 import ImageLabeler from "./ImageLabeler";
@@ -10,7 +10,12 @@ import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 import { AppDispatch, RootState } from "../state/store";
-import { removeFile, updateBoxes, setImageFinalized } from "../state/filesState/fileSlice";
+import {
+  removeFile,
+  updateBoxes,
+  setImageFinalized,
+  setImagesUnfinalized,
+} from "../state/filesState/fileSlice";
 import { AnnotatedImage, BoundingBox } from "../types/Image";
 
 import { Button } from "@/Components/ui/button";
@@ -27,7 +32,6 @@ import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-  TooltipProvider,
 } from "@/Components/ui/tooltip";
 import { buttonHover, buttonTap } from "@/lib/animations";
 
@@ -36,7 +40,6 @@ interface ImageLabelerCarouselProps {
   opacity: number;
   isSwitchOn: boolean;
   detectionMode?: DetectionMode;
-  confThreshold?: number;
   detectionPreset?: DetectionPreset;
   className?: string;
   samEnabled?: boolean;
@@ -47,18 +50,17 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   opacity,
   isSwitchOn,
   detectionMode = "manual",
-  confThreshold = 0.5,
   detectionPreset = "balanced",
   className = "",
   samEnabled = false,
 }) => {
   const {
     images,
-    setImages,
     boxes,
     selectedBoxId,
     setSelectedImage,
     setBoxesFromSuperAnnotation,
+    flipAllBoxOrientations,
     selectBox,
     deleteBox,
   } = useContext(UndoRedoClearContext);
@@ -73,14 +75,16 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const [isDetecting, setIsDetecting] = useState(false);
   const [autoDetectProgress, setAutoDetectProgress] = useState<{ message: string; percent: number } | null>(null);
   const [isAutoBoxCorrection, setIsAutoBoxCorrection] = useState(false);
-  const [isSegmentingBoxes, setIsSegmentingBoxes] = useState(false);
-  const [segmentProgress, setSegmentProgress] = useState<{ current: number; total: number } | null>(null);
   const [isBulkFinalizing, setIsBulkFinalizing] = useState(false);
+  const [isUnfinalizingCurrent, setIsUnfinalizingCurrent] = useState(false);
+  const [isBulkUnfinalizing, setIsBulkUnfinalizing] = useState(false);
   const [finalizedBoxSignatureByImageId, setFinalizedBoxSignatureByImageId] = useState<Record<number, string>>({});
   // Tracks which image IDs have been explicitly finalized by the user
   const [finalizedImageIds, setFinalizedImageIds] = useState<Set<number>>(new Set());
+  const [finalizingImageIds, setFinalizingImageIds] = useState<Set<number>>(new Set());
   const [annotationHydratedIds, setAnnotationHydratedIds] = useState<Set<number>>(new Set());
   const annotationLoadInFlight = useRef<Set<number>>(new Set());
+  const recentlyUnfinalizedIds = useRef<Set<number>>(new Set());
 
   // Use Context images for display, but check Redux for "has images" to avoid race conditions
   const totalImages = images.length;
@@ -99,6 +103,10 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       setSelectedImage(newIndex);
     }
   }, [totalImages, currentIndex, setSelectedImage]);
+
+  useEffect(() => {
+    setSelectedImage(currentIndex);
+  }, [currentIndex, setSelectedImage]);
 
   // Get current image safely
   const current = useMemo(() => {
@@ -134,21 +142,22 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   }, [current?.boxes]);
 
   // isCurrentFinalized: true if the user finalized this session OR the session was restored from disk as finalized.
-  // Belt-and-suspenders: also check Redux directly by filename in case the context sync missed the update.
+  // Belt-and-suspenders: also check Redux directly by image id in case the context sync missed the update.
   const isCurrentFinalizedInRedux = useMemo(() => {
-    if (!current?.filename || !current?.speciesId) return false;
-    return reduxFileArray.some(
-      (f) => f.filename === current.filename && f.speciesId === current.speciesId && Boolean(f.isFinalized)
-    );
-  }, [reduxFileArray, current?.filename, current?.speciesId]);
+    if (!current) return false;
+    const reduxImage = reduxFileArray.find((f) => f.id === current.id);
+    return Boolean(reduxImage?.isFinalized);
+  }, [reduxFileArray, current]);
 
   const isCurrentFinalized = current
     ? (finalizedImageIds.has(current.id) || Boolean(current.isFinalized) || isCurrentFinalizedInRedux)
     : false;
+  const isCurrentFinalizing = current ? finalizingImageIds.has(current.id) : false;
 
   const isFinalizePending = Boolean(
     current &&
     !isCurrentFinalized &&
+    !isCurrentFinalizing &&
     hasFinalizableBoxes &&
     finalizedBoxSignatureByImageId[current.id] !== currentBoxSignature
   );
@@ -162,6 +171,10 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       })),
     [images]
   );
+  const finalizationCandidatesRef = useRef(finalizationCandidates);
+  useEffect(() => {
+    finalizationCandidatesRef.current = finalizationCandidates;
+  }, [finalizationCandidates]);
 
   // Re-hydrate finalized status from persisted session labels whenever this view mounts.
   // This keeps "Detection Finalized" state stable after leaving/re-entering workspace.
@@ -181,18 +194,23 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         );
         if (finalizedNames.size === 0) return;
 
+        const candidates = finalizationCandidatesRef.current;
         setFinalizedImageIds((prev) => {
           const next = new Set(prev);
-          finalizationCandidates.forEach((img) => {
-            if (finalizedNames.has(img.filename)) {
+          candidates.forEach((img) => {
+            if (!recentlyUnfinalizedIds.current.has(img.id) && finalizedNames.has(img.filename)) {
               next.add(img.id);
             }
           });
           return next;
         });
 
-        finalizationCandidates.forEach((img) => {
-          if (finalizedNames.has(img.filename) && !img.isFinalized) {
+        candidates.forEach((img) => {
+          if (
+            !recentlyUnfinalizedIds.current.has(img.id) &&
+            finalizedNames.has(img.filename) &&
+            !img.isFinalized
+          ) {
             dispatch(setImageFinalized({ id: img.id }));
           }
         });
@@ -205,7 +223,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [activeSpeciesId, finalizationCandidates, dispatch]);
+  }, [activeSpeciesId, dispatch]);
 
   useEffect(() => {
     if (detectionMode !== "auto") {
@@ -252,13 +270,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       cancelled = true;
     };
   }, [current, annotationHydratedIds, dispatch]);
-
-  const handleUpdateBoxes = useCallback(
-    (id: number, boxes: BoundingBox[]) => {
-      dispatch(updateBoxes({ id, boxes }));
-    },
-    [dispatch]
-  );
 
   const handleDeleteImage = useCallback(() => {
     if (!current) return;
@@ -323,33 +334,25 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     [dispatch]
   );
 
-  const finalizeImageSegments = useCallback(async (image: AnnotatedImage | null): Promise<boolean> => {
-    if (!image?.speciesId || !image?.filename) return false;
-    const sourceBoxes = await ensureImageBoxesLoaded(image);
+  const getMatchingImageIds = useCallback((speciesId?: string, filename?: string): number[] => {
+    const safeSpeciesId = String(speciesId || "");
+    const safeFilename = String(filename || "").toLowerCase();
+    return images
+      .filter(
+        (img) =>
+          String(img.speciesId || "") === safeSpeciesId &&
+          String(img.filename || "").toLowerCase() === safeFilename
+      )
+      .map((img) => img.id);
+  }, [images]);
 
-    // Compute class_ids from placed landmarks via the backend, then persist them
-    // so the training pipeline (prepare_dataset.py / export_obb_dataset) can use them.
-    const classIdMap = new Map<number, number>();
-    const boxesWithObb = (sourceBoxes || []).filter((b) => b.obbCorners && b.obbCorners.length === 4);
-    if (boxesWithObb.length > 0 && image.speciesId) {
-      try {
-        const tagResult = await window.api.tagClassIds(image.speciesId, sourceBoxes || []);
-        if (tagResult.ok && tagResult.taggedBoxes) {
-          for (const { id, class_id } of tagResult.taggedBoxes) {
-            classIdMap.set(id, class_id);
-          }
-          // Merge class_ids into boxes and save so payload.boxes has them on disk
-          const updatedBoxes = (sourceBoxes || []).map((b) => ({
-            ...b,
-            ...(classIdMap.has(b.id) ? { class_id: classIdMap.get(b.id) } : {}),
-          }));
-          dispatch(updateBoxes({ id: image.id, boxes: updatedBoxes }));
-          await window.api.sessionSaveAnnotations(image.speciesId, image.filename, updatedBoxes);
-        }
-      } catch (_) {
-        // Non-fatal: class_id will default to 0 in training pipeline
-      }
+  const finalizeImageSegments = useCallback(async (
+    image: AnnotatedImage | null
+  ): Promise<{ ok: boolean; speciesId?: string; filename?: string; signature?: string; error?: string }> => {
+    if (!image?.speciesId || !image?.filename) {
+      return { ok: false, error: "No active image." };
     }
+    const sourceBoxes = await ensureImageBoxesLoaded(image);
 
     const acceptedBoxes = (sourceBoxes || [])
       .filter((b) => b.width > 0 && b.height > 0)
@@ -369,23 +372,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       }));
 
     const imageId = image.id;
-    const sig = JSON.stringify(
-      acceptedBoxes
-        .map((b) => ({
-          left: b.left,
-          top: b.top,
-          width: b.width,
-          height: b.height,
-        }))
-        .slice()
-        .sort((a, b) =>
-          a.left - b.left ||
-          a.top - b.top ||
-          a.width - b.width ||
-          a.height - b.height
-        )
-    );
-
     try {
       const result = await window.api.sessionFinalizeAcceptedBoxes(
         image.speciesId,
@@ -393,22 +379,190 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         acceptedBoxes,
         image.path
       );
-      if (result.ok) {
-        setFinalizedBoxSignatureByImageId((prev) => ({ ...prev, [imageId]: sig }));
-        setFinalizedImageIds((prev) => new Set([...prev, imageId]));
-        dispatch(setImageFinalized({ id: imageId }));
-        return true;
+      if (result.ok && result.segmentQueueState === "queued" && result.signature) {
+        const matchingIds = getMatchingImageIds(image.speciesId, image.filename);
+        setFinalizingImageIds((prev) => new Set([...prev, ...(matchingIds.length ? matchingIds : [imageId])]));
+        return {
+          ok: true,
+          speciesId: image.speciesId,
+          filename: image.filename,
+          signature: result.signature,
+        };
       }
-      return false;
+      return {
+        ok: false,
+        speciesId: image.speciesId,
+        filename: image.filename,
+        error: result.error || "Segment finalization was not queued.",
+      };
     } catch (err) {
       console.error("Failed to finalize accepted boxes:", err);
-      return false;
+      return {
+        ok: false,
+        speciesId: image.speciesId,
+        filename: image.filename,
+        error: err instanceof Error ? err.message : "Failed to finalize accepted boxes.",
+      };
     }
-  }, [dispatch, ensureImageBoxesLoaded]);
+  }, [ensureImageBoxesLoaded, getMatchingImageIds]);
 
-  const finalizeCurrentImageSegments = useCallback(async (): Promise<boolean> => {
+  const finalizeCurrentImageSegments = useCallback(async (): Promise<{ ok: boolean; speciesId?: string; filename?: string; signature?: string; error?: string }> => {
     return finalizeImageSegments(current);
   }, [current, finalizeImageSegments]);
+
+  const clearFinalizedLocalState = useCallback((imageIds: number[]) => {
+    if (!imageIds.length) return;
+    const idSet = new Set(imageIds);
+    setFinalizedImageIds((prev) => {
+      const next = new Set(prev);
+      imageIds.forEach((id) => next.delete(id));
+      return next;
+    });
+    setFinalizedBoxSignatureByImageId((prev) => {
+      const next = { ...prev };
+      idSet.forEach((id) => {
+        delete next[id];
+      });
+      return next;
+    });
+  }, []);
+
+  const clearFinalizingLocalState = useCallback((imageIds: number[]) => {
+    if (!imageIds.length) return;
+    setFinalizingImageIds((prev) => {
+      const next = new Set(prev);
+      imageIds.forEach((id) => next.delete(id));
+      return next;
+    });
+  }, []);
+
+  const waitForSegmentSaveOutcome = useCallback(async (
+    speciesId: string,
+    filename: string,
+    signature?: string
+  ) => {
+    const isTerminal = (state: string) => state === "saved" || state === "skipped" || state === "failed";
+    try {
+      const initial = await window.api.sessionGetSegmentSaveStatus(speciesId, filename);
+      if (
+        initial.ok &&
+        initial.status &&
+        (!signature || initial.status.signature === signature) &&
+        isTerminal(initial.status.state)
+      ) {
+        return { speciesId, filename, ...initial.status };
+      }
+    } catch {
+      // fall through to event wait
+    }
+
+    return await new Promise<{
+      speciesId: string;
+      filename: string;
+      state: "idle" | "queued" | "running" | "saved" | "skipped" | "failed";
+      signature?: string;
+      updatedAt: string;
+      reason?: string;
+      expectedCount?: number;
+      savedCount?: number;
+    }>((resolve) => {
+      const unsub = window.api.onSegmentSaveStatus((data) => {
+        if (
+          data.speciesId === speciesId &&
+          data.filename === filename &&
+          (!signature || data.signature === signature) &&
+          isTerminal(data.state)
+        ) {
+          unsub();
+          resolve(data);
+        }
+      });
+      setTimeout(() => {
+        unsub();
+        resolve({
+          speciesId,
+          filename,
+          state: "failed",
+          updatedAt: new Date().toISOString(),
+          reason: "timeout",
+        });
+      }, 120_000);
+    });
+  }, []);
+
+  useEffect(() => {
+    const unsub = window.api.onSegmentSaveStatus((data) => {
+      const matchingIds = getMatchingImageIds(data.speciesId, data.filename);
+      if (matchingIds.length === 0) return;
+
+      if (data.state === "saved") {
+        clearFinalizingLocalState(matchingIds);
+        setFinalizedImageIds((prev) => new Set([...prev, ...matchingIds]));
+        if (data.signature) {
+          setFinalizedBoxSignatureByImageId((prev) => {
+            const next = { ...prev };
+            matchingIds.forEach((id) => {
+              next[id] = data.signature as string;
+            });
+            return next;
+          });
+        }
+        matchingIds.forEach((id) => dispatch(setImageFinalized({ id })));
+        return;
+      }
+
+      if (data.state === "failed" || data.state === "skipped") {
+        clearFinalizingLocalState(matchingIds);
+        clearFinalizedLocalState(matchingIds);
+        dispatch(setImagesUnfinalized({ ids: matchingIds }));
+      }
+    });
+    return () => {
+      unsub();
+    };
+  }, [clearFinalizedLocalState, clearFinalizingLocalState, dispatch, getMatchingImageIds]);
+
+  const handleUnfinalizeCurrentImage = useCallback(async () => {
+    if (!current?.speciesId || !current?.filename) return;
+    setIsUnfinalizingCurrent(true);
+    try {
+      const filenameLower = String(current.filename || "").toLowerCase();
+      const matchingIds = images
+        .filter(
+          (img) =>
+            String(img.speciesId || "") === String(current.speciesId || "") &&
+            String(img.filename || "").toLowerCase() === filenameLower
+        )
+        .map((img) => img.id);
+      const imagePath = current.path ?? current.diskPath;
+      const result = await window.api.sessionUnfinalizeImage(
+        current.speciesId,
+        current.filename,
+        imagePath
+      );
+      if (!result.ok) {
+        toast.error(result.error || "Failed to unfinalize image.");
+        return;
+      }
+
+      const idsToClear = matchingIds.length > 0 ? matchingIds : [current.id];
+      idsToClear.forEach((id) => recentlyUnfinalizedIds.current.add(id));
+      clearFinalizedLocalState(idsToClear);
+      clearFinalizingLocalState(idsToClear);
+      dispatch(setImagesUnfinalized({ ids: idsToClear }));
+
+      if (!result.removedFromList && !result.hadFinalizedDetection) {
+        toast.info("Image was already unfinalized.");
+      } else {
+        toast.success("Image unfinalized. Detection editing is enabled again.");
+      }
+    } catch (err) {
+      console.error("Failed to unfinalize image:", err);
+      toast.error("Failed to unfinalize image.");
+    } finally {
+      setIsUnfinalizingCurrent(false);
+    }
+  }, [clearFinalizedLocalState, clearFinalizingLocalState, current, dispatch, images]);
 
   const finalizableImages = useMemo(() => {
     return images.filter((img) => {
@@ -417,20 +571,61 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         Boolean(img.hasBoxes);
       if (!hasValidBoxes || !img.speciesId || !img.filename) return false;
       const finalized = Boolean(img.isFinalized) || finalizedImageIds.has(img.id);
-      return !finalized;
+      const finalizing = finalizingImageIds.has(img.id);
+      return !finalized && !finalizing;
     });
-  }, [images, finalizedImageIds]);
+  }, [images, finalizedImageIds, finalizingImageIds]);
 
   const finalizableImageCount = finalizableImages.length;
-  const segmentableImageCount = useMemo(() => {
+  const finalizedImages = useMemo(() => {
     return images.filter((img) => {
-      const imgPath = img.path || img.diskPath;
-      const hasValidBoxes =
-        (img.boxes || []).some((b) => b.width > 0 && b.height > 0) ||
-        Boolean(img.hasBoxes);
-      return Boolean(imgPath) && hasValidBoxes;
-    }).length;
-  }, [images]);
+      if (!img.speciesId || !img.filename) return false;
+      return Boolean(img.isFinalized) || finalizedImageIds.has(img.id);
+    });
+  }, [images, finalizedImageIds]);
+  const finalizedImageCount = finalizedImages.length;
+
+  const handleUnfinalizeAllFinalized = useCallback(async () => {
+    if (!activeSpeciesId || finalizedImages.length === 0) {
+      toast.info("No finalized images to unfinalize.");
+      return;
+    }
+
+    setIsBulkUnfinalizing(true);
+    try {
+      const filenames = finalizedImages
+        .map((img) => String(img.filename || "").trim())
+        .filter((name) => name.length > 0);
+      const result = await window.api.sessionUnfinalizeImages(activeSpeciesId, filenames);
+      if (!result.ok && result.succeeded === 0) {
+        toast.error(result.error || "Failed to unfinalize finalized images.");
+        return;
+      }
+
+      const failedFilenames = new Set(
+        (result.errors || []).map((e) => String(e.filename || "").toLowerCase())
+      );
+      const succeededIds = finalizedImages
+        .filter((img) => !failedFilenames.has(String(img.filename || "").toLowerCase()))
+        .map((img) => img.id);
+
+      succeededIds.forEach((id) => recentlyUnfinalizedIds.current.add(id));
+      clearFinalizedLocalState(succeededIds);
+      clearFinalizingLocalState(succeededIds);
+      dispatch(setImagesUnfinalized({ ids: succeededIds }));
+
+      if (result.failed === 0) {
+        toast.success(`Unfinalized ${result.succeeded} image(s).`);
+      } else {
+        toast.warning(`Unfinalized ${result.succeeded} image(s), ${result.failed} failed.`);
+      }
+    } catch (err) {
+      console.error("Failed to unfinalize finalized images:", err);
+      toast.error("Failed to unfinalize finalized images.");
+    } finally {
+      setIsBulkUnfinalizing(false);
+    }
+  }, [activeSpeciesId, clearFinalizedLocalState, clearFinalizingLocalState, dispatch, finalizedImages]);
 
   const handleNext = useCallback(() => {
     if (totalImages <= 1) return;
@@ -461,7 +656,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 
   const toggleMagnifiedView = () => setIsMagnified((prev) => !prev);
 
-  // Handle AI auto-detection via SuperAnnotator pipeline (YOLO-World + optional SAM2)
+  // Handle AI auto-detection via the session OBB detector and optional SAM2 refinement.
   const handleAutoDetect = useCallback(async () => {
     const promptClass = className.trim();
     if (!current || !current.path) return;
@@ -476,7 +671,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 
     try {
       const result = await window.api.superAnnotate(current.path, promptClass, undefined, {
-        confThreshold,
         samEnabled,
         maxObjects: 25,
         detectionMode: "auto",
@@ -487,16 +681,9 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       if (result.ok && Array.isArray(result.objects) && result.objects.length > 0) {
         setBoxesFromSuperAnnotation(result.objects);
         setIsAutoBoxCorrection(false);
-        const isOpenCv = result.detection_method === "opencv" || result.detection_method === "opencv_fallback";
-        if (isOpenCv) {
-          toast.success(
-            `Detected ${result.objects.length} object${result.objects.length > 1 ? "s" : ""} using OpenCV (YOLO unavailable).`
-          );
-        } else {
-          toast.success(`Detected ${result.objects.length} object${result.objects.length > 1 ? "s" : ""}.`);
-        }
+        toast.success(`Detected ${result.objects.length} object${result.objects.length > 1 ? "s" : ""}.`);
       } else if (result.ok) {
-        toast.info("No objects detected. Try a different class prompt or lower confidence.");
+        toast.info("No objects detected. Try a different class prompt or detection goal.");
       } else {
         toast.error(result.error || "Auto-detect failed.");
       }
@@ -511,20 +698,34 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       setIsDetecting(false);
       setAutoDetectProgress(null);
     }
-  }, [current, className, confThreshold, samEnabled, detectionPreset, setBoxesFromSuperAnnotation]);
+  }, [current, className, samEnabled, detectionPreset, setBoxesFromSuperAnnotation]);
 
   const handleAutoDetectOrFinalize = useCallback(async () => {
     if (isFinalizePending) {
-      const ok = await finalizeCurrentImageSegments();
-      if (ok) {
+      const queued = await finalizeCurrentImageSegments();
+      if (!queued.ok || !queued.speciesId || !queued.filename) {
+        toast.error(queued.error || "Failed to finalize accepted boxes.");
+        return;
+      }
+      const outcome = await waitForSegmentSaveOutcome(
+        queued.speciesId,
+        queued.filename,
+        queued.signature
+      );
+      if (outcome.state === "saved") {
         toast.success("Finalized accepted boxes for this image.");
       } else {
-        toast.error("Failed to finalize accepted boxes.");
+        toast.error(
+          outcome.reason ||
+            (outcome.expectedCount != null && outcome.savedCount != null
+              ? `Saved ${outcome.savedCount}/${outcome.expectedCount} segments.`
+              : "Failed to finalize accepted boxes.")
+        );
       }
       return;
     }
     await handleAutoDetect();
-  }, [isFinalizePending, finalizeCurrentImageSegments, handleAutoDetect]);
+  }, [handleAutoDetect, finalizeCurrentImageSegments, isFinalizePending, waitForSegmentSaveOutcome]);
 
   const handleFinalizeAllWithBoxes = useCallback(async () => {
     if (finalizableImageCount === 0) {
@@ -533,17 +734,44 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     }
 
     setIsBulkFinalizing(true);
-    let successCount = 0;
+    const pendingRequests: Array<{ speciesId: string; filename: string; signature?: string }> = [];
     let failCount = 0;
+
     try {
       for (const image of finalizableImages) {
-        const ok = await finalizeImageSegments(image);
-        if (ok) successCount += 1;
-        else failCount += 1;
+        const request = await finalizeImageSegments(image);
+        if (request.ok && request.speciesId && request.filename) {
+          pendingRequests.push({
+            speciesId: request.speciesId,
+            filename: request.filename,
+            signature: request.signature,
+          });
+        } else {
+          failCount += 1;
+        }
       }
-    } finally {
+    } catch (err) {
+      console.error("Finalize-all error:", err);
       setIsBulkFinalizing(false);
+      toast.error("Failed to finalize images with boxes.");
+      return;
     }
+
+    if (pendingRequests.length === 0) {
+      setIsBulkFinalizing(false);
+      toast.error("Failed to finalize images with boxes.");
+      return;
+    }
+
+    const outcomes = await Promise.all(
+      pendingRequests.map((request) =>
+        waitForSegmentSaveOutcome(request.speciesId, request.filename, request.signature)
+      )
+    );
+    const successCount = outcomes.filter((outcome) => outcome.state === "saved").length;
+    failCount += outcomes.length - successCount;
+
+    setIsBulkFinalizing(false);
 
     if (successCount > 0 && failCount === 0) {
       toast.success(`Finalized ${successCount} image(s) with accepted boxes.`);
@@ -552,7 +780,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     } else {
       toast.error("Failed to finalize images with boxes.");
     }
-  }, [finalizableImageCount, finalizableImages, finalizeImageSegments]);
+  }, [finalizableImageCount, finalizableImages, finalizeImageSegments, waitForSegmentSaveOutcome]);
 
   const handleToggleAutoBoxCorrection = useCallback(() => {
     if (!isAutoBoxCorrection && selectedBoxId === null && boxes.length > 0) {
@@ -581,136 +809,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     deleteBox(selectedBoxId);
     toast.success("Selected detected box removed.");
   }, [selectedBoxId, boxes, current, deleteBox]);
-
-  const handleSegmentAllBoxes = useCallback(async () => {
-    if (!samEnabled) {
-      toast.info("Enable SAM2 first, then run segmentation.");
-      return;
-    }
-    const candidates = images
-      .map((img) => {
-        const imgPath = img.path || img.diskPath;
-        const validBoxes = (img.boxes || []).filter((b) => b.width > 0 && b.height > 0);
-        return {
-          image: img,
-          imagePath: imgPath,
-          validBoxes,
-        };
-      })
-      .filter((entry) => Boolean(entry.imagePath) && entry.validBoxes.length > 0);
-
-    if (candidates.length === 0) {
-      toast.info("No images with valid bounding boxes to segment.");
-      return;
-    }
-
-    const totalBoxes = candidates.reduce((sum, entry) => sum + entry.validBoxes.length, 0);
-    setIsSegmentingBoxes(true);
-    setSegmentProgress({ current: 0, total: totalBoxes });
-    let success = 0;
-    let failed = 0;
-    let processed = 0;
-    let imagesUpdated = 0;
-    const errorCounts = new Map<string, number>();
-    const updatedBoxesByImageId = new Map<number, BoundingBox[]>();
-
-    try {
-      for (const entry of candidates) {
-        const imagePath = entry.imagePath!;
-        let localBoxes = (entry.image.boxes || []).map((b) => ({ ...b }));
-        let imageHadUpdate = false;
-
-        for (const box of entry.validBoxes) {
-          processed += 1;
-          setSegmentProgress({ current: processed, total: totalBoxes });
-
-          const left = Math.round(box.left);
-          const top = Math.round(box.top);
-          const width = Math.max(1, Math.round(box.width));
-          const height = Math.max(1, Math.round(box.height));
-
-          try {
-            const result = await window.api.resegmentBox(imagePath, [
-              left,
-              top,
-              left + width,
-              top + height,
-            ]);
-            if (result.ok && Array.isArray(result.maskOutline) && result.maskOutline.length > 2) {
-              localBoxes = localBoxes.map((candidateBox) =>
-                candidateBox.id === box.id
-                  ? {
-                      ...candidateBox,
-                      maskOutline: result.maskOutline,
-                    }
-                  : candidateBox
-              );
-              success += 1;
-              imageHadUpdate = true;
-            } else {
-              failed += 1;
-              const reason = (result.error || "unknown_error").trim();
-              errorCounts.set(reason, (errorCounts.get(reason) || 0) + 1);
-            }
-          } catch (err) {
-            console.error(`SAM segmentation failed for box ${box.id}:`, err);
-            failed += 1;
-            const reason = err instanceof Error ? err.message : "request_failed";
-            errorCounts.set(reason, (errorCounts.get(reason) || 0) + 1);
-          }
-        }
-
-        if (imageHadUpdate) {
-          updatedBoxesByImageId.set(entry.image.id, localBoxes);
-          imagesUpdated += 1;
-        }
-      }
-
-      if (updatedBoxesByImageId.size > 0) {
-        setImages((prev) =>
-          prev.map((img) => {
-            const updatedBoxes = updatedBoxesByImageId.get(img.id);
-            return updatedBoxes ? { ...img, boxes: updatedBoxes } : img;
-          })
-        );
-
-        const persistOps: Promise<unknown>[] = [];
-        for (const [imageId, updatedBoxes] of updatedBoxesByImageId.entries()) {
-          dispatch(updateBoxes({ id: imageId, boxes: updatedBoxes }));
-          const imageMeta = images.find((img) => img.id === imageId);
-          if (imageMeta?.speciesId && imageMeta?.filename) {
-            persistOps.push(
-              window.api.sessionSaveAnnotations(imageMeta.speciesId, imageMeta.filename, updatedBoxes)
-            );
-          }
-        }
-        if (persistOps.length > 0) {
-          await Promise.allSettled(persistOps);
-        }
-      }
-    } finally {
-      setIsSegmentingBoxes(false);
-      setSegmentProgress(null);
-    }
-
-    if (success > 0 && failed === 0) {
-      toast.success(
-        `Segmented ${success} box${success === 1 ? "" : "es"} across ${imagesUpdated} image${imagesUpdated === 1 ? "" : "s"}.`
-      );
-    } else if (success > 0) {
-      const topError = [...errorCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
-      toast.warning(
-        `Segmented ${success} box${success === 1 ? "" : "es"} across ${imagesUpdated} image${imagesUpdated === 1 ? "" : "s"}; ${failed} failed` +
-          (topError ? ` (${topError})` : ".")
-      );
-    } else {
-      const topError = [...errorCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
-      toast.error(
-        `SAM2 did not produce segments for the current boxes` +
-          (topError ? `: ${topError}` : ".")
-      );
-    }
-  }, [samEnabled, images, setImages, dispatch]);
 
   // Get active species schema from Redux for the zoomed view
   const activeSpeciesForSchema = useSelector((state: RootState) =>
@@ -813,7 +911,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   }
 
   return (
-    <TooltipProvider>
       <Card className="flex h-full w-full min-h-0 min-w-0 flex-col gap-3 border-border/50 bg-card/50 p-4 backdrop-blur-sm">
         {/* Toolbar */}
         <div className="flex w-full flex-col gap-2 md:flex-row md:items-start md:justify-between">
@@ -828,13 +925,42 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 
           <div className="flex min-w-0 flex-1 flex-wrap items-center justify-start gap-2 md:justify-end">
             {/* Finalized badge — shown in any detection mode once finalized */}
-            {isCurrentFinalized ? (
+            {isCurrentFinalizing ? (
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/15 px-3 py-1 text-xs font-bold text-amber-300 ring-1 ring-amber-500/40">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Finalizing Segments
+                </span>
+                <span className="text-xs text-muted-foreground">Editing locked until segment save completes</span>
+              </div>
+            ) : isCurrentFinalized ? (
               <div className="flex items-center gap-2">
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-3 py-1 text-xs font-bold text-emerald-400 ring-1 ring-emerald-500/40">
                   <CheckCircle2 className="h-3.5 w-3.5" />
                   Detection Finalized
                 </span>
                 <span className="text-xs text-muted-foreground">Landmark mode only</span>
+                <motion.div {...buttonHover} {...buttonTap}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleUnfinalizeCurrentImage}
+                    disabled={isUnfinalizingCurrent || !current}
+                    className="font-bold"
+                  >
+                    {isUnfinalizingCurrent ? (
+                      <>
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        Unfinalizing...
+                      </>
+                    ) : (
+                      <>
+                        <LockOpen className="mr-1.5 h-3.5 w-3.5" />
+                        Unfinalize This Image
+                      </>
+                    )}
+                  </Button>
+                </motion.div>
               </div>
             ) : (detectionMode === "auto" || isFinalizePending) ? (
               /* Finalize shared across modes; auto-detect/correction controls in auto mode only */
@@ -844,7 +970,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                     variant={isFinalizePending ? "default" : "outline"}
                     size="sm"
                     onClick={handleAutoDetectOrFinalize}
-                    disabled={isDetecting || !current}
+                    disabled={isDetecting || !current || isCurrentFinalizing}
                     className={isFinalizePending ? "font-bold bg-emerald-600 hover:bg-emerald-700 text-white border-0" : "font-bold"}
                   >
                     {isDetecting ? (
@@ -909,33 +1035,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
               </>
             ) : null}
 
-            {samEnabled && segmentableImageCount > 0 && (
-              <motion.div {...buttonHover} {...buttonTap}>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleSegmentAllBoxes}
-                  disabled={isDetecting || isSegmentingBoxes}
-                  className="font-bold"
-                  title="Run SAM2 on every accepted box in all images"
-                >
-                  {isSegmentingBoxes ? (
-                    <>
-                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                      {segmentProgress
-                        ? `Segmenting ${segmentProgress.current}/${segmentProgress.total}`
-                        : "Segmenting..."}
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="mr-1.5 h-3.5 w-3.5" />
-                      Segment All Boxes ({segmentableImageCount} img)
-                    </>
-                  )}
-                </Button>
-              </motion.div>
-            )}
-
             <motion.div {...buttonHover} {...buttonTap}>
               <Button
                 variant="outline"
@@ -962,6 +1061,31 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 )}
               </Button>
             </motion.div>
+
+            {finalizedImageCount > 0 && (
+              <motion.div {...buttonHover} {...buttonTap}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleUnfinalizeAllFinalized}
+                  disabled={isBulkUnfinalizing || isDetecting}
+                  className="font-bold"
+                  title="Remove finalized lock from all finalized images"
+                >
+                  {isBulkUnfinalizing ? (
+                    <>
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      Unfinalizing...
+                    </>
+                  ) : (
+                    <>
+                      <LockOpen className="mr-1.5 h-3.5 w-3.5" />
+                      Unfinalize All Finalized ({finalizedImageCount})
+                    </>
+                  )}
+                </Button>
+              </motion.div>
+            )}
 
             {hasAnnotations && (
               <motion.div {...buttonHover} {...buttonTap}>
@@ -1068,9 +1192,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
               <ImageLabeler
                 key={current.id}
                 imageURL={current.url}
-                onBoxesChange={(newBoxes) =>
-                  handleUpdateBoxes(current.id, newBoxes)
-                }
                 color={color}
                 opacity={opacity}
                 mode={isSwitchOn}
@@ -1079,8 +1200,9 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 imagePath={current.path ?? undefined}
                 samEnabled={samEnabled}
                 hideSegmentOutlines={isCurrentFinalized}
-                lockBoxes={isCurrentFinalized}
+                lockBoxes={isCurrentFinalized || isCurrentFinalizing}
                 orientationMode={activeOrientationMode}
+                onFlipAll={flipAllBoxOrientations}
               />
               {/* Finalized overlay banner */}
               {isCurrentFinalized && (
@@ -1145,9 +1267,6 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         {current && (
           <MagnifiedImageLabeler
             imageURL={current.url}
-            onBoxesChange={(newBoxes) =>
-              handleUpdateBoxes(current.id, newBoxes)
-            }
             color={color}
             opacity={opacity}
             open={isMagnified}
@@ -1159,12 +1278,11 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
             imagePath={current.path ?? undefined}
             samEnabled={samEnabled}
             hideSegmentOutlines={isCurrentFinalized}
-            lockBoxes={isCurrentFinalized}
+            lockBoxes={isCurrentFinalized || isCurrentFinalizing}
             orientationMode={activeOrientationMode}
           />
         )}
       </Card>
-    </TooltipProvider>
   );
 };
 

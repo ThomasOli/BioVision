@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import { AnnotatedImage, OrientationPolicy } from '../src/types/Image';
+import { AnnotatedImage, GeometryMappingConfig, OrientationPolicy } from '../src/types/Image';
 
 // --------- Expose some API to the Renderer process ---------
 contextBridge.exposeInMainWorld('ipcRenderer', withPrototype(ipcRenderer))
@@ -45,6 +45,9 @@ interface PredictOptions {
     height: number;
     right?: number;
     bottom?: number;
+    obbCorners?: [number, number][];
+    angle?: number;
+    class_id?: number;
     orientation_hint?: {
       orientation?: "left" | "right";
       confidence?: number;
@@ -52,6 +55,19 @@ interface PredictOptions {
       head_point?: [number, number];
       tail_point?: [number, number];
     };
+  }>;
+}
+
+interface PredictBatchArgs {
+  speciesId?: string;
+  modelName: string;
+  predictorType?: "dlib" | "cnn";
+  allowIncompatible?: boolean;
+  items: Array<{
+    batchIndex: number;
+    imagePath: string;
+    filename?: string;
+    boxes: NonNullable<PredictOptions["boxes"]>;
   }>;
 }
 
@@ -77,6 +93,8 @@ contextBridge.exposeInMainWorld("api", {
     speciesId?: string,
     options?: PredictOptions
   ) => ipcRenderer.invoke("ml:predict", imagePath, tag, speciesId, options),
+  predictImagesBatch: (args: PredictBatchArgs) =>
+    ipcRenderer.invoke("ml:predict-batch", args),
   checkModelCompatibility: (args: {
     speciesId?: string;
     modelName: string;
@@ -86,7 +104,11 @@ contextBridge.exposeInMainWorld("api", {
   selectImageFolder: () => ipcRenderer.invoke("select-image-folder"),
   getProjectRoot: () => ipcRenderer.invoke("ml:get-project-root"),
   selectProjectRoot: () => ipcRenderer.invoke("ml:select-project-root"),
-  listModels: (speciesId?: string) => ipcRenderer.invoke("ml:list-models", speciesId),
+  listModels: (args?: string | {
+    speciesId?: string;
+    activeOnly?: boolean;
+    includeDeprecated?: boolean;
+  }) => ipcRenderer.invoke("ml:list-models", args),
   deleteModel: (
     modelName: string,
     speciesId?: string,
@@ -105,7 +127,13 @@ contextBridge.exposeInMainWorld("api", {
     imageFolderPath: string;
     annotationFilePath: string;
     speciesId: string;
+    geometryConfig?: GeometryMappingConfig;
+    useSam2BoxDerivation?: boolean;
   }) => ipcRenderer.invoke("ml:load-annotated-folder", args),
+  importPreAnnotatedDataset: (args?: {
+    speciesId?: string;
+    geometryConfig?: GeometryMappingConfig;
+  }) => ipcRenderer.invoke("ml:import-preannotated-dataset", args),
   // Multi-specimen detection
   detectSpecimens: (imagePath: string, options?: DetectionOptions) =>
     ipcRenderer.invoke("ml:detect-specimens", imagePath, options),
@@ -136,6 +164,15 @@ contextBridge.exposeInMainWorld("api", {
     }[],
     imagePath?: string
   ) => ipcRenderer.invoke("session:finalize-accepted-boxes", { speciesId, filename, boxes, imagePath }),
+  sessionUnfinalizeImage: (
+    speciesId: string,
+    filename: string,
+    imagePath?: string
+  ) => ipcRenderer.invoke("session:unfinalize-image", { speciesId, filename, imagePath }),
+  sessionUnfinalizeImages: (
+    speciesId: string,
+    filenames?: string[]
+  ) => ipcRenderer.invoke("session:unfinalize-images", { speciesId, filenames }),
   sessionAddRejectedDetection: (
     speciesId: string,
     filename: string,
@@ -152,6 +189,8 @@ contextBridge.exposeInMainWorld("api", {
   sessionLoad: (speciesId: string) => ipcRenderer.invoke("session:load", { speciesId }),
   sessionLoadAnnotation: (speciesId: string, filename: string) =>
     ipcRenderer.invoke("session:load-annotation", { speciesId, filename }),
+  sessionGetSegmentSaveStatus: (speciesId: string, filename: string) =>
+    ipcRenderer.invoke("session:get-segment-save-status", { speciesId, filename }),
   sessionList: () => ipcRenderer.invoke("session:list"),
   sessionDeleteImage: (speciesId: string, filename: string) =>
     ipcRenderer.invoke("session:delete-image", { speciesId, filename }),
@@ -162,7 +201,6 @@ contextBridge.exposeInMainWorld("api", {
     className: string,
     modelTag?: string,
     options?: {
-      confThreshold?: number;
       samEnabled?: boolean;
       maxObjects?: number;
       detectionMode?: string;
@@ -173,17 +211,27 @@ contextBridge.exposeInMainWorld("api", {
     speciesId?: string
   ) => ipcRenderer.invoke("ml:super-annotate", { imagePath, className, modelTag, options, speciesId }),
   checkSuperAnnotator: () => ipcRenderer.invoke("ml:check-super-annotator"),
-  resegmentBox: (imagePath: string, boxXyxy: [number, number, number, number]) =>
-    ipcRenderer.invoke("ml:resegment-box", { imagePath, boxXyxy }),
-  trainObbDetector: (speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small" }) =>
+  resegmentBox: (
+    imagePath: string,
+    boxXyxy: [number, number, number, number],
+    iterative?: boolean
+  ) => ipcRenderer.invoke("ml:resegment-box", { imagePath, boxXyxy, iterative }),
+  trainObbDetector: (
+    speciesId: string,
+    options?: { epochs?: number; modelTier?: "nano" | "small"; iou?: number; cls?: number; box?: number }
+  ) =>
     ipcRenderer.invoke("ml:train-obb-detector", speciesId, options),
-  tagClassIds: (speciesId: string, boxes: any[]) =>
-    ipcRenderer.invoke("ml:tag-class-ids", speciesId, boxes),
   onSuperAnnotateProgress: (callback: (data: any) => void) => {
     ipcRenderer.on("ml:super-annotate-progress", (_event: any, data: any) => callback(data));
     return () => { ipcRenderer.removeAllListeners("ml:super-annotate-progress"); };
   },
-  onPredictProgress: (callback: (data: { percent: number; stage: string }) => void) => {
+  onPredictProgress: (callback: (data: {
+    percent: number;
+    stage: string;
+    currentIndex?: number;
+    total?: number;
+    imagePath?: string;
+  }) => void) => {
     ipcRenderer.on("ml:predict-progress", (_event: any, data: any) => callback(data));
     return () => { ipcRenderer.removeAllListeners("ml:predict-progress"); };
   },
@@ -199,7 +247,23 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.on("ml:train-progress", handler);
     return () => { ipcRenderer.removeListener("ml:train-progress", handler); };
   },
+  onSegmentSaveStatus: (callback: (data: {
+    speciesId: string;
+    filename: string;
+    state: "idle" | "queued" | "running" | "saved" | "skipped" | "failed";
+    signature?: string;
+    updatedAt: string;
+    reason?: string;
+    expectedCount?: number;
+    savedCount?: number;
+  }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on("session:segment-save-status", handler);
+    return () => { ipcRenderer.removeListener("session:segment-save-status", handler); };
+  },
   sessionListInferenceSessions: () => ipcRenderer.invoke("session:list-inference-sessions"),
+  sessionDeleteSchemaSession: (speciesId: string) =>
+    ipcRenderer.invoke("session:delete-schema-session", { speciesId }),
   sessionCreateInferenceSession: (speciesId: string, displayName?: string) =>
     ipcRenderer.invoke("session:create-inference-session", { speciesId, displayName }),
   sessionGetInferenceSession: (speciesId: string) =>
@@ -246,6 +310,8 @@ contextBridge.exposeInMainWorld("api", {
         confidence?: number;
         class_id?: number;
         class_name?: string;
+        obbCorners?: [number, number][];
+        angle?: number;
         orientation_override?: "left" | "right" | "uncertain";
         orientation_hint?: {
           orientation?: "left" | "right";
@@ -263,6 +329,10 @@ contextBridge.exposeInMainWorld("api", {
       saved?: boolean;
       reviewComplete?: boolean;
       committedAt?: string | null;
+      landmarkModelKey?: string | null;
+      landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose" | null;
+      boxSignature?: string | null;
+      inferenceSignature?: string | null;
       clear?: boolean;
     }
   ) =>
@@ -276,6 +346,10 @@ contextBridge.exposeInMainWorld("api", {
       saved: options?.saved,
       reviewComplete: options?.reviewComplete,
       committedAt: options?.committedAt,
+      landmarkModelKey: options?.landmarkModelKey,
+      landmarkPredictorType: options?.landmarkPredictorType,
+      boxSignature: options?.boxSignature,
+      inferenceSignature: options?.inferenceSignature,
       clear: options?.clear,
     }),
   sessionLoadInferenceReviewDrafts: (speciesId: string, inferenceSessionId?: string) =>

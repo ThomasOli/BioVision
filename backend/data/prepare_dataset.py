@@ -15,7 +15,6 @@ _BACKEND_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if _BACKEND_ROOT not in _sys.path:
     _sys.path.insert(0, _BACKEND_ROOT)
 
-from detection.detect_specimen import detect_specimen
 from bv_utils.image_utils import load_image, safe_imread, safe_imwrite
 import bv_utils.orientation_utils as ou
 
@@ -351,144 +350,66 @@ def standardize_crop(
     orientation_hint=None,
 ):
     """
-    Crop image to bounding box + padding, resize to STANDARD_SIZE x STANDARD_SIZE,
-    and remap landmarks to the new coordinate space.
-
-    If mirror=True the cropped image is flipped horizontally and landmark x-coords
-    are mirrored within the 512x512 crop space. The flip remains local to each
-    specimen crop.
-
-    When the box has obbCorners, the OBB geometry engine is used instead of the
-    PCA/AABB path: extract_obb_crop() deskews the specimen, apply_obb_geometry()
-    applies schema-specific canonical flips, and landmarks are remapped via the
-    same affine matrix M that was applied to the image pixels.
-
-    Returns (cropped_image, remapped_landmarks, crop_metadata).
+    Extract an OBB crop, apply schema-specific OBB geometry normalization,
+    and remap landmarks into STANDARD_SIZE space.
     """
-    # --- OBB fast-path (takes priority when obbCorners are present) ---
     obb_corners = box.get("obbCorners") or box.get("obb_corners")
-    class_id = box.get("class_id", 0)
-    if obb_corners and len(obb_corners) == 4:
-        apply_leveling = ((orientation_policy or {}).get("obbLevelingMode", "on") == "on")
-        crop, crop_meta = ou.extract_obb_crop(
-            image, obb_corners, pad_ratio=0.15, apply_leveling=apply_leveling
-        )
-        crop, crop_meta, debug = ou.apply_obb_geometry(
-            crop, crop_meta, int(class_id), orientation_policy or {}
-        )
+    if not obb_corners or len(obb_corners) != 4:
+        raise ValueError("standardize_crop requires OBB geometry")
 
-        # Affine-correct landmark remap:
-        # Step 1 — Rotate landmark coords by M (the same warpAffine applied to pixels).
-        # Guard: empty landmarks (box drawn but no points placed) → skip dot-product.
-        M = np.array(crop_meta["affine_M"], dtype=np.float64)  # 2×3
-        lm_pts = np.array([[lm["x"], lm["y"]] for lm in landmarks], dtype=np.float64)
-        if apply_leveling and len(lm_pts):
-            ones = np.ones((len(lm_pts), 1), dtype=np.float64)
-            rotated_pts = (M @ np.hstack([lm_pts, ones]).T).T  # shape (N, 2)
-        else:
-            rotated_pts = lm_pts  # no rotation (leveling off) or empty landmark set
+    class_id = int(box.get("class_id", 0))
+    apply_leveling = ((orientation_policy or {}).get("obbLevelingMode", "on") == "on")
+    crop, crop_meta = ou.extract_standardized_obb_crop(
+        image,
+        obb_corners,
+        apply_leveling=apply_leveling,
+    )
+    crop, crop_meta, debug = ou.apply_obb_geometry(
+        crop, crop_meta, class_id, orientation_policy or {}
+    )
 
-        # Step 2 — Shift by crop_origin, scale to STANDARD_SIZE, mirror/rotate if flipped.
-        ox, oy = crop_meta["crop_origin"]
-        scale = crop_meta["scale"]
-        was_flipped = bool(crop_meta.get("canonical_flip_applied", False))
-        was_rotated_180 = bool(debug.get("rotated_180", False))
-        landmarks_512 = []
-        for i, lm in enumerate(landmarks):
-            x512 = (rotated_pts[i][0] - ox) * scale
-            y512 = (rotated_pts[i][1] - oy) * scale
-            if was_flipped:
-                x512 = (STANDARD_SIZE - 1) - x512  # horizontal mirror (directional/bilateral)
-            if was_rotated_180:
-                # cv2.ROTATE_180 → both axes mirrored (axial mode, large OBB angle)
-                x512 = (STANDARD_SIZE - 1) - x512
-                y512 = (STANDARD_SIZE - 1) - y512
-            x512 = float(np.clip(x512, 0, STANDARD_SIZE - 1))
-            y512 = float(np.clip(y512, 0, STANDARD_SIZE - 1))
-            landmarks_512.append({**lm, "x": x512, "y": y512})
+    M = np.array(crop_meta["affine_M"], dtype=np.float64)
+    lm_pts = np.array([[lm["x"], lm["y"]] for lm in landmarks], dtype=np.float64)
+    if apply_leveling and len(lm_pts):
+        ones = np.ones((len(lm_pts), 1), dtype=np.float64)
+        rotated_pts = (M @ np.hstack([lm_pts, ones]).T).T
+    else:
+        rotated_pts = lm_pts
 
-        meta = {
-            **crop_meta,
-            "original_box": {
-                "left": box.get("left", 0),
-                "top": box.get("top", 0),
-                "width": box.get("width", 0),
-                "height": box.get("height", 0),
-            },
-            "mirrored": bool(was_flipped) ^ bool(mirror),
-            "manual_mirror_requested": bool(mirror),
-            "canonical_flip_applied": was_flipped,
-            "canonicalization": debug,
-            "canonical_mask_source": "obb",
-        }
-        return crop, landmarks_512, meta
+    was_flipped = bool(crop_meta.get("canonical_flip_applied", False))
+    was_rotated_180 = bool(debug.get("rotated_180", False))
+    rotated_landmarks = [
+        {**lm, "x": float(rotated_pts[i][0]), "y": float(rotated_pts[i][1])}
+        for i, lm in enumerate(landmarks)
+    ]
+    landmarks_512 = ou.remap_landmarks_to_standard(rotated_landmarks, crop_meta, mirror=False)
+    for landmark in landmarks_512:
+        x512 = float(landmark["x"])
+        y512 = float(landmark["y"])
+        if was_flipped:
+            x512 = (STANDARD_SIZE - 1) - x512
+        if was_rotated_180:
+            x512 = (STANDARD_SIZE - 1) - x512
+            y512 = (STANDARD_SIZE - 1) - y512
+        landmark["x"] = float(np.clip(x512, 0, STANDARD_SIZE - 1))
+        landmark["y"] = float(np.clip(y512, 0, STANDARD_SIZE - 1))
 
-    # --- Existing PCA/AABB path (boxes without obbCorners) ---
-    bx, by = int(box["left"]), int(box["top"])
-    bw, bh = int(box["width"]), int(box["height"])
-    xyxy = [bx, by, bx + bw, by + bh]
-
-    standardized, metadata = ou.base_standardize(image, xyxy, pad_ratio=pad_ratio)
-    canonicalization = None
-    mask_source = None
-    canonical_flip_applied = False
-
-    mode = ou.get_orientation_mode(orientation_policy or {})
-    pca_mode = str((orientation_policy or {}).get("pcaLevelingMode", "off")).strip().lower()
-    if pca_mode not in ("off", "on", "auto"):
-        pca_mode = "off"
-    should_canonicalize = mode != "invariant" and pca_mode in ("on", "auto")
-
-    if should_canonicalize:
-        mask_512 = None
-        if mask_full is not None:
-            try:
-                ox, oy = [int(v) for v in metadata["crop_origin"]]
-                cw, ch = [int(v) for v in metadata["crop_size"]]
-                if cw > 0 and ch > 0:
-                    mask_crop = mask_full[oy:oy + ch, ox:ox + cw]
-                    if mask_crop.size > 0:
-                        mask_512 = cv2.resize(
-                            (mask_crop > 0).astype("uint8"),
-                            (STANDARD_SIZE, STANDARD_SIZE),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
-                        mask_source = "segments"
-            except Exception:
-                mask_512 = None
-        if mask_512 is None:
-            mask_512 = _rough_mask_from_crop(standardized)
-            if mask_512 is not None:
-                mask_source = "rough_otsu"
-
-        if mask_512 is not None:
-            standardized, _rot_mask, canonicalization = ou.canonicalize_with_mask(
-                standardized,
-                mask_512,
-                policy=orientation_policy or {},
-                pca_mode="auto",
-                orientation_hint=orientation_hint,
-            )
-            canonical_flip_applied = bool((canonicalization or {}).get("canonical_flip_applied", False))
-
-    # Keep image and landmark coordinates in the same mirrored frame.
-    # canonical_flip_applied is already baked into `standardized`.
-    # `mirror` here is an optional additional legacy flip.
-    total_flip = bool(canonical_flip_applied) ^ bool(mirror)
-    remapped = ou.remap_landmarks_to_standard(landmarks, metadata, mirror=total_flip)
-    if mirror:
-        standardized = cv2.flip(standardized, 1)
-
-    metadata = {
-        **metadata,
-        "original_box": {"left": bx, "top": by, "width": bw, "height": bh},
-        "mirrored": total_flip,
+    meta = {
+        **crop_meta,
+        "original_box": {
+            "left": box.get("left", 0),
+            "top": box.get("top", 0),
+            "width": box.get("width", 0),
+            "height": box.get("height", 0),
+        },
+        "mirrored": bool(was_flipped) ^ bool(mirror),
         "manual_mirror_requested": bool(mirror),
-        "canonical_flip_applied": canonical_flip_applied,
-        "canonicalization": canonicalization,
-        "canonical_mask_source": mask_source,
+        "canonical_flip_applied": was_flipped,
+        "canonicalization": debug,
+        "canonicalization_source": "obb_geometry",
+        "canonical_mask_source": "none",
     }
-    return standardized, remapped, metadata
+    return crop, landmarks_512, meta
 
 
 def detect_orientation(landmarks, head_id=None, tail_id=None):
@@ -514,8 +435,8 @@ def _resolve_training_prep_box_jitter_profile(orientation_policy, orientation_mo
     """
     Resolve schema-aware training-prep box jitter profile.
 
-    Defaults to conservative dlib-safe jitter because this dataset feeds both
-    dlib and CNN training.
+    Defaults to scale-only dlib-safe variance because this dataset feeds
+    mean-shape training and should not translate canonical crops.
     """
     raw = (orientation_policy or {}).get("trainingPrepBoxJitter", "auto")
     if raw in (False, 0, "off", "none", "disabled"):
@@ -530,26 +451,17 @@ def _resolve_training_prep_box_jitter_profile(orientation_policy, orientation_mo
         }
 
     engine = "dlib"
-    if isinstance(raw, dict):
-        engine_raw = str(raw.get("engine", "dlib")).strip().lower()
-        if engine_raw in ("dlib", "cnn"):
-            engine = engine_raw
-    elif isinstance(raw, str):
-        lowered = raw.strip().lower()
-        if lowered in ("cnn", "dlib"):
-            engine = lowered
 
     profile = ou.get_box_jitter_profile(orientation_mode, engine=engine)
     size_bucket = _dataset_size_bucket(train_count)
 
-    # Small datasets benefit from additional detector-noise simulation.
+    # Small datasets can benefit from a little more volume, but dlib keeps
+    # the same scale-only geometry regardless of dataset size.
     if profile.get("enabled"):
         if size_bucket == "tiny":
-            profile["copies_per_sample"] = int(profile.get("copies_per_sample", 0)) + 1
-            profile["translate_ratio"] = float(profile.get("translate_ratio", 0.0)) + 0.005
+            profile["copies_per_sample"] = int(profile.get("copies_per_sample", 0)) + (1 if engine == "cnn" else 0)
         elif size_bucket == "small":
             profile["copies_per_sample"] = int(profile.get("copies_per_sample", 0)) + (1 if engine == "cnn" else 0)
-            profile["translate_ratio"] = float(profile.get("translate_ratio", 0.0)) + (0.003 if engine == "cnn" else 0.0)
 
     # Optional explicit overrides.
     if isinstance(raw, dict):
@@ -562,7 +474,7 @@ def _resolve_training_prep_box_jitter_profile(orientation_policy, orientation_mo
                 pass
         if "translate_ratio" in raw:
             try:
-                profile["translate_ratio"] = max(0.0, float(raw.get("translate_ratio", 0.0)))
+                profile["translate_ratio"] = 0.0 if engine == "dlib" else max(0.0, float(raw.get("translate_ratio", 0.0)))
             except Exception:
                 pass
         if "scale_range" in raw and isinstance(raw.get("scale_range"), (list, tuple)) and len(raw.get("scale_range")) == 2:
@@ -578,76 +490,60 @@ def _resolve_training_prep_box_jitter_profile(orientation_policy, orientation_mo
         **profile,
         "engine": engine,
         "size_bucket": size_bucket,
+        "translate_ratio": 0.0 if engine == "dlib" else float(profile.get("translate_ratio", 0.0)),
+        "strategy": str(profile.get("strategy") or ("scale_only_pre_standardize" if engine == "dlib" else "box_jitter")),
         "source": "policy_custom" if isinstance(raw, dict) else ("policy_engine" if isinstance(raw, str) and raw.strip().lower() in ("dlib", "cnn") else "default_auto"),
     }
 
 
-def _apply_box_jitter_to_crop(crop_img, landmarks, rng, translate_ratio, scale_range):
+def _scale_obb_about_center(box, scale_factor):
     """
-    Apply crop-space translate/scale jitter to simulate detector-box variability.
+    Uniformly scale an OBB about its center without changing orientation.
     """
-    if crop_img is None or crop_img.size == 0:
-        return None, None, None
-    h, w = crop_img.shape[:2]
-    if h != STANDARD_SIZE or w != STANDARD_SIZE:
-        return None, None, None
+    if not isinstance(box, dict):
+        return None
+    try:
+        scale = float(scale_factor)
+    except Exception:
+        return None
+    if scale <= 0:
+        return None
 
-    cx = (STANDARD_SIZE - 1) / 2.0
-    cy = (STANDARD_SIZE - 1) / 2.0
-    max_shift = float(max(0.0, translate_ratio)) * float(STANDARD_SIZE)
-    tx = float(rng.uniform(-max_shift, max_shift))
-    ty = float(rng.uniform(-max_shift, max_shift))
+    obb_corners = box.get("obbCorners") or box.get("obb_corners")
+    if not isinstance(obb_corners, (list, tuple)) or len(obb_corners) != 4:
+        return None
 
-    scale_lo, scale_hi = float(scale_range[0]), float(scale_range[1])
-    if scale_lo <= 0 or scale_hi <= 0:
-        scale_lo, scale_hi = 1.0, 1.0
-    if scale_hi < scale_lo:
-        scale_lo, scale_hi = scale_hi, scale_lo
-    scale = float(rng.uniform(scale_lo, scale_hi))
+    try:
+        corners = np.array([[float(pt[0]), float(pt[1])] for pt in obb_corners], dtype=np.float64)
+    except Exception:
+        return None
 
-    m = np.array(
-        [[scale, 0.0, (1.0 - scale) * cx + tx], [0.0, scale, (1.0 - scale) * cy + ty]],
-        dtype=np.float32,
-    )
-    out_img = cv2.warpAffine(
-        crop_img,
-        m,
-        (STANDARD_SIZE, STANDARD_SIZE),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
+    center = corners.mean(axis=0)
+    scaled_corners = center + (corners - center) * scale
+    xs = scaled_corners[:, 0]
+    ys = scaled_corners[:, 1]
+    scaled_list = [[float(x), float(y)] for x, y in scaled_corners]
 
-    out_landmarks = []
-    for lm in landmarks:
-        try:
-            x = float(lm.get("x", -1))
-            y = float(lm.get("y", -1))
-            lm_id = int(lm.get("id"))
-        except Exception:
-            continue
-        if x < 0 or y < 0:
-            continue
-        x2 = scale * x + (1.0 - scale) * cx + tx
-        y2 = scale * y + (1.0 - scale) * cy + ty
-        x2 = max(0.0, min(float(STANDARD_SIZE - 1), x2))
-        y2 = max(0.0, min(float(STANDARD_SIZE - 1), y2))
-        out_landmarks.append({"id": lm_id, "x": x2, "y": y2})
-
-    if not out_landmarks:
-        return None, None, None
-    return out_img, out_landmarks, {"translate_x": tx, "translate_y": ty, "scale": scale}
+    scaled_box = dict(box)
+    scaled_box["obbCorners"] = scaled_list
+    if "obb_corners" in scaled_box:
+        scaled_box["obb_corners"] = scaled_list
+    scaled_box["left"] = float(xs.min())
+    scaled_box["top"] = float(ys.min())
+    scaled_box["width"] = max(1.0, float(xs.max() - xs.min()))
+    scaled_box["height"] = max(1.0, float(ys.max() - ys.min()))
+    return scaled_box
 
 
-def _augment_train_entries_with_box_jitter(train_entries, corrected_dir, profile, seed):
+def _augment_train_entries_with_box_scale(train_entries, corrected_dir, profile, seed, orientation_policy):
     """
-    Augment train entries with schema-specific box jitter crops.
+    Augment train entries by scaling source OBBs before standardization.
     """
     enabled = bool(profile.get("enabled", False))
     copies = int(max(0, profile.get("copies_per_sample", 0)))
     if (not enabled) or copies <= 0 or not train_entries:
         return [], []
 
-    translate_ratio = float(max(0.0, profile.get("translate_ratio", 0.0)))
     scale_range = profile.get("scale_range", (1.0, 1.0))
     try:
         scale_range = (float(scale_range[0]), float(scale_range[1]))
@@ -656,44 +552,75 @@ def _augment_train_entries_with_box_jitter(train_entries, corrected_dir, profile
 
     rng = np.random.default_rng(int(seed) + 113)
     augmented_entries = []
-    jitter_log = []
+    box_scale_log = []
+    image_cache = {}
     base_entries = list(train_entries)
     for idx, entry in enumerate(base_entries):
-        img = safe_imread(entry["path"])
-        if img is None:
+        source_path = entry.get("source_full_image_path")
+        source_box = entry.get("source_box")
+        source_landmarks = entry.get("source_landmarks")
+        if not source_path or not isinstance(source_box, dict) or not isinstance(source_landmarks, list):
             continue
+
+        full_img = image_cache.get(source_path)
+        if full_img is None:
+            full_img = safe_imread(source_path)
+            if full_img is None:
+                continue
+            image_cache[source_path] = full_img
+
         base_name = os.path.splitext(os.path.basename(entry["path"]))[0]
+        scale_lo, scale_hi = scale_range
+        if scale_lo <= 0 or scale_hi <= 0:
+            scale_lo, scale_hi = 1.0, 1.0
+        if scale_hi < scale_lo:
+            scale_lo, scale_hi = scale_hi, scale_lo
+
         for j in range(copies):
-            out_img, out_landmarks, jitter_meta = _apply_box_jitter_to_crop(
-                img,
-                entry["landmarks"],
-                rng,
-                translate_ratio=translate_ratio,
-                scale_range=scale_range,
-            )
+            scale_factor = float(rng.uniform(scale_lo, scale_hi))
+            scaled_box = _scale_obb_about_center(source_box, scale_factor)
+            if scaled_box is None:
+                continue
+            try:
+                out_img, out_landmarks, _ = standardize_crop(
+                    full_img,
+                    scaled_box,
+                    source_landmarks,
+                    mirror=False,
+                    orientation_policy=orientation_policy,
+                )
+            except Exception:
+                continue
             if out_img is None or not out_landmarks:
                 continue
-            jitter_path = os.path.join(corrected_dir, f"{base_name}_jit_{idx:05d}_{j + 1:02d}.png")
-            safe_imwrite(jitter_path, out_img)
+
+            scale_path = os.path.join(corrected_dir, f"{base_name}_boxscale_{idx:05d}_{j + 1:02d}.png")
+            safe_imwrite(scale_path, out_img)
             augmented_entries.append(
                 {
-                    "path": jitter_path,
+                    "path": scale_path,
                     "landmarks": out_landmarks,
                     "source_image": entry["source_image"],
                     "box_index": entry.get("box_index", 0),
-                    "is_box_jitter_augmented": True,
+                    "source_full_image_path": source_path,
+                    "source_box": scaled_box,
+                    "source_landmarks": [dict(lm) for lm in source_landmarks],
+                    "is_box_scale_augmented": True,
                 }
             )
-            jitter_log.append(
+            box_scale_log.append(
                 {
+                    "strategy": str(profile.get("strategy", "scale_only_pre_standardize")),
                     "source_crop_path": entry["path"],
-                    "augmented_crop_path": jitter_path,
+                    "augmented_crop_path": scale_path,
                     "source_image": entry["source_image"],
                     "box_index": entry.get("box_index", 0),
-                    **(jitter_meta or {}),
+                    "scale": scale_factor,
+                    "translate_x": 0.0,
+                    "translate_y": 0.0,
                 }
             )
-    return augmented_entries, jitter_log
+    return augmented_entries, box_scale_log
 
 
 def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
@@ -736,6 +663,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     if pca_mode not in ("off", "on", "auto"):
         pca_mode = "off"
     canonical_training_enabled = orientation_mode != "invariant" and pca_mode in ("on", "auto")
+    obb_canonicalization_enabled = orientation_mode != "invariant"
     segment_index = _build_segment_index(project_root) if canonical_training_enabled else {}
 
     debug_log, orientation_log, processed = [], [], []
@@ -794,9 +722,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         corrected_path = os.path.join(corrected_dir, f"{base}.png")
         safe_imwrite(corrected_path, img)
 
-        detected = detect_specimen(corrected_path, margin=20)
-        if not detected:
-            detected = {'left': 0, 'top': 0, 'width': w, 'height': h, 'right': w, 'bottom': h}
+        detected = None
 
         debug_log.append({
             "filename": img_filename,
@@ -846,8 +772,33 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                         box_coords["obbCorners"] = obb_corners_raw
                     if box_data.get("angle") is not None:
                         box_coords["angle"] = box_data["angle"]
+                else:
+                    derived_obb = ou.derive_obb_from_landmarks(
+                        valid_lm,
+                        image_shape=(h, w),
+                        head_id=head_landmark_id,
+                        tail_id=tail_landmark_id,
+                        mode=orientation_mode,
+                    )
+                    box_coords.update(
+                        {
+                            "left": int(round(derived_obb["left"])),
+                            "top": int(round(derived_obb["top"])),
+                            "width": int(round(derived_obb["width"])),
+                            "height": int(round(derived_obb["height"])),
+                            "obbCorners": derived_obb["obbCorners"],
+                            "angle": derived_obb["angle"],
+                        }
+                    )
                 if box_data.get("class_id") is not None:
                     box_coords["class_id"] = box_data["class_id"]
+                else:
+                    box_coords["class_id"] = ou.derive_class_id_from_landmarks(
+                        valid_lm,
+                        mode=orientation_mode,
+                        head_id=head_landmark_id,
+                        tail_id=tail_landmark_id,
+                    )
 
                 # Detect orientation for this individual specimen.
                 # The flip is deferred to standardize_crop (mirror=was_mirrored) so that
@@ -890,7 +841,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                     "source_image_path": img_path,
                 })
         else:
-            # Single-specimen mode: flatten all landmarks, use auto-detected box
+            # Single-specimen mode: flatten all landmarks, derive OBB directly from landmarks
             if json_boxes:
                 all_lm = [lm for box in json_boxes for lm in box.get("landmarks", [])]
             else:
@@ -920,9 +871,29 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             )
             if canonical_training_enabled:
                 was_mirrored = False
-            # NOTE: do NOT mirror landmarks in image space here.
-            # The flip is applied per-crop inside standardize_crop (mirror=was_mirrored)
-            # so both the image pixels and the landmark coords stay consistent.
+            derived_obb = ou.derive_obb_from_landmarks(
+                valid_lm,
+                image_shape=(h, w),
+                head_id=head_landmark_id,
+                tail_id=tail_landmark_id,
+                mode=orientation_mode,
+            )
+            detected = {
+                "left": int(round(derived_obb["left"])),
+                "top": int(round(derived_obb["top"])),
+                "width": int(round(derived_obb["width"])),
+                "height": int(round(derived_obb["height"])),
+                "right": int(round(derived_obb["right"])),
+                "bottom": int(round(derived_obb["bottom"])),
+                "obbCorners": derived_obb["obbCorners"],
+                "angle": derived_obb["angle"],
+                "class_id": ou.derive_class_id_from_landmarks(
+                    valid_lm,
+                    mode=orientation_mode,
+                    head_id=head_landmark_id,
+                    tail_id=tail_landmark_id,
+                ),
+            }
 
             orientation_log.append({
                 "filename": img_filename,
@@ -995,33 +966,14 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         for bi, box_data in enumerate(p["boxes"]):
             box = box_data["box"]
             landmarks = box_data["landmarks"]
-            orig_orientation = box_data.get("orientation")
-            mirror = box_data.get("mirrored", False)
-            if canonical_training_enabled:
-                # Canonicalizer applies directional flips from orientation hint;
-                # disable the legacy manual mirror to avoid double flips.
-                mirror = False
-
-            xyxy = _box_to_xyxy(box)
-            mask_full = None
-            if canonical_training_enabled and xyxy is not None:
-                mask_full = _segment_mask_for_box(
-                    full_img.shape[:2],
-                    p.get("source_image_path", p["path"]),
-                    xyxy,
-                    p.get("scale", 1.0),
-                    segment_index,
-                    min_iou=0.30,
-                )
+            has_obb_corners = bool(box.get("obbCorners") or box.get("obb_corners"))
 
             cropped_img, remapped_lm, meta = standardize_crop(
                 full_img,
                 box,
                 landmarks,
-                mirror=mirror,
-                orientation_policy=orientation_policy if canonical_training_enabled else None,
-                mask_full=mask_full,
-                orientation_hint=orig_orientation,
+                mirror=False,
+                orientation_policy=orientation_policy,
             )
 
             # Save cropped image — one per box
@@ -1034,6 +986,9 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "landmarks": remapped_lm,
                 "source_image": p["filename"],
                 "box_index": bi,
+                "source_full_image_path": p["path"],
+                "source_box": dict(box),
+                "source_landmarks": [dict(lm) for lm in landmarks],
             })
 
             crop_metadata_log.append({
@@ -1041,6 +996,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "box_index": bi,
                 "crop_path": crop_path,
                 "canonical_training_enabled": canonical_training_enabled,
+                "obb_canonicalization_enabled": bool(obb_canonicalization_enabled and has_obb_corners),
                 **meta,
             })
 
@@ -1154,29 +1110,31 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             else:
                 train_entries.extend(by_source[s])
 
-    train_entries_pre_jitter = len(train_entries)
-    prep_box_jitter_profile = _resolve_training_prep_box_jitter_profile(
+    train_entries_pre_boxscale = len(train_entries)
+    prep_box_scale_profile = _resolve_training_prep_box_jitter_profile(
         orientation_policy,
         orientation_mode,
-        train_entries_pre_jitter,
+        train_entries_pre_boxscale,
     )
     cnn_recommended_box_jitter = ou.get_box_jitter_profile(orientation_mode, engine="cnn")
-    jitter_augmented_entries, jitter_aug_log = _augment_train_entries_with_box_jitter(
+    boxscale_augmented_entries, boxscale_aug_log = _augment_train_entries_with_box_scale(
         train_entries,
         corrected_dir,
-        prep_box_jitter_profile,
+        prep_box_scale_profile,
         seed=seed,
+        orientation_policy=orientation_policy,
     )
-    if jitter_augmented_entries:
-        train_entries.extend(jitter_augmented_entries)
+    if boxscale_augmented_entries:
+        train_entries.extend(boxscale_augmented_entries)
         crop_metadata_log.extend(
             {
                 "source_image": e.get("source_image"),
                 "box_index": e.get("box_index", 0),
                 "crop_path": e.get("path"),
-                "is_box_jitter_augmented": True,
+                "is_box_scale_augmented": True,
+                "augmentation_strategy": str(prep_box_scale_profile.get("strategy", "scale_only_pre_standardize")),
             }
-            for e in jitter_augmented_entries
+            for e in boxscale_augmented_entries
         )
 
     def write_xml(entries, path):
@@ -1236,9 +1194,9 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "canonical_training_enabled": canonical_training_enabled,
                 "pca_leveling_mode": pca_mode,
                 "segment_index_entries": sum(len(v) for v in segment_index.values()) if segment_index else 0,
-                "training_prep_box_jitter_profile": prep_box_jitter_profile,
+                "training_prep_box_scale_profile": prep_box_scale_profile,
                 "cnn_recommended_box_jitter_profile": cnn_recommended_box_jitter,
-                "training_prep_box_jitter_added_crops": len(jitter_augmented_entries),
+                "training_prep_box_scale_added_crops": len(boxscale_augmented_entries),
             }
         }, f, indent=2)
 
@@ -1281,16 +1239,16 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     with open(os.path.join(debug_dir, f"training_boxes_{tag}.json"), "w", encoding="utf-8") as f:
         json.dump(debug_log, f, indent=2)
 
-    with open(os.path.join(debug_dir, f"box_jitter_{tag}.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(debug_dir, f"box_scale_{tag}.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
                 "orientation_mode": orientation_mode,
-                "profile_applied": prep_box_jitter_profile,
+                "profile_applied": prep_box_scale_profile,
                 "cnn_recommended_profile": cnn_recommended_box_jitter,
-                "train_entries_before_jitter": train_entries_pre_jitter,
-                "jitter_entries_added": len(jitter_augmented_entries),
-                "train_entries_after_jitter": len(train_entries),
-                "samples": jitter_aug_log[:5000],
+                "train_entries_before_boxscale": train_entries_pre_boxscale,
+                "boxscale_entries_added": len(boxscale_augmented_entries),
+                "train_entries_after_boxscale": len(train_entries),
+                "samples": boxscale_aug_log[:5000],
             },
             f,
             indent=2,
@@ -1299,9 +1257,9 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     with open(os.path.join(debug_dir, f"split_info_{tag}.json"), "w", encoding="utf-8") as f:
         json.dump({
             "train_crops": len(train_entries),
-            "train_crops_before_jitter": train_entries_pre_jitter,
-            "train_crops_after_jitter": len(train_entries),
-            "train_jitter_crops_added": len(jitter_augmented_entries),
+            "train_crops_before_boxscale": train_entries_pre_boxscale,
+            "train_crops_after_boxscale": len(train_entries),
+            "train_boxscale_crops_added": len(boxscale_augmented_entries),
             "test_crops": len(test_entries),
             "total_crops": len(standardized_entries),
             "train_sources": sorted(train_source_set),
@@ -1310,7 +1268,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             "test_source_count": len(test_source_set),
             "source_overlap_count": len(set(train_source_set) & set(test_source_set)),
             "standard_size": STANDARD_SIZE,
-            "training_prep_box_jitter_profile": prep_box_jitter_profile,
+            "training_prep_box_scale_profile": prep_box_scale_profile,
             "cnn_recommended_box_jitter_profile": cnn_recommended_box_jitter,
             "train_files": [e["path"] for e in train_entries],
             "test_files": [e["path"] for e in test_entries]
@@ -1346,5 +1304,3 @@ if __name__ == "__main__":
         seed=int(sys.argv[4]) if len(sys.argv) > 4 else 42,
         target_orientation=sys.argv[5] if len(sys.argv) > 5 else 'left'
     )
-
-

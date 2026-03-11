@@ -1,5 +1,5 @@
 """
-Train a CNN landmark predictor (configurable backbone + regression head).
+Train a CNN landmark predictor (configurable backbone + heatmap head).
 
 Uses the same dlib XML files produced by prepare_dataset.py so no additional
 data preparation is needed — just run this after prepare_dataset.py.
@@ -22,6 +22,7 @@ import time
 from contextlib import nullcontext
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import re
 
 import cv2
 import numpy as np
@@ -46,6 +47,8 @@ except ImportError as e:
     sys.exit(1)
 
 STANDARD_SIZE = 512
+HEATMAP_SIGMA_PX = 2.5
+TRAIN_VAL_FRACTION = 0.125
 
 
 def _resolve_orientation_aug_policy(project_root):
@@ -66,133 +69,167 @@ def _is_canonical_training_enabled(orientation_policy, orientation_mode):
     return mode != "invariant" and pca_mode in ("on", "auto")
 
 
-def _tune_cnn_directional_aug_profile(
+def _tune_cnn_aug_profile_by_mode(
     base_profile,
     *,
     orientation_mode,
-    size_bucket,
+    tier,
     canonical_training_enabled,
 ):
-    """
-    Strengthen directional CNN robustness while preserving orientation semantics.
+    """Route CNN geometric augmentation by orientation mode.
 
-    - Canonicalized directional data (SAM2/PCA flow): moderate geometry.
-    - Non-canonical directional data: stronger geometry.
-    - Small datasets: slightly stronger augmentation for regularization.
+    directional / bilateral
+        Chirality (left/right semantics) must be preserved. Rotation is capped
+        at ±25° non-canonical (±16° canonical). 180° rotation disabled.
+        Starvation/balanced datasets get slightly expanded ranges for
+        regularisation because the model hasn't seen enough diversity.
+
+    axial
+        0° and 180° are biologically equivalent (pill-shaped / seed-shaped
+        specimens have no head/tail). rotate_180_prob=0.5 exploits that
+        equivalence. Translation jitter is kept tight to prevent the trees
+        from confusing which pole they are looking at.
+
+    invariant
+        Circular or amorphous objects — no chirality or polarity to protect.
+        Full 360° rotation, vertical + horizontal flips, large scale range.
+        The heavy augmentation acts as regularisation so starvation-tier
+        models can use lower dropout and larger batch (handled separately in
+        _resolve_cnn_training_profile).
     """
     profile = dict(base_profile or {})
     mode = str(orientation_mode or "").strip().lower()
-    if mode != "directional":
-        return profile
 
-    if canonical_training_enabled:
-        profile.update(
+    if mode in ("directional", "bilateral"):
+        tuned = (
             {
-                "flip_prob": 0.45,
-                "vertical_flip_prob": 0.0,
-                "rotation_range": (-16.0, 16.0),
-                "rotate_180_prob": 0.0,
-                "scale_range": (0.94, 1.06),
-                "translate_ratio": 0.05,
+                "starvation": {"flip_prob": 0.15, "vertical_flip_prob": 0.0, "rotation_range": (-10.0, 10.0), "rotate_180_prob": 0.0, "scale_range": (0.97, 1.03), "translate_ratio": 0.02, "occlusion_prob": 0.05},
+                "balanced": {"flip_prob": 0.25, "vertical_flip_prob": 0.0, "rotation_range": (-12.0, 12.0), "rotate_180_prob": 0.0, "scale_range": (0.95, 1.05), "translate_ratio": 0.03, "occlusion_prob": 0.10},
+                "deep": {"flip_prob": 0.35, "vertical_flip_prob": 0.0, "rotation_range": (-15.0, 15.0), "rotate_180_prob": 0.0, "scale_range": (0.93, 1.07), "translate_ratio": 0.04, "occlusion_prob": 0.15},
+            }
+            if canonical_training_enabled
+            else {
+                "starvation": {"flip_prob": 0.20, "vertical_flip_prob": 0.0, "rotation_range": (-14.0, 14.0), "rotate_180_prob": 0.0, "scale_range": (0.95, 1.05), "translate_ratio": 0.03, "occlusion_prob": 0.08},
+                "balanced": {"flip_prob": 0.30, "vertical_flip_prob": 0.0, "rotation_range": (-18.0, 18.0), "rotate_180_prob": 0.0, "scale_range": (0.93, 1.07), "translate_ratio": 0.04, "occlusion_prob": 0.12},
+                "deep": {"flip_prob": 0.40, "vertical_flip_prob": 0.0, "rotation_range": (-22.0, 22.0), "rotate_180_prob": 0.0, "scale_range": (0.91, 1.09), "translate_ratio": 0.05, "occlusion_prob": 0.15},
             }
         )
-    else:
-        profile.update(
-            {
-                "flip_prob": 0.5,
-                "vertical_flip_prob": 0.0,
-                "rotation_range": (-30.0, 30.0),
-                "rotate_180_prob": 0.0,
-                "scale_range": (0.88, 1.12),
-                "translate_ratio": 0.09,
-            }
-        )
+        profile.update(tuned.get(tier, tuned["balanced"]))
 
-    # Dataset-size adaptation: tiny/small datasets need extra regularization.
-    if size_bucket == "tiny":
-        lo, hi = profile["rotation_range"]
-        profile["rotation_range"] = (float(lo) - 4.0, float(hi) + 4.0)
-        s_lo, s_hi = profile["scale_range"]
-        profile["scale_range"] = (max(0.82, float(s_lo) - 0.02), min(1.20, float(s_hi) + 0.02))
-        profile["translate_ratio"] = min(0.11, float(profile["translate_ratio"]) + 0.015)
-    elif size_bucket == "small":
-        lo, hi = profile["rotation_range"]
-        profile["rotation_range"] = (float(lo) - 2.0, float(hi) + 2.0)
-        profile["translate_ratio"] = min(0.10, float(profile["translate_ratio"]) + 0.01)
+    elif mode == "axial":
+        # Pole ambiguity: 0° == 180°, but heavy translation triggers pole flip.
+        profile.update({
+            "flip_prob": 0.5,
+            "vertical_flip_prob": 0.0,
+            "rotation_range": (-10.0, 10.0),
+            "rotate_180_prob": 0.5,    # semantically equivalent for axial
+            "scale_range": (0.90, 1.10),
+            "translate_ratio": 0.04,
+        })
+
+    elif mode == "invariant":
+        # No chirality or polarity — full geometric freedom.
+        profile.update({
+            "flip_prob": 0.5,
+            "vertical_flip_prob": 0.5,
+            "rotation_range": (-180.0, 180.0),
+            "rotate_180_prob": 0.0,    # redundant when range already covers ±180°
+            "scale_range": (0.80, 1.20),
+            "translate_ratio": 0.10,
+        })
+
+    if mode == "axial":
+        tuned = {
+            "starvation": {"flip_prob": 0.20, "vertical_flip_prob": 0.0, "rotation_range": (-8.0, 8.0), "rotate_180_prob": 0.5, "scale_range": (0.96, 1.04), "translate_ratio": 0.02, "occlusion_prob": 0.05},
+            "balanced": {"flip_prob": 0.30, "vertical_flip_prob": 0.0, "rotation_range": (-10.0, 10.0), "rotate_180_prob": 0.5, "scale_range": (0.94, 1.06), "translate_ratio": 0.03, "occlusion_prob": 0.10},
+            "deep": {"flip_prob": 0.35, "vertical_flip_prob": 0.0, "rotation_range": (-12.0, 12.0), "rotate_180_prob": 0.5, "scale_range": (0.92, 1.08), "translate_ratio": 0.04, "occlusion_prob": 0.12},
+        }
+        profile.update(tuned.get(tier, tuned["balanced"]))
+    elif mode == "invariant":
+        tuned = {
+            "starvation": {"flip_prob": 0.35, "vertical_flip_prob": 0.25, "rotation_range": (-90.0, 90.0), "rotate_180_prob": 0.0, "scale_range": (0.90, 1.10), "translate_ratio": 0.05, "occlusion_prob": 0.08},
+            "balanced": {"flip_prob": 0.45, "vertical_flip_prob": 0.35, "rotation_range": (-140.0, 140.0), "rotate_180_prob": 0.0, "scale_range": (0.86, 1.14), "translate_ratio": 0.08, "occlusion_prob": 0.12},
+            "deep": {"flip_prob": 0.50, "vertical_flip_prob": 0.50, "rotation_range": (-180.0, 180.0), "rotate_180_prob": 0.0, "scale_range": (0.82, 1.18), "translate_ratio": 0.10, "occlusion_prob": 0.15},
+        }
+        profile.update(tuned.get(tier, tuned["balanced"]))
 
     return profile
 
 
-def _dataset_size_bucket(num_samples):
+def _capacity_tier(n_raw: int) -> str:
+    """3-tier capacity bucket based on unique real-world source images.
+
+    starvation (< 250) : prevent catastrophic memorisation.
+    balanced (250–999) : standard feature extraction.
+    deep (≥ 1000)      : capture long-tail morphological variance.
     """
-    Resolve training-size bucket from effective training sample count.
-    """
-    n = int(max(0, num_samples))
-    if n < 120:
-        return "tiny"
-    if n < 300:
-        return "small"
-    if n < 700:
-        return "medium"
-    if n < 1500:
-        return "large"
-    return "xlarge"
+    n = int(max(0, n_raw))
+    if n < 250:
+        return "starvation"
+    if n < 1000:
+        return "balanced"
+    return "deep"
 
 
 def _resolve_cnn_training_profile(num_samples, orientation_mode):
+    """Return adaptive CNN optimisation defaults by dataset size and orientation.
+
+    3-tier system with early_stop_patience per tier. For invariant starvation,
+    the heavy 360° augmentation already acts as strong regularisation, so
+    dropout and batch size are relaxed compared to the base starvation tier.
     """
-    Return adaptive CNN optimization defaults by dataset size.
-    """
-    bucket = _dataset_size_bucket(num_samples)
+    tier = _capacity_tier(num_samples)
     profiles = {
-        # Small datasets need longer training + stronger regularization.
-        "tiny": {
-            "epochs": 140,
+        "starvation": {
+            "epochs": 150,
             "lr": 3e-4,
-            "batch_size": 8,
-            "weight_decay": 4e-4,
-            "dropout": 0.35,
+            "batch_size": 4,
+            "weight_decay": 8e-4,
+            "dropout": 0.5,
+            "early_stop_patience": 15,
         },
-        "small": {
-            "epochs": 110,
-            "lr": 2e-4,
-            "batch_size": 10,
-            "weight_decay": 3e-4,
-            "dropout": 0.3,
-        },
-        # Mid-size dataset baseline.
-        "medium": {
-            "epochs": 90,
+        "balanced": {
+            "epochs": 100,
             "lr": 1.5e-4,
             "batch_size": 12,
             "weight_decay": 2e-4,
             "dropout": 0.25,
+            "early_stop_patience": 20,
         },
-        "large": {
+        "deep": {
             "epochs": 70,
-            "lr": 1e-4,
-            "batch_size": 16,
-            "weight_decay": 1e-4,
-            "dropout": 0.2,
-        },
-        "xlarge": {
-            "epochs": 55,
             "lr": 8e-5,
-            "batch_size": 24,
+            "batch_size": 20,
             "weight_decay": 8e-5,
-            "dropout": 0.15,
+            "dropout": 0.1,
+            "early_stop_patience": 30,
         },
     }
-    profile = dict(profiles[bucket])
+    profile = dict(profiles[tier])
 
-    # Harder orientation regimes often need more optimization steps.
     mode = str(orientation_mode or "").strip().lower()
+    # Harder orientation regimes benefit from more optimisation steps.
     if mode == "invariant":
         profile["epochs"] = int(round(profile["epochs"] * 1.15))
     elif mode == "axial":
         profile["epochs"] = int(round(profile["epochs"] * 1.08))
 
-    return profile, bucket
+    # Invariant starvation relief: heavy 360° augmentation substitutes for
+    # dropout regularisation, allowing more stable batch gradients.
+    if mode == "invariant" and tier == "starvation":
+        profile["dropout"] = 0.35
+        profile["batch_size"] = 8
+
+    return profile, tier
+
+
+def _resolve_visual_aug_profile(tier):
+    profiles = {
+        "starvation": {"brightness": 0.18, "contrast": 0.18, "saturation": 0.10, "blur_prob": 0.15},
+        "balanced": {"brightness": 0.24, "contrast": 0.24, "saturation": 0.15, "blur_prob": 0.22},
+        "deep": {"brightness": 0.30, "contrast": 0.30, "saturation": 0.20, "blur_prob": 0.30},
+    }
+    return dict(profiles.get(tier, profiles["balanced"]))
 
 
 def _load_id_mapping(project_root, tag):
@@ -286,6 +323,50 @@ def _collect_landmark_ids(records):
     return sorted(common, key=lambda n: (int(n) if n.isdigit() else float("inf"), n))
 
 
+def _record_source_key(image_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(str(image_path or "")))[0]
+    stem = re.sub(r"_boxscale_\d+_\d+$", "", stem)
+    stem = re.sub(r"_jit_\d+_\d+$", "", stem)
+    stem = re.sub(r"_crop$", "", stem)
+    stem = re.sub(r"_box\d+$", "", stem)
+    return stem
+
+
+def _split_train_val_records(records, *, val_fraction=TRAIN_VAL_FRACTION, seed=42):
+    if not records:
+        return [], [], {"train_sources": [], "val_sources": []}
+
+    grouped = {}
+    for record in records:
+        grouped.setdefault(_record_source_key(record[0]), []).append(record)
+
+    source_keys = sorted(grouped.keys())
+    if len(source_keys) <= 1:
+        return list(records), [], {"train_sources": source_keys, "val_sources": []}
+
+    rng = np.random.default_rng(int(seed))
+    shuffled = list(source_keys)
+    rng.shuffle(shuffled)
+
+    val_sources_target = max(1, int(round(len(shuffled) * float(val_fraction))))
+    val_sources_target = min(max(1, len(shuffled) - 1), val_sources_target)
+    val_sources = set(sorted(shuffled[:val_sources_target]))
+    train_sources = [src for src in source_keys if src not in val_sources]
+
+    train_records = []
+    val_records = []
+    for src in source_keys:
+        if src in val_sources:
+            val_records.extend(grouped[src])
+        else:
+            train_records.extend(grouped[src])
+
+    return train_records, val_records, {
+        "train_sources": train_sources,
+        "val_sources": sorted(val_sources),
+    }
+
+
 class LandmarkDataset(Dataset):
     """
     Dataset backed by dlib XML (same crops as dlib training).
@@ -307,6 +388,8 @@ class LandmarkDataset(Dataset):
         scale_range=(0.88, 1.12),
         translate_ratio=0.08,
         bilateral_index_pairs=None,
+        occlusion_prob=0.0,
+        return_meta=False,
     ):
         self.records = records
         self.landmark_keys = landmark_keys  # ordered list of part-name strings
@@ -324,6 +407,8 @@ class LandmarkDataset(Dataset):
             for a, b in (bilateral_index_pairs or [])
             if int(a) != int(b)
         ]
+        self.occlusion_prob = float(max(0.0, min(1.0, occlusion_prob)))
+        self.return_meta = bool(return_meta)
 
     def _apply_geometric_augment(self, img_rgb, coords_px):
         """
@@ -375,7 +460,28 @@ class LandmarkDataset(Dataset):
         coords_aug = hom @ M.T  # [N,2]
         coords_aug[:, 0] = np.clip(coords_aug[:, 0], 0.0, float(w - 1))
         coords_aug[:, 1] = np.clip(coords_aug[:, 1], 0.0, float(h - 1))
+        img = self._apply_occlusion_dropout(img)
         return img, coords_aug
+
+    def _apply_occlusion_dropout(self, img: np.ndarray) -> np.ndarray:
+        """Randomly black out 1–3 rectangular patches to force holistic landmark learning.
+
+        Patches are pure image-space operations so landmark coordinates never
+        need updating. Only applied during augmentation (augment=True guard is
+        in _apply_geometric_augment which is the sole caller).
+        """
+        if self._rng.random() >= self.occlusion_prob:
+            return img
+        h, w = img.shape[:2]
+        img = img.copy()
+        n_patches = int(self._rng.integers(1, 4))
+        for _ in range(n_patches):
+            ph = int(self._rng.integers(max(1, int(h * 0.08)), max(2, int(h * 0.20)) + 1))
+            pw = int(self._rng.integers(max(1, int(w * 0.08)), max(2, int(w * 0.20)) + 1))
+            y0 = int(self._rng.integers(0, max(1, h - ph + 1)))
+            x0 = int(self._rng.integers(0, max(1, w - pw + 1)))
+            img[y0:y0 + ph, x0:x0 + pw, :] = 0
+        return img
 
     def __len__(self):
         return len(self.records)
@@ -405,6 +511,8 @@ class LandmarkDataset(Dataset):
             flat.append(float(coords_np[i, 0]) / denom)
             flat.append(float(coords_np[i, 1]) / denom)
         target = torch.tensor(flat, dtype=torch.float32)
+        if self.return_meta:
+            return img, target, {"img_path": img_path, "source_key": _record_source_key(img_path)}
         return img, target
 
 
@@ -525,47 +633,32 @@ class CNNLandmarkPredictor(nn.Module):
         self.n_landmarks = int(n_landmarks)
         self.features = features
         self.head_type = str(head_type or "heatmap_deconv").strip().lower()
-        if self.head_type not in ("heatmap_deconv", "regression"):
-            self.head_type = "heatmap_deconv"
+        if self.head_type != "heatmap_deconv":
+            raise ValueError("CNNLandmarkPredictor supports only the heatmap_deconv head.")
         self.softargmax_beta = float(softargmax_beta)
         self.deconv_layers = int(max(1, deconv_layers))
         self.deconv_filters = int(max(32, deconv_filters))
 
-        if self.head_type == "regression":
-            self.pool = nn.AdaptiveAvgPool2d(1)
-            self.head = nn.Sequential(
-                nn.Flatten(),
-                nn.Linear(feat_dim, 256),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(256, self.n_landmarks * 2),
-                nn.Sigmoid(),
+        layers = []
+        in_ch = feat_dim
+        for _ in range(self.deconv_layers):
+            layers.extend(
+                [
+                    nn.ConvTranspose2d(
+                        in_ch,
+                        self.deconv_filters,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(self.deconv_filters),
+                    nn.ReLU(inplace=True),
+                ]
             )
-            self.deconv = None
-            self.heatmap_head = None
-        else:
-            layers = []
-            in_ch = feat_dim
-            for _ in range(self.deconv_layers):
-                layers.extend(
-                    [
-                        nn.ConvTranspose2d(
-                            in_ch,
-                            self.deconv_filters,
-                            kernel_size=4,
-                            stride=2,
-                            padding=1,
-                            bias=False,
-                        ),
-                        nn.BatchNorm2d(self.deconv_filters),
-                        nn.ReLU(inplace=True),
-                    ]
-                )
-                in_ch = self.deconv_filters
-            self.deconv = nn.Sequential(*layers)
-            self.heatmap_head = nn.Conv2d(in_ch, self.n_landmarks, kernel_size=1, stride=1, padding=0)
-            self.pool = None
-            self.head = None
+            in_ch = self.deconv_filters
+        self.deconv = nn.Sequential(*layers)
+        self.heatmap_head = nn.Conv2d(in_ch, self.n_landmarks, kernel_size=1, stride=1, padding=0)
 
         self.model_variant = resolved_variant
         self.variant_fallback_reason = fallback_reason
@@ -573,10 +666,6 @@ class CNNLandmarkPredictor(nn.Module):
 
     def forward(self, x, return_heatmaps=False):
         x = self.features(x)
-        if self.head_type == "regression":
-            x = self.pool(x)
-            return self.head(x)
-
         up = self.deconv(x)
         heatmaps = self.heatmap_head(up)
         coords = _spatial_soft_argmax_2d(heatmaps, beta=self.softargmax_beta)
@@ -599,25 +688,58 @@ def wing_loss(pred, target, w=10.0, eps=2.0):
     return loss.mean()
 
 
+def _build_gaussian_heatmaps(target_coords, height, width, sigma_px=HEATMAP_SIGMA_PX):
+    coords = target_coords.view(target_coords.size(0), -1, 2)
+    xs = torch.linspace(0.0, 1.0, steps=width, device=target_coords.device, dtype=target_coords.dtype)
+    ys = torch.linspace(0.0, 1.0, steps=height, device=target_coords.device, dtype=target_coords.dtype)
+    grid_x = xs.view(1, 1, 1, width)
+    grid_y = ys.view(1, 1, height, 1)
+    cx = coords[:, :, 0].view(coords.size(0), coords.size(1), 1, 1)
+    cy = coords[:, :, 1].view(coords.size(0), coords.size(1), 1, 1)
+    sigma_x = float(sigma_px) / float(max(1, width - 1))
+    sigma_y = float(sigma_px) / float(max(1, height - 1))
+    sigma_x = max(sigma_x, 1e-6)
+    sigma_y = max(sigma_y, 1e-6)
+    return torch.exp(
+        -(
+            ((grid_x - cx) ** 2) / (2.0 * sigma_x * sigma_x)
+            + ((grid_y - cy) ** 2) / (2.0 * sigma_y * sigma_y)
+        )
+    )
+
+
+def _cnn_composite_loss(pred_coords, pred_heatmaps, target_coords):
+    coord_loss = wing_loss(pred_coords, target_coords)
+    if pred_heatmaps is None:
+        return coord_loss, coord_loss.detach(), torch.zeros_like(coord_loss.detach())
+    target_heatmaps = _build_gaussian_heatmaps(
+        target_coords,
+        pred_heatmaps.shape[-2],
+        pred_heatmaps.shape[-1],
+    )
+    heatmap_loss = torch.mean((torch.sigmoid(pred_heatmaps) - target_heatmaps) ** 2)
+    total_loss = heatmap_loss + (0.25 * coord_loss)
+    return total_loss, coord_loss.detach(), heatmap_loss.detach()
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def _compute_error(model, loader, device):
-    """
-    Mean normalised per-landmark distance (in [0,1] coord space).
-    Comparable to dlib's normalised pixel error.
-    """
+def _compute_error_stats(model, loader, device):
+    """Return normalized/pixel error summaries plus per-landmark medians."""
     model.eval()
-    total = 0.0
-    count = 0
+    per_image_errors = []
+    per_landmark_errors = []
+    dev_str = str(device)
+    if dev_str == "cuda":
+        use_amp_eval, amp_eval_type, amp_eval_dtype = True, "cuda", torch.float16
+    elif dev_str == "mps":
+        use_amp_eval, amp_eval_type, amp_eval_dtype = True, "mps", torch.bfloat16
+    else:
+        use_amp_eval, amp_eval_type, amp_eval_dtype = False, "cpu", torch.float32
     with torch.no_grad():
-        dev_str = str(device)
-        if dev_str == "cuda":
-            use_amp_eval, amp_eval_type, amp_eval_dtype = True, "cuda", torch.float16
-        elif dev_str == "mps":
-            use_amp_eval, amp_eval_type, amp_eval_dtype = True, "mps", torch.bfloat16
-        else:
-            use_amp_eval, amp_eval_type, amp_eval_dtype = False, "cpu", torch.float32
         for imgs, targets in loader:
+            if isinstance(imgs, (list, tuple)):
+                imgs = imgs[0]
             imgs = imgs.to(device, non_blocking=(dev_str == "cuda"))
             targets = targets.to(device, non_blocking=(dev_str == "cuda"))
             amp_ctx = (
@@ -628,34 +750,87 @@ def _compute_error(model, loader, device):
             with amp_ctx:
                 preds = model(imgs)
             diff = (preds - targets).view(preds.size(0), -1, 2)
-            dists = torch.norm(diff, dim=2)  # shape [batch, n_landmarks]
-            total += dists.mean(dim=1).sum().item()
-            count += preds.size(0)
-    return total / count if count > 0 else float("nan")
+            dists = torch.norm(diff, dim=2)           # [batch, n_landmarks]
+            per_image = dists.mean(dim=1).cpu().numpy()  # [batch]
+            per_image_errors.extend(per_image.tolist())
+            per_landmark_errors.append(dists.cpu().numpy())
+    if not per_image_errors:
+        return {
+            "mean": float("nan"),
+            "median": float("nan"),
+            "mean_px": float("nan"),
+            "median_px": float("nan"),
+            "per_landmark_median": [],
+            "per_landmark_median_px": [],
+        }
+    arr = np.array(per_image_errors, dtype=np.float64)
+    per_landmark = np.concatenate(per_landmark_errors, axis=0) if per_landmark_errors else np.empty((0, 0))
+    denom = float(max(1, STANDARD_SIZE - 1))
+    return {
+        "mean": float(arr.mean()),
+        "median": float(np.median(arr)),
+        "mean_px": float(arr.mean() * denom),
+        "median_px": float(np.median(arr) * denom),
+        "per_landmark_median": per_landmark.size and np.median(per_landmark, axis=0).astype(float).tolist() or [],
+        "per_landmark_median_px": per_landmark.size and (np.median(per_landmark, axis=0) * denom).astype(float).tolist() or [],
+    }
 
 
-def _run_pipeline_parity_eval(project_root, tag, predictor_type, train_xml, test_xml, run_dir=None):
-    """
-    Evaluate end-to-end inference parity on train/test XML crops.
-    """
-    try:
-        from training.pipeline_parity_eval import evaluate_pipeline_parity
-
-        return evaluate_pipeline_parity(
-            project_root=project_root,
-            tag=tag,
-            predictor_type=predictor_type,
-            train_xml=train_xml,
-            test_xml=test_xml if os.path.exists(test_xml) else None,
-            debug_output_dir=run_dir,
-            outlier_px_threshold=400.0,
-        )
-    except Exception as exc:
-        return {"error": str(exc)}
+def _build_heldout_crop_report(model, records, landmark_keys, transform, device):
+    if not records:
+        return []
+    ds = LandmarkDataset(
+        records,
+        landmark_keys,
+        transform=transform,
+        augment=False,
+        seed=42,
+        return_meta=True,
+    )
+    loader = DataLoader(ds, batch_size=1, shuffle=False)
+    model.eval()
+    entries = []
+    dev_str = str(device)
+    if dev_str == "cuda":
+        use_amp_eval, amp_eval_type, amp_eval_dtype = True, "cuda", torch.float16
+    elif dev_str == "mps":
+        use_amp_eval, amp_eval_type, amp_eval_dtype = True, "mps", torch.bfloat16
+    else:
+        use_amp_eval, amp_eval_type, amp_eval_dtype = False, "cpu", torch.float32
+    with torch.no_grad():
+        for imgs, targets, meta in loader:
+            imgs = imgs.to(device, non_blocking=(dev_str == "cuda"))
+            targets = targets.to(device, non_blocking=(dev_str == "cuda"))
+            amp_ctx = (
+                torch.autocast(device_type=amp_eval_type, dtype=amp_eval_dtype, enabled=True)
+                if use_amp_eval
+                else nullcontext()
+            )
+            with amp_ctx:
+                preds = model(imgs)
+            dists = torch.norm((preds - targets).view(preds.size(0), -1, 2), dim=2)
+            per_landmark = dists[0].detach().cpu().numpy().astype(np.float64)
+            mean_err = float(per_landmark.mean())
+            denom = float(max(1, STANDARD_SIZE - 1))
+            img_path = meta["img_path"][0] if isinstance(meta.get("img_path"), list) else meta.get("img_path")
+            source_key = meta["source_key"][0] if isinstance(meta.get("source_key"), list) else meta.get("source_key")
+            entries.append(
+                {
+                    "img_path": str(img_path or ""),
+                    "source_key": str(source_key or ""),
+                    "mean_error": mean_err,
+                    "mean_error_px": mean_err * denom,
+                    "median_landmark_error": float(np.median(per_landmark)),
+                    "median_landmark_error_px": float(np.median(per_landmark) * denom),
+                    "per_landmark_error": per_landmark.tolist(),
+                    "per_landmark_error_px": (per_landmark * denom).tolist(),
+                }
+            )
+    return entries
 
 
 def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
-                    model_variant="simplebaseline", skip_parity=False, device_override=None):
+                    model_variant="simplebaseline", device_override=None):
     """
     Train a CNN landmark predictor for a given session + model tag.
 
@@ -690,11 +865,19 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
                                 "Run prepare_dataset.py first.")
 
     # Parse records
-    train_records = _parse_dlib_xml(train_xml)
+    train_records_all = _parse_dlib_xml(train_xml)
     test_records = _parse_dlib_xml(test_xml) if os.path.exists(test_xml) else []
 
-    if not train_records:
+    if not train_records_all:
         raise ValueError(f"No valid training samples found in {train_xml}")
+
+    train_records, val_records, split_meta = _split_train_val_records(
+        train_records_all,
+        val_fraction=TRAIN_VAL_FRACTION,
+        seed=42,
+    )
+    if not train_records:
+        raise ValueError("CNN training split produced no train records.")
 
     requested_epochs = None
     try:
@@ -723,18 +906,23 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     if requested_batch_size is not None and requested_batch_size <= 0:
         requested_batch_size = None
 
+    train_source_count = len(set(split_meta.get("train_sources", [])))
+    val_source_count = len(set(split_meta.get("val_sources", [])))
+    test_source_count = len({_record_source_key(path) for path, _ in test_records})
+    source_count_for_bucket = len({_record_source_key(path) for path, _ in train_records_all})
+
     adaptive_profile, size_bucket = _resolve_cnn_training_profile(
-        len(train_records),
+        source_count_for_bucket,
         orientation_mode,
     )
     canonical_training_enabled = _is_canonical_training_enabled(
         orientation_policy,
         orientation_mode,
     )
-    aug_profile = _tune_cnn_directional_aug_profile(
+    aug_profile = _tune_cnn_aug_profile_by_mode(
         aug_profile,
         orientation_mode=orientation_mode,
-        size_bucket=size_bucket,
+        tier=size_bucket,
         canonical_training_enabled=canonical_training_enabled,
     )
     resolved_epochs = requested_epochs if requested_epochs is not None else int(adaptive_profile["epochs"])
@@ -744,6 +932,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     )
     resolved_weight_decay = float(adaptive_profile["weight_decay"])
     resolved_dropout = float(adaptive_profile["dropout"])
+    resolved_patience = int(adaptive_profile.get("early_stop_patience", 20))
 
     # Determine landmark keys (part names that exist in all training records)
     landmark_keys = _collect_landmark_ids(train_records)
@@ -758,7 +947,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     )
 
     print(f"Training CNN: {len(train_records)} train samples, "
-          f"{len(test_records)} test samples, {n_landmarks} landmarks",
+          f"{len(val_records)} val samples, {len(test_records)} test samples, {n_landmarks} landmarks",
           file=sys.stderr)
 
     # Determine device — honour explicit override from Electron (--device flag)
@@ -830,6 +1019,8 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         except Exception:
             pass
 
+    visual_aug_profile = _resolve_visual_aug_profile(size_bucket)
+
     train_params_log = {
         "model_type": "cnn",
         "tag": tag,
@@ -837,7 +1028,12 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "train_xml": train_xml,
         "test_xml": test_xml if os.path.exists(test_xml) else None,
         "dataset_size_bucket": size_bucket,
+        "source_count_for_bucket": source_count_for_bucket,
+        "train_source_count": train_source_count,
+        "val_source_count": val_source_count,
+        "test_source_count": test_source_count,
         "train_samples": len(train_records),
+        "val_samples": len(val_records),
         "test_samples": len(test_records),
         "n_landmarks": n_landmarks,
         "landmark_keys": landmark_keys,
@@ -864,7 +1060,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             "enabled": True,
             "profile": aug_profile,
         },
-        "skip_parity": bool(skip_parity),
+        "visual_augmentation": visual_aug_profile,
     }
 
     # Unified default: deconv heatmap head with soft-argmax decoding.
@@ -883,10 +1079,14 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     train_transform = tv_transforms.Compose([
         tv_transforms.ToPILImage(),
         tv_transforms.Resize((STANDARD_SIZE, STANDARD_SIZE)),
-        tv_transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+        tv_transforms.ColorJitter(
+            brightness=float(visual_aug_profile.get("brightness", 0.24)),
+            contrast=float(visual_aug_profile.get("contrast", 0.24)),
+            saturation=float(visual_aug_profile.get("saturation", 0.15)),
+        ),
         tv_transforms.RandomApply(
             [tv_transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))],
-            p=0.3,
+            p=float(visual_aug_profile.get("blur_prob", 0.22)),
         ),
         tv_transforms.ToTensor(),
         tv_transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -913,9 +1113,22 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         scale_range=tuple(aug_profile.get("scale_range", (0.88, 1.12))),
         translate_ratio=float(aug_profile.get("translate_ratio", 0.08)),
         bilateral_index_pairs=bilateral_index_pairs,
+        occlusion_prob=float(aug_profile.get("occlusion_prob", 0.1)),
     )
     train_loader = DataLoader(train_ds, batch_size=resolved_batch_size,
                               shuffle=True, drop_last=False, **loader_kwargs)
+
+    val_loader = None
+    if val_records:
+        val_ds = LandmarkDataset(
+            val_records,
+            landmark_keys,
+            transform=val_transform,
+            augment=False,
+            seed=42,
+        )
+        val_loader = DataLoader(val_ds, batch_size=resolved_batch_size,
+                                shuffle=False, **loader_kwargs)
 
     test_loader = None
     if test_records:
@@ -971,6 +1184,13 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     train_started_at = time.time()
     consecutive_nan_batches = 0
     MAX_CONSECUTIVE_NAN = 3
+    # Early stopping state
+    _best_val_error = float("inf")
+    _best_model_state = None
+    _no_improve_epochs = 0
+    best_epoch = 0
+    epochs_completed = 0
+    stop_reason = "completed"
 
     print(
         "PROGRESS_JSON " + json.dumps({
@@ -987,6 +1207,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             "workers": int(loader_workers),
             "epochs": int(resolved_epochs),
             "train_samples": int(len(train_records)),
+            "val_samples": int(len(val_records)),
             "test_samples": int(len(test_records)),
         }),
         file=sys.stderr,
@@ -995,6 +1216,8 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     for epoch in range(1, resolved_epochs + 1):
         model.train()
         epoch_loss = 0.0
+        epoch_coord_loss = 0.0
+        epoch_heatmap_loss = 0.0
         epoch_started_at = time.time()
         lr_now = float(scheduler.get_last_lr()[0]) if scheduler is not None else float(resolved_lr)
         for imgs, targets in train_loader:
@@ -1007,8 +1230,8 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
                 else nullcontext()
             )
             with amp_ctx:
-                preds = model(imgs)
-                loss = wing_loss(preds, targets)
+                preds, pred_heatmaps = model(imgs, return_heatmaps=True)
+                loss, coord_loss_value, heatmap_loss_value = _cnn_composite_loss(preds, pred_heatmaps, targets)
             if not torch.isfinite(loss):
                 consecutive_nan_batches += 1
                 print(
@@ -1038,20 +1261,59 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
                 loss.backward()
                 optimizer.step()
             epoch_loss += loss.item() * imgs.size(0)
+            epoch_coord_loss += float(coord_loss_value.item()) * imgs.size(0)
+            epoch_heatmap_loss += float(heatmap_loss_value.item()) * imgs.size(0)
         scheduler.step()
+        epochs_completed = epoch
+
+        val_stats = _compute_error_stats(model, val_loader, device) if val_loader is not None else None
+
+        # Early stopping on validation only
+        if val_stats is not None:
+            val_err = float(val_stats["mean"])
+            if val_err < _best_val_error:
+                _best_val_error = val_err
+                _best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                _no_improve_epochs = 0
+                best_epoch = epoch
+            else:
+                _no_improve_epochs += 1
+                if _no_improve_epochs >= resolved_patience:
+                    stop_reason = "early_stopping"
+                    print(
+                        f"Early stopping at epoch {epoch}/{resolved_epochs} "
+                        f"(no improvement for {resolved_patience} consecutive epochs, "
+                        f"best_val={_best_val_error:.6f})",
+                        file=sys.stderr,
+                    )
+                    break
+        elif _best_model_state is None:
+            _best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
 
         avg_loss = epoch_loss / max(len(train_records), 1)
-        epoch_losses.append({"epoch": epoch, "loss": avg_loss})
+        avg_coord_loss = epoch_coord_loss / max(len(train_records), 1)
+        avg_heatmap_loss = epoch_heatmap_loss / max(len(train_records), 1)
+        epoch_losses.append(
+            {
+                "epoch": epoch,
+                "train_loss": avg_loss,
+                "coord_loss": avg_coord_loss,
+                "heatmap_loss": avg_heatmap_loss,
+                "val_error": float(val_stats["mean"]) if val_stats is not None else None,
+                "val_error_px": float(val_stats["mean_px"]) if val_stats is not None else None,
+            }
+        )
         pct = int(10 + 85 * (epoch / resolved_epochs))
         epoch_sec = max(1e-6, time.time() - epoch_started_at)
         elapsed_sec = max(0.0, time.time() - train_started_at)
         avg_epoch_sec = elapsed_sec / max(1, epoch)
         eta_sec = max(0.0, (resolved_epochs - epoch) * avg_epoch_sec)
         samples_per_sec = float(len(train_records)) / epoch_sec
-        message = (
-            f"Epoch {epoch}/{resolved_epochs} | loss={avg_loss:.4f} | "
-            f"lr={lr_now:.2e} | {samples_per_sec:.1f} img/s | eta={int(round(eta_sec))}s"
-        )
+        message = f"Epoch {epoch}/{resolved_epochs} | loss={avg_loss:.4f}"
+        if val_stats is not None:
+            message += f" | val={float(val_stats['mean']):.4f}"
+        message += f" | lr={lr_now:.2e} | {samples_per_sec:.1f} img/s | eta={int(round(eta_sec))}s"
         print(f"PROGRESS {pct} {message}", file=sys.stderr)
         print(
             "PROGRESS_JSON " + json.dumps(
@@ -1063,6 +1325,10 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
                     "epoch": int(epoch),
                     "epochs": int(resolved_epochs),
                     "loss": float(avg_loss),
+                    "coord_loss": float(avg_coord_loss),
+                    "heatmap_loss": float(avg_heatmap_loss),
+                    "val_error": float(val_stats["mean"]) if val_stats is not None else None,
+                    "val_error_px": float(val_stats["mean_px"]) if val_stats is not None else None,
                     "lr": float(lr_now),
                     "epoch_sec": float(epoch_sec),
                     "elapsed_sec": float(elapsed_sec),
@@ -1073,6 +1339,14 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
                     "device": str(device),
                 }
             ),
+            file=sys.stderr,
+        )
+
+    # Restore best checkpoint if early stopping saved one
+    if _best_model_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in _best_model_state.items()})
+        print(
+            f"Restored best checkpoint (val_error={_best_val_error:.6f})",
             file=sys.stderr,
         )
 
@@ -1125,6 +1399,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             print(f"Warning: could not load id_mapping_{tag}.json: {exc}", file=sys.stderr)
 
     config = {
+        "cnn_format_version": 2,
         "n_landmarks": n_landmarks,
         "landmark_keys": landmark_keys,
         "landmark_ids": landmark_ids,
@@ -1143,6 +1418,10 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "cnn_deconv_layers": cnn_deconv_layers,
         "cnn_deconv_filters": cnn_deconv_filters,
         "cnn_softargmax_beta": cnn_softargmax_beta,
+        "best_epoch": int(best_epoch),
+        "epochs_completed": int(epochs_completed),
+        "stop_reason": stop_reason,
+        "best_val_error": None if not np.isfinite(_best_val_error) else float(_best_val_error),
     }
     config_path = os.path.join(modeldir, f"cnn_{tag}_config.json")
     with open(config_path, "w", encoding="utf-8") as f:
@@ -1162,90 +1441,56 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         file=sys.stderr,
     )
 
-    # Compute train / test error (normalised mean landmark distance)
-    train_error = _compute_error(model, train_val_loader, device)
-    test_error = _compute_error(model, test_loader, device) if test_loader else None
-    pipeline_parity = {"skipped": True, "reason": "skip_parity"} if skip_parity else None
-    if skip_parity:
-        print("PROGRESS 98 skipping_pipeline_parity", file=sys.stderr)
-        print(
-            "PROGRESS_JSON " + json.dumps(
-                {
-                    "percent": 98,
-                    "stage": "evaluation",
-                    "substage": "pipeline_parity_skipped",
-                    "message": "Skipping pipeline parity evaluation by user option.",
-                }
-            ),
-            file=sys.stderr,
-        )
-    else:
-        print("PROGRESS 98 evaluating_pipeline_parity", file=sys.stderr)
-        print(
-            "PROGRESS_JSON " + json.dumps(
-                {
-                    "percent": 98,
-                    "stage": "evaluation",
-                    "substage": "pipeline_parity",
-                    "message": "Running pipeline parity evaluation (GT + detected boxes).",
-                }
-            ),
-            file=sys.stderr,
-        )
-        pipeline_parity = _run_pipeline_parity_eval(
-            project_root,
-            tag,
-            "cnn",
-            train_xml,
-            test_xml,
-            run_dir=run_dir,
-        )
-        if isinstance(pipeline_parity, dict) and not pipeline_parity.get("error"):
-            try:
-                train_gt = (
-                    pipeline_parity.get("splits", {})
-                    .get("train", {})
-                    .get("gt_boxes", {})
-                    .get("pixel_error_mean")
-                )
-                test_gt = (
-                    pipeline_parity.get("splits", {})
-                    .get("test", {})
-                    .get("gt_boxes", {})
-                    .get("pixel_error_mean")
-                )
-                print(
-                    f"Pipeline parity (CNN, GT boxes): train_mean_px={train_gt}, test_mean_px={test_gt}",
-                    file=sys.stderr,
-                )
-                orientation_test = (
-                    pipeline_parity.get("orientation_signal_summary", {})
-                    .get("test", {})
-                    .get("detected_boxes", {})
-                )
-                if isinstance(orientation_test, dict):
-                    print(
-                        "Orientation signal (cnn, test/detected): "
-                        f"hint_present={orientation_test.get('detector_hint_present', 0)} "
-                        f"hint_missing={orientation_test.get('detector_hint_missing', 0)} "
-                        f"warnings={orientation_test.get('warning_code_counts', {})}",
-                        file=sys.stderr,
-                    )
-            except Exception:
-                pass
+    # Compute train / val / test mean + median error
+    train_stats = _compute_error_stats(model, train_val_loader, device)
+    val_stats = _compute_error_stats(model, val_loader, device) if val_loader else None
+    test_stats = _compute_error_stats(model, test_loader, device) if test_loader else None
+    heldout_crop_report = _build_heldout_crop_report(
+        model,
+        test_records,
+        landmark_keys,
+        val_transform,
+        device,
+    ) if test_records else []
     # Stdout protocol matching train_shape_model.py
     print("MODEL_PATH", model_path)
-    print("TRAIN_ERROR", round(train_error, 6))
-    if test_error is not None:
-        print("TEST_ERROR", round(test_error, 6))
+    print("TRAIN_ERROR", round(float(train_stats["mean"]), 6))
+    print("TRAIN_MEDIAN_ERROR", round(float(train_stats["median"]), 6))
+    if test_stats is not None:
+        print("TEST_ERROR", round(float(test_stats["mean"]), 6))
+        print("TEST_MEDIAN_ERROR", round(float(test_stats["median"]), 6))
 
     results = {
         "model_path": model_path,
         "config_path": config_path,
-        "train_error": train_error,
-        "test_error": test_error,
+        "train_error": float(train_stats["mean"]),
+        "train_median_error": float(train_stats["median"]),
+        "train_error_px": float(train_stats["mean_px"]),
+        "train_median_error_px": float(train_stats["median_px"]),
+        "train_per_landmark_median": list(train_stats["per_landmark_median"]),
+        "train_per_landmark_median_px": list(train_stats["per_landmark_median_px"]),
+        "val_error": float(val_stats["mean"]) if val_stats is not None else None,
+        "val_median_error": float(val_stats["median"]) if val_stats is not None else None,
+        "val_error_px": float(val_stats["mean_px"]) if val_stats is not None else None,
+        "val_median_error_px": float(val_stats["median_px"]) if val_stats is not None else None,
+        "val_per_landmark_median": list(val_stats["per_landmark_median"]) if val_stats is not None else [],
+        "val_per_landmark_median_px": list(val_stats["per_landmark_median_px"]) if val_stats is not None else [],
+        "best_val_error": None if not np.isfinite(_best_val_error) else float(_best_val_error),
+        "test_error": float(test_stats["mean"]) if test_stats is not None else None,
+        "test_median_error": float(test_stats["median"]) if test_stats is not None else None,
+        "test_error_px": float(test_stats["mean_px"]) if test_stats is not None else None,
+        "test_median_error_px": float(test_stats["median_px"]) if test_stats is not None else None,
+        "test_per_landmark_median": list(test_stats["per_landmark_median"]) if test_stats is not None else [],
+        "test_per_landmark_median_px": list(test_stats["per_landmark_median_px"]) if test_stats is not None else [],
+        "best_epoch": int(best_epoch),
+        "epochs_completed": int(epochs_completed),
+        "stop_reason": stop_reason,
+        "source_counts": {
+            "train": int(train_source_count),
+            "val": int(val_source_count),
+            "test": int(test_source_count),
+        },
         "n_landmarks": n_landmarks,
-        "pipeline_parity": pipeline_parity,
     }
     dio.write_json(
         os.path.join(debug_dir, f"training_results_{tag}_cnn.json"),
@@ -1267,6 +1512,15 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         },
     )
     dio.write_run_json(run_dir, "loss_curve.json", {"epochs": epoch_losses})
+    dio.write_run_json(run_dir, "heldout_crop_report.json", {"images": heldout_crop_report})
+    dio.write_json(
+        os.path.join(debug_dir, f"heldout_crop_report_{tag}_cnn.json"),
+        {
+            "tag": tag,
+            "run_id": run_id,
+            "images": heldout_crop_report,
+        },
+    )
     for name in [
         f"id_mapping_{tag}.json",
         f"crop_metadata_{tag}.json",
@@ -1283,8 +1537,15 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         extra={
             "status": "completed",
             "model_path": model_path,
-            "train_error": train_error,
-            "test_error": test_error,
+            "train_error": float(train_stats["mean"]),
+            "train_median_error": float(train_stats["median"]),
+            "val_error": float(val_stats["mean"]) if val_stats is not None else None,
+            "val_median_error": float(val_stats["median"]) if val_stats is not None else None,
+            "test_error": float(test_stats["mean"]) if test_stats is not None else None,
+            "test_median_error": float(test_stats["median"]) if test_stats is not None else None,
+            "best_epoch": int(best_epoch),
+            "epochs_completed": int(epochs_completed),
+            "stop_reason": stop_reason,
         },
     )
     print(f"CNN run debug saved to: {run_dir}", file=sys.stderr)
@@ -1312,7 +1573,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--model-variant", type=str, default="simplebaseline")
-    parser.add_argument("--skip-parity", action="store_true")
     parser.add_argument(
         "--device",
         type=str,
@@ -1329,6 +1589,5 @@ if __name__ == "__main__":
         lr=args.lr,
         batch_size=args.batch_size,
         model_variant=args.model_variant,
-        skip_parity=bool(args.skip_parity),
         device_override=args.device,
     )

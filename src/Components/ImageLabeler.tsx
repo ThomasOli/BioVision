@@ -58,9 +58,63 @@ function cornersToAabb(
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+function getBoxHitCorners(box: BoundingBox): [number, number][] {
+  if (box.obbCorners && box.obbCorners.length === 4) {
+    return box.obbCorners;
+  }
+  return [
+    [box.left, box.top],
+    [box.left + box.width, box.top],
+    [box.left + box.width, box.top + box.height],
+    [box.left, box.top + box.height],
+  ];
+}
+
+function isPointOnSegment(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  epsilon = 0.75
+): boolean {
+  const cross = Math.abs((py - ay) * (bx - ax) - (px - ax) * (by - ay));
+  if (cross > epsilon) return false;
+  const dot = (px - ax) * (bx - ax) + (py - ay) * (by - ay);
+  if (dot < -epsilon) return false;
+  const lenSq = (bx - ax) ** 2 + (by - ay) ** 2;
+  return dot <= lenSq + epsilon;
+}
+
+function isPointInPolygon(x: number, y: number, corners: [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = corners.length - 1; i < corners.length; j = i++) {
+    const [xi, yi] = corners[i];
+    const [xj, yj] = corners[j];
+    if (isPointOnSegment(x, y, xi, yi, xj, yj)) {
+      return true;
+    }
+    const intersects =
+      (yi > y) !== (yj > y) &&
+      x < ((xj - xi) * (y - yi)) / ((yj - yi) || Number.EPSILON) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function getPolygonArea(corners: [number, number][]): number {
+  let sum = 0;
+  for (let i = 0; i < corners.length; i++) {
+    const [x1, y1] = corners[i];
+    const [x2, y2] = corners[(i + 1) % corners.length];
+    sum += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(sum) / 2;
+}
+
 interface ImageLabelerProps {
   imageURL: string;
-  onBoxesChange: (boxes: BoundingBox[]) => void;
   color: string;
   opacity: number;
   mode: boolean; // View-only mode
@@ -71,11 +125,11 @@ interface ImageLabelerProps {
   hideSegmentOutlines?: boolean; // Hide SAM2 mask overlays (e.g. after finalize)
   lockBoxes?: boolean;           // Prevent drawing/adding new boxes (landmark-only mode)
   orientationMode?: "directional" | "bilateral" | "axial" | "invariant";
+  onFlipAll?: () => void;        // Flip orientation of all boxes in the entire dataset
 }
 
 const ImageLabeler: React.FC<ImageLabelerProps> = ({
   imageURL,
-  onBoxesChange,
   color,
   opacity,
   mode,
@@ -86,6 +140,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   hideSegmentOutlines = false,
   lockBoxes = false,
   orientationMode,
+  onFlipAll,
 }) => {
   const {
     addLandmark,
@@ -98,8 +153,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     redo,
   } = useContext(UndoRedoClearContext);
 
-  // Track which box is currently being re-segmented by SAM2
-  const [resegmentingBoxId, setResegmentingBoxId] = useState<number | null>(null);
+  // Track which boxes are currently being re-segmented by SAM2 (supports concurrent)
+  const [resegmentingBoxIds, setResegmentingBoxIds] = useState<Set<number>>(new Set());
+  // Track box IDs that have already been auto-triggered for the current image
+  const autoSegmentedRef = useRef<Set<number>>(new Set());
 
   // Use refs to avoid re-running keyboard effect when undo/redo change
   const undoRef = useRef(undo);
@@ -120,12 +177,22 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     h: 600,
   });
 
-  const [scale, setScale] = useState(1);
+  const scale = useMemo(() => {
+    if (!imageDimensions) return 1;
+    return Math.min(
+      containerSize.w / imageDimensions.width,
+      containerSize.h / imageDimensions.height,
+      1
+    ) * 0.98;
+  }, [imageDimensions, containerSize]);
 
   // Drag-to-draw bounding box state
   const [isDrawingBox, setIsDrawingBox] = useState(false);
   const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(null);
   const [drawCurrent, setDrawCurrent] = useState<{ x: number; y: number } | null>(null);
+  // RAF throttle refs for mouse-move during box drawing
+  const pendingDrawMove = useRef<{ x: number; y: number } | null>(null);
+  const drawMoveRafRef = useRef<number | null>(null);
   const [isRedrawingSelected, setIsRedrawingSelected] = useState(false);
   const [drawDefaultOrientation, setDrawDefaultOrientation] = useState<"left" | "right">(() =>
     ((typeof window !== "undefined" && window.localStorage.getItem("bv_draw_default_orientation")) as "left" | "right") ?? "left"
@@ -133,6 +200,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
   // Track if we just created a box to avoid double-adding landmarks
   const pendingBoxRef = useRef<{ x: number; y: number } | null>(null);
+  const suppressCanvasClickRef = useRef(false);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -169,16 +237,6 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     if (!imageDimensions) return 2;
     return Math.max(2, imageDimensions.width * 0.002);
   }, [imageDimensions]);
-
-  useEffect(() => {
-    if (!imageDimensions) return;
-
-    const widthScale = containerSize.w / imageDimensions.width;
-    const heightScale = containerSize.h / imageDimensions.height;
-
-    const next = Math.min(widthScale, heightScale) * 0.98;
-    setScale(Math.min(next, 1));
-  }, [imageDimensions, containerSize]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -236,7 +294,9 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   const triggerResegment = useCallback(
     async (boxId: number, left: number, top: number, width: number, height: number) => {
       if (!samEnabled || !imagePath) return;
-      setResegmentingBoxId(boxId);
+      // Guard: skip if already in-flight for this box
+      if (resegmentingBoxIds.has(boxId)) return;
+      setResegmentingBoxIds((prev) => new Set([...prev, boxId]));
       try {
         const result = await window.api.resegmentBox(imagePath, [left, top, left + width, top + height]);
         if (result.ok && result.maskOutline && result.maskOutline.length > 0) {
@@ -245,11 +305,35 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       } catch (err) {
         console.error("SAM2 re-segmentation failed:", err);
       } finally {
-        setResegmentingBoxId(null);
+        setResegmentingBoxIds((prev) => { const n = new Set(prev); n.delete(boxId); return n; });
       }
     },
-    [samEnabled, imagePath, updateBox]
+    [samEnabled, imagePath, updateBox, resegmentingBoxIds]
   );
+
+  // Reset auto-triggered tracking when image changes
+  useEffect(() => {
+    autoSegmentedRef.current.clear();
+  }, [imagePath]);
+
+  // Auto-trigger SAM2 for boxes that have no mask outline (current image only)
+  useEffect(() => {
+    if (!samEnabled || !imagePath) return;
+    const pending = boxes.filter(
+      (b) =>
+        (!b.maskOutline || b.maskOutline.length === 0) &&
+        !autoSegmentedRef.current.has(b.id) &&
+        !resegmentingBoxIds.has(b.id)
+    );
+    if (pending.length === 0) return;
+    // Mark all pending before async work to prevent re-triggering on renders
+    pending.forEach((b) => autoSegmentedRef.current.add(b.id));
+    void (async () => {
+      for (const box of pending) {
+        await triggerResegment(box.id, box.left, box.top, box.width, box.height);
+      }
+    })();
+  }, [boxes, samEnabled, imagePath]); // intentionally excludes triggerResegment/resegmentingBoxIds to avoid loops
 
   // Keep one shared box set across manual/auto modes so switching modes
   // never hides or drops accepted boxes.
@@ -257,38 +341,35 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     return boxes;
   }, [boxes]);
 
-  // Check if point is inside a box
-  const findBoxAtPoint = useCallback(
-    (x: number, y: number): BoundingBox | null => {
-      // Give priority to the currently selected box so that clicking near
-      // the edge of a selected box doesn't accidentally activate an adjacent one
-      if (selectedBoxId !== null) {
-        const selectedBox = visibleBoxes.find(b => b.id === selectedBoxId);
-        if (
-          selectedBox &&
-          x >= selectedBox.left &&
-          x <= selectedBox.left + selectedBox.width &&
-          y >= selectedBox.top &&
-          y <= selectedBox.top + selectedBox.height
-        ) {
-          return selectedBox;
-        }
-      }
-      // Check boxes in reverse order (top-most first)
-      for (let i = visibleBoxes.length - 1; i >= 0; i--) {
-        const box = visibleBoxes[i];
-        if (
-          x >= box.left &&
-          x <= box.left + box.width &&
-          y >= box.top &&
-          y <= box.top + box.height
-        ) {
-          return box;
-        }
-      }
-      return null;
+  const getBoxesAtPoint = useCallback(
+    (x: number, y: number): BoundingBox[] => {
+      return visibleBoxes
+        .map((box, index) => ({
+          box,
+          index,
+          area: getPolygonArea(getBoxHitCorners(box)),
+        }))
+        .filter(({ box }) => isPointInPolygon(x, y, getBoxHitCorners(box)))
+        .sort((a, b) => a.area - b.area || b.index - a.index)
+        .map(({ box }) => box);
     },
-    [visibleBoxes, selectedBoxId]
+    [visibleBoxes]
+  );
+
+  const resolveTargetBoxAtPoint = useCallback(
+    (x: number, y: number): BoundingBox | null => {
+      const candidates = getBoxesAtPoint(x, y);
+      if (candidates.length === 0) return null;
+      if (candidates.length === 1 || selectedBoxId === null) {
+        return candidates[0];
+      }
+      const selectedIndex = candidates.findIndex((box) => box.id === selectedBoxId);
+      if (selectedIndex === -1) {
+        return candidates[0];
+      }
+      return candidates[(selectedIndex + 1) % candidates.length];
+    },
+    [getBoxesAtPoint, selectedBoxId]
   );
 
   // Drag-to-draw handlers for manual mode
@@ -299,7 +380,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       if (!pos || !isPointInBounds(pos.x, pos.y)) return;
 
       // Don't start drawing if clicking inside an existing visible box
-      const clickedBox = findBoxAtPoint(pos.x, pos.y);
+      const clickedBox = getBoxesAtPoint(pos.x, pos.y)[0] ?? null;
       if (detectionMode === "manual") {
         if (clickedBox) return;
         setIsDrawingBox(true);
@@ -319,7 +400,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         setDrawCurrent(pos);
       }
     },
-    [mode, lockBoxes, detectionMode, autoCorrectionMode, selectedBoxId, getPointerPosition, isPointInBounds, findBoxAtPoint]
+    [mode, lockBoxes, detectionMode, autoCorrectionMode, selectedBoxId, getPointerPosition, isPointInBounds, getBoxesAtPoint]
   );
 
   const handleMouseMove = useCallback(
@@ -331,7 +412,18 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       // Clamp to image bounds
       const x = imageDimensions ? Math.max(0, Math.min(pos.x, imageDimensions.width)) : pos.x;
       const y = imageDimensions ? Math.max(0, Math.min(pos.y, imageDimensions.height)) : pos.y;
-      setDrawCurrent({ x, y });
+
+      // RAF-throttle: store latest position and only apply once per frame
+      pendingDrawMove.current = { x, y };
+      if (!drawMoveRafRef.current) {
+        drawMoveRafRef.current = requestAnimationFrame(() => {
+          drawMoveRafRef.current = null;
+          if (pendingDrawMove.current) {
+            setDrawCurrent(pendingDrawMove.current);
+            pendingDrawMove.current = null;
+          }
+        });
+      }
     },
     [isDrawingBox, drawStart, getPointerPosition, imageDimensions]
   );
@@ -392,6 +484,13 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         }
       }
 
+      // Cancel any pending RAF move so it doesn't fire after mouse-up
+      if (drawMoveRafRef.current) {
+        cancelAnimationFrame(drawMoveRafRef.current);
+        drawMoveRafRef.current = null;
+      }
+      pendingDrawMove.current = null;
+
       setIsDrawingBox(false);
       setIsRedrawingSelected(false);
       setDrawStart(null);
@@ -414,6 +513,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   // Click to add landmark or select box
   const handleCanvasClick = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
+      if (suppressCanvasClickRef.current) {
+        suppressCanvasClickRef.current = false;
+        return;
+      }
       if (!image || !imageDimensions || mode) return;
 
       const pos = getPointerPosition(e);
@@ -421,11 +524,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
       // In auto mode, check if clicking on a box to select it
       if (detectionMode === "auto") {
-        const clickedBox = findBoxAtPoint(pos.x, pos.y);
+        const candidates = getBoxesAtPoint(pos.x, pos.y);
+        const clickedBox = resolveTargetBoxAtPoint(pos.x, pos.y);
 
         if (clickedBox) {
-          // If clicking on a different box, select it
-          if (selectedBoxId !== clickedBox.id) {
+          if (selectedBoxId !== clickedBox.id || candidates.length > 1) {
             selectBox(clickedBox.id);
             return;
           }
@@ -443,9 +546,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
 
       // Manual mode: clicking inside an existing box adds a landmark to it
       if (detectionMode === "manual") {
-        const clickedBox = findBoxAtPoint(pos.x, pos.y);
+        const candidates = getBoxesAtPoint(pos.x, pos.y);
+        const clickedBox = resolveTargetBoxAtPoint(pos.x, pos.y);
         if (clickedBox) {
-          if (selectedBoxId !== clickedBox.id) {
+          if (selectedBoxId !== clickedBox.id || candidates.length > 1) {
             selectBox(clickedBox.id);
             return;
           }
@@ -455,7 +559,21 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         return;
       }
     },
-    [image, imageDimensions, mode, getPointerPosition, isPointInBounds, selectedBoxId, selectBox, addLandmark, detectionMode, findBoxAtPoint, autoCorrectionMode]
+    [image, imageDimensions, mode, getPointerPosition, isPointInBounds, selectedBoxId, selectBox, addLandmark, detectionMode, getBoxesAtPoint, resolveTargetBoxAtPoint, autoCorrectionMode]
+  );
+
+  const handleBoxPointerDown = useCallback(
+    (e: KonvaEventObject<MouseEvent>) => {
+      e.cancelBubble = true;
+      const pos = getPointerPosition(e);
+      if (!pos) return;
+      const targetBox = resolveTargetBoxAtPoint(pos.x, pos.y);
+      if (targetBox && selectedBoxId !== targetBox.id) {
+        suppressCanvasClickRef.current = true;
+        selectBox(targetBox.id);
+      }
+    },
+    [getPointerPosition, resolveTargetBoxAtPoint, selectedBoxId, selectBox]
   );
 
   useEffect(() => {
@@ -476,10 +594,6 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     tr.getLayer()?.batchDraw();
   }, [mode, lockBoxes, detectionMode, autoCorrectionMode, selectedBoxId, visibleBoxes]);
 
-  useEffect(() => {
-    onBoxesChange(boxes);
-  }, [boxes, onBoxesChange]);
-
   if (imageError) {
     return <div className="text-destructive">Error loading image.</div>;
   }
@@ -487,9 +601,24 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   const stageW = imageDimensions ? imageDimensions.width * scale : 0;
   const stageH = imageDimensions ? imageDimensions.height * scale : 0;
 
-  // Gate orientation arrows on vector schemas (directional + bilateral)
-  const showOrientationArrow = !orientationMode || orientationMode === "directional" || orientationMode === "bilateral";
+  const normalizedOrientationMode = typeof orientationMode === "string"
+    ? orientationMode.trim().toLowerCase()
+    : undefined;
+  // Gate orientation arrows on vector schemas (directional + bilateral).
+  // Unknown/unset mode defaults to showing arrows.
+  const showOrientationArrow =
+    !normalizedOrientationMode ||
+    normalizedOrientationMode === "directional" ||
+    normalizedOrientationMode === "bilateral";
   const isVectorSchema = showOrientationArrow; // same condition
+
+  // Derive active orientation from selected box (reflects its class_id or hint)
+  const selectedBox = selectedBoxId !== null ? boxes.find(b => b.id === selectedBoxId) ?? null : null;
+  const activeOrientation: "left" | "right" = selectedBox
+    ? (selectedBox.class_id === 0 ? "left"
+       : selectedBox.class_id === 1 ? "right"
+       : selectedBox.orientation_hint?.orientation === "right" ? "right" : "left")
+    : drawDefaultOrientation;
 
   // Colors for boxes
   const getBoxColor = (isSelected: boolean) => {
@@ -502,25 +631,46 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       ref={containerRef}
       className="relative flex h-full w-full min-h-0 min-w-0 flex-col"
     >
-      {!mode && !lockBoxes && detectionMode === "manual" && isVectorSchema && (
-        <div className="absolute top-2 right-2 z-10">
+      {!mode && !lockBoxes && isVectorSchema && (detectionMode === "manual" || detectionMode === "auto") && (
+        <div className="absolute top-2 right-2 z-10 flex gap-1">
           <button
             className="px-2 py-1 text-xs border rounded bg-background/90 hover:bg-muted shadow-sm"
             onClick={() => {
-              const next = drawDefaultOrientation === "left" ? "right" : "left";
-              setDrawDefaultOrientation(next);
-              window.localStorage.setItem("bv_draw_default_orientation", next);
-              if (selectedBoxId !== null) {
-                const sel = boxes.find(b => b.id === selectedBoxId);
-                if (sel && sel.class_id !== undefined) {
-                  updateBox(selectedBoxId, { class_id: sel.class_id === 0 ? 1 : 0 });
-                }
+              if (selectedBox) {
+                // Per-box toggle only — do not change drawDefaultOrientation
+                const nextClassId = activeOrientation === "left" ? 1 : 0;
+                updateBox(selectedBox.id, {
+                  class_id: nextClassId,
+                  orientation_hint: {
+                    orientation: nextClassId === 0 ? "left" : "right",
+                    confidence: 1.0,
+                    source: "user_toggle",
+                  },
+                });
+              } else {
+                // No box selected — change default for future new boxes only
+                const next = drawDefaultOrientation === "left" ? "right" : "left";
+                setDrawDefaultOrientation(next);
+                window.localStorage.setItem("bv_draw_default_orientation", next);
               }
             }}
-            title="Toggle default head direction for new boxes"
+            title={selectedBox
+              ? "Toggle orientation of selected box"
+              : "Set default orientation for new boxes"}
           >
-            {drawDefaultOrientation === "left" ? "\u2190 Head" : "Head \u2192"}
+            {normalizedOrientationMode === "bilateral"
+              ? (activeOrientation === "left" ? "\u2191 Head" : "Head \u2193")
+              : (activeOrientation === "left" ? "\u2190 Head" : "Head \u2192")}
           </button>
+          {onFlipAll && (
+            <button
+              className="px-2 py-1 text-xs border rounded bg-background/90 hover:bg-muted shadow-sm"
+              onClick={onFlipAll}
+              title="Flip orientation of all boxes in the entire dataset"
+            >
+              {"\u21c6"} Flip All
+            </button>
+          )}
         </div>
       )}
       <div className="flex flex-1 min-h-0 min-w-0 items-center justify-center rounded-xl border bg-muted/30 p-4">
@@ -605,6 +755,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                         fill={isSelected ? "rgba(59, 130, 246, 0.15)" : "rgba(100, 100, 100, 0.1)"}
                         stroke={isSelected ? "#3b82f6" : "#6b7280"}
                         strokeWidth={boxStrokeWidth * 0.5}
+                        listening={false}
                       />
                     )}
                     {/* OBB polygon outline (rendered when obbCorners available) */}
@@ -616,7 +767,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                         strokeWidth={boxStrokeWidth}
                         dash={isSelected ? undefined : [8, 4]}
                         fill={isSelected ? "rgba(59, 130, 246, 0.08)" : "transparent"}
-                        listening={!isEditableSelected}
+                        onMouseDown={handleBoxPointerDown}
                       />
                     )}
                     {/* Interactive rect — center-anchored so rotation uses center pivot.
@@ -633,8 +784,9 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                       stroke={hasObb ? "transparent" : boxColor}
                       strokeWidth={boxStrokeWidth}
                       dash={isSelected ? undefined : [10, 5]}
-                      fill={isEditableSelected && hasObb ? "rgba(0,0,0,0.001)" : "transparent"}
+                      fill={hasObb ? "rgba(0,0,0,0.001)" : "transparent"}
                       draggable={isEditableSelected}
+                      onMouseDown={handleBoxPointerDown}
                       onDragEnd={(e) => {
                         if (!isEditableSelected || !imageDimensions) return;
                         const node = e.target;
@@ -705,6 +857,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                       fontSize={getTextFontSize * 1.2}
                       fill={boxColor}
                       fontStyle="bold"
+                      listening={false}
                     />
                     {/* Confidence badge if available */}
                     {box.confidence !== undefined && (
@@ -714,10 +867,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                         text={`${(box.confidence * 100).toFixed(0)}%`}
                         fontSize={getTextFontSize * 0.9}
                         fill={boxColor}
+                        listening={false}
                       />
                     )}
                     {/* SAM2 re-segmenting indicator */}
-                    {resegmentingBoxId === box.id && (
+                    {resegmentingBoxIds.has(box.id) && (
                       <Text
                         x={box.left + 5}
                         y={box.top + box.height - getTextFontSize * 1.5 - 5}
@@ -725,15 +879,20 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                         fontSize={getTextFontSize * 0.9}
                         fill="#60a5fa"
                         fontStyle="bold"
+                        listening={false}
                       />
                     )}
                     {/* Orientation arrow + tilt angle */}
                     {(() => {
                       const corners = box.obbCorners && box.obbCorners.length === 4
                         ? box.obbCorners as [number,number][]
-                        : null;
-                      if (!corners) return null;
-                      if (orientationMode === "invariant") return null;
+                        : ([
+                            [box.left, box.top],
+                            [box.left + box.width, box.top],
+                            [box.left + box.width, box.top + box.height],
+                            [box.left, box.top + box.height],
+                          ] as [number, number][]);
+                      if (normalizedOrientationMode === "invariant") return null;
                       const [cp0, cp1, cp2, cp3] = corners;
                       // Tilt angle (schema-independent, only needs corners)
                       const adx1 = cp1[0]-cp0[0], ady1 = cp1[1]-cp0[1];
@@ -743,34 +902,44 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                       adeg = ((adeg % 180) + 180) % 180;
                       if (adeg > 90) adeg = 180 - adeg;
                       // Arrow (vector schemas only)
-                      const hasOrientation = box.class_id !== undefined;
                       let arrowEl = null;
-                      if (showOrientationArrow && hasOrientation) {
-                        const isLeft = box.class_id === 0;
-                        const isRight = box.class_id === 1;
-                        const cLen01 = Math.hypot(cp1[0]-cp0[0], cp1[1]-cp0[1]);
-                        const cLen12 = Math.hypot(cp2[0]-cp1[0], cp2[1]-cp1[1]);
-                        let cMidA: [number,number], cMidB: [number,number];
-                        if (cLen01 >= cLen12) {
-                          cMidA = [(cp0[0]+cp3[0])/2, (cp0[1]+cp3[1])/2];
-                          cMidB = [(cp1[0]+cp2[0])/2, (cp1[1]+cp2[1])/2];
+                      if (showOrientationArrow) {
+                        const hintOrientation = box.orientation_hint?.orientation;
+                        const effectiveClassId =
+                          box.class_id === 0 || box.class_id === 1
+                            ? box.class_id
+                            : hintOrientation === "right"
+                              ? 1
+                              : 0; // default left; no fallback to global drawDefaultOrientation
+                        const isLeft = effectiveClassId === 0;
+                        const isBilateral = normalizedOrientationMode === "bilateral";
+                        // Canonical edge midpoints (from buildObbCorners order):
+                        // LEFT=cp3→cp0, RIGHT=cp1→cp2, TOP=cp0→cp1, BOTTOM=cp2→cp3
+                        let emX: number, emY: number;
+                        if (!isBilateral) {
+                          [emX, emY] = isLeft
+                            ? [(cp3[0]+cp0[0])/2, (cp3[1]+cp0[1])/2]
+                            : [(cp1[0]+cp2[0])/2, (cp1[1]+cp2[1])/2];
                         } else {
-                          cMidA = [(cp0[0]+cp1[0])/2, (cp0[1]+cp1[1])/2];
-                          cMidB = [(cp2[0]+cp3[0])/2, (cp2[1]+cp3[1])/2];
+                          [emX, emY] = isLeft
+                            ? [(cp0[0]+cp1[0])/2, (cp0[1]+cp1[1])/2]
+                            : [(cp2[0]+cp3[0])/2, (cp2[1]+cp3[1])/2];
                         }
-                        const [cLeftEnd, cRightEnd] = cMidA[0] <= cMidB[0] ? [cMidA, cMidB] : [cMidB, cMidA];
-                        const cHead = (isLeft || !isRight) ? cLeftEnd : cRightEnd;
-                        const cTail = (isLeft || !isRight) ? cRightEnd : cLeftEnd;
-                        const cAxisLen = Math.hypot(cHead[0]-cTail[0], cHead[1]-cTail[1]) || 1;
-                        if (cAxisLen >= 24) {
-                          const cNx = (cHead[0]-cTail[0])/cAxisLen, cNy = (cHead[1]-cTail[1])/cAxisLen;
-                          const arrowLen  = Math.min(Math.max(cAxisLen * 0.25, 14), 32);
-                          const cHSizeLen = Math.min(Math.max(cAxisLen * 0.10, 6), 10);
-                          const cHSizeW   = Math.min(Math.max(cAxisLen * 0.07, 5), 8);
+                        const ccx = (cp0[0]+cp1[0]+cp2[0]+cp3[0])/4;
+                        const ccy = (cp0[1]+cp1[1]+cp2[1]+cp3[1])/4;
+                        const outLen = Math.hypot(emX-ccx, emY-ccy) || 1;
+                        const nx = (emX-ccx)/outLen, ny = (emY-ccy)/outLen;
+                        const arrowLen = Math.min(Math.max(outLen * 0.6, 14), 40);
+                        const tipX = emX + nx * 4, tipY = emY + ny * 4;
+                        const tailX = emX - nx * arrowLen, tailY = emY - ny * arrowLen;
+                        const fullLen = Math.hypot(tipX-tailX, tipY-tailY);
+                        if (fullLen >= 24) {
+                          const cHSizeLen = Math.min(Math.max(fullLen * 0.20, 6), 10);
+                          const cHSizeW   = Math.min(Math.max(fullLen * 0.15, 5), 8);
                           arrowEl = (
                             <Arrow
                               key={`orient-arrow-${box.id}`}
-                              points={[cHead[0] - cNx*arrowLen, cHead[1] - cNy*arrowLen, cHead[0], cHead[1]]}
+                              points={[tailX, tailY, tipX, tipY]}
                               pointerLength={cHSizeLen}
                               pointerWidth={cHSizeW}
                               fill={boxColor}
@@ -792,6 +961,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                             text={`${Math.round(adeg)}\u00B0`}
                             fontSize={getTextFontSize * 0.9}
                             fill={boxColor}
+                            listening={false}
                           />
                         </>
                       );
@@ -845,6 +1015,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                             radius={getScaledRadius()}
                             fill={color}
                             opacity={landmarkOpacity}
+                            listening={false}
                           />
                           <Text
                             x={point.x + 4}
@@ -853,6 +1024,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                             fontSize={getTextFontSize}
                             fill={color}
                             opacity={landmarkOpacity}
+                            listening={false}
                           />
                         </React.Fragment>
                       );

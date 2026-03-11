@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Info, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Input } from "@/Components/ui/input";
 import { Label } from "@/Components/ui/label";
 import { Progress } from "@/Components/ui/progress";
+import { ScrollArea } from "@/Components/ui/scroll-area";
 import { Slider } from "@/Components/ui/slider";
 import { Switch } from "@/Components/ui/switch";
 import {
@@ -50,12 +51,11 @@ interface TrainModelDialogProps {
     selectable: boolean;
     recommended?: boolean;
     reason?: string | null;
+    recommendationReason?: string | null;
   }[];
   cnnVariant?: string;
   setCnnVariant?: (variant: string) => void;
   cnnVariantWarning?: string;
-  skipParity?: boolean;
-  setSkipParity?: (value: boolean) => void;
   speciesId?: string;
   augmentationPolicy?: AugmentationPolicy;
   onAugmentationPolicyChange?: (policy: AugmentationPolicy) => void;
@@ -102,8 +102,6 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   cnnVariant = "simplebaseline",
   setCnnVariant,
   cnnVariantWarning,
-  skipParity = false,
-  setSkipParity,
   speciesId,
   augmentationPolicy,
   onAugmentationPolicyChange,
@@ -220,18 +218,6 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     if (Number.isFinite(eta) && eta >= 0) return `ETA ${Math.round(eta)}s`;
     return null;
   }, [progressDetails]);
-  const progressParityLabel = useMemo(() => {
-    if (!progressDetails) return null;
-    const done = Number(progressDetails.records_done);
-    const total = Number(progressDetails.records_total);
-    const split = typeof progressDetails.split === "string" ? progressDetails.split : "";
-    const mode = typeof progressDetails.eval_mode === "string" ? progressDetails.eval_mode : "";
-    if (Number.isFinite(done) && Number.isFinite(total) && total > 0) {
-      const scope = [split, mode].filter(Boolean).join("/");
-      return `${scope || "parity"} ${Math.round(done)}/${Math.round(total)}`;
-    }
-    return null;
-  }, [progressDetails]);
   const cnnSupported = useMemo(
     () => cnnVariants.length === 0 || cnnVariants.some((v) => v.selectable),
     [cnnVariants]
@@ -243,6 +229,9 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   const showVerticalFlip = !gravityAligned && orientationMode === "invariant";
   const showRotate180 = !gravityAligned && orientationMode === "axial";
   const showDirectionalHint = orientationMode === "directional";
+  const scrollAreaRef = useRef<HTMLDivElement | null>(null);
+  const [showScrollTopFade, setShowScrollTopFade] = useState(false);
+  const [showScrollBottomFade, setShowScrollBottomFade] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -259,19 +248,143 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [open, handleClose, onTrain]);
 
+  useEffect(() => {
+    if (!open) {
+      setShowScrollTopFade(false);
+      setShowScrollBottomFade(false);
+      return;
+    }
+
+    let viewport: HTMLDivElement | null = null;
+    let resizeObserver: ResizeObserver | null = null;
+    let frameId = 0;
+    const syncScrollFades = () => {
+      if (!viewport) return;
+      const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      const hasOverflow = maxScrollTop > 6;
+      setShowScrollTopFade(hasOverflow && viewport.scrollTop > 6);
+      setShowScrollBottomFade(hasOverflow && viewport.scrollTop < maxScrollTop - 6);
+    };
+
+    frameId = window.requestAnimationFrame(() => {
+      viewport = scrollAreaRef.current?.querySelector("[data-radix-scroll-area-viewport]") as HTMLDivElement | null;
+      if (!viewport) return;
+      syncScrollFades();
+      viewport.addEventListener("scroll", syncScrollFades, { passive: true });
+      window.addEventListener("resize", syncScrollFades);
+      if (typeof ResizeObserver !== "undefined") {
+        resizeObserver = new ResizeObserver(syncScrollFades);
+        resizeObserver.observe(viewport);
+        const content = viewport.firstElementChild as HTMLElement | null;
+        if (content) {
+          resizeObserver.observe(content);
+        }
+      }
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      if (viewport) {
+        viewport.removeEventListener("scroll", syncScrollFades);
+      }
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", syncScrollFades);
+    };
+  }, [
+    open,
+    predictorType,
+    obbDetectorReady,
+    showObbStep,
+    isTraining,
+    preflightSummary,
+    preflightWarning,
+    cnnVariantWarning,
+    orientationMode,
+    speciesId,
+    trainingProgress?.percent,
+    localAugPolicy,
+  ]);
+
   return (
     <Dialog open={open} onOpenChange={(value) => !isTraining && setOpen(value)}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
+      <DialogContent className="flex h-[92vh] max-h-[92vh] min-h-0 flex-col overflow-hidden p-0 sm:max-w-lg">
+        <DialogHeader className="shrink-0">
+          <div className="px-6 pt-6">
           <DialogTitle className="text-sm font-bold">
             Train new model
           </DialogTitle>
           <DialogDescription className="text-xs">
             Give your model a clear, versioned name (Ctrl/Cmd+Enter to start).
           </DialogDescription>
+          </div>
         </DialogHeader>
+        <div className="relative min-h-0 flex-1 overflow-hidden px-6">
+          <div
+            className={cn(
+              "pointer-events-none absolute inset-x-1 top-0 z-10 h-8 rounded-t-xl bg-gradient-to-b from-background via-background/92 to-transparent transition-opacity",
+              showScrollTopFade ? "opacity-100" : "opacity-0"
+            )}
+          />
+          <div
+            className={cn(
+              "pointer-events-none absolute inset-x-1 bottom-0 z-10 h-10 rounded-b-xl bg-gradient-to-t from-background via-background/92 to-transparent transition-opacity",
+              showScrollBottomFade ? "opacity-100" : "opacity-0"
+            )}
+          />
+          <ScrollArea
+            ref={scrollAreaRef}
+            className="h-full min-h-0 rounded-xl border border-border/60 bg-muted/20 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+          >
+            <div className="space-y-1 px-4 pb-6 pt-3">
 
         {/* Step 1: OBB Detector — shown when session has OBB annotations or detector already trained */}
+        {speciesId && (
+          <details className="rounded-md border border-border/60 bg-muted/20">
+            <summary className="cursor-pointer px-3 py-2 text-xs font-semibold select-none">
+              Session Orientation Policy
+            </summary>
+            <div className="flex flex-col gap-3 px-3 pb-3 pt-1">
+              <div className="flex items-start gap-3">
+                <div>
+                  <Label className="text-xs font-medium">Gravity-aligned imaging</Label>
+                  <p className="text-[11px] text-muted-foreground">
+                    Keeps upright specimens on a tight rotation prior by default.
+                  </p>
+                </div>
+                <p className="flex-1 text-[11px] text-muted-foreground">
+                  This shared session setting affects OBB synthetic export and OBB detector training, and also informs CNN augmentation defaults.
+                </p>
+                <Switch
+                  checked={localAugPolicy.gravity_aligned ?? true}
+                  onCheckedChange={(v) => {
+                    const newPolicy: Partial<AugmentationPolicy> = { gravity_aligned: v };
+                    if (v) newPolicy.rotation_range = [-15, 15];
+                    handleAugPolicyChange(newPolicy);
+                  }}
+                  disabled={isTraining}
+                />
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <Label className="text-xs text-muted-foreground">
+                  Shared rotation range: {(localAugPolicy.rotation_range?.[0] ?? -15).toFixed(0)}° to {(localAugPolicy.rotation_range?.[1] ?? 15).toFixed(0)}°
+                </Label>
+                <p className="text-[11px] text-muted-foreground">
+                  Used by OBB synthetic export, YOLO OBB augmentation, and CNN rotation augmentation. Dlib remains capped separately in Python.
+                </p>
+                <Slider
+                  value={localAugPolicy.rotation_range ?? [-15, 15]}
+                  onValueChange={([lo, hi]) => handleAugPolicyChange({ rotation_range: [lo, hi] })}
+                  min={-rotationMax}
+                  max={rotationMax}
+                  step={1}
+                  disabled={isTraining}
+                />
+              </div>
+            </div>
+          </details>
+        )}
+
         {(showObbStep || obbDetectorReady) && (
           <div className={`rounded-md border px-3 py-2 mb-1 ${obbDetectorReady ? "border-green-500/40 bg-green-500/5" : "border-amber-500/40 bg-amber-500/5"}`}>
             <div className="flex items-center justify-between gap-2">
@@ -346,14 +459,67 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
             )}
           </div>
         )}
-        {/* Step 2 label when OBB step is shown */}
-        {showObbStep && (
+        {/* Step 2 label — only once OBB detector is ready */}
+        {obbDetectorReady && (
           <p className="text-[11px] font-semibold text-muted-foreground px-1">
             Step 2: Train Landmark Predictor
           </p>
         )}
 
-        <div className="space-y-4 py-4">
+        {showObbStep && !obbDetectorReady && (
+          <p className="text-[11px] text-muted-foreground px-1 py-2">
+            Train the OBB detector above before configuring the landmark predictor.
+          </p>
+        )}
+
+        {false && speciesId && (
+          <details className="rounded-md border border-border/60 bg-muted/20">
+            <summary className="cursor-pointer px-3 py-2 text-xs font-semibold select-none">
+              Session Orientation Policy
+            </summary>
+            <div className="flex flex-col gap-3 px-3 pb-3 pt-1">
+              <div className="flex items-start gap-3">
+                <div>
+                  <Label className="text-xs font-medium">Gravity-aligned imaging</Label>
+                  <p className="text-[11px] text-muted-foreground">
+                    Keeps upright specimens on a tight rotation prior by default.
+                  </p>
+                </div>
+                <p className="flex-1 text-[11px] text-muted-foreground">
+                  This shared session setting affects OBB synthetic export and OBB detector training, and also informs CNN augmentation defaults.
+                </p>
+                <Switch
+                  checked={localAugPolicy.gravity_aligned ?? true}
+                  onCheckedChange={(v) => {
+                    const newPolicy: Partial<AugmentationPolicy> = { gravity_aligned: v };
+                    if (v) newPolicy.rotation_range = [-15, 15];
+                    handleAugPolicyChange(newPolicy);
+                  }}
+                  disabled={isTraining}
+                />
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <Label className="text-xs text-muted-foreground">
+                  Shared rotation range: {(localAugPolicy.rotation_range?.[0] ?? -15).toFixed(0)}° to {(localAugPolicy.rotation_range?.[1] ?? 15).toFixed(0)}°
+                </Label>
+                <p className="text-[11px] text-muted-foreground">
+                  Used by OBB synthetic export, YOLO OBB augmentation, and CNN rotation augmentation. Dlib remains capped separately in Python.
+                </p>
+                <Slider
+                  value={localAugPolicy.rotation_range ?? [-15, 15]}
+                  onValueChange={([lo, hi]) => handleAugPolicyChange({ rotation_range: [lo, hi] })}
+                  min={-rotationMax}
+                  max={rotationMax}
+                  step={1}
+                  disabled={isTraining}
+                />
+              </div>
+            </div>
+          </details>
+        )}
+
+        {(!showObbStep || obbDetectorReady) && <div className="space-y-4 py-4">
           <div className="space-y-2">
             <Label htmlFor="model-name" className="text-sm font-medium">
               Model name
@@ -413,7 +579,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                   <div>
                     <p className="text-xs font-semibold">dlib Shape Predictor</p>
                     <p className="text-[11px] text-muted-foreground">
-                      Fast training - best for standardized, controlled-conditions images (mean shape predictor)
+                      Fast controlled-image fallback. Best when crops are highly standardized and appearance variation is limited.
                     </p>
                   </div>
                 </label>
@@ -435,9 +601,9 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                     className="mt-0.5 accent-primary"
                   />
                   <div>
-                    <p className="text-xs font-semibold">CNN (SimpleBaseline default)</p>
+                    <p className="text-xs font-semibold">CNN Landmark Model</p>
                     <p className="text-[11px] text-muted-foreground">
-                      Slower training - robust to varied lighting and orientations - requires PyTorch
+                      Recommended for general use. Stronger visual generalization, heatmap-based localization, and dataset-size-aware backbone selection.
                     </p>
                     {!cnnSupported && (
                       <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
@@ -472,9 +638,16 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                     ))}
                   </select>
                   {selectedCnnVariant && (
-                    <p className="text-[11px] text-muted-foreground">
-                      {selectedCnnVariant.description}
-                    </p>
+                    <div className="space-y-1">
+                      <p className="text-[11px] text-muted-foreground">
+                        {selectedCnnVariant.description}
+                      </p>
+                      {selectedCnnVariant.recommendationReason && (
+                        <p className="text-[11px] text-emerald-700 dark:text-emerald-400">
+                          {selectedCnnVariant.recommendationReason}
+                        </p>
+                      )}
+                    </div>
                   )}
                   {!selectedCnnVariant?.selectable && selectedCnnVariant?.reason && (
                     <p className="text-[11px] text-amber-600 dark:text-amber-400">
@@ -491,42 +664,26 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
             </div>
           )}
 
-          {setSkipParity && (
-            <div className="space-y-2">
-              <Label className="text-sm font-medium">Evaluation options</Label>
-              <label className="flex items-start gap-3 rounded-md border border-border/50 p-3">
-                <input
-                  type="checkbox"
-                  checked={skipParity}
-                  onChange={(e) => setSkipParity(e.target.checked)}
-                  disabled={isTraining}
-                  className="mt-0.5 accent-primary"
-                />
-                <div>
-                  <p className="text-xs font-semibold">Skip pipeline parity (faster)</p>
-                  <p className="text-[11px] text-muted-foreground">
-                    Trains and saves model without running GT/detected parity checks.
-                  </p>
-                </div>
-              </label>
-            </div>
-          )}
-
           {/* Augmentation & Schema Studio — only shown when a session is active and CNN is selected */}
           {speciesId && predictorType === "cnn" && (
             <details className="rounded-md border border-border/60 bg-muted/20">
               <summary className="cursor-pointer px-3 py-2 text-xs font-semibold select-none">
-                Augmentation &amp; Schema Studio
+                CNN Augmentation Studio
               </summary>
               <div className="flex flex-col gap-3 px-3 pb-3 pt-1">
-                {/* Gravity-aligned toggle */}
-                <div className="flex items-center justify-between">
+                <p className="text-[11px] text-muted-foreground">
+                  These controls affect CNN augmentation only. Shared session orientation settings are configured above.
+                </p>
+                <div className="hidden">
                   <div>
                     <Label className="text-xs font-medium">Gravity-aligned imaging</Label>
                     <p className="text-[11px] text-muted-foreground">
                       Locks synthetic rotation to ±15° (for specimens always upright)
                     </p>
                   </div>
+                  <p className="flex-1 text-[11px] text-muted-foreground">
+                    Upright sessions should usually keep this range tight so OBB export and training do not learn unnecessary tilt.
+                  </p>
                   <Switch
                     checked={localAugPolicy.gravity_aligned ?? true}
                     onCheckedChange={(v) => {
@@ -539,10 +696,13 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                 </div>
 
                 {/* Rotation range — CNN micro-augmentation only; Dlib is always capped at ±6° in Python */}
-                <div className="flex flex-col gap-1">
+                <div className="hidden flex-col gap-1">
                   <Label className="text-xs text-muted-foreground">
                     CNN rotation: {(localAugPolicy.rotation_range?.[0] ?? -15).toFixed(0)}° to {(localAugPolicy.rotation_range?.[1] ?? 15).toFixed(0)}°
                   </Label>
+                  <p className="text-[11px] text-muted-foreground">
+                    Shared session policy: this same range now drives OBB synthetic export and YOLO OBB augmentation in addition to CNN augmentation. Dlib remains capped separately in Python.
+                  </p>
                   <Slider
                     value={localAugPolicy.rotation_range ?? [-15, 15]}
                     onValueChange={([lo, hi]) => handleAugPolicyChange({ rotation_range: [lo, hi] })}
@@ -552,7 +712,6 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                     disabled={isTraining}
                   />
                 </div>
-
                 {/* Scale range */}
                 <div className="flex flex-col gap-1">
                   <Label className="text-xs text-muted-foreground">
@@ -659,20 +818,22 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                 className="h-2"
                 value={Math.max(0, Math.min(100, Math.round(trainingProgress?.percent ?? 0)))}
               />
-              {(progressEpochLabel || progressLossLabel || progressLrLabel || progressEtaLabel || progressParityLabel) && (
+              {(progressEpochLabel || progressLossLabel || progressLrLabel || progressEtaLabel) && (
                 <div className="grid grid-cols-2 gap-1 text-[11px] text-muted-foreground">
                   <span>{progressEpochLabel || " "}</span>
                   <span className="text-right">{progressEtaLabel || " "}</span>
                   <span>{progressLossLabel || " "}</span>
                   <span className="text-right">{progressLrLabel || " "}</span>
-                  {progressParityLabel && <span className="col-span-2">{progressParityLabel}</span>}
                 </div>
               )}
             </div>
           )}
+            </div>}
+            </div>
+          </ScrollArea>
         </div>
 
-        <DialogFooter className="gap-2 sm:gap-0">
+        {(!showObbStep || obbDetectorReady) && <DialogFooter className="shrink-0 gap-2 px-6 pb-6 pt-2 sm:gap-0">
           <Button
             variant="outline"
             onClick={handleClose}
@@ -690,7 +851,8 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
               "Train model"
             )}
           </Button>
-        </DialogFooter>
+        </DialogFooter>}
+
       </DialogContent>
     </Dialog>
   );

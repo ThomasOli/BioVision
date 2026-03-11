@@ -1,4 +1,5 @@
 ﻿import React, { useEffect, useState } from "react";
+import { useCallback, useMemo } from "react";
 import { motion } from "framer-motion";
 import { useDispatch, useSelector } from "react-redux";
 import { Copy, FolderOpen, Loader2, Home, Trash2 } from "lucide-react";
@@ -6,8 +7,8 @@ import { toast } from "sonner";
 
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
+import store from "../state/store";
 import { clearFiles } from "../state/filesState/fileSlice";
-import { selectCnnTier } from "../state/hardwareSlice";
 import Landmark from "./Landmark";
 import { TrainModelDialog } from "./PopUp";
 import { DetectionModeSelector, DetectionMode, DetectionPreset } from "./DetectionModeSelector";
@@ -16,12 +17,10 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
 import { Separator } from "@/Components/ui/separator";
-import { ScrollArea } from "@/Components/ui/scroll-area";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-  TooltipProvider,
 } from "@/Components/ui/tooltip";
 import { sidebarContainer, sidebarItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
 
@@ -35,8 +34,6 @@ interface MenuProps {
   // Detection mode
   detectionMode?: DetectionMode;
   onDetectionModeChange?: (mode: DetectionMode) => void;
-  autoConfidence?: number;
-  onAutoConfidenceChange?: (value: number) => void;
   detectionPreset?: DetectionPreset;
   onDetectionPresetChange?: (preset: DetectionPreset) => void;
   // Auto mode class name
@@ -54,6 +51,32 @@ type CnnVariantOption = {
   selectable: boolean;
   recommended?: boolean;
   reason?: string | null;
+  recommendationReason?: string | null;
+};
+
+const CNN_VARIANT_LIGHT_TO_HEAVY = [
+  "mobilenet_v3_large",
+  "efficientnet_b0",
+  "resnet50",
+  "hrnet_w32",
+] as const;
+
+const getDatasetSizeBucket = (count: number): "starvation" | "balanced" | "deep" => {
+  if (count < 250) return "starvation";
+  if (count < 1000) return "balanced";
+  return "deep";
+};
+
+const getRecommendedCnnVariantId = (bucket: "starvation" | "balanced" | "deep"): string => {
+  if (bucket === "starvation") return "mobilenet_v3_large";
+  if (bucket === "balanced") return "efficientnet_b0";
+  return "resnet50";
+};
+
+const getRecommendationReason = (bucket: "starvation" | "balanced" | "deep"): string => {
+  if (bucket === "starvation") return "Recommended for small datasets";
+  if (bucket === "balanced") return "Recommended for medium datasets";
+  return "Recommended for large datasets";
 };
 
 const Menu: React.FC<MenuProps> = ({
@@ -65,8 +88,6 @@ const Menu: React.FC<MenuProps> = ({
   onTrainDialogOpened,
   detectionMode = "manual",
   onDetectionModeChange,
-  autoConfidence = 0.5,
-  onAutoConfidenceChange,
   detectionPreset = "balanced",
   onDetectionPresetChange,
   className = "",
@@ -115,9 +136,9 @@ const Menu: React.FC<MenuProps> = ({
   const [preflightSummary, setPreflightSummary] = useState("");
   const [preflightWarning, setPreflightWarning] = useState("");
   const [predictorType, setPredictorType] = useState<"dlib" | "cnn">("dlib");
-  const [skipParity, setSkipParity] = useState(false);
   const [cnnVariants, setCnnVariants] = useState<CnnVariantOption[]>([]);
   const [cnnVariant, setCnnVariant] = useState<string>("simplebaseline");
+  const [cnnVariantTouched, setCnnVariantTouched] = useState(false);
   const [cnnVariantWarning, setCnnVariantWarning] = useState<string>("");
   const [obbDetectorReady, setObbDetectorReady] = useState(false);
   const [isTrainingObb, setIsTrainingObb] = useState(false);
@@ -125,22 +146,22 @@ const Menu: React.FC<MenuProps> = ({
   const [obbHyperparams, setObbHyperparams] = useState({ iou: 0.3, cls: 1.5, box: 5.0 });
   const [augmentationPolicy, setAugmentationPolicy] = useState<AugmentationPolicy | undefined>(undefined);
   const [orientationMode, setOrientationMode] = useState<string | undefined>(undefined);
+  const [sessionImageCountHint, setSessionImageCountHint] = useState(0);
 
-  const fileArray = useSelector((state: RootState) => state.files.fileArray);
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
-  const cnnTier = useSelector(selectCnnTier); // "fast" (gpu/mps) | "slow" (cpu)
-  const hasWorkspaceData = (fileArray?.length ?? 0) > 0;
-
-  // Derive OBB readiness for the training dialog:
-  // - hasFinalizedBoxes: user has locked at least one detection box (flat AABB or OBB)
-  // - hasObbAnnotations: user has at least one box with explicit OBB corners
-  // Either condition unlocks the "Train OBB Detector" step in PopUp
-  const hasFinalizedBoxes = (fileArray ?? []).some((img) => img.isFinalized === true);
-  const canTrain = hasFinalizedBoxes && !isTraining;
-  const hasObbAnnotations = (fileArray ?? []).some((img) =>
-    img.boxes?.some((b) => Array.isArray(b.obbCorners) && b.obbCorners.length === 4)
+  const workspaceImageCount = useSelector((state: RootState) => state.files.fileArray.length);
+  const finalizedImageCount = useSelector((state: RootState) =>
+    state.files.fileArray.filter((img) => img.isFinalized === true).length
   );
-  const showObbStep = hasFinalizedBoxes || hasObbAnnotations;
+  const hasWorkspaceData = workspaceImageCount > 0;
+
+  // showObbStep: unlocks the "Train OBB Detector" step only once the user has
+  // finalized at least one image (clicked "Finalize This Image").
+  const hasFinalizedBoxes = useSelector((state: RootState) =>
+    state.files.fileArray.some((img) => img.isFinalized === true)
+  );
+  const canTrain = hasFinalizedBoxes && !isTraining;
+  const showObbStep = hasFinalizedBoxes;
 
   useEffect(() => {
     const fetchProjectRoot = async () => {
@@ -158,6 +179,7 @@ const Menu: React.FC<MenuProps> = ({
   // Load augmentationPolicy and orientationMode from session when the train dialog opens
   useEffect(() => {
     if (!openTrainDialog || !activeSpeciesId) return;
+    setCnnVariantTouched(false);
     window.api.sessionLoad(activeSpeciesId).then((result) => {
       if (result?.ok) {
         if (result.meta?.augmentationPolicy) {
@@ -165,6 +187,10 @@ const Menu: React.FC<MenuProps> = ({
         }
         const mode = result.meta?.orientationPolicy?.mode;
         if (typeof mode === "string") setOrientationMode(mode);
+        setObbDetectorReady(Boolean(result.meta?.obbDetectorReady));
+        setSessionImageCountHint(
+          typeof result.meta?.imageCount === "number" ? result.meta.imageCount : 0
+        );
       }
     }).catch(() => {/* ignore */});
   }, [openTrainDialog, activeSpeciesId]);
@@ -216,25 +242,85 @@ const Menu: React.FC<MenuProps> = ({
     void loadCnnVariants();
   }, []);
 
+  const datasetSizeCount = useMemo(() => {
+    if (finalizedImageCount > 0) return finalizedImageCount;
+    if (sessionImageCountHint > 0) return sessionImageCountHint;
+    return workspaceImageCount;
+  }, [finalizedImageCount, sessionImageCountHint, workspaceImageCount]);
+
+  const cnnDatasetBucket = useMemo(
+    () => getDatasetSizeBucket(datasetSizeCount),
+    [datasetSizeCount]
+  );
+
+  const recommendedCnnVariantId = useMemo(
+    () => getRecommendedCnnVariantId(cnnDatasetBucket),
+    [cnnDatasetBucket]
+  );
+
+  const recommendedSelectableCnnVariantId = useMemo(() => {
+    const preferredIdx = CNN_VARIANT_LIGHT_TO_HEAVY.indexOf(
+      recommendedCnnVariantId as (typeof CNN_VARIANT_LIGHT_TO_HEAVY)[number]
+    );
+    if (preferredIdx >= 0) {
+      for (let i = preferredIdx; i >= 0; i -= 1) {
+        const fallbackId = CNN_VARIANT_LIGHT_TO_HEAVY[i];
+        if (cnnVariants.some((variant) => variant.id === fallbackId && variant.selectable)) {
+          return fallbackId;
+        }
+      }
+    }
+    return (
+      cnnVariants.find((variant) => variant.selectable)?.id ??
+      recommendedCnnVariantId
+    );
+  }, [cnnVariants, recommendedCnnVariantId]);
+
+  const datasetAwareCnnVariants = useMemo(() => {
+    const recommendationReason = getRecommendationReason(cnnDatasetBucket);
+    return cnnVariants.map((variant) => {
+      const isRecommended = variant.id === recommendedSelectableCnnVariantId && variant.selectable;
+      let description = variant.description;
+      if (variant.id === "hrnet_w32") {
+        description = `${variant.description} High-capacity / experimental.`;
+      }
+      return {
+        ...variant,
+        recommended: isRecommended,
+        recommendationReason: isRecommended ? recommendationReason : null,
+        description,
+      };
+    });
+  }, [cnnVariants, cnnDatasetBucket, recommendedSelectableCnnVariantId]);
+
+  const handleCnnVariantChange = useCallback((variantId: string) => {
+    setCnnVariantTouched(true);
+    setCnnVariant(variantId);
+  }, []);
+
   useEffect(() => {
-    if (predictorType !== "cnn" || cnnVariants.length === 0) return;
-    const current = cnnVariants.find((v) => v.id === cnnVariant);
-    if (current?.selectable) return;
-    // Prefer tier-appropriate backbone, then Python-recommended, then first selectable
-    const tierPreferred = cnnTier === "slow" ? "mobilenet_v3_large" : cnnTier === "fast" ? "resnet50" : null;
-    const tierMatch = tierPreferred
-      ? cnnVariants.find((v) => v.id === tierPreferred && v.selectable)?.id
-      : undefined;
-    const fallback =
-      tierMatch ??
-      cnnVariants.find((v) => v.recommended && v.selectable)?.id ??
-      cnnVariants.find((v) => v.selectable)?.id;
-    if (fallback) setCnnVariant(fallback);
-  }, [predictorType, cnnVariants, cnnVariant, cnnTier]);
+    if (predictorType !== "cnn" || datasetAwareCnnVariants.length === 0) return;
+    const current = datasetAwareCnnVariants.find((v) => v.id === cnnVariant);
+    if (!current?.selectable) {
+      if (recommendedSelectableCnnVariantId) {
+        setCnnVariant(recommendedSelectableCnnVariantId);
+      }
+      return;
+    }
+    if (!cnnVariantTouched && current.id !== recommendedSelectableCnnVariantId && recommendedSelectableCnnVariantId) {
+      setCnnVariant(recommendedSelectableCnnVariantId);
+    }
+  }, [
+    predictorType,
+    datasetAwareCnnVariants,
+    cnnVariant,
+    cnnVariantTouched,
+    recommendedSelectableCnnVariantId,
+  ]);
 
   // Check OBB detector readiness when species or train dialog opens
   useEffect(() => {
-    if (!activeSpeciesId) {
+    if (!openTrainDialog || !activeSpeciesId) {
       setObbDetectorReady(false);
       return;
     }
@@ -257,7 +343,10 @@ const Menu: React.FC<MenuProps> = ({
       if (result?.ok) {
         setObbDetectorReady(true);
         const mapStr = typeof result.map50 === "number" ? ` (mAP50: ${result.map50.toFixed(3)})` : "";
-        setObbTrainingMessage(`OBB detector trained${mapStr} — ready.`);
+        const warningText = Array.isArray(result.warnings) && result.warnings.length > 0
+          ? ` Warnings: ${result.warnings.join(" ")}`
+          : "";
+        setObbTrainingMessage(`OBB detector trained${mapStr} — ready.${warningText}`);
       } else {
         setObbTrainingMessage(`OBB training failed: ${result?.error ?? "unknown error"}`);
       }
@@ -313,14 +402,16 @@ const Menu: React.FC<MenuProps> = ({
       return null;
     }
 
+    const latestFileArray = store.getState().files.fileArray;
+
     if (autosaveWorkspace && !activeSpeciesId && hasWorkspaceData) {
-      await window.api.saveLabels(fileArray);
+      await window.api.saveLabels(latestFileArray);
     }
 
     const preflight = await window.api.trainingPreflight({
       speciesId: activeSpeciesId ?? undefined,
       modelName: name,
-      workspaceImages: fileArray.length,
+      workspaceImages: latestFileArray.length,
     });
 
     if (!preflight.ok) {
@@ -375,9 +466,6 @@ const Menu: React.FC<MenuProps> = ({
         speciesId: activeSpeciesId ?? undefined,
         predictorType,
         cnnVariant: predictorType === "cnn" ? cnnVariant : undefined,
-        customOptions: {
-          skip_parity: skipParity,
-        },
       });
       if (!result.ok) throw new Error(result.error);
       console.log("Training output:", result.output);
@@ -424,7 +512,6 @@ const Menu: React.FC<MenuProps> = ({
   }, []);
 
   return (
-    <TooltipProvider>
       <div className="flex h-screen w-full flex-col overflow-hidden bg-background">
         <TrainModelDialog
           handleTrainConfirm={handleTrainConfirm}
@@ -437,12 +524,10 @@ const Menu: React.FC<MenuProps> = ({
           preflightWarning={preflightWarning}
           predictorType={predictorType}
           setPredictorType={setPredictorType}
-          cnnVariants={cnnVariants}
+          cnnVariants={datasetAwareCnnVariants}
           cnnVariant={cnnVariant}
-          setCnnVariant={setCnnVariant}
+          setCnnVariant={handleCnnVariantChange}
           cnnVariantWarning={cnnVariantWarning}
-          skipParity={skipParity}
-          setSkipParity={setSkipParity}
           trainingProgress={trainingProgress}
           obbDetectorReady={obbDetectorReady}
           showObbStep={showObbStep}
@@ -462,7 +547,7 @@ const Menu: React.FC<MenuProps> = ({
           orientationMode={orientationMode}
         />
 
-        <ScrollArea className="flex-1">
+        <div className="flex-1 overflow-y-auto">
           <motion.div
             variants={sidebarContainer}
             initial="hidden"
@@ -476,14 +561,16 @@ const Menu: React.FC<MenuProps> = ({
                   <motion.div {...buttonHover} {...buttonTap}>
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={onNavigateToLanding}
-                          className="shrink-0"
-                        >
-                          <Home className="h-5 w-5" />
-                        </Button>
+                        <span className="inline-flex">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={onNavigateToLanding}
+                            className="shrink-0"
+                          >
+                            <Home className="h-5 w-5" />
+                          </Button>
+                        </span>
                       </TooltipTrigger>
                       <TooltipContent side="right">
                         Back to Home
@@ -585,11 +672,11 @@ const Menu: React.FC<MenuProps> = ({
                     <Separator />
                     <div className="flex items-center justify-between">
                       <p className="text-xs text-muted-foreground">
-                        {fileArray?.length
-                          ? `${fileArray.length} image(s) loaded`
+                        {workspaceImageCount
+                          ? `${workspaceImageCount} image(s) loaded`
                           : "No images loaded"}
                       </p>
-                      {(fileArray?.length ?? 0) > 0 && (
+                      {workspaceImageCount > 0 && (
                         <motion.div {...buttonHover} {...buttonTap}>
                           <Button
                             variant="ghost"
@@ -624,7 +711,7 @@ const Menu: React.FC<MenuProps> = ({
             </motion.div>
 
             {/* Detection Mode */}
-            {onDetectionModeChange && onAutoConfidenceChange && (
+            {onDetectionModeChange && (
               <motion.div variants={sidebarItem}>
                 <motion.div variants={cardHover} initial="initial" whileHover="hover">
                   <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
@@ -637,8 +724,6 @@ const Menu: React.FC<MenuProps> = ({
                       <DetectionModeSelector
                         mode={detectionMode}
                         onModeChange={onDetectionModeChange}
-                        autoConfidence={autoConfidence}
-                        onAutoConfidenceChange={onAutoConfidenceChange}
                         detectionPreset={detectionPreset}
                         onDetectionPresetChange={onDetectionPresetChange}
                         className={className}
@@ -680,7 +765,7 @@ const Menu: React.FC<MenuProps> = ({
             {/* Spacer for footer */}
             <div className="h-24" />
           </motion.div>
-        </ScrollArea>
+        </div>
 
         {/* Sticky footer */}
         <div className="border-t bg-background p-4">
@@ -702,10 +787,7 @@ const Menu: React.FC<MenuProps> = ({
           </motion.div>
         </div>
       </div>
-    </TooltipProvider>
   );
 };
 
 export default Menu;
-
-

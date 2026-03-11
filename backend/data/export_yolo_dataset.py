@@ -26,6 +26,7 @@ if _BACKEND_ROOT not in _sys.path:
     _sys.path.insert(0, _BACKEND_ROOT)
 
 from bv_utils.image_utils import safe_imread, safe_imwrite
+from bv_utils.orientation_utils import resolve_session_augmentation_profile
 
 
 def _clamp(v, lo, hi):
@@ -464,179 +465,276 @@ def _sample_orientation_classes(sample, head_id, tail_id):
     return classes
 
 
-def _select_val_indices(
-    export_records,
+def _resolve_obb_class_id(box, orientation_class_enabled=False, head_id=None, tail_id=None):
+    """
+    Resolve class id used by OBB export.
+    Priority:
+      1) explicit box.class_id
+      2) orientation from landmarks (when enabled)
+      3) default 0
+    """
+    if not orientation_class_enabled:
+        return 0
+
+    class_id = box.get("class_id", None)
+    if class_id is not None:
+        try:
+            return int(class_id)
+        except Exception:
+            pass
+
+    orientation = _compute_box_orientation(box, head_id, tail_id)
+    if orientation == "right":
+        return 1
+    if orientation == "left":
+        return 0
+    return 0
+
+
+def _sample_class_histogram(sample, orientation_class_enabled=False, head_id=None, tail_id=None):
+    """
+    Count class instances for a sample based on export class-id resolution.
+    Returns dict[class_id -> instance_count].
+    """
+    hist = {}
+    for box in sample.get("boxes", []):
+        width = _safe_float(box.get("width"), 0.0)
+        height = _safe_float(box.get("height"), 0.0)
+        if width is None or height is None or width <= 0 or height <= 0:
+            continue
+        class_id = _resolve_obb_class_id(
+            box,
+            orientation_class_enabled=orientation_class_enabled,
+            head_id=head_id,
+            tail_id=tail_id,
+        )
+        hist[class_id] = hist.get(class_id, 0) + 1
+    return hist
+
+
+def _box_rotation_degrees(box):
+    angle_val = box.get("angle")
+    if angle_val is not None:
+        try:
+            return float(angle_val)
+        except Exception:
+            pass
+    obb_corners = box.get("obbCorners") or box.get("obb_corners")
+    if not isinstance(obb_corners, list) or len(obb_corners) != 4:
+        return None
+    try:
+        p0 = obb_corners[0]
+        p1 = obb_corners[1]
+        return math.degrees(math.atan2(float(p1[1]) - float(p0[1]), float(p1[0]) - float(p0[0])))
+    except Exception:
+        return None
+
+
+def _sample_has_rotated_obb(sample, threshold_deg=3.0):
+    for box in sample.get("boxes", []):
+        obb_corners = box.get("obbCorners") or box.get("obb_corners")
+        if not isinstance(obb_corners, list) or len(obb_corners) != 4:
+            continue
+        angle = _box_rotation_degrees(box)
+        if angle is None:
+            return True
+        angle_mod = abs(float(angle)) % 180.0
+        dist_to_axis = min(abs(angle_mod - 0.0), abs(angle_mod - 90.0), abs(angle_mod - 180.0))
+        if dist_to_axis > float(threshold_deg):
+            return True
+    return False
+
+
+def _select_obb_val_indices(
+    samples,
     val_ratio,
     seed,
     orientation_class_enabled=False,
     head_id=None,
     tail_id=None,
+    minority_small_cutoff=20,
+    minority_target_ratio=0.15,
+    minority_min_ratio=0.10,
+    minority_max_ratio=0.20,
 ):
-    total = len(export_records)
+    """
+    Select val indices for OBB export with optional minority-protection policy.
+
+    Minority policy:
+      - Determine minority classes dynamically from class instance counts.
+      - When minority count is small (<= cutoff), keep minority val instances
+        near target_ratio, bounded to [minority_min_ratio, minority_max_ratio].
+      - Selection is image-level but instance-aware (best effort).
+    """
+    total = len(samples)
     if total <= 0:
-        return set(), 0
+        return set(), 0, {
+            "minority_rule_applied": False,
+            "minority_class_ids": [],
+            "minority_total_instances": 0,
+            "minority_val_instances": 0,
+        }
+
+    if total == 1:
+        return set(), 0, {
+            "minority_rule_applied": False,
+            "minority_class_ids": [],
+            "minority_total_instances": 0,
+            "minority_val_instances": 0,
+        }
 
     val_count = max(1, int(total * val_ratio))
     val_count = min(val_count, total)
-    all_indices = list(range(total))
     rng = random.Random(seed)
+    shuffled_indices = list(range(total))
+    rng.shuffle(shuffled_indices)
+    rotated_sample_flags = [_sample_has_rotated_obb(sample) for sample in samples]
+    rotated_indices = [idx for idx in shuffled_indices if rotated_sample_flags[idx]]
 
     if not orientation_class_enabled:
-        rng.shuffle(all_indices)
-        return set(all_indices[:val_count]), val_count
+        selected = []
+        selected_set = set()
+        if rotated_indices and val_count > 0:
+            selected.append(rotated_indices[0])
+            selected_set.add(rotated_indices[0])
+        for idx in shuffled_indices:
+            if len(selected) >= val_count:
+                break
+            if idx in selected_set:
+                continue
+            selected.append(idx)
+            selected_set.add(idx)
+        val_set = set(selected[:val_count])
+        return val_set, val_count, {
+            "minority_rule_applied": False,
+            "minority_class_ids": [],
+            "minority_total_instances": 0,
+            "minority_val_instances": 0,
+            "rotated_real_images_total": int(len(rotated_indices)),
+            "rotated_real_images_val": int(sum(1 for idx in val_set if rotated_sample_flags[idx])),
+        }
 
-    positive_indices = [i for i, r in enumerate(export_records) if r.get("kind") == "positive"]
-    negative_indices = [i for i, r in enumerate(export_records) if r.get("kind") != "positive"]
+    sample_hists = [
+        _sample_class_histogram(
+            s,
+            orientation_class_enabled=orientation_class_enabled,
+            head_id=head_id,
+            tail_id=tail_id,
+        )
+        for s in samples
+    ]
 
-    target_pos = 0
-    if positive_indices:
-        target_pos = max(1, int(round(len(positive_indices) * val_ratio)))
-        target_pos = min(target_pos, len(positive_indices), val_count)
+    class_counts = {}
+    for hist in sample_hists:
+        for class_id, count in hist.items():
+            class_counts[class_id] = class_counts.get(class_id, 0) + int(count)
 
-    right_pos = []
-    non_right_pos = []
-    for idx in positive_indices:
-        sample = export_records[idx].get("sample", {})
-        classes = _sample_orientation_classes(sample, head_id, tail_id)
-        if 1 in classes:
-            right_pos.append(idx)
-        else:
-            non_right_pos.append(idx)
+    present_classes = sorted([cid for cid, cnt in class_counts.items() if cnt > 0])
+    if not present_classes:
+        return set(shuffled_indices[:val_count]), val_count, {
+            "minority_rule_applied": False,
+            "minority_class_ids": [],
+            "minority_total_instances": 0,
+            "minority_val_instances": 0,
+        }
+
+    min_nonzero = min(class_counts[cid] for cid in present_classes)
+    minority_class_ids = sorted([cid for cid in present_classes if class_counts[cid] == min_nonzero])
+    minority_total_instances = int(sum(class_counts[cid] for cid in minority_class_ids))
+
+    # Apply minority rule only when minority class is truly scarce.
+    minority_rule_applied = bool(
+        len(present_classes) >= 2 and min_nonzero <= int(minority_small_cutoff)
+    )
 
     selected = []
-    if target_pos > 0:
-        if right_pos and non_right_pos and target_pos >= 2:
-            right_target = int(round(target_pos * (len(right_pos) / float(max(1, len(positive_indices))))))
-            right_target = max(1, min(len(right_pos), right_target))
-            non_right_target = target_pos - right_target
-            if non_right_target <= 0:
-                non_right_target = 1
-                right_target = max(1, target_pos - 1)
-            if non_right_target > len(non_right_pos):
-                non_right_target = len(non_right_pos)
-                right_target = min(len(right_pos), target_pos - non_right_target)
+    selected_set = set()
 
-            rng.shuffle(right_pos)
-            rng.shuffle(non_right_pos)
-            selected.extend(right_pos[:right_target])
-            selected.extend(non_right_pos[:non_right_target])
-        else:
-            pool = positive_indices[:]
-            rng.shuffle(pool)
-            selected.extend(pool[:target_pos])
+    class_presence_observed = {cid: 0 for cid in present_classes}
 
-    remaining = val_count - len(selected)
-    if remaining > 0:
-        neg_pool = [i for i in negative_indices if i not in selected]
-        rng.shuffle(neg_pool)
-        selected.extend(neg_pool[:remaining])
+    def _add_index(idx):
+        if idx in selected_set or len(selected) >= val_count:
+            return False
+        selected.append(idx)
+        selected_set.add(idx)
+        hist = sample_hists[idx]
+        for cid in present_classes:
+            if hist.get(cid, 0) > 0:
+                class_presence_observed[cid] += int(hist.get(cid, 0))
+        return True
 
+    if rotated_indices and val_count > 0:
+        _add_index(rotated_indices[0])
+
+    # Image-level minority split: collect all images that contain ≥1 minority class box,
+    # then allocate exactly floor(count × minority_max_ratio) of them to val.
+    # Images not selected for val are locked into training (excluded from random fill).
+    minority_image_indices: list[int] = []
+    minority_image_train_set: set[int] = set()
+    n_minority_val: int = 0
+
+    if minority_rule_applied:
+        minority_image_indices = [
+            idx for idx in shuffled_indices
+            if any(sample_hists[idx].get(cid, 0) > 0 for cid in minority_class_ids)
+        ]
+        n_minority_val = int(math.floor(len(minority_image_indices) * float(minority_max_ratio)))
+        # Add the first n_minority_val minority images to val.
+        for idx in minority_image_indices[:n_minority_val]:
+            _add_index(idx)
+        # Lock remaining minority images into training (they must not go to val via random fill).
+        minority_image_train_set = set(minority_image_indices[n_minority_val:])
+
+    # Enforce class presence in val where capacity allows.
     if len(selected) < val_count:
-        fallback_pool = [i for i in all_indices if i not in selected]
-        rng.shuffle(fallback_pool)
-        selected.extend(fallback_pool[: (val_count - len(selected))])
-
-    return set(selected), val_count
-
-
-def _count_label_class_instances(label_dir):
-    class_counts = {}
-    total_instances = 0
-    for txt_path in glob.glob(os.path.join(label_dir, "*.txt")):
-        try:
-            with open(txt_path, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-        except Exception:
-            continue
-        for ln in lines:
-            parts = ln.split()
-            if not parts:
-                continue
-            try:
-                class_id = int(float(parts[0]))
-            except Exception:
-                continue
-            class_counts[class_id] = class_counts.get(class_id, 0) + 1
-            total_instances += 1
-    return {"total_instances": total_instances, "class_counts": class_counts}
-
-
-def _move_synthetic_right_to_val(out_dir, target_right_instances=8, seed=0):
-    train_lbl_dir = os.path.join(out_dir, "labels", "train")
-    train_img_dir = os.path.join(out_dir, "images", "train")
-    val_lbl_dir = os.path.join(out_dir, "labels", "val")
-    val_img_dir = os.path.join(out_dir, "images", "val")
-    os.makedirs(val_lbl_dir, exist_ok=True)
-    os.makedirs(val_img_dir, exist_ok=True)
-
-    candidates = []
-    for lbl_path in glob.glob(os.path.join(train_lbl_dir, "__synth_*.txt")):
-        base = os.path.splitext(os.path.basename(lbl_path))[0]
-        right_count = 0
-        total = 0
-        try:
-            with open(lbl_path, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-        except Exception:
-            continue
-        for ln in lines:
-            parts = ln.split()
-            if not parts:
-                continue
-            try:
-                class_id = int(float(parts[0]))
-            except Exception:
-                continue
-            total += 1
-            if class_id == 1:
-                right_count += 1
-        if right_count > 0 and total > 0:
-            candidates.append(
-                {
-                    "base": base,
-                    "label_path": lbl_path,
-                    "right_count": right_count,
-                    "total": total,
-                }
-            )
-
-    rng = random.Random(seed)
-    rng.shuffle(candidates)
-
-    moved_images = 0
-    moved_right_instances = 0
-    moved_basenames = []
-    target = max(1, int(target_right_instances))
-
-    for c in candidates:
-        if moved_right_instances >= target:
-            break
-        base = c["base"]
-        src_lbl = c["label_path"]
-        src_img = None
-        for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
-            candidate = os.path.join(train_img_dir, base + ext)
-            if os.path.exists(candidate):
-                src_img = candidate
+        for cid in present_classes:
+            if len(selected) >= val_count:
                 break
-        if src_img is None:
-            continue
+            if class_presence_observed.get(cid, 0) > 0:
+                continue
+            # Do not force minority-class images into val when the 80/20 split
+            # allocated 0 val slots for them (i.e. too few minority images to split).
+            if minority_rule_applied and cid in minority_class_ids and n_minority_val == 0:
+                continue
+            candidate = None
+            candidate_count = 0
+            for idx in shuffled_indices:
+                if idx in selected_set:
+                    continue
+                count = int(sample_hists[idx].get(cid, 0))
+                if count > candidate_count:
+                    candidate = idx
+                    candidate_count = count
+            if candidate is not None and candidate_count > 0:
+                _add_index(candidate)
 
-        try:
-            dst_lbl = os.path.join(val_lbl_dir, os.path.basename(src_lbl))
-            dst_img = os.path.join(val_img_dir, os.path.basename(src_img))
-            shutil.move(src_lbl, dst_lbl)
-            shutil.move(src_img, dst_img)
-            moved_images += 1
-            moved_right_instances += int(c["right_count"])
-            moved_basenames.append(base)
-        except Exception:
-            continue
+    # Fill remaining val slots randomly, skipping images locked into training by the minority rule.
+    if len(selected) < val_count:
+        for idx in shuffled_indices:
+            if len(selected) >= val_count:
+                break
+            if idx in selected_set:
+                continue
+            if minority_image_train_set and idx in minority_image_train_set:
+                continue
+            _add_index(idx)
 
-    return {
-        "moved_images": moved_images,
-        "moved_right_instances": moved_right_instances,
-        "moved_basenames": moved_basenames,
+    val_set = set(selected[:val_count])
+
+    minority_val_instances = 0
+    if minority_class_ids:
+        for idx in val_set:
+            hist = sample_hists[idx]
+            for cid in minority_class_ids:
+                minority_val_instances += int(hist.get(cid, 0))
+
+    return val_set, val_count, {
+        "minority_rule_applied": bool(minority_rule_applied),
+        "minority_class_ids": minority_class_ids,
+        "minority_total_instances": minority_total_instances,
+        "minority_val_instances": int(minority_val_instances),
+        "rotated_real_images_total": int(len(rotated_indices)),
+        "rotated_real_images_val": int(sum(1 for idx in val_set if rotated_sample_flags[idx])),
     }
 
 
@@ -644,13 +742,17 @@ def _move_synthetic_right_to_val(out_dir, target_right_instances=8, seed=0):
 # Synthetic generation from finalized segment crops
 # -----------------------------------------------------------------------------
 
-def _collect_finalized_segments(session_dir, anchor_index=None):
+def _collect_finalized_segments(session_dir, anchor_index=None, finalized_images=None):
     """
     Collect finalized SAM2 segments (RGBA).
     Only segments with accepted_by_user=true are used.
 
     When anchor_index is provided, attempts to attach head/tail anchor points
     (in segment crop coordinates) for orientation-aware synthetic labeling.
+
+    When finalized_images is a frozenset of normalized source image paths,
+    segments whose source_image is not in the set are skipped (stale segment
+    guard for deleted or reverted images).
     """
     seg_dir = os.path.join(session_dir, "segments")
     if not os.path.isdir(seg_dir):
@@ -674,6 +776,11 @@ def _collect_finalized_segments(session_dir, anchor_index=None):
                 meta = json.load(f)
             if not bool(meta.get("accepted_by_user", False)):
                 continue
+            if meta.get("mask_source") == "rectangle_fallback":
+                continue
+            if finalized_images is not None:
+                if _norm_path(meta.get("source_image", "")) not in finalized_images:
+                    continue
         except Exception:
             continue
 
@@ -1019,7 +1126,11 @@ def _place_chip(canvas, chip_rgba, placed_boxes, rng, min_gap_px=8, max_attempts
 
         roi = canvas[y:y + h, x:x + w].astype(np.float32)
         fg = chip_rgba[:, :, :3].astype(np.float32)
-        a = (chip_rgba[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
+        # Feather the binary SAM2 mask edge to avoid hard dark halos where the
+        # object silhouette meets the gradient background.
+        alpha_raw = chip_rgba[:, :, 3].astype(np.float32)
+        alpha_soft = cv2.GaussianBlur(alpha_raw, (0, 0), sigmaX=2.0, sigmaY=2.0)
+        a = (alpha_soft / 255.0)[:, :, None]
         blended = fg * a + roi * (1.0 - a)
         canvas[y:y + h, x:x + w] = blended.astype(np.uint8)
         placed_boxes.append(cand)
@@ -1028,417 +1139,37 @@ def _place_chip(canvas, chip_rgba, placed_boxes, rng, min_gap_px=8, max_attempts
     return None
 
 
-
-# -----------------------------------------------------------------------------
-# Main export
-# -----------------------------------------------------------------------------
-
-def export_dataset(
-    session_dir,
-    class_name,
-    val_ratio=0.2,
-    seed=42,
-    return_details=False,
-    finalized_only=True,
-):
-    """
-    Export session annotations to YOLO/YOLO-Pose format.
-    """
-    labels_dir = os.path.join(session_dir, "labels")
-    images_dir = os.path.join(session_dir, "images")
-
-    if not os.path.isdir(labels_dir):
-        raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
-    if not os.path.isdir(images_dir):
-        raise FileNotFoundError(f"Images directory not found: {images_dir}")
-
-    head_id, tail_id = _load_head_tail_ids(session_dir)
-    finalized_set = _load_finalized_filenames(session_dir) if finalized_only else set()
-
-    positives = []
-    negatives = []
-    skipped_unfinalized = 0
-    finalized_label_files = 0
-    finalized_fallback_to_boxes = 0
-
-    for fname in sorted(os.listdir(labels_dir)):
-        if not fname.endswith(".json"):
-            continue
-
-        label_path = os.path.join(labels_dir, fname)
-        try:
-            with open(label_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            continue
-
-        image_filename = data.get("imageFilename", "")
-        if not image_filename:
-            continue
-
-        if finalized_only:
-            is_finalized, boxes, used_fallback = _get_finalized_boxes(
-                data, image_filename, finalized_set
-            )
-            if not is_finalized:
-                skipped_unfinalized += 1
-                continue
-            if used_fallback:
-                finalized_fallback_to_boxes += 1
-            finalized_label_files += 1
-        else:
-            boxes = []
-            for b in data.get("boxes", []):
-                nb = _normalize_box(b)
-                if nb:
-                    boxes.append(nb)
-
-        rejected = data.get("rejectedDetections", [])
-        if not boxes and not rejected:
-            continue
-
-        image_path = os.path.join(images_dir, image_filename)
-        if not os.path.exists(image_path):
-            base = os.path.splitext(image_filename)[0]
-            resolved = None
-            for ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"]:
-                candidate = os.path.join(images_dir, base + ext)
-                if os.path.exists(candidate):
-                    resolved = candidate
-                    image_filename = base + ext
-                    break
-            if not resolved:
-                continue
-            image_path = resolved
-
-        sample_base = {"image_path": image_path, "image_filename": image_filename}
-        if boxes:
-            positives.append({**sample_base, "boxes": boxes})
-        if isinstance(rejected, list) and rejected:
-            negatives.append({**sample_base, "rejected": rejected})
-
-    if not positives and not negatives:
-        if finalized_only:
-            raise ValueError(
-                f"No finalized detection labels found in {labels_dir}. "
-                f"Finalize accepted boxes before training."
-            )
-        raise ValueError(f"No annotated images found in {labels_dir}")
-
-    image_cache = {}
-    for sample in positives + negatives:
-        if sample["image_path"] in image_cache:
-            continue
-        img = safe_imread(sample["image_path"])
-        if img is None:
-            raise ValueError(f"Failed to read image: {sample['image_path']}")
-        h, w = img.shape[:2]
-        image_cache[sample["image_path"]] = {
-            "img": img,
-            "img_width": w,
-            "img_height": h,
-        }
-
-    for sample in positives:
-        meta = image_cache[sample["image_path"]]
-        sample["img_width"] = meta["img_width"]
-        sample["img_height"] = meta["img_height"]
-
-    total_box_count = 0
-    orientation_labeled_boxes = 0
-    real_orientation_left_boxes = 0
-    real_orientation_right_boxes = 0
-    real_orientation_unknown_boxes = 0
-    for p in positives:
-        for box in p["boxes"]:
-            total_box_count += 1
-            orientation = _compute_box_orientation(box, head_id, tail_id)
-            if orientation in ("left", "right"):
-                orientation_labeled_boxes += 1
-                if orientation == "left":
-                    real_orientation_left_boxes += 1
-                else:
-                    real_orientation_right_boxes += 1
-            else:
-                real_orientation_unknown_boxes += 1
-
-    orientation_labeled_ratio = (
-        float(orientation_labeled_boxes) / float(total_box_count)
-        if total_box_count > 0
-        else 0.0
-    )
-    _is_vector_schema = str(orientation_schema or "").lower() in ("directional", "bilateral")
-    orientation_class_enabled = bool(
-        _is_vector_schema
-        and head_id is not None
-        and tail_id is not None
-        and total_box_count > 0
-        and orientation_labeled_ratio >= 0.60
-    )
-    num_detection_classes = 2 if orientation_class_enabled else 1
-    orientation_preflight_warnings = []
-    if orientation_class_enabled:
-        oriented_total = real_orientation_left_boxes + real_orientation_right_boxes
-        if real_orientation_right_boxes == 0:
-            orientation_preflight_warnings.append(
-                "No real right-facing finalized boxes found; orientation detector may collapse to left on unseen data."
-            )
-        elif oriented_total > 0:
-            min_minor_class = max(6, int(round(oriented_total * 0.10)))
-            if real_orientation_right_boxes < min_minor_class:
-                orientation_preflight_warnings.append(
-                    "Real right-facing boxes are underrepresented; add more real right-facing finalized images for robust orientation generalization."
-                )
-            imbalance_ratio = max(
-                float(real_orientation_left_boxes),
-                float(real_orientation_right_boxes),
-            ) / max(1.0, float(min(real_orientation_left_boxes, real_orientation_right_boxes)))
-            if imbalance_ratio >= 6.0:
-                orientation_preflight_warnings.append(
-                    "Severe left/right class imbalance in real finalized boxes; reduce imbalance before relying on orientation class predictions."
-                )
-
-    export_records = []
-    for p in positives:
-        export_records.append({"kind": "positive", "sample": p})
-    for n in negatives:
-        for i, rej in enumerate(n["rejected"]):
-            export_records.append({
-                "kind": "negative",
-                "sample": n,
-                "rejected_index": i,
-                "rejected_box": rej,
-            })
-
-    if not export_records:
-        raise ValueError("No exportable records after filtering.")
-
-    val_indices, val_count = _select_val_indices(
-        export_records,
-        val_ratio=val_ratio,
-        seed=seed,
-        orientation_class_enabled=orientation_class_enabled,
-        head_id=head_id,
-        tail_id=tail_id,
-    )
-
-    out_dir = os.path.join(session_dir, "yolo_dataset")
-    _reset_output_dataset_dir(out_dir)
-
-    num_positive_images = 0
-    num_negative_crops = 0
-
-    for i, record in enumerate(export_records):
-        split = "val" if i in val_indices else "train"
-        sample = record["sample"]
-        img_meta = image_cache[sample["image_path"]]
-        img = img_meta["img"]
-        img_h = img_meta["img_height"]
-        img_w = img_meta["img_width"]
-
-        if record["kind"] == "positive":
-            dest_img_name = sample["image_filename"]
-            dest_img = os.path.join(out_dir, "images", split, dest_img_name)
-            if not os.path.exists(dest_img):
-                shutil.copy2(sample["image_path"], dest_img)
-
-            label_basename = os.path.splitext(dest_img_name)[0] + ".txt"
-            label_path = os.path.join(out_dir, "labels", split, label_basename)
-
-            lines = []
-            for box in sample["boxes"]:
-                left = box.get("left", 0)
-                top = box.get("top", 0)
-                width = box.get("width", 0)
-                height = box.get("height", 0)
-                if width <= 0 or height <= 0:
-                    continue
-
-                x_center = _clamp((left + width / 2.0) / img_w, 0.0, 1.0)
-                y_center = _clamp((top + height / 2.0) / img_h, 0.0, 1.0)
-                norm_w = _clamp(width / img_w, 0.0, 1.0)
-                norm_h = _clamp(height / img_h, 0.0, 1.0)
-
-                class_id = 0
-                if orientation_class_enabled:
-                    class_id = int(box.get("class_id", 0))
-                lines.append(
-                    f"{class_id} {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}"
-                )
-
-            with open(label_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n" if lines else "")
-            num_positive_images += 1
-            continue
-
-        # negative crop from user-rejected detections
-        rej = record["rejected_box"]
-        rx = _safe_int(rej.get("left", 0))
-        ry = _safe_int(rej.get("top", 0))
-        rw = _safe_int(rej.get("width", 0))
-        rh = _safe_int(rej.get("height", 0))
-        if rw <= 1 or rh <= 1:
-            continue
-
-        cx = rx + rw // 2
-        cy = ry + rh // 2
-        pad_w = max(8, int(rw * 0.2))
-        pad_h = max(8, int(rh * 0.2))
-        x1 = _clamp(cx - rw // 2 - pad_w, 0, img_w - 1)
-        y1 = _clamp(cy - rh // 2 - pad_h, 0, img_h - 1)
-        x2 = _clamp(cx + rw // 2 + pad_w, 1, img_w)
-        y2 = _clamp(cy + rh // 2 + pad_h, 1, img_h)
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        crop = img[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
-
-        base = os.path.splitext(sample["image_filename"])[0]
-        dest_img_name = f"{base}__neg_{record['rejected_index']}.jpg"
-        dest_img = os.path.join(out_dir, "images", split, dest_img_name)
-        safe_imwrite(dest_img, crop)
-
-        label_basename = os.path.splitext(dest_img_name)[0] + ".txt"
-        label_path = os.path.join(out_dir, "labels", split, label_basename)
-        with open(label_path, "w", encoding="utf-8") as f:
-            f.write("")
-        num_negative_crops += 1
-
-    num_synthetic = 0
-    synth_manifest = []
-
-    val_counts_before_balance = _count_label_class_instances(os.path.join(out_dir, "labels", "val"))
-    val_right_before = int(val_counts_before_balance.get("class_counts", {}).get(1, 0))
-    synthetic_val_balance = {
-        "moved_images": 0,
-        "moved_right_instances": 0,
-        "moved_basenames": [],
-    }
-    if orientation_class_enabled and val_right_before <= 0:
-        target_right = max(4, int(round(max(1, val_count) * 0.25)))
-        synthetic_val_balance = _move_synthetic_right_to_val(
-            out_dir,
-            target_right_instances=target_right,
-            seed=seed + 17,
-        )
-        moved = set(synthetic_val_balance.get("moved_basenames", []))
-        if moved:
-            for m in synth_manifest:
-                image_name = str(m.get("image", ""))
-                image_base = os.path.splitext(image_name)[0]
-                if image_base in moved:
-                    m["split"] = "val"
-
-    synth_manifest_path = None
-    if synth_manifest:
-        synth_manifest_path = os.path.join(out_dir, "synth_manifest.json")
-        try:
-            with open(synth_manifest_path, "w", encoding="utf-8") as f:
-                json.dump(synth_manifest, f, indent=2)
-        except Exception:
-            synth_manifest_path = None
-
-    train_counts = _count_label_class_instances(os.path.join(out_dir, "labels", "train"))
-    val_counts = _count_label_class_instances(os.path.join(out_dir, "labels", "val"))
-
-    yaml_path = os.path.join(out_dir, "dataset.yaml")
-    yaml_lines = [
-        f"path: {out_dir}",
-        "train: images/train",
-        "val: images/val",
-        "nc: 1",
-        "",
-        "names:",
-        f"  0: {class_name}",
-    ]
-    if orientation_class_enabled:
-        yaml_lines = [
-            f"path: {out_dir}",
-            "train: images/train",
-            "val: images/val",
-            "nc: 2",
-            "",
-            "names:",
-            f"  0: {class_name}_left",
-            f"  1: {class_name}_right",
-        ]
-
-    with open(yaml_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(yaml_lines) + "\n")
-
-    stats = {
-        "yaml_path": yaml_path,
-        "finalized_only": bool(finalized_only),
-        "skipped_unfinalized_images": skipped_unfinalized,
-        "finalized_label_files": finalized_label_files,
-        "finalized_fallback_to_boxes": finalized_fallback_to_boxes,
-        "total_records": len(export_records),
-        "val_records": val_count,
-        "train_records": max(0, len(export_records) - val_count),
-        "positive_images": num_positive_images,
-        "negative_crops": num_negative_crops,
-        "num_synthetic": num_synthetic,
-        "synthetic_enabled": False,
-        "synthetic_disabled_reason": "obb_pipeline",
-        "synthetic_mode": None,
-        "synthetic_n_per_segment": 0,
-        "synthetic_max_images": None,
-        "synthetic_max_instances": None,
-        "synthetic_instances_generated": 0,
-        "synthetic_left_instances": 0,
-        "synthetic_right_instances": 0,
-        "synthetic_ambiguous_skipped": 0,
-        "synthetic_missing_anchor_skipped": 0,
-        "synthetic_segments_total": 0,
-        "synthetic_segments_with_anchors": 0,
-        "synthetic_segments_missing_anchors": 0,
-        "synthetic_manifest_path": synth_manifest_path,
-        "synthetic_val_balance_applied": bool(
-            orientation_class_enabled and int(synthetic_val_balance.get("moved_images", 0)) > 0
-        ),
-        "synthetic_val_moved_images": int(synthetic_val_balance.get("moved_images", 0)),
-        "synthetic_val_right_instances_added": int(synthetic_val_balance.get("moved_right_instances", 0)),
-        "train_class_counts": train_counts.get("class_counts", {}),
-        "val_class_counts": val_counts.get("class_counts", {}),
-        "num_classes": num_detection_classes,
-        "orientation_class_enabled": orientation_class_enabled,
-        "orientation_labeled_boxes": orientation_labeled_boxes,
-        "orientation_unlabeled_boxes": max(0, total_box_count - orientation_labeled_boxes),
-        "orientation_labeled_ratio": round(orientation_labeled_ratio, 6),
-        "real_orientation_left_boxes": real_orientation_left_boxes,
-        "real_orientation_right_boxes": real_orientation_right_boxes,
-        "real_orientation_unknown_boxes": real_orientation_unknown_boxes,
-        "orientation_preflight_warnings": orientation_preflight_warnings,
-        "head_id": head_id,
-        "tail_id": tail_id,
-        "total_boxes": total_box_count,
-    }
-    if return_details:
-        return stats
-    return yaml_path
-
-
 # -----------------------------------------------------------------------------
 # OBB dataset export for YOLOv8-OBB training
 # -----------------------------------------------------------------------------
 
-def _load_orientation_config(session_dir):
-    """Returns (orientation_mode: str, gravity_aligned: bool)."""
-    session_path = os.path.join(session_dir, "session.json")
-    try:
-        with open(session_path, "r", encoding="utf-8") as f:
-            session = json.load(f)
-        policy = session.get("orientationPolicy", {})
-        mode = str(policy.get("mode", "invariant")).lower()
-        if mode not in ("directional", "bilateral", "axial", "invariant"):
-            mode = "invariant"
-        aug_policy = session.get("augmentationPolicy", {})
-        gravity_aligned = bool(aug_policy.get("gravity_aligned", True))
-        return mode, gravity_aligned
-    except Exception:
-        return "invariant", True
+def _resolve_obb_rotation_policy(session_dir, fallback_mode="invariant"):
+    """
+    Resolve the session's effective OBB augmentation policy.
+
+    OBB export intentionally reuses the shared session rotation_range semantics.
+    """
+    mode, _orientation_policy, augmentation_policy, profile = resolve_session_augmentation_profile(
+        session_dir,
+        engine="cnn",
+        fallback_mode=fallback_mode,
+    )
+    raw_range = profile.get("rotation_range", (-15.0, 15.0))
+    if isinstance(raw_range, list):
+        raw_range = tuple(raw_range)
+    if not isinstance(raw_range, tuple) or len(raw_range) != 2:
+        raw_range = (-15.0, 15.0)
+    lo = _safe_float(raw_range[0], -15.0)
+    hi = _safe_float(raw_range[1], 15.0)
+    if lo is None or hi is None:
+        lo, hi = -15.0, 15.0
+    if lo > hi:
+        lo, hi = hi, lo
+    return {
+        "mode": mode,
+        "gravity_aligned": bool(augmentation_policy.get("gravity_aligned", True)),
+        "rotation_range": (float(lo), float(hi)),
+    }
 
 
 def _compute_base_class_id(head_tail_chip, orientation_schema):
@@ -1530,7 +1261,7 @@ def _generate_synthetic_obb_images(
     seed=0,
     split="train",
     manifest=None,
-    gravity_aligned=False,
+    rotation_range=(-15.0, 15.0),
 ):
     """
     Generate synthetic OBB train images from finalized segment crops.
@@ -1538,10 +1269,15 @@ def _generate_synthetic_obb_images(
     Uses schema-aware class_id mapping. When gravity_aligned=True, rotation is
     clamped to ±15° to match gravity-constrained imaging setups.
     """
+    # rotation_range is the resolved session policy and overrides the historical
+    # gravity-aligned clamp described above.
     needs_anchor = orientation_schema in ("directional", "axial")
     anchor_index = _build_anchor_index(positives or [], head_id, tail_id) if needs_anchor else {}
+    finalized_imgs = frozenset(_norm_path(s["image_path"]) for s in (positives or []))
     segments, seg_stats = _collect_finalized_segments(
-        session_dir, anchor_index=anchor_index if needs_anchor else None
+        session_dir,
+        anchor_index=anchor_index if needs_anchor else None,
+        finalized_images=finalized_imgs if finalized_imgs else None,
     )
     if not segments:
         return {"num_generated": 0, "num_instances_generated": 0, **seg_stats}
@@ -1595,7 +1331,7 @@ def _generate_synthetic_obb_images(
             aug, head_tail_aug, aug_info = _augment_segment_chip(
                 chip,
                 rng,
-                rot_range=(-15.0, 15.0) if gravity_aligned else (-180.0, 180.0),
+                rot_range=rotation_range,
                 head_tail_chip=head_tail_chip,
             )
 
@@ -1667,9 +1403,8 @@ def export_obb_dataset(
     """
     Export session annotations to YOLOv8-OBB format.
 
-    Boxes with obbCorners get the 4-corner format:
+    Boxes must provide valid obbCorners in canonical [LT, RT, RB, LB] order:
       class_id x1 y1 x2 y2 x3 y3 x4 y4  (all normalized)
-    Boxes without obbCorners fall back to axis-aligned 4-corner format at 0°.
 
     Args:
         generate_synthetic: When False, skip the SAM2-based synthetic augmentation
@@ -1691,6 +1426,7 @@ def export_obb_dataset(
     finalized_set = _load_finalized_filenames(session_dir)
 
     out_dir = os.path.join(session_dir, "obb_dataset")
+    _reset_output_dataset_dir(out_dir)
     for split in ("train", "val"):
         os.makedirs(os.path.join(out_dir, "images", split), exist_ok=True)
         os.makedirs(os.path.join(out_dir, "labels", split), exist_ok=True)
@@ -1738,26 +1474,33 @@ def export_obb_dataset(
 
     # Split train/val — stratified when multiple orientation classes are present so that
     # val always contains at least one sample from each class.
-    rng = random.Random(seed)
-    indices = list(range(len(samples)))
-    rng.shuffle(indices)
-    n_val = max(1, int(len(indices) * val_ratio)) if len(indices) > 1 else 0
-
-    if orientation_class_enabled and n_val > 0:
-        # Separate indices by whether the sample contains any class-1 (right-facing) box.
-        right_indices = [i for i in indices
-                         if 1 in _sample_orientation_classes(samples[i], head_id, tail_id)]
-        other_indices = [i for i in indices if i not in set(right_indices)]
-
-        if right_indices and other_indices:
-            # Reserve one slot from each class, then fill the rest from the shuffled pool.
-            guaranteed = [right_indices[0], other_indices[0]]
-            remaining_pool = [i for i in indices if i not in set(guaranteed)]
-            val_set = set(guaranteed + remaining_pool[: max(0, n_val - len(guaranteed))])
-        else:
-            val_set = set(indices[:n_val])
-    else:
-        val_set = set(indices[:n_val])
+    val_set, _val_count, split_stats = _select_obb_val_indices(
+        samples,
+        val_ratio=val_ratio,
+        seed=seed,
+        orientation_class_enabled=orientation_class_enabled,
+        head_id=head_id,
+        tail_id=tail_id,
+        minority_small_cutoff=20,
+        minority_target_ratio=0.20,
+        minority_min_ratio=0.00,
+        minority_max_ratio=0.20,
+    )
+    warnings = []
+    rotated_total = int(split_stats.get("rotated_real_images_total", 0))
+    rotated_val = int(split_stats.get("rotated_real_images_val", 0))
+    if rotated_total == 0:
+        warnings.append(
+            "No rotated real OBB samples were found; validation angle metrics and preview OBBs will be weak."
+        )
+    elif rotated_total < 2:
+        warnings.append(
+            "Very few rotated real OBB samples were found; validation angle metrics may be unstable."
+        )
+    elif rotated_val == 0:
+        warnings.append(
+            "Validation split has no rotated real OBB samples; angle validation coverage is insufficient."
+        )
 
     num_boxes = 0
     num_images = 0
@@ -1784,35 +1527,27 @@ def export_obb_dataset(
             # Determine class_id from orientation (set by frontend toggle)
             class_id = 0
             if orientation_class_enabled:
-                class_id = int(box.get("class_id", 0))
+                class_id = _resolve_obb_class_id(
+                    box,
+                    orientation_class_enabled=orientation_class_enabled,
+                    head_id=head_id,
+                    tail_id=tail_id,
+                )
 
             obb_corners = box.get("obbCorners") or box.get("obb_corners")
-            if obb_corners and len(obb_corners) == 4:
-                # 4-corner OBB format (already in image pixel coords)
-                pts = []
-                for px, py in obb_corners:
-                    pts.extend([
-                        _clamp(float(px) / img_w, 0.0, 1.0),
-                        _clamp(float(py) / img_h, 0.0, 1.0),
-                    ])
-                lines.append(f"{class_id} " + " ".join(f"{v:.6f}" for v in pts))
-            else:
-                # Fallback: derive 4 axis-aligned corners from AABB
-                left = float(box.get("left", 0))
-                top = float(box.get("top", 0))
-                width = float(box.get("width", 0))
-                height = float(box.get("height", 0))
-                if width <= 0 or height <= 0:
-                    continue
-                # AABB corners: top-left, top-right, bottom-right, bottom-left
-                pts = [
-                    _clamp(left / img_w, 0.0, 1.0),           _clamp(top / img_h, 0.0, 1.0),
-                    _clamp((left + width) / img_w, 0.0, 1.0), _clamp(top / img_h, 0.0, 1.0),
-                    _clamp((left + width) / img_w, 0.0, 1.0), _clamp((top + height) / img_h, 0.0, 1.0),
-                    _clamp(left / img_w, 0.0, 1.0),           _clamp((top + height) / img_h, 0.0, 1.0),
-                ]
-                lines.append(f"{class_id} " + " ".join(f"{v:.6f}" for v in pts))
+            if not (obb_corners and len(obb_corners) == 4):
+                warnings.append(
+                    f"{sample['image_filename']}: skipped box without valid OBB corners; rerun session OBB migration or reimport labels."
+                )
+                continue
 
+            pts = []
+            for px, py in obb_corners:
+                pts.extend([
+                    _clamp(float(px) / img_w, 0.0, 1.0),
+                    _clamp(float(py) / img_h, 0.0, 1.0),
+                ])
+            lines.append(f"{class_id} " + " ".join(f"{v:.6f}" for v in pts))
             num_boxes += 1
 
         with open(label_path, "w", encoding="utf-8") as f:
@@ -1836,8 +1571,10 @@ def export_obb_dataset(
         f.write("\n".join(yaml_lines) + "\n")
 
     # --- Synthetic data augmentation ---
-    orientation_schema, gravity_aligned = _load_orientation_config(session_dir)
-    SYNTHETIC_RATIO = 2
+    resolved_policy = _resolve_obb_rotation_policy(session_dir, fallback_mode=orientation_schema)
+    orientation_schema = resolved_policy["mode"]
+    rotation_range = resolved_policy["rotation_range"]
+    SYNTHETIC_RATIO = 1
     n_real_train = sum(1 for i in range(len(samples)) if i not in val_set)
     max_synth = max(0, int(n_real_train * SYNTHETIC_RATIO))
 
@@ -1858,7 +1595,7 @@ def export_obb_dataset(
             seed=seed + 1,
             split="train",
             manifest=synth_manifest,
-            gravity_aligned=gravity_aligned,
+            rotation_range=rotation_range,
         )
         manifest_path = os.path.join(out_dir, "synth_manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -1876,15 +1613,11 @@ def export_obb_dataset(
         "num_images": num_images,
         "num_boxes": num_boxes,
         "synthetic": synth_stats,
+        "minority_rule_applied": bool(split_stats.get("minority_rule_applied", False)),
+        "minority_class_ids": list(split_stats.get("minority_class_ids", [])),
+        "minority_total_instances": int(split_stats.get("minority_total_instances", 0)),
+        "minority_val_instances": int(split_stats.get("minority_val_instances", 0)),
+        "rotated_real_images_total": rotated_total,
+        "rotated_real_images_val": rotated_val,
+        "warnings": warnings,
     }
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <session_dir> <class_name>", file=sys.stderr)
-        sys.exit(1)
-
-    session_dir_arg = sys.argv[1]
-    class_name_arg = sys.argv[2]
-    details = export_dataset(session_dir_arg, class_name_arg, return_details=True)
-    print(json.dumps({"ok": True, **details}))

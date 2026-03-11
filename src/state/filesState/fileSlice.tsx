@@ -68,10 +68,51 @@ const fileSlice = createSlice({
         image.isFinalized = true;
       }
     },
+    setImageUnfinalized: (state, action: PayloadAction<{ id: number }>) => {
+      const image = state.fileArray.find((img) => img.id === action.payload.id);
+      if (image) {
+        image.isFinalized = false;
+      }
+    },
+    setImagesUnfinalized: (state, action: PayloadAction<{ ids: number[] }>) => {
+      const idSet = new Set(action.payload.ids || []);
+      if (idSet.size === 0) return;
+      state.fileArray.forEach((image) => {
+        if (idSet.has(image.id)) {
+          image.isFinalized = false;
+        }
+      });
+    },
+    // Flip class_id (0↔1) and orientation_hint on every box in the entire dataset
+    flipAllOrientations: (state) => {
+      state.fileArray = state.fileArray.map((img) => ({
+        ...img,
+        boxes: (img.boxes ?? []).map((box) => {
+          const currentId = box.class_id !== undefined ? box.class_id : 0;
+          const nextId = currentId === 0 ? 1 : 0;
+          return {
+            ...box,
+            class_id: nextId,
+            orientation_hint: box.orientation_hint
+              ? { ...box.orientation_hint, orientation: nextId === 0 ? "left" : "right" as "left" | "right" }
+              : undefined,
+          };
+        }),
+      }));
+    },
   },
 });
 
-export const { removeFile, updateBoxes, clearFiles, setSessionImages, addFilesWithSpecies, setImageFinalized } =
-  fileSlice.actions;
+export const {
+  removeFile,
+  updateBoxes,
+  clearFiles,
+  setSessionImages,
+  addFilesWithSpecies,
+  setImageFinalized,
+  setImageUnfinalized,
+  setImagesUnfinalized,
+  flipAllOrientations,
+} = fileSlice.actions;
 
 export default fileSlice.reducer;

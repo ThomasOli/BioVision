@@ -28,8 +28,14 @@ const speciesSlice = createSlice({
         Object.assign(species, action.payload.updates);
       }
     },
+    removeSpecies: (state, action: PayloadAction<string>) => {
+      state.species = state.species.filter((s) => s.id !== action.payload);
+      if (state.activeSpeciesId === action.payload) {
+        state.activeSpeciesId = state.species[0]?.id ?? null;
+      }
+    },
   },
 });
 
-export const { addSpecies, setActiveSpecies, updateSpecies } = speciesSlice.actions;
+export const { addSpecies, setActiveSpecies, updateSpecies, removeSpecies } = speciesSlice.actions;
 export default speciesSlice.reducer;

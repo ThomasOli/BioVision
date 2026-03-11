@@ -1,14 +1,17 @@
-import React, { ChangeEvent, useState, DragEvent } from "react";
+import React, { ChangeEvent, useEffect, useMemo, useState, DragEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Upload, Folder, Trash2, X, ImageIcon, Loader2, FileText, FolderOpen, Tag } from "lucide-react";
 import { useDispatch, useSelector } from "react-redux";
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
+import { Input } from "@/Components/ui/input";
 import { Progress } from "@/Components/ui/progress";
 import { ScrollArea } from "@/Components/ui/scroll-area";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/Components/ui/dialog";
 import { addFilesWithSpecies } from "../state/filesState/fileSlice";
+import { updateSpecies } from "../state/speciesState/speciesSlice";
 import type { RootState } from "../state/store";
-import type { AnnotatedImage, BoundingBox } from "../types/Image";
+import type { AnnotatedImage, BoundingBox, GeometryMappingConfig, LandmarkDefinition } from "../types/Image";
 import { staggerContainer, staggerItem, dropzoneActive, buttonHover, buttonTap } from "@/lib/animations";
 import { toast } from "sonner";
 
@@ -29,9 +32,24 @@ async function fileToBase64(file: File): Promise<string> {
   });
 }
 
+const DEFAULT_GEOMETRY_CONFIG: GeometryMappingConfig = {
+  axisMode: "auto",
+  paddingMode: "tight",
+  paddingProfile: {
+    forwardPct: 10,
+    backwardPct: 10,
+    topPct: 10,
+    bottomPct: 10,
+  },
+};
+
 const UploadImages: React.FC = () => {
   const dispatch = useDispatch();
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
+  const activeSpecies = useSelector((state: RootState) =>
+    state.species.species.find((species) => species.id === state.species.activeSpeciesId)
+  );
+  const fallbackLandmarkTemplate = activeSpecies?.landmarkTemplate ?? [];
 
   const [activeTab, setActiveTab] = useState<"upload" | "preannotated">("upload");
 
@@ -46,6 +64,202 @@ const UploadImages: React.FC = () => {
   const [paFolderPath, setPaFolderPath] = useState<string | null>(null);
   const [paAnnotationPath, setPaAnnotationPath] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [geometryModalOpen, setGeometryModalOpen] = useState(false);
+  const [geometryConfig, setGeometryConfig] = useState<GeometryMappingConfig>(DEFAULT_GEOMETRY_CONFIG);
+  const [useSam2BoxDerivation, setUseSam2BoxDerivation] = useState(false);
+  const [guidedAnteriorCategory, setGuidedAnteriorCategory] = useState("");
+  const [guidedPosteriorCategory, setGuidedPosteriorCategory] = useState("");
+  const [guidedAnteriorLandmarkId, setGuidedAnteriorLandmarkId] = useState<string>("");
+  const [guidedPosteriorLandmarkId, setGuidedPosteriorLandmarkId] = useState<string>("");
+  const [sessionLandmarkTemplate, setSessionLandmarkTemplate] = useState<LandmarkDefinition[] | null>(null);
+  const [sessionTemplateSpeciesId, setSessionTemplateSpeciesId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!activeSpeciesId) {
+      setSessionLandmarkTemplate(null);
+      setSessionTemplateSpeciesId(null);
+      return;
+    }
+
+    if (activeTab !== "preannotated") {
+      return;
+    }
+
+    window.api.sessionLoad(activeSpeciesId).then((result) => {
+      if (cancelled) return;
+      if (!result?.ok) {
+        setSessionLandmarkTemplate(null);
+        setSessionTemplateSpeciesId(activeSpeciesId);
+        return;
+      }
+      const loadedTemplate = Array.isArray(result.meta?.landmarkTemplate)
+        ? (result.meta?.landmarkTemplate as LandmarkDefinition[])
+        : [];
+      setSessionLandmarkTemplate(loadedTemplate);
+      setSessionTemplateSpeciesId(activeSpeciesId);
+
+      const fallbackSerialized = JSON.stringify(fallbackLandmarkTemplate ?? []);
+      const loadedSerialized = JSON.stringify(loadedTemplate ?? []);
+      if (fallbackSerialized !== loadedSerialized) {
+        dispatch(
+          updateSpecies({
+            id: activeSpeciesId,
+            updates: {
+              landmarkTemplate: loadedTemplate,
+              ...(result.meta?.orientationPolicy
+                ? { orientationPolicy: result.meta.orientationPolicy }
+                : {}),
+            },
+          })
+        );
+      }
+    }).catch(() => {
+      if (cancelled) return;
+      setSessionLandmarkTemplate(null);
+      setSessionTemplateSpeciesId(activeSpeciesId);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSpeciesId, activeTab, dispatch, fallbackLandmarkTemplate]);
+
+  const landmarkTemplate =
+    activeSpeciesId &&
+    sessionTemplateSpeciesId === activeSpeciesId &&
+    Array.isArray(sessionLandmarkTemplate)
+      ? sessionLandmarkTemplate
+      : fallbackLandmarkTemplate;
+
+  const categoryToIds = useMemo(() => {
+    const out = new Map<string, number[]>();
+    landmarkTemplate.forEach((landmark: LandmarkDefinition) => {
+      const category = String(landmark.category || "").trim().toLowerCase();
+      if (!category) return;
+      const existing = out.get(category) ?? [];
+      existing.push(Number(landmark.index));
+      existing.sort((a, b) => a - b);
+      out.set(category, existing);
+    });
+    return out;
+  }, [landmarkTemplate]);
+
+  const allCategoryOptions = useMemo(
+    () => [...categoryToIds.keys()].map((category) => ({ value: category, label: category })),
+    [categoryToIds]
+  );
+  const allCategoryValues = allCategoryOptions.map((c) => c.value);
+  const anteriorCategoryOptions = allCategoryValues;
+  const posteriorCategoryOptions = allCategoryValues;
+  const hasGuidedCategoryAnchors = anteriorCategoryOptions.length > 0 && posteriorCategoryOptions.length > 0;
+  const landmarkById = useMemo(() => {
+    const out = new Map<number, LandmarkDefinition>();
+    landmarkTemplate.forEach((landmark) => {
+      out.set(Number(landmark.index), landmark);
+    });
+    return out;
+  }, [landmarkTemplate]);
+
+  const anteriorLandmarkOptions = useMemo(() => {
+    const ids = categoryToIds.get(guidedAnteriorCategory) ?? [];
+    return ids.map((id) => {
+      const landmark = landmarkById.get(id);
+      const labelBase = landmark?.name?.trim() || `Landmark ${id}`;
+      return { value: String(id), label: `${labelBase} (#${id})` };
+    });
+  }, [categoryToIds, guidedAnteriorCategory, landmarkById]);
+
+  const posteriorLandmarkOptions = useMemo(() => {
+    const ids = categoryToIds.get(guidedPosteriorCategory) ?? [];
+    return ids.map((id) => {
+      const landmark = landmarkById.get(id);
+      const labelBase = landmark?.name?.trim() || `Landmark ${id}`;
+      return { value: String(id), label: `${labelBase} (#${id})` };
+    });
+  }, [categoryToIds, guidedPosteriorCategory, landmarkById]);
+
+  useEffect(() => {
+    if (hasGuidedCategoryAnchors) {
+      if (!guidedAnteriorCategory || !anteriorCategoryOptions.includes(guidedAnteriorCategory)) {
+        setGuidedAnteriorCategory(anteriorCategoryOptions[0] ?? "");
+      }
+      if (!guidedPosteriorCategory || !posteriorCategoryOptions.includes(guidedPosteriorCategory)) {
+        setGuidedPosteriorCategory(posteriorCategoryOptions[0] ?? "");
+      }
+    } else {
+      if (guidedAnteriorCategory) setGuidedAnteriorCategory("");
+      if (guidedPosteriorCategory) setGuidedPosteriorCategory("");
+    }
+  }, [hasGuidedCategoryAnchors, guidedAnteriorCategory, guidedPosteriorCategory, anteriorCategoryOptions, posteriorCategoryOptions]);
+
+  useEffect(() => {
+    const validValues = anteriorLandmarkOptions.map((option) => option.value);
+    if (validValues.length === 0) {
+      if (guidedAnteriorLandmarkId) setGuidedAnteriorLandmarkId("");
+      return;
+    }
+    if (!guidedAnteriorLandmarkId || !validValues.includes(guidedAnteriorLandmarkId)) {
+      setGuidedAnteriorLandmarkId(validValues[0]);
+    }
+  }, [anteriorLandmarkOptions, guidedAnteriorLandmarkId]);
+
+  useEffect(() => {
+    const validValues = posteriorLandmarkOptions.map((option) => option.value);
+    if (validValues.length === 0) {
+      if (guidedPosteriorLandmarkId) setGuidedPosteriorLandmarkId("");
+      return;
+    }
+    if (!guidedPosteriorLandmarkId || !validValues.includes(guidedPosteriorLandmarkId)) {
+      setGuidedPosteriorLandmarkId(validValues[0]);
+    }
+  }, [guidedPosteriorLandmarkId, posteriorLandmarkOptions]);
+
+  const resolveAnchorIds = () => {
+    if (geometryConfig.axisMode !== "manual_anchors") return undefined;
+    const anteriorId = Number(guidedAnteriorLandmarkId);
+    const posteriorId = Number(guidedPosteriorLandmarkId);
+    if (!Number.isFinite(anteriorId) || !Number.isFinite(posteriorId)) return undefined;
+    return { anteriorId: Number(anteriorId), posteriorId: Number(posteriorId) };
+  };
+
+  const resolvedAnchorIds = resolveAnchorIds();
+  const manualAnchorError =
+    geometryConfig.axisMode !== "manual_anchors"
+      ? null
+      : !hasGuidedCategoryAnchors
+      ? "This schema does not define usable landmark categories for manual anchors."
+      : !resolvedAnchorIds
+      ? "Select both anterior and posterior landmarks."
+      : resolvedAnchorIds.anteriorId === resolvedAnchorIds.posteriorId
+      ? "Anterior and posterior anchors must resolve to different landmark ids."
+      : null;
+
+  const resolveImportGeometryConfig = (): GeometryMappingConfig => ({
+    axisMode: geometryConfig.axisMode,
+    ...(geometryConfig.axisMode === "manual_anchors" && resolvedAnchorIds
+      ? { anchorLandmarkIds: resolvedAnchorIds }
+      : {}),
+    paddingMode: geometryConfig.paddingMode,
+    ...(geometryConfig.paddingMode === "asymmetric"
+      ? {
+          paddingProfile: {
+            forwardPct: Math.max(0, Number(geometryConfig.paddingProfile?.forwardPct) || 0),
+            backwardPct: Math.max(0, Number(geometryConfig.paddingProfile?.backwardPct) || 0),
+            topPct: Math.max(0, Number(geometryConfig.paddingProfile?.topPct) || 0),
+            bottomPct: Math.max(0, Number(geometryConfig.paddingProfile?.bottomPct) || 0),
+          },
+        }
+      : {
+          paddingProfile: {
+            forwardPct: 10,
+            backwardPct: 10,
+            topPct: 10,
+            bottomPct: 10,
+          },
+        }),
+  });
 
   const appendToQueue = (incomingFiles: File[], incomingPreviews: string[]) => {
     const existingKeys = new Set(selectedFiles.map(fileKey));
@@ -211,12 +425,18 @@ const UploadImages: React.FC = () => {
 
   const handleImportAnnotated = async () => {
     if (!paFolderPath || !paAnnotationPath || !activeSpeciesId) return;
+    if (manualAnchorError) {
+      toast.error(manualAnchorError);
+      return;
+    }
     setIsImporting(true);
     try {
       const result = await window.api.loadAnnotatedFolder({
         imageFolderPath: paFolderPath,
         annotationFilePath: paAnnotationPath,
         speciesId: activeSpeciesId,
+        geometryConfig: resolveImportGeometryConfig(),
+        useSam2BoxDerivation,
       });
 
       if (!result.ok || !result.images?.length) {
@@ -249,9 +469,13 @@ const UploadImages: React.FC = () => {
         ? ` ${result.unmatched.length} image(s) had no matching annotation.`
         : "";
       toast.success(`Imported ${result.images.length} images with landmarks.${unmatchedMsg}`);
+      if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+        toast.warning(result.warnings[0]);
+      }
 
       setPaFolderPath(null);
       setPaAnnotationPath(null);
+      setGeometryModalOpen(false);
     } catch (err) {
       console.error("Pre-annotated import failed:", err);
       toast.error("Import failed. Please try again.");
@@ -387,8 +611,232 @@ const UploadImages: React.FC = () => {
   const paFolderParts = paFolderPath ? paFolderPath.split(/[\\/]/).filter(Boolean) : [];
   const paFolderName = paFolderParts.length > 0 ? paFolderParts[paFolderParts.length - 1] : null;
 
+  const updatePadding = (key: "forwardPct" | "backwardPct" | "topPct" | "bottomPct", value: string) => {
+    const numeric = Math.max(0, Number(value) || 0);
+    setGeometryConfig((current) => ({
+      ...current,
+      paddingProfile: {
+        forwardPct: current.paddingProfile?.forwardPct ?? 10,
+        backwardPct: current.paddingProfile?.backwardPct ?? 10,
+        topPct: current.paddingProfile?.topPct ?? 10,
+        bottomPct: current.paddingProfile?.bottomPct ?? 10,
+        [key]: numeric,
+      },
+    }));
+  };
+
   return (
     <div className="flex w-full flex-col items-center gap-3">
+      <Dialog open={geometryModalOpen} onOpenChange={(open) => !isImporting && setGeometryModalOpen(open)}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Geometry Mapping</DialogTitle>
+            <DialogDescription>
+              Configure how missing OBB geometry should be derived from landmarks during import.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 text-sm">
+            <div className="space-y-2">
+              <p className="font-semibold">Axis Definition</p>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="radio"
+                  name="geometry-axis-mode"
+                  checked={geometryConfig.axisMode === "auto"}
+                  onChange={() =>
+                    setGeometryConfig((current) => ({
+                      ...current,
+                      axisMode: "auto",
+                    }))
+                  }
+                />
+                <div>
+                  <div className="font-medium">Auto</div>
+                  <div className="text-xs text-muted-foreground">Use the schema-aware bi-centroid/head-tail derivation.</div>
+                </div>
+              </label>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="radio"
+                  name="geometry-axis-mode"
+                  checked={geometryConfig.axisMode === "manual_anchors"}
+                  onChange={() =>
+                    setGeometryConfig((current) => ({
+                      ...current,
+                      axisMode: "manual_anchors",
+                    }))
+                  }
+                />
+                <div className="w-full space-y-2">
+                  <div>
+                    <div className="font-medium">Manual anchors</div>
+                    <div className="text-xs text-muted-foreground">Define explicit anterior and posterior categories from this active schema session.</div>
+                  </div>
+                  {geometryConfig.axisMode === "manual_anchors" && (
+                    hasGuidedCategoryAnchors ? (
+                      <div className="grid grid-cols-2 gap-2 rounded-md border p-3">
+                        <label className="space-y-1 text-xs">
+                          <span>Anterior category</span>
+                          <select
+                            className="w-full rounded-md border bg-background px-2 py-2"
+                            value={guidedAnteriorCategory}
+                            onChange={(event) => setGuidedAnteriorCategory(event.target.value)}
+                          >
+                            {anteriorCategoryOptions.map((category) => (
+                              <option key={`anterior-category-${category}`} value={category}>
+                                {category}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="space-y-1 text-xs">
+                          <span>Anterior landmark</span>
+                          <select
+                            className="w-full rounded-md border bg-background px-2 py-2"
+                            value={guidedAnteriorLandmarkId}
+                            onChange={(event) => setGuidedAnteriorLandmarkId(event.target.value)}
+                            disabled={anteriorLandmarkOptions.length === 0}
+                          >
+                            {anteriorLandmarkOptions.map((landmark) => (
+                              <option key={`anterior-landmark-${landmark.value}`} value={landmark.value}>
+                                {landmark.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="space-y-1 text-xs">
+                          <span>Posterior category</span>
+                          <select
+                            className="w-full rounded-md border bg-background px-2 py-2"
+                            value={guidedPosteriorCategory}
+                            onChange={(event) => setGuidedPosteriorCategory(event.target.value)}
+                          >
+                            {posteriorCategoryOptions.map((category) => (
+                              <option key={`posterior-category-${category}`} value={category}>
+                                {category}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="space-y-1 text-xs">
+                          <span>Posterior landmark</span>
+                          <select
+                            className="w-full rounded-md border bg-background px-2 py-2"
+                            value={guidedPosteriorLandmarkId}
+                            onChange={(event) => setGuidedPosteriorLandmarkId(event.target.value)}
+                            disabled={posteriorLandmarkOptions.length === 0}
+                          >
+                            {posteriorLandmarkOptions.map((landmark) => (
+                              <option key={`posterior-landmark-${landmark.value}`} value={landmark.value}>
+                                {landmark.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                    ) : (
+                      <div className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
+                        No session categories are available for manual anchors in this schema.
+                      </div>
+                    )
+                  )}
+                </div>
+              </label>
+              {manualAnchorError && <p className="text-xs text-destructive">{manualAnchorError}</p>}
+            </div>
+
+            <div className="space-y-2">
+              <p className="font-semibold">Envelope Inflation</p>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="radio"
+                  name="geometry-padding-mode"
+                  checked={geometryConfig.paddingMode === "tight"}
+                  onChange={() =>
+                    setGeometryConfig((current) => ({
+                      ...current,
+                      paddingMode: "tight",
+                    }))
+                  }
+                />
+                <div>
+                  <div className="font-medium">Tight</div>
+                  <div className="text-xs text-muted-foreground">Use the standard 10% margin on all sides.</div>
+                </div>
+              </label>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="radio"
+                  name="geometry-padding-mode"
+                  checked={geometryConfig.paddingMode === "asymmetric"}
+                  onChange={() =>
+                    setGeometryConfig((current) => ({
+                      ...current,
+                      paddingMode: "asymmetric",
+                    }))
+                  }
+                />
+                <div className="w-full space-y-2">
+                  <div>
+                    <div className="font-medium">Asymmetric</div>
+                    <div className="text-xs text-muted-foreground">Extend the specimen envelope beyond the landmark hull in the OBB frame.</div>
+                  </div>
+                  {geometryConfig.paddingMode === "asymmetric" && (
+                    <div className="grid grid-cols-2 gap-2">
+                      {([
+                        ["forwardPct", "Forward %"],
+                        ["backwardPct", "Backward %"],
+                        ["topPct", "Top %"],
+                        ["bottomPct", "Bottom %"],
+                      ] as const).map(([key, label]) => (
+                        <label key={key} className="space-y-1 text-xs">
+                          <span>{label}</span>
+                          <Input
+                            type="number"
+                            min={0}
+                            step={1}
+                            value={geometryConfig.paddingProfile?.[key] ?? 0}
+                            onChange={(event) => updatePadding(key, event.target.value)}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </label>
+            </div>
+
+            <div className="space-y-2">
+              <p className="font-semibold">SAM2 Box Derivation</p>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="checkbox"
+                  checked={useSam2BoxDerivation}
+                  onChange={(event) => setUseSam2BoxDerivation(event.target.checked)}
+                />
+                <div>
+                  <div className="font-medium">Use iterative SAM2 during import</div>
+                  <div className="text-xs text-muted-foreground">
+                    Regenerate each imported box from a SAM2 mask. This is slower, but it can replace coarse imported boxes with mask-aligned geometry.
+                  </div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button variant="outline" disabled={isImporting} onClick={() => setGeometryModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button disabled={isImporting || Boolean(manualAnchorError)} onClick={handleImportAnnotated}>
+              {isImporting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              {isImporting ? "Importing..." : "Start Import"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Tab switcher */}
       <div className="flex w-full max-w-[320px] rounded-lg border bg-muted/30 p-1">
         <button
@@ -474,7 +922,7 @@ const UploadImages: React.FC = () => {
             <Button
               className="w-full font-bold"
               disabled={!paFolderPath || !paAnnotationPath || !activeSpeciesId || isImporting}
-              onClick={handleImportAnnotated}
+              onClick={() => setGeometryModalOpen(true)}
             >
               {isImporting ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />

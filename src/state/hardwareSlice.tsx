@@ -10,7 +10,7 @@ export interface HardwareState {
   gpuName: string | null;
   /** True only when device is cuda/mps AND system RAM >= 8 GB */
   sam2Enabled: boolean;
-  /** Always true — YOLO-World runs on CPU */
+  /** Legacy runtime capability flag retained for compatibility */
   yoloWorldEnabled: boolean;
   /** "fast" for cuda/mps; "slow" for cpu-only */
   cnnTier: CnnTier;
@@ -38,7 +38,7 @@ const hardwareSlice = createSlice({
 
 export const { setHardwareCapabilities } = hardwareSlice.actions;
 
-// Selectors — typed with `any` to avoid circular dep with store.tsx
+// Selectors â€” typed with `any` to avoid circular dep with store.tsx
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const selectSam2Enabled = (state: any): boolean => state.hardware.sam2Enabled;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

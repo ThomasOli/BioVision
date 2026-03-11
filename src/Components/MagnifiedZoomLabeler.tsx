@@ -19,7 +19,6 @@ import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-  TooltipProvider,
 } from "@/Components/ui/tooltip";
 import { modalContent } from "@/lib/animations";
 import { BoundingBox, LandmarkSchema } from "../types/Image";
@@ -74,9 +73,63 @@ function cornersToAabb(
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+function getBoxHitCorners(box: BoundingBox): [number, number][] {
+  if (box.obbCorners && box.obbCorners.length === 4) {
+    return box.obbCorners;
+  }
+  return [
+    [box.left, box.top],
+    [box.left + box.width, box.top],
+    [box.left + box.width, box.top + box.height],
+    [box.left, box.top + box.height],
+  ];
+}
+
+function isPointOnSegment(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  epsilon = 0.75
+): boolean {
+  const cross = Math.abs((py - ay) * (bx - ax) - (px - ax) * (by - ay));
+  if (cross > epsilon) return false;
+  const dot = (px - ax) * (bx - ax) + (py - ay) * (by - ay);
+  if (dot < -epsilon) return false;
+  const lenSq = (bx - ax) ** 2 + (by - ay) ** 2;
+  return dot <= lenSq + epsilon;
+}
+
+function isPointInPolygon(x: number, y: number, corners: [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = corners.length - 1; i < corners.length; j = i++) {
+    const [xi, yi] = corners[i];
+    const [xj, yj] = corners[j];
+    if (isPointOnSegment(x, y, xi, yi, xj, yj)) {
+      return true;
+    }
+    const intersects =
+      (yi > y) !== (yj > y) &&
+      x < ((xj - xi) * (y - yi)) / ((yj - yi) || Number.EPSILON) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function getPolygonArea(corners: [number, number][]): number {
+  let sum = 0;
+  for (let i = 0; i < corners.length; i++) {
+    const [x1, y1] = corners[i];
+    const [x2, y2] = corners[(i + 1) % corners.length];
+    sum += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(sum) / 2;
+}
+
 interface MagnifiedImageLabelerProps {
   imageURL: string;
-  onBoxesChange: (boxes: BoundingBox[]) => void;
   color: string;
   opacity: number;
   open: boolean;
@@ -146,6 +199,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
 
   // Track if we just created a box to avoid double-adding landmarks
   const pendingBoxRef = useRef<{ x: number; y: number } | null>(null);
+  const suppressCanvasClickRef = useRef(false);
   // Auto-select the most-recently drawn box so the Transformer appears immediately
   const pendingSelectRef = useRef<boolean>(false);
   useEffect(() => {
@@ -159,6 +213,9 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
   const [isDrawingBox, setIsDrawingBox] = useState(false);
   const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(null);
   const [drawCurrent, setDrawCurrent] = useState<{ x: number; y: number } | null>(null);
+  // RAF throttle refs for mouse-move during box drawing
+  const pendingDrawMove = useRef<{ x: number; y: number } | null>(null);
+  const drawMoveRafRef = useRef<number | null>(null);
   const [isRedrawingSelected, setIsRedrawingSelected] = useState(false);
   const [drawDefaultOrientation, setDrawDefaultOrientation] = useState<"left" | "right">(() =>
     ((typeof window !== "undefined" && window.localStorage.getItem("bv_draw_default_orientation")) as "left" | "right") ?? "left"
@@ -316,42 +373,44 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     [imageDimensions]
   );
 
-  // Check if point is inside a box
-  const findBoxAtPoint = useCallback(
-    (x: number, y: number): BoundingBox | null => {
-      // Give priority to the currently selected box so that clicking near
-      // the edge of a selected box doesn't accidentally activate an adjacent one
-      if (selectedBoxId !== null) {
-        const selectedBox = visibleBoxes.find(b => b.id === selectedBoxId);
-        if (
-          selectedBox &&
-          x >= selectedBox.left &&
-          x <= selectedBox.left + selectedBox.width &&
-          y >= selectedBox.top &&
-          y <= selectedBox.top + selectedBox.height
-        ) {
-          return selectedBox;
-        }
-      }
-      for (let i = visibleBoxes.length - 1; i >= 0; i--) {
-        const box = visibleBoxes[i];
-        if (
-          x >= box.left &&
-          x <= box.left + box.width &&
-          y >= box.top &&
-          y <= box.top + box.height
-        ) {
-          return box;
-        }
-      }
-      return null;
+  const getBoxesAtPoint = useCallback(
+    (x: number, y: number): BoundingBox[] => {
+      return visibleBoxes
+        .map((box, index) => ({
+          box,
+          index,
+          area: getPolygonArea(getBoxHitCorners(box)),
+        }))
+        .filter(({ box }) => isPointInPolygon(x, y, getBoxHitCorners(box)))
+        .sort((a, b) => a.area - b.area || b.index - a.index)
+        .map(({ box }) => box);
     },
-    [visibleBoxes, selectedBoxId]
+    [visibleBoxes]
+  );
+
+  const resolveTargetBoxAtPoint = useCallback(
+    (x: number, y: number): BoundingBox | null => {
+      const candidates = getBoxesAtPoint(x, y);
+      if (candidates.length === 0) return null;
+      if (candidates.length === 1 || selectedBoxId === null) {
+        return candidates[0];
+      }
+      const selectedIndex = candidates.findIndex((box) => box.id === selectedBoxId);
+      if (selectedIndex === -1) {
+        return candidates[0];
+      }
+      return candidates[(selectedIndex + 1) % candidates.length];
+    },
+    [getBoxesAtPoint, selectedBoxId]
   );
 
   // Click to add landmark - supports both manual and auto mode
   const handleCanvasClick = useCallback(
     (e: KonvaEventObject<MouseEvent>) => {
+      if (suppressCanvasClickRef.current) {
+        suppressCanvasClickRef.current = false;
+        return;
+      }
       // Don't add landmarks if we're in drag mode or just finished dragging
       if (!image || !imageDimensions || mode || isSpaceHeld || isDragging) return;
       // Ignore middle mouse button clicks
@@ -362,10 +421,11 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
 
       // Auto mode: click to select box, click inside selected box to add landmark
       if (detectionMode === "auto") {
-        const clickedBox = findBoxAtPoint(pos.x, pos.y);
+        const candidates = getBoxesAtPoint(pos.x, pos.y);
+        const clickedBox = resolveTargetBoxAtPoint(pos.x, pos.y);
 
         if (clickedBox) {
-          if (selectedBoxId !== clickedBox.id) {
+          if (selectedBoxId !== clickedBox.id || candidates.length > 1) {
             selectBox(clickedBox.id);
             return;
           }
@@ -379,9 +439,10 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
 
       // Manual mode: clicking inside an existing box adds a landmark to it
       if (detectionMode === "manual") {
-        const clickedBox = findBoxAtPoint(pos.x, pos.y);
+        const candidates = getBoxesAtPoint(pos.x, pos.y);
+        const clickedBox = resolveTargetBoxAtPoint(pos.x, pos.y);
         if (clickedBox) {
-          if (selectedBoxId !== clickedBox.id) {
+          if (selectedBoxId !== clickedBox.id || candidates.length > 1) {
             selectBox(clickedBox.id);
             return;
           }
@@ -390,7 +451,21 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
         return;
       }
     },
-    [image, imageDimensions, mode, isSpaceHeld, isDragging, getPointerPosition, isPointInBounds, selectedBoxId, selectBox, addLandmark, detectionMode, findBoxAtPoint, autoCorrectionMode]
+    [image, imageDimensions, mode, isSpaceHeld, isDragging, getPointerPosition, isPointInBounds, selectedBoxId, selectBox, addLandmark, detectionMode, getBoxesAtPoint, resolveTargetBoxAtPoint, autoCorrectionMode]
+  );
+
+  const handleBoxPointerDown = useCallback(
+    (e: KonvaEventObject<MouseEvent>) => {
+      e.cancelBubble = true;
+      const pos = getPointerPosition(e);
+      if (!pos) return;
+      const targetBox = resolveTargetBoxAtPoint(pos.x, pos.y);
+      if (targetBox && selectedBoxId !== targetBox.id) {
+        suppressCanvasClickRef.current = true;
+        selectBox(targetBox.id);
+      }
+    },
+    [getPointerPosition, resolveTargetBoxAtPoint, selectedBoxId, selectBox]
   );
 
   // Note: Keyboard undo/redo is handled by ImageLabeler (parent component)
@@ -443,7 +518,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     if (detectionMode === "manual" && !mode && !lockBoxes && !isSpaceHeld && e.evt.button === 0) {
       const pos = getPointerPosition(e);
       if (!pos || !isPointInBounds(pos.x, pos.y)) return;
-      const clickedBox = findBoxAtPoint(pos.x, pos.y);
+      const clickedBox = getBoxesAtPoint(pos.x, pos.y)[0] ?? null;
       if (!clickedBox) {
         setIsDrawingBox(true);
         setIsRedrawingSelected(false);
@@ -457,7 +532,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     if (detectionMode === "auto" && autoCorrectionMode && !mode && !isSpaceHeld && e.evt.button === 0) {
       const pos = getPointerPosition(e);
       if (!pos || !isPointInBounds(pos.x, pos.y)) return;
-      const clickedBox = findBoxAtPoint(pos.x, pos.y);
+      const clickedBox = getBoxesAtPoint(pos.x, pos.y)[0] ?? null;
       if (!clickedBox && selectedBoxId !== null) {
         setIsDrawingBox(true);
         setIsRedrawingSelected(true);
@@ -465,7 +540,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
         setDrawCurrent(pos);
       }
     }
-  }, [isSpaceHeld, detectionMode, autoCorrectionMode, mode, lockBoxes, selectedBoxId, getPointerPosition, isPointInBounds, findBoxAtPoint]);
+  }, [isSpaceHeld, detectionMode, autoCorrectionMode, mode, lockBoxes, selectedBoxId, getPointerPosition, isPointInBounds, getBoxesAtPoint]);
 
   const handleMouseMove = useCallback((e: KonvaEventObject<MouseEvent>) => {
     // Pan mode
@@ -485,7 +560,18 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
       if (!pos) return;
       const x = imageDimensions ? Math.max(0, Math.min(pos.x, imageDimensions.width)) : pos.x;
       const y = imageDimensions ? Math.max(0, Math.min(pos.y, imageDimensions.height)) : pos.y;
-      setDrawCurrent({ x, y });
+
+      // RAF-throttle: store latest position and only apply once per frame
+      pendingDrawMove.current = { x, y };
+      if (!drawMoveRafRef.current) {
+        drawMoveRafRef.current = requestAnimationFrame(() => {
+          drawMoveRafRef.current = null;
+          if (pendingDrawMove.current) {
+            setDrawCurrent(pendingDrawMove.current);
+            pendingDrawMove.current = null;
+          }
+        });
+      }
     }
   }, [isDragging, isDrawingBox, drawStart, getPointerPosition, imageDimensions]);
 
@@ -542,6 +628,13 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
         }
       }
     }
+
+    // Cancel any pending RAF move so it doesn't fire after mouse-up
+    if (drawMoveRafRef.current) {
+      cancelAnimationFrame(drawMoveRafRef.current);
+      drawMoveRafRef.current = null;
+    }
+    pendingDrawMove.current = null;
 
     setIsDrawingBox(false);
     setIsRedrawingSelected(false);
@@ -605,9 +698,24 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     return <div className="text-destructive">Error loading image.</div>;
   }
 
-  // Gate orientation arrows on vector schemas (directional + bilateral)
-  const showOrientationArrow = !orientationMode || orientationMode === "directional" || orientationMode === "bilateral";
+  const normalizedOrientationMode = typeof orientationMode === "string"
+    ? orientationMode.trim().toLowerCase()
+    : undefined;
+  // Gate orientation arrows on vector schemas (directional + bilateral).
+  // Unknown/unset mode defaults to showing arrows.
+  const showOrientationArrow =
+    !normalizedOrientationMode ||
+    normalizedOrientationMode === "directional" ||
+    normalizedOrientationMode === "bilateral";
   const isVectorSchema = showOrientationArrow; // same condition
+
+  // Derive active orientation from selected box (reflects its class_id or hint)
+  const selectedBox = selectedBoxId !== null ? boxes.find(b => b.id === selectedBoxId) ?? null : null;
+  const activeOrientation: "left" | "right" = selectedBox
+    ? (selectedBox.class_id === 0 ? "left"
+       : selectedBox.class_id === 1 ? "right"
+       : selectedBox.orientation_hint?.orientation === "right" ? "right" : "left")
+    : drawDefaultOrientation;
 
   // Colors for boxes
   const getBoxColor = (isSelected: boolean) => {
@@ -621,8 +729,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     : (visibleBoxes.length > 0 ? visibleBoxes[0].id : null);
 
   return (
-    <TooltipProvider>
-      <Dialog open={open} onOpenChange={(value) => !value && onClose()}>
+    <Dialog open={open} onOpenChange={(value) => !value && onClose()}>
         <DialogContent
           className="max-w-[95vw] max-h-[90vh] p-4 flex flex-col overflow-hidden"
           hideCloseButton
@@ -657,28 +764,38 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                   </TooltipTrigger>
                   <TooltipContent>Toggle landmark placement guide</TooltipContent>
                 </Tooltip>
-                {!mode && !lockBoxes && detectionMode === "manual" && isVectorSchema && (
+                {!mode && !lockBoxes && isVectorSchema && (detectionMode === "manual" || detectionMode === "auto") && (
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
                         variant="outline"
                         size="sm"
                         onClick={() => {
-                          const next = drawDefaultOrientation === "left" ? "right" : "left";
-                          setDrawDefaultOrientation(next);
-                          window.localStorage.setItem("bv_draw_default_orientation", next);
-                          if (selectedBoxId !== null) {
-                            const sel = boxes.find(b => b.id === selectedBoxId);
-                            if (sel && sel.class_id !== undefined) {
-                              updateBox(selectedBoxId, { class_id: sel.class_id === 0 ? 1 : 0 });
-                            }
+                          if (selectedBox) {
+                            // Per-box toggle only — do not change drawDefaultOrientation
+                            const nextClassId = activeOrientation === "left" ? 1 : 0;
+                            updateBox(selectedBox.id, {
+                              class_id: nextClassId,
+                              orientation_hint: {
+                                orientation: nextClassId === 0 ? "left" : "right",
+                                confidence: 1.0,
+                                source: "user_toggle",
+                              },
+                            });
+                          } else {
+                            // No box selected — change default for future new boxes only
+                            const next = drawDefaultOrientation === "left" ? "right" : "left";
+                            setDrawDefaultOrientation(next);
+                            window.localStorage.setItem("bv_draw_default_orientation", next);
                           }
                         }}
                       >
-                        {drawDefaultOrientation === "left" ? "\u2190 Head" : "Head \u2192"}
+                        {normalizedOrientationMode === "bilateral"
+                          ? (activeOrientation === "left" ? "\u2191 Head" : "Head \u2193")
+                          : (activeOrientation === "left" ? "\u2190 Head" : "Head \u2192")}
                       </Button>
                     </TooltipTrigger>
-                    <TooltipContent>Toggle default head direction for new boxes</TooltipContent>
+                    <TooltipContent>{selectedBox ? "Toggle orientation of selected box" : "Set default orientation for new boxes"}</TooltipContent>
                   </Tooltip>
                 )}
               </div>
@@ -772,6 +889,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                           fill={isSelected ? "rgba(59, 130, 246, 0.15)" : "rgba(100, 100, 100, 0.1)"}
                           stroke={isSelected ? "#3b82f6" : "#6b7280"}
                           strokeWidth={boxStrokeWidth * 0.5}
+                          listening={false}
                         />
                       )}
                       {/* OBB polygon outline */}
@@ -783,7 +901,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                           strokeWidth={boxStrokeWidth}
                           dash={isSelected ? undefined : [8, 4]}
                           fill={isSelected ? "rgba(59, 130, 246, 0.08)" : "transparent"}
-                          listening={!isEditableSelected}
+                          onMouseDown={handleBoxPointerDown}
                         />
                       )}
                       {/* Interactive rect — center-anchored for correct rotation pivot */}
@@ -799,8 +917,9 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                         stroke={hasObb ? "transparent" : boxColor}
                         strokeWidth={boxStrokeWidth}
                         dash={isSelected ? undefined : [10, 5]}
-                        fill={isEditableSelected && hasObb ? "rgba(0,0,0,0.001)" : (isSelected && !hasObb ? "rgba(59, 130, 246, 0.1)" : "transparent")}
+                        fill={hasObb ? "rgba(0,0,0,0.001)" : (isSelected && !hasObb ? "rgba(59, 130, 246, 0.1)" : "transparent")}
                         draggable={isEditableSelected}
+                        onMouseDown={handleBoxPointerDown}
                         onDragEnd={(e) => {
                           if (!isEditableSelected || !imageDimensions) return;
                           const node = e.target;
@@ -871,6 +990,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                         fontSize={getTextConfig().fontSize * 1.2}
                         fill={boxColor}
                         fontStyle="bold"
+                        listening={false}
                       />
                       {/* Confidence badge if available */}
                       {box.confidence !== undefined && (
@@ -880,6 +1000,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                           text={`${(box.confidence * 100).toFixed(0)}%`}
                           fontSize={getTextConfig().fontSize * 0.9}
                           fill={boxColor}
+                          listening={false}
                         />
                       )}
                       {/* SAM2 re-segmenting indicator */}
@@ -891,15 +1012,20 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                           fontSize={getTextConfig().fontSize * 0.9}
                           fill="#60a5fa"
                           fontStyle="bold"
+                          listening={false}
                         />
                       )}
                       {/* Orientation arrow + tilt angle */}
                       {(() => {
                         const corners = box.obbCorners && box.obbCorners.length === 4
                           ? box.obbCorners as [number,number][]
-                          : null;
-                        if (!corners) return null;
-                        if (orientationMode === "invariant") return null;
+                          : ([
+                              [box.left, box.top],
+                              [box.left + box.width, box.top],
+                              [box.left + box.width, box.top + box.height],
+                              [box.left, box.top + box.height],
+                            ] as [number, number][]);
+                        if (normalizedOrientationMode === "invariant") return null;
                         const [cp0, cp1, cp2, cp3] = corners;
                         // Tilt angle (schema-independent, only needs corners)
                         const adx1 = cp1[0]-cp0[0], ady1 = cp1[1]-cp0[1];
@@ -909,33 +1035,43 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                         adeg = ((adeg % 180) + 180) % 180;
                         if (adeg > 90) adeg = 180 - adeg;
                         // Arrow (vector schemas only)
-                        const hasOrientation = box.class_id !== undefined;
                         let arrowEl = null;
-                        if (showOrientationArrow && hasOrientation) {
-                          const isLeft = box.class_id === 0;
-                          const isRight = box.class_id === 1;
-                          const cLen01 = Math.hypot(cp1[0]-cp0[0], cp1[1]-cp0[1]);
-                          const cLen12 = Math.hypot(cp2[0]-cp1[0], cp2[1]-cp1[1]);
-                          let cMidA: [number,number], cMidB: [number,number];
-                          if (cLen01 >= cLen12) {
-                            cMidA = [(cp0[0]+cp3[0])/2, (cp0[1]+cp3[1])/2];
-                            cMidB = [(cp1[0]+cp2[0])/2, (cp1[1]+cp2[1])/2];
+                        if (showOrientationArrow) {
+                          const hintOrientation = box.orientation_hint?.orientation;
+                          const effectiveClassId =
+                            box.class_id === 0 || box.class_id === 1
+                              ? box.class_id
+                              : hintOrientation === "right"
+                                ? 1
+                                : 0; // default left; no fallback to global drawDefaultOrientation
+                          const isLeft = effectiveClassId === 0;
+                          const isBilateral = normalizedOrientationMode === "bilateral";
+                          // Canonical edge midpoints (from buildObbCorners order):
+                          // LEFT=cp3→cp0, RIGHT=cp1→cp2, TOP=cp0→cp1, BOTTOM=cp2→cp3
+                          let emX: number, emY: number;
+                          if (!isBilateral) {
+                            [emX, emY] = isLeft
+                              ? [(cp3[0]+cp0[0])/2, (cp3[1]+cp0[1])/2]
+                              : [(cp1[0]+cp2[0])/2, (cp1[1]+cp2[1])/2];
                           } else {
-                            cMidA = [(cp0[0]+cp1[0])/2, (cp0[1]+cp1[1])/2];
-                            cMidB = [(cp2[0]+cp3[0])/2, (cp2[1]+cp3[1])/2];
+                            [emX, emY] = isLeft
+                              ? [(cp0[0]+cp1[0])/2, (cp0[1]+cp1[1])/2]
+                              : [(cp2[0]+cp3[0])/2, (cp2[1]+cp3[1])/2];
                           }
-                          const [cLeftEnd, cRightEnd] = cMidA[0] <= cMidB[0] ? [cMidA, cMidB] : [cMidB, cMidA];
-                          const cHead = (isLeft || !isRight) ? cLeftEnd : cRightEnd;
-                          const cTail = (isLeft || !isRight) ? cRightEnd : cLeftEnd;
-                          const cAxisLen = Math.hypot(cHead[0]-cTail[0], cHead[1]-cTail[1]) || 1;
-                          if (cAxisLen >= 24) {
-                            const cNx = (cHead[0]-cTail[0])/cAxisLen, cNy = (cHead[1]-cTail[1])/cAxisLen;
-                            const arrowLen  = Math.min(Math.max(cAxisLen * 0.25, 14), 32);
-                            const cHSizeLen = Math.min(Math.max(cAxisLen * 0.10, 6), 10);
-                            const cHSizeW   = Math.min(Math.max(cAxisLen * 0.07, 5), 8);
+                          const ccx = (cp0[0]+cp1[0]+cp2[0]+cp3[0])/4;
+                          const ccy = (cp0[1]+cp1[1]+cp2[1]+cp3[1])/4;
+                          const outLen = Math.hypot(emX-ccx, emY-ccy) || 1;
+                          const nx = (emX-ccx)/outLen, ny = (emY-ccy)/outLen;
+                          const arrowLen = Math.min(Math.max(outLen * 0.6, 14), 40);
+                          const tipX = emX + nx * 4, tipY = emY + ny * 4;
+                          const tailX = emX - nx * arrowLen, tailY = emY - ny * arrowLen;
+                          const fullLen = Math.hypot(tipX-tailX, tipY-tailY);
+                          if (fullLen >= 24) {
+                            const cHSizeLen = Math.min(Math.max(fullLen * 0.20, 6), 10);
+                            const cHSizeW   = Math.min(Math.max(fullLen * 0.15, 5), 8);
                             arrowEl = (
                               <Arrow
-                                points={[cHead[0] - cNx*arrowLen, cHead[1] - cNy*arrowLen, cHead[0], cHead[1]]}
+                                points={[tailX, tailY, tipX, tipY]}
                                 pointerLength={cHSizeLen}
                                 pointerWidth={cHSizeW}
                                 fill={boxColor}
@@ -956,6 +1092,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                               text={`${Math.round(adeg)}\u00B0`}
                               fontSize={getTextConfig().fontSize * 0.9}
                               fill={boxColor}
+                              listening={false}
                             />
                           </>
                         );
@@ -1008,6 +1145,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                               radius={getScaledRadius()}
                               fill={color}
                               opacity={landmarkOpacity}
+                              listening={false}
                             />
                             <Text
                               x={point.x + 2.5}
@@ -1016,6 +1154,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
                               fontSize={getTextConfig().fontSize}
                               fill={color}
                               opacity={landmarkOpacity}
+                              listening={false}
                             />
                           </React.Fragment>
                         );
@@ -1042,7 +1181,6 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
         </motion.div>
       </DialogContent>
     </Dialog>
-    </TooltipProvider>
   );
 };
 

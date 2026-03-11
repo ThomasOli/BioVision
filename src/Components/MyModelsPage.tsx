@@ -12,6 +12,7 @@ import {
   MoreVertical,
   Check,
   X,
+  AlertTriangle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useSelector } from "react-redux";
@@ -199,14 +200,26 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
                 <span>{formatDate(model.createdAt)}</span>
               </div>
             </div>
+            {model.compatible === false && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <div>
+                    <div className="font-medium">Retrain required</div>
+                    <div>{model.reason || "This model is incompatible with the current heatmap-head CNN runtime."}</div>
+                  </div>
+                </div>
+              </div>
+            )}
             <motion.div {...buttonHover} {...buttonTap}>
               <Button
                 size="sm"
                 className="w-full"
                 onClick={onUse}
+                disabled={model.compatible === false}
               >
                 <Play className="mr-2 h-4 w-4" />
-                Use for Inference
+                {model.compatible === false ? "Unavailable for Inference" : "Use for Inference"}
               </Button>
             </motion.div>
           </CardContent>
@@ -251,6 +264,10 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
   }, [loadModels]);
 
   const handleUseModel = (model: TrainedModel) => {
+    if (model.compatible === false) {
+      toast.error(model.reason || "This CNN model predates the heatmap-head format and must be retrained.");
+      return;
+    }
     onSelectModelForInference(`${model.name}::${model.predictorType ?? "dlib"}`);
     onNavigate("inference");
   };
