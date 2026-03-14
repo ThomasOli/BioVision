@@ -303,10 +303,10 @@ def _scale_box_to_original(box, scale):
 
 def _resolve_orientation_hint_from_box(box, min_confidence=0.25, min_dx_ratio=0.05):
     """
-    Resolve a robust left/right hint from detector output.
+    Resolve a robust session-aware orientation hint from detector output.
 
     Uses orientation_utils.resolve_orientation_hint with a reliability gate so
-    ambiguous pose vectors do not force incorrect mirrored landmark layouts.
+    ambiguous pose vectors do not force incorrect orientation locks.
     """
     if not isinstance(box, dict):
         return None
@@ -335,10 +335,7 @@ def _should_try_canonicalization(orientation_policy):
     if not isinstance(orientation_policy, dict):
         return False
     mode = str(orientation_policy.get("mode", "invariant")).strip().lower()
-    pca_mode = str(orientation_policy.get("pcaLevelingMode", "off")).strip().lower()
-    if pca_mode not in ("off", "on", "auto"):
-        pca_mode = "off"
-    return mode != "invariant" and pca_mode in ("on", "auto")
+    return mode != "invariant"
 
 
 def _get_sam2_model():
@@ -502,7 +499,6 @@ def _build_inference_metadata(orientation_debug, *, clamped_landmark_count=0, bo
     canonical = debug.get("canonicalization")
     if not isinstance(canonical, dict):
         canonical = {}
-    pca_rotation = canonical.get("pca_rotation")
     direction_conf = canonical.get("inferred_direction_confidence")
     raw_hint = debug.get("orientation_hint_raw")
     hint_orientation = None
@@ -526,8 +522,6 @@ def _build_inference_metadata(orientation_debug, *, clamped_landmark_count=0, bo
     requires_review = clamp_count >= 3
     return {
         "mask_source": canonical.get("mask_source"),
-        "pca_rotation": pca_rotation,
-        "pca_angle": pca_rotation,
         "canonical_flip_applied": bool(canonical.get("canonical_flip_applied", False)),
         "direction_source": canonical.get("direction_source"),
         "inferred_direction": canonical.get("inferred_direction"),
@@ -620,6 +614,26 @@ def _predict_with_orientation_lock(
             ),
         }
         return landmarks_512, was_flipped, orientation_debug
+
+    if orientation_mode == "bilateral" and orientation_hint in ("up", "down"):
+        primary = predict_fn(crop_512) or []
+        direction_source = None
+        direction_conf = None
+        if isinstance(canonicalization_debug, dict):
+            direction_source = canonicalization_debug.get("direction_source")
+            direction_conf = canonicalization_debug.get("direction_confidence")
+        return primary, False, {
+            "used_flipped_crop": False,
+            "selection_reason": "bilateral_detector_hint_only",
+            "candidate_b_evaluated": False,
+            "head_landmark_id": head_landmark_id,
+            "tail_landmark_id": tail_landmark_id,
+            "target_orientation": target_orientation,
+            "locked_from_canonicalization": True,
+            "lock_direction_source": direction_source,
+            "lock_direction_confidence": direction_conf,
+            "orientation_hint": orientation_hint,
+        }
 
     lock_orientation = ou.should_lock_orientation_from_canonicalization(
         canonicalization_debug,
@@ -1032,6 +1046,7 @@ def _detect_single_obb_box(
     detector_h,
     *,
     yolo_model_path=None,
+    orientation_policy=None,
     input_box=None,
     original_w=None,
     original_h=None,
@@ -1061,7 +1076,12 @@ def _detect_single_obb_box(
             cv2.imwrite(temp_path, detector_img)
             detection_path = temp_path
 
-        detected = detect_specimen(detection_path, margin=20, yolo_model_path=yolo_model_path)
+        detected = detect_specimen(
+            detection_path,
+            margin=20,
+            yolo_model_path=yolo_model_path,
+            orientation_policy=orientation_policy,
+        )
         if detected is None:
             raise RuntimeError("OBB detector produced no detections.")
         detected = _ensure_obb_box_geometry(
@@ -1090,6 +1110,7 @@ def _detect_multi_obb_boxes(
     detector_h,
     *,
     yolo_model_path=None,
+    orientation_policy=None,
     input_boxes=None,
     min_area_ratio=0.02,
     original_w=None,
@@ -1127,6 +1148,7 @@ def _detect_multi_obb_boxes(
             detection_path,
             min_area_ratio=min_area_ratio,
             yolo_model_path=yolo_model_path,
+            orientation_policy=orientation_policy,
         )
         detected_boxes = detection_result.get("boxes", []) if isinstance(detection_result, dict) else []
         if not detected_boxes:
@@ -1314,6 +1336,7 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box
         detector_w,
         detector_h,
         yolo_model_path=yolo_model_path,
+        orientation_policy=orientation_policy,
         input_box=input_box,
         original_w=orig_w,
         original_h=orig_h,
@@ -1434,6 +1457,7 @@ def predict_multi_specimen(
         detector_w,
         detector_h,
         yolo_model_path=yolo_model_path,
+        orientation_policy=orientation_policy,
         input_boxes=input_boxes,
         min_area_ratio=min_area_ratio,
         original_w=orig_w,
@@ -1646,6 +1670,7 @@ def predict_cnn_image(project_root, tag, image_path, yolo_model_path=None, input
         detector_w,
         detector_h,
         yolo_model_path=yolo_model_path,
+        orientation_policy=orientation_policy,
         input_box=input_box,
         original_w=orig_w,
         original_h=orig_h,
@@ -1746,6 +1771,7 @@ def predict_cnn_multi_specimen(
         detector_w,
         detector_h,
         yolo_model_path=yolo_model_path,
+        orientation_policy=orientation_policy,
         input_boxes=input_boxes,
         min_area_ratio=min_area_ratio,
         original_w=orig_w,

@@ -9,7 +9,8 @@ Example:
 
 What it does:
   1. Removes the `finalizedDetection` key from every label JSON in <session_dir>/labels/
-  2. Deletes all files in <session_dir>/segments/
+  2. Clears <session_dir>/finalized_images.json
+  3. Deletes all files in <session_dir>/segments/
 
 After running, restart the app and re-finalize images to regenerate clean segments.
 """
@@ -27,6 +28,7 @@ def reset_session(session_dir: str) -> None:
         sys.exit(1)
 
     labels_dir = os.path.join(session_dir, "labels")
+    finalized_list_path = os.path.join(session_dir, "finalized_images.json")
     segments_dir = os.path.join(session_dir, "segments")
 
     # --- 1. Clear finalizedDetection from label JSONs ---
@@ -50,7 +52,18 @@ def reset_session(session_dir: str) -> None:
     else:
         print(f"  No labels/ directory found at {labels_dir}")
 
-    # --- 2. Delete all segment files ---
+    # --- 2. Clear finalized_images.json ---
+    if os.path.exists(finalized_list_path):
+        try:
+            with open(finalized_list_path, "w", encoding="utf-8") as f:
+                json.dump([], f)
+            print("\n  cleared: finalized_images.json")
+        except Exception as e:
+            print(f"\n  WARNING: could not clear finalized_images.json: {e}")
+    else:
+        print("\n  No finalized_images.json found")
+
+    # --- 3. Delete all segment files ---
     cleared_segments = 0
     if os.path.isdir(segments_dir):
         cleared_segments = len(os.listdir(segments_dir))

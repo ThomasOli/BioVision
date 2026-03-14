@@ -659,10 +659,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         fallback_to_min=(orientation_mode == "directional"),
     )
     tail_landmark_id = _resolve_tail_landmark_id(project_root, tail_categories=tail_categories)
-    pca_mode = str(orientation_policy.get("pcaLevelingMode", "off")).strip().lower()
-    if pca_mode not in ("off", "on", "auto"):
-        pca_mode = "off"
-    canonical_training_enabled = orientation_mode != "invariant" and pca_mode in ("on", "auto")
+    canonical_training_enabled = orientation_mode != "invariant"
     obb_canonicalization_enabled = orientation_mode != "invariant"
     segment_index = _build_segment_index(project_root) if canonical_training_enabled else {}
 
@@ -1192,7 +1189,6 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "head_landmark_id": head_landmark_id,
                 "tail_landmark_id": tail_landmark_id,
                 "canonical_training_enabled": canonical_training_enabled,
-                "pca_leveling_mode": pca_mode,
                 "segment_index_entries": sum(len(v) for v in segment_index.values()) if segment_index else 0,
                 "training_prep_box_scale_profile": prep_box_scale_profile,
                 "cnn_recommended_box_jitter_profile": cnn_recommended_box_jitter,

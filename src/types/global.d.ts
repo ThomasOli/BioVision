@@ -1,4 +1,4 @@
-import { AnnotatedImage, GeometryMappingConfig, TrainedModel, OrientationPolicy } from "./Image";
+import { AnnotatedImage, GeometryMappingConfig, TrainedModel, OrientationPolicy, ReusableSchemaTemplate } from "./Image";
 export {};
 
 interface SaveLabelsResult {
@@ -82,8 +82,6 @@ interface PredictImageResult {
       num_landmarks: number;
       inference_metadata?: {
         mask_source?: "sam2" | "rough_otsu" | string;
-        pca_rotation?: number;
-        pca_angle?: number;
         canonical_flip_applied?: boolean;
         direction_source?: string;
         inferred_direction?: "left" | "right" | null;
@@ -92,7 +90,7 @@ interface PredictImageResult {
         used_flipped_crop?: boolean;
         was_flipped?: boolean;
         selection_reason?: string;
-        detector_hint_orientation?: "left" | "right" | string | null;
+        detector_hint_orientation?: import("./Image").StoredOrientationLabel | string | null;
         detector_hint_source?: string | null;
         orientation_warning?: {
           code?: string;
@@ -107,8 +105,6 @@ interface PredictImageResult {
     inferenceSignature?: string;
     inference_metadata?: {
       mask_source?: "sam2" | "rough_otsu" | string;
-      pca_rotation?: number;
-      pca_angle?: number;
       canonical_flip_applied?: boolean;
       direction_source?: string;
       inferred_direction?: "left" | "right" | null;
@@ -117,7 +113,7 @@ interface PredictImageResult {
       used_flipped_crop?: boolean;
       was_flipped?: boolean;
       selection_reason?: string;
-      detector_hint_orientation?: "left" | "right" | string | null;
+      detector_hint_orientation?: import("./Image").StoredOrientationLabel | string | null;
       detector_hint_source?: string | null;
       orientation_warning?: {
         code?: string;
@@ -143,7 +139,7 @@ interface PredictOptions {
     angle?: number;
     class_id?: number;
     orientation_hint?: {
-      orientation?: "left" | "right";
+      orientation?: import("./Image").StoredOrientationLabel;
       confidence?: number;
       source?: string;
       head_point?: [number, number];
@@ -210,6 +206,11 @@ interface SelectImageFolderResult {
 
 interface DetectionOptions {
   speciesId?: string;
+  conf?: number;
+  nmsIou?: number;
+  maxObjects?: number;
+  imgsz?: import("./Image").ObbImageSize;
+  detectionPreset?: import("./Image").ObbDetectionPreset;
 }
 
 interface DetectedBox {
@@ -222,9 +223,9 @@ interface DetectedBox {
   confidence: number;
   class_id: number;
   class_name: string;
-  orientation_override?: "left" | "right" | "uncertain";
+  orientation_override?: import("./Image").OrientationLabel;
   orientation_hint?: {
-    orientation?: "left" | "right";
+    orientation?: import("./Image").StoredOrientationLabel;
     confidence?: number;
     source?: string;
     head_point?: [number, number];
@@ -258,6 +259,7 @@ interface LoadAnnotatedFolderResult {
     autoDerived: number;
     fallbackBoxes: number;
     usedAsymmetricPadding: boolean;
+    translatedToFitImage?: number;
   };
   error?: string;
 }
@@ -281,8 +283,10 @@ interface SuperAnnotateOptions {
   samEnabled?: boolean;
   maxObjects?: number;
   detectionMode?: string;  // "auto" | "manual"
-  detectionPreset?: "balanced" | "precision" | "recall" | "single_object";
-  pcaMode?: "off" | "on" | "auto";
+  detectionPreset?: import("./Image").ObbDetectionPreset;
+  conf?: number;
+  nmsIou?: number;
+  imgsz?: import("./Image").ObbImageSize;
   useOrientationHint?: boolean;
 }
 
@@ -306,7 +310,7 @@ interface SuperAnnotateObject {
   detection_method: string;
   class_id?: number;
   orientation_hint?: {
-    orientation?: "left" | "right";
+    orientation?: import("./Image").StoredOrientationLabel;
     confidence?: number;
     source?: string;
   };
@@ -330,10 +334,14 @@ interface SuperAnnotateResult {
 
 interface CheckSuperAnnotatorResult {
   available: boolean;
-  mode: "auto_high_performance" | "auto_lite" | "classic_fallback";
+  mode: "unknown" | "auto_high_performance" | "auto_lite" | "classic_fallback";
   gpu: boolean;
   yolo_ready: boolean;
   sam2_ready: boolean;
+  runtimeState?: "not_started" | "checking" | "not_initialized" | "initializing" | "ready" | "failed";
+  statusSource?: "local_estimate" | "python_probe" | "python_check";
+  pythonPath?: string;
+  usingRepoVenv?: boolean;
   yolo_failed?: boolean;
   sam2_failed?: boolean;
   yolo_error?: string | null;
@@ -379,12 +387,21 @@ interface TrainProgressEvent {
 }
 
 interface SegmentSaveStatus {
-  state: "idle" | "queued" | "running" | "saved" | "skipped" | "failed";
+  state:
+    | "idle"
+    | "queued"
+    | "running"
+    | "saved"
+    | "already_finalized"
+    | "finalized_without_segments"
+    | "skipped"
+    | "failed";
   signature?: string;
   updatedAt: string;
   reason?: string;
   expectedCount?: number;
   savedCount?: number;
+  details?: import("./Image").FinalizeFailureDetail[];
 }
 
 interface InferenceReviewDraftSpecimen {
@@ -398,9 +415,9 @@ interface InferenceReviewDraftSpecimen {
     class_name?: string;
     obbCorners?: [number, number][];
     angle?: number;
-    orientation_override?: "left" | "right" | "uncertain";
+    orientation_override?: import("./Image").OrientationLabel;
     orientation_hint?: {
-      orientation?: "left" | "right";
+      orientation?: import("./Image").StoredOrientationLabel;
       confidence?: number;
       source?: string;
       head_point?: [number, number];
@@ -457,6 +474,9 @@ interface InferenceSessionSummary {
   schemaName: string;
   schemaImageCount: number;
   schemaUpdatedAt: string;
+  schemaGroupKey: string;
+  canonicalSpeciesId: string;
+  hiddenSessionCount?: number;
   exists: boolean;
   inferenceSessionId?: string;
   displayName?: string;
@@ -491,10 +511,18 @@ interface SessionMeta {
   imageCount: number;
   lastModified: string;
   landmarkCount: number;
+  schemaFingerprint?: string;
+  schemaKind?: "default" | "custom";
+  schemaSourceId?: string;
   orientationPolicy?: OrientationPolicy;
   orientationPolicyConfigured?: boolean;
   obbDetectorReady?: boolean;
   augmentationPolicy?: AugmentationPolicy;
+  obbTrainingSettings?: import("./Image").ObbTrainingSettings;
+  obbDetectionSettings?: import("./Image").ObbDetectionSettings;
+  obbTrainingSettingsCustomized?: boolean;
+  obbDetectionSettingsCustomized?: boolean;
+  representativeImageDimensions?: import("./Image").RepresentativeImageDimensions;
 }
 
   interface Window {
@@ -533,13 +561,15 @@ interface SessionMeta {
       deleteModel: (
         modelName: string,
         speciesId?: string,
-        predictorType?: "dlib" | "cnn" | "yolo_pose"
+        predictorType?: "dlib" | "cnn",
+        modelKind?: "landmark" | "obb_detector"
       ) => Promise<{ ok: boolean; error?: string }>;
       renameModel: (
         oldName: string,
         newName: string,
         speciesId?: string,
-        predictorType?: "dlib" | "cnn" | "yolo_pose"
+        predictorType?: "dlib" | "cnn",
+        modelKind?: "landmark" | "obb_detector"
       ) => Promise<{ ok: boolean; error?: string }>;
       selectImages: () => Promise<{ canceled: boolean; files?: { path: string; name: string; data: string; mimeType: string }[] }>;
       selectFolderPath: () => Promise<{ canceled: boolean; folderPath?: string }>;
@@ -569,6 +599,7 @@ interface SessionMeta {
           autoDerived: number;
           fallbackBoxes: number;
           usedAsymmetricPadding: boolean;
+          translatedToFitImage?: number;
         };
         error?: string;
       }>;
@@ -579,7 +610,12 @@ interface SessionMeta {
         speciesId: string,
         name: string,
         landmarkTemplate: import("./Image").LandmarkDefinition[],
-        orientationPolicy?: OrientationPolicy
+        orientationPolicy?: OrientationPolicy,
+        schemaMetadata?: {
+          schemaKind?: "default" | "custom";
+          schemaSourceId?: string;
+          schemaFingerprint?: string;
+        }
       ) => Promise<{ ok: boolean; error?: string }>;
       sessionUpdateOrientationPolicy: (
         speciesId: string,
@@ -588,6 +624,15 @@ interface SessionMeta {
       sessionUpdateAugmentation: (
         speciesId: string,
         augmentationPolicy: AugmentationPolicy
+      ) => Promise<{ ok: boolean; error?: string }>;
+      sessionUpdateObbDetectorSettings: (
+        speciesId: string,
+        settings: {
+          obbTrainingSettings?: import("./Image").ObbTrainingSettings;
+          obbDetectionSettings?: import("./Image").ObbDetectionSettings;
+          obbTrainingSettingsCustomized?: boolean;
+          obbDetectionSettingsCustomized?: boolean;
+        }
       ) => Promise<{ ok: boolean; error?: string }>;
       sessionSaveImage: (speciesId: string, imageData: string, filename: string, mimeType: string) => Promise<{ ok: boolean; diskPath: string; error?: string }>;
       sessionSaveAnnotations: (speciesId: string, filename: string, boxes: import("./Image").BoundingBox[]) => Promise<{ ok: boolean; error?: string }>;
@@ -599,9 +644,19 @@ interface SessionMeta {
           top: number;
           width: number;
           height: number;
+          orientation_override?: import("./Image").OrientationLabel;
+          obbCorners?: [number, number][];
+          angle?: number;
+          class_id?: number;
+          orientation_hint?: {
+            orientation?: import("./Image").StoredOrientationLabel;
+            confidence?: number;
+            source?: string;
+          };
           landmarks?: { id: number; x: number; y: number; isSkipped?: boolean }[];
         }[],
-        imagePath?: string
+        imagePath?: string,
+        generateSegments?: boolean
       ) => Promise<{
         ok: boolean;
         finalized?: boolean;
@@ -610,7 +665,17 @@ interface SessionMeta {
         signature?: string;
         skipped?: boolean;
         segmentSaveQueued?: boolean;
-        segmentQueueState?: "queued" | "skipped";
+        segmentQueueState?:
+          | "queued"
+          | "running"
+          | "saved"
+          | "already_finalized"
+          | "finalized_without_segments"
+          | "skipped";
+        reason?: string;
+        expectedCount?: number;
+        savedCount?: number;
+        details?: import("./Image").FinalizeFailureDetail[];
         error?: string;
       }>;
       sessionUnfinalizeImage: (
@@ -660,10 +725,18 @@ interface SessionMeta {
           landmarkTemplate?: import("./Image").LandmarkDefinition[];
           speciesId?: string;
           imageCount?: number;
+          schemaFingerprint?: string;
+          schemaKind?: "default" | "custom";
+          schemaSourceId?: string;
           orientationPolicy?: OrientationPolicy;
           orientationPolicyConfigured?: boolean;
           augmentationPolicy?: AugmentationPolicy;
           obbDetectorReady?: boolean;
+          obbTrainingSettings?: import("./Image").ObbTrainingSettings;
+          obbDetectionSettings?: import("./Image").ObbDetectionSettings;
+          obbTrainingSettingsCustomized?: boolean;
+          obbDetectionSettingsCustomized?: boolean;
+          representativeImageDimensions?: import("./Image").RepresentativeImageDimensions;
         };
         error?: string;
       }>;
@@ -684,6 +757,33 @@ interface SessionMeta {
       sessionList: () => Promise<{ ok: boolean; sessions: SessionMeta[]; error?: string }>;
       sessionDeleteImage: (speciesId: string, filename: string) => Promise<{ ok: boolean; error?: string }>;
       sessionDeleteAllImages: (speciesId: string) => Promise<{ ok: boolean; error?: string }>;
+      schemaListTemplates: () => Promise<{
+        ok: boolean;
+        templates: ReusableSchemaTemplate[];
+        error?: string;
+      }>;
+      schemaSaveCustomTemplate: (template: {
+        name: string;
+        description: string;
+        landmarks: import("./Image").LandmarkDefinition[];
+        orientationPolicy?: import("./Image").OrientationPolicy;
+        sourcePresetId?: string;
+      }) => Promise<{
+        ok: boolean;
+        template?: ReusableSchemaTemplate;
+        error?: string;
+      }>;
+      schemaUpdateCustomTemplate: (templateId: string, updates: {
+        name: string;
+        description: string;
+        landmarks: import("./Image").LandmarkDefinition[];
+        orientationPolicy?: import("./Image").OrientationPolicy;
+        sourcePresetId?: string;
+      }) => Promise<{
+        ok: boolean;
+        template?: ReusableSchemaTemplate;
+        error?: string;
+      }>;
       // SuperAnnotator pipeline
       superAnnotate: (imagePath: string, className: string, modelTag?: string, options?: SuperAnnotateOptions, speciesId?: string) => Promise<SuperAnnotateResult>;
       checkSuperAnnotator: () => Promise<CheckSuperAnnotatorResult>;
@@ -700,7 +800,16 @@ interface SessionMeta {
         score?: number;
         error?: string;
       }>;
-      trainObbDetector: (speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small"; iou?: number; cls?: number; box?: number }) => Promise<{
+      trainObbDetector: (speciesId: string, options?: {
+        epochs?: number;
+        batch?: number;
+        modelTier?: import("./Image").ObbModelTier;
+        imgsz?: import("./Image").ObbImageSize;
+        iou?: number;
+        cls?: number;
+        box?: number;
+        samEnabled?: boolean;
+      }) => Promise<{
         ok: boolean;
         modelPath?: string;
         map50?: number | null;
@@ -716,6 +825,7 @@ interface SessionMeta {
         imagePath?: string;
       }) => void) => () => void;
       onTrainProgress: (callback: (data: TrainProgressEvent) => void) => () => void;
+      onObbTrainProgress: (callback: (data: import("./Image").ObbTrainProgressEvent) => void) => () => void;
       onSegmentSaveStatus: (callback: (data: {
         speciesId: string;
         filename: string;
@@ -723,6 +833,9 @@ interface SessionMeta {
         signature?: string;
         updatedAt: string;
         reason?: string;
+        expectedCount?: number;
+        savedCount?: number;
+        details?: import("./Image").FinalizeFailureDetail[];
       }) => void) => () => void;
       sessionListInferenceSessions: () => Promise<{
         ok: boolean;
@@ -826,4 +939,8 @@ interface HardwareCapabilities {
   gpuName: string | null;
   /** Total system RAM in GB, or null if detection failed */
   ramGb: number | null;
+  runtimeState?: "not_started" | "checking" | "not_initialized" | "initializing" | "ready" | "failed";
+  statusSource?: "local_estimate" | "python_probe" | "python_check";
+  pythonPath?: string;
+  usingRepoVenv?: boolean;
 }

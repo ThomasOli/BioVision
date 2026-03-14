@@ -2,7 +2,13 @@
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSelector } from "react-redux";
 import { RootState } from "../state/store";
-import { Point, BoundingBox, AnnotatedImage } from "../types/Image";
+import { Point, BoundingBox, AnnotatedImage, StoredOrientationLabel } from "../types/Image";
+import {
+  getClassIdForOrientationLabel,
+  getOppositeOrientationLabel,
+  getOrientationHintForClassId,
+  getOrientationLabelFromBox,
+} from "@/lib/orientationDisplay";
 
 // Deep clone helper for boxes
 const cloneBoxes = (boxes: BoundingBox[]): BoundingBox[] =>
@@ -51,7 +57,7 @@ interface SuperAnnotateObjectData {
   detection_method: string;
   class_id?: number;
   orientation_hint?: {
-    orientation?: "left" | "right";
+    orientation?: StoredOrientationLabel;
     confidence?: number;
     source?: string;
   };
@@ -109,6 +115,16 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     return Math.min(...template.map((lm) => lm.index));
   }, [activeSpeciesId, speciesList]);
 
+  const activeOrientationPolicy = useMemo(
+    () => speciesList.find((s) => s.id === activeSpeciesId)?.orientationPolicy,
+    [activeSpeciesId, speciesList]
+  );
+  const activeOrientationMode = activeOrientationPolicy?.mode;
+  const activeBilateralClassAxis = activeOrientationPolicy?.bilateralClassAxis;
+  const effectiveBilateralClassAxis =
+    activeBilateralClassAxis ??
+    (activeOrientationMode === "bilateral" ? "vertical_obb" : undefined);
+
   // Keep images in sync with Redux fileArray, filtered by activeSpeciesId
   useEffect(() => {
     setImages((prevImages) => {
@@ -142,6 +158,12 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
           const reduxFinalized = Boolean(fromRedux.isFinalized);
           if (Boolean(img.isFinalized) !== reduxFinalized) {
             next.isFinalized = reduxFinalized;
+            changed = true;
+          }
+          const reduxFinalizePhase = fromRedux.finalizePhase;
+          const currentFinalizePhase = img.finalizePhase;
+          if (JSON.stringify(currentFinalizePhase ?? null) !== JSON.stringify(reduxFinalizePhase ?? null)) {
+            next.finalizePhase = reduxFinalizePhase;
             changed = true;
           }
           if (fromRedux.hasBoxes && !img.hasBoxes) {
@@ -467,21 +489,47 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
       return prevImages.map((img) => {
         if (!img.boxes?.length) return img;
         const flippedBoxes = img.boxes.map((box) => {
-          const currentId = box.class_id !== undefined ? box.class_id : 0;
-          const nextId = currentId === 0 ? 1 : 0;
+          const currentOrientation = getOrientationLabelFromBox(
+            activeOrientationMode,
+            box,
+            effectiveBilateralClassAxis,
+            0
+          );
+          const nextOrientation = getOppositeOrientationLabel(
+            activeOrientationMode,
+            currentOrientation,
+            effectiveBilateralClassAxis
+          );
+          const nextId =
+            getClassIdForOrientationLabel(
+              activeOrientationMode,
+              nextOrientation,
+              effectiveBilateralClassAxis
+            ) ?? (box.class_id === 1 ? 0 : 1);
           return {
             ...box,
             class_id: nextId,
-            orientation_hint: box.orientation_hint
-              ? { ...box.orientation_hint, orientation: nextId === 0 ? "left" as const : "right" as const }
-              : undefined,
+            orientation_hint: {
+              ...(box.orientation_hint ?? {}),
+              orientation:
+                getOrientationHintForClassId(
+                  activeOrientationMode,
+                  nextId,
+                  effectiveBilateralClassAxis
+                ) ?? nextOrientation,
+              confidence:
+                Number.isFinite(Number(box.orientation_hint?.confidence))
+                  ? Number(box.orientation_hint?.confidence)
+                  : 1,
+              source: box.orientation_hint?.source || "user_flip_all",
+            },
           };
         });
         markDirty(img.id);
         return { ...img, boxes: flippedBoxes };
       });
     });
-  }, [markDirty]);
+  }, [effectiveBilateralClassAxis, activeOrientationMode, markDirty]);
 
   const addLandmark = useCallback(
     (boxId: number, pointData: Omit<Point, "id">) => {

@@ -31,6 +31,7 @@ import {
   BoundingBox,
   LandmarkDefinition,
   OrientationPolicy,
+  ReusableSchemaTemplate,
 } from "@/types/Image";
 import type { RootState } from "@/state/store";
 import { SettingsModal } from "./SettingsModal";
@@ -101,20 +102,62 @@ function formatDate(dateStr: string): string {
   }
 }
 
-/** Deterministic session ID for a default schema so the same schema always maps to the same session */
+type SchemaKind = "default" | "custom";
+type EditableSchemaDraft = {
+  id?: string;
+  name: string;
+  description: string;
+  landmarks: LandmarkDefinition[];
+  sourcePresetId?: string;
+  orientationPolicy?: OrientationPolicy;
+};
+
+function normalizeSchemaComponent(value: string | undefined): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeSchemaSlug(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function computeSchemaFingerprint(landmarkTemplate: LandmarkDefinition[]): string {
+  const normalized = (landmarkTemplate || []).map((landmark, position) => ({
+    index: Number.isFinite(Number(landmark?.index)) ? Math.max(1, Number(landmark.index)) : position + 1,
+    name: normalizeSchemaComponent(landmark?.name),
+    category: normalizeSchemaComponent(landmark?.category),
+  }));
+
+  let hash = 2166136261;
+  const input = JSON.stringify(normalized);
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function shortSchemaFingerprint(fingerprint: string): string {
+  return String(fingerprint || "").slice(0, 8);
+}
+
 function schemaToSessionId(schema: LandmarkSchema): string {
   return `schema-${schema.id}`;
 }
 
-/** Deterministic session ID for a custom schema based on its name */
-function customSchemaToSessionId(name: string): string {
-  const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  return `schema-custom-${normalized || Date.now()}`;
+function customSchemaBaseSessionId(name: string): string {
+  const normalized = normalizeSchemaSlug(name);
+  return `schema-custom-${normalized || "untitled"}`;
+}
+
+function buildForkedSessionId(baseSessionId: string, schemaFingerprint: string): string {
+  return `${baseSessionId}-${shortSchemaFingerprint(schemaFingerprint)}`;
 }
 
 function inferDefaultOrientationPolicy(
   landmarkTemplate: LandmarkDefinition[]
 ): OrientationPolicy {
+  const byName = (name: string) =>
+    landmarkTemplate.find((lm) => String(lm.name || "").trim().toLowerCase() === name)?.index;
   const categories = new Set(
     (landmarkTemplate || [])
       .map((lm) => (lm.category || "").trim().toLowerCase())
@@ -125,17 +168,22 @@ function inferDefaultOrientationPolicy(
   const hasCaudalTail = categories.has("caudal-fin");
   const tailCategories = ["tail", "caudal-fin"].filter((cat) => categories.has(cat));
   if (hasHead || hasTail || hasCaudalTail) {
+    const snoutTip = byName("snout tip");
+    const upperCaudal = byName("upper caudal peduncle");
+    const lowerCaudal = byName("lower caudal peduncle");
     return {
       mode: "directional",
       targetOrientation: "left",
       headCategories: ["head"],
       tailCategories: tailCategories.length > 0 ? tailCategories : ["tail", "caudal-fin"],
-      pcaLevelingMode: "auto",
+      ...(Number.isFinite(Number(snoutTip)) ? { anteriorAnchorIds: [Number(snoutTip)] } : {}),
+      ...(Number.isFinite(Number(upperCaudal)) && Number.isFinite(Number(lowerCaudal))
+        ? { posteriorAnchorIds: [Number(upperCaudal), Number(lowerCaudal)] }
+        : {}),
     };
   }
   return {
     mode: "invariant",
-    pcaLevelingMode: "off",
   };
 }
 
@@ -145,12 +193,20 @@ type PendingSessionLaunch =
       speciesId: string;
       name: string;
       landmarkTemplate: LandmarkDefinition[];
+      orientationPolicy?: OrientationPolicy;
+      schemaKind: SchemaKind;
+      schemaSourceId: string;
+      schemaFingerprint: string;
     }
   | {
       type: "resume";
       speciesId: string;
       name: string;
       landmarkTemplate: LandmarkDefinition[];
+      orientationPolicy?: OrientationPolicy;
+      schemaKind: SchemaKind;
+      schemaSourceId: string;
+      schemaFingerprint: string;
     };
 
 const ORIENTATION_MODE_LABELS: Record<OrientationPolicy["mode"], { title: string; description: string }> = {
@@ -176,7 +232,7 @@ const ORIENTATION_MODE_DETAILS: Record<OrientationPolicy["mode"], string> = {
   directional:
     "Backend goal: the OBB detector levels the crop to the major axis, then class_id enforces a canonical facing direction (head-left). Best for side-view organisms.",
   bilateral:
-    "Backend goal: the OBB detector levels the crop along the symmetry axis; class_id tags mirrored specimens; bilateral augmentation handles paired left/right structures.",
+    "Backend goal: the OBB detector levels the crop along the symmetry axis; class_id encodes canonical up/down orientation for vertically symmetric specimens.",
   axial:
     "Backend goal: the OBB detector levels the long axis; class_id (0=up, 1=down) triggers a 180° rotation to a canonical up-facing orientation.",
   invariant:
@@ -198,22 +254,35 @@ function buildOrientationPolicy(
   const tailCategories = ["tail", "caudal-fin"].filter((cat) => categories.has(cat));
 
   if (mode === "directional") {
+    const snoutTip = landmarkTemplate.find((lm) => String(lm.name || "").trim().toLowerCase() === "snout tip")?.index;
+    const upperCaudal = landmarkTemplate.find((lm) => String(lm.name || "").trim().toLowerCase() === "upper caudal peduncle")?.index;
+    const lowerCaudal = landmarkTemplate.find((lm) => String(lm.name || "").trim().toLowerCase() === "lower caudal peduncle")?.index;
     return {
       mode,
       targetOrientation: "left",
       headCategories: hasHead ? ["head"] : [],
       tailCategories:
         hasTail || hasCaudalTail ? (tailCategories.length > 0 ? tailCategories : ["tail", "caudal-fin"]) : [],
-      pcaLevelingMode: "auto",
+      ...(Number.isFinite(Number(snoutTip)) ? { anteriorAnchorIds: [Number(snoutTip)] } : {}),
+      ...(Number.isFinite(Number(upperCaudal)) && Number.isFinite(Number(lowerCaudal))
+        ? { posteriorAnchorIds: [Number(upperCaudal), Number(lowerCaudal)] }
+        : {}),
     };
   }
   if (mode === "bilateral") {
-    return { mode, pcaLevelingMode: "auto" };
+    const distal = landmarkTemplate.find((lm) => Number(lm.index) === 3)?.index;
+    const basal = landmarkTemplate.find((lm) => Number(lm.index) === 12)?.index;
+    return {
+      mode,
+      bilateralClassAxis: "vertical_obb",
+      ...(Number.isFinite(Number(distal)) ? { anteriorAnchorIds: [Number(distal)] } : {}),
+      ...(Number.isFinite(Number(basal)) ? { posteriorAnchorIds: [Number(basal)] } : {}),
+    };
   }
   if (mode === "axial") {
-    return { mode, pcaLevelingMode: "auto" };
+    return { mode };
   }
-  return { mode: "invariant", pcaLevelingMode: "off" };
+  return { mode: "invariant" };
 }
 
 export const LandingPage: React.FC<LandingPageProps> = ({
@@ -227,6 +296,9 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [helpOpen, setHelpOpen] = useState(false);
   const [schemaDialogOpen, setSchemaDialogOpen] = useState(false);
   const [customSchemaDialogOpen, setCustomSchemaDialogOpen] = useState(false);
+  const [customSchemaTemplates, setCustomSchemaTemplates] = useState<ReusableSchemaTemplate[]>([]);
+  const [schemaEditorMode, setSchemaEditorMode] = useState<"create" | "edit-default" | "edit-custom">("create");
+  const [schemaEditorInitial, setSchemaEditorInitial] = useState<EditableSchemaDraft | null>(null);
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [resumingSessionId, setResumingSessionId] = useState<string | null>(null);
@@ -238,9 +310,15 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   useEffect(() => {
     const loadSessions = async () => {
       try {
-        const result = await window.api.sessionList();
-        if (result.ok) {
-          setSessions(result.sessions);
+        const [sessionResult, templateResult] = await Promise.all([
+          window.api.sessionList(),
+          window.api.schemaListTemplates(),
+        ]);
+        if (sessionResult.ok) {
+          setSessions(sessionResult.sessions);
+        }
+        if (templateResult.ok) {
+          setCustomSchemaTemplates(templateResult.templates);
         }
       } catch (err) {
         console.error("Failed to load sessions:", err);
@@ -251,6 +329,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     loadSessions();
   }, []);
 
+  const upsertCustomTemplate = (template: ReusableSchemaTemplate) => {
+    setCustomSchemaTemplates((prev) => {
+      const next = [template, ...prev.filter((existing) => existing.id !== template.id)];
+      next.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+      return next;
+    });
+  };
+
   // Auto-open schema dialog when navigated here from models page
   useEffect(() => {
     if (openSchemaDialogOnMount) {
@@ -260,16 +346,68 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   }, [openSchemaDialogOnMount, onSchemaDialogOpened]);
 
   const openOrientationDialogForLaunch = (launch: PendingSessionLaunch) => {
-    const suggested = inferDefaultOrientationPolicy(launch.landmarkTemplate).mode;
+    const suggested = launch.orientationPolicy?.mode || inferDefaultOrientationPolicy(launch.landmarkTemplate).mode;
     setPendingSessionLaunch(launch);
     setSelectedOrientationMode(suggested);
     setOrientationDialogOpen(true);
   };
 
+  const resolveSchemaSession = async (args: {
+    schemaKind: SchemaKind;
+    schemaSourceId: string;
+    schemaFingerprint: string;
+    baseSessionId: string;
+    preferredSessionId: string;
+  }): Promise<{ speciesId: string; exists: boolean }> => {
+    const exact = sessions.find(
+      (session) =>
+        session.schemaKind === args.schemaKind &&
+        session.schemaSourceId === args.schemaSourceId &&
+        session.schemaFingerprint === args.schemaFingerprint
+    );
+    if (exact) {
+      return { speciesId: exact.speciesId, exists: true };
+    }
+
+    const legacyBase = sessions.find((session) => session.speciesId === args.baseSessionId);
+    if (legacyBase) {
+      try {
+        const loaded = await window.api.sessionLoad(args.baseSessionId);
+        if (loaded.ok) {
+          const loadedTemplate = Array.isArray(loaded.meta?.landmarkTemplate)
+            ? loaded.meta.landmarkTemplate
+            : [];
+          const loadedFingerprint =
+            String(loaded.meta?.schemaFingerprint || "") ||
+            computeSchemaFingerprint(loadedTemplate);
+          if (loadedFingerprint === args.schemaFingerprint) {
+            return { speciesId: args.baseSessionId, exists: true };
+          }
+        }
+      } catch {
+        // Fall through to fork/create resolution.
+      }
+    }
+
+    const speciesId =
+      args.schemaKind === "default" && !legacyBase
+        ? args.baseSessionId
+        : args.preferredSessionId;
+    return {
+      speciesId,
+      exists: sessions.some((session) => session.speciesId === speciesId),
+    };
+  };
+
   const beginResumeWithOrientationCheck = async (
     speciesId: string,
     sessionName: string,
-    fallbackTemplate: LandmarkDefinition[] = []
+    fallbackTemplate: LandmarkDefinition[] = [],
+    schemaMetadata?: {
+      schemaKind: SchemaKind;
+      schemaSourceId: string;
+      schemaFingerprint: string;
+    }
   ) => {
     const existingSession = sessions.find((s) => s.speciesId === speciesId);
     const hasConfiguredFromList = Boolean(
@@ -307,21 +445,52 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       speciesId,
       name: sessionName,
       landmarkTemplate: template,
+      orientationPolicy: existingSession?.orientationPolicy,
+      schemaKind: schemaMetadata?.schemaKind || "default",
+      schemaSourceId: schemaMetadata?.schemaSourceId || speciesId,
+      schemaFingerprint:
+        schemaMetadata?.schemaFingerprint || computeSchemaFingerprint(template),
     });
   };
 
   const confirmOrientationSelection = async () => {
     if (!pendingSessionLaunch) return;
     const launch = pendingSessionLaunch;
-    const policy = buildOrientationPolicy(
+    const builtPolicy = buildOrientationPolicy(
       selectedOrientationMode,
       launch.landmarkTemplate
     );
+    const policy: OrientationPolicy = {
+      ...builtPolicy,
+      ...(Array.isArray(launch.orientationPolicy?.anteriorAnchorIds) && launch.orientationPolicy.anteriorAnchorIds.length > 0
+        ? { anteriorAnchorIds: launch.orientationPolicy.anteriorAnchorIds }
+        : {}),
+      ...(Array.isArray(launch.orientationPolicy?.posteriorAnchorIds) && launch.orientationPolicy.posteriorAnchorIds.length > 0
+        ? { posteriorAnchorIds: launch.orientationPolicy.posteriorAnchorIds }
+        : {}),
+      ...(Array.isArray(launch.orientationPolicy?.headCategories) && launch.orientationPolicy.headCategories.length > 0
+        ? { headCategories: launch.orientationPolicy.headCategories }
+        : {}),
+      ...(Array.isArray(launch.orientationPolicy?.tailCategories) && launch.orientationPolicy.tailCategories.length > 0
+        ? { tailCategories: launch.orientationPolicy.tailCategories }
+        : {}),
+      ...(launch.orientationPolicy?.obbLevelingMode ? { obbLevelingMode: launch.orientationPolicy.obbLevelingMode } : {}),
+    };
     setOrientationDialogOpen(false);
     setPendingSessionLaunch(null);
 
     if (launch.type === "create") {
-      await createNewSession(launch.speciesId, launch.name, launch.landmarkTemplate, policy);
+      await createNewSession(
+        launch.speciesId,
+        launch.name,
+        launch.landmarkTemplate,
+        policy,
+        {
+          schemaKind: launch.schemaKind,
+          schemaSourceId: launch.schemaSourceId,
+          schemaFingerprint: launch.schemaFingerprint,
+        }
+      );
       return;
     }
 
@@ -356,7 +525,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           models: [],
           imageCount: 0,
           annotationCount: 0,
-          createdAt: new Date(),
+          createdAt: new Date().toISOString(),
         };
         dispatch(addSpecies(reconstructed));
       } else {
@@ -402,6 +571,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           history: [] as BoundingBox[][],
           future: [] as BoundingBox[][],
           speciesId,
+          isFinalized: img.finalized ?? false,
           hasBoxes: img.hasBoxes ?? false,
         };
       });
@@ -421,7 +591,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     speciesId: string,
     name: string,
     landmarkTemplate: LandmarkDefinition[],
-    orientationPolicyOverride?: OrientationPolicy
+    orientationPolicyOverride?: OrientationPolicy,
+    schemaMetadata?: {
+      schemaKind: SchemaKind;
+      schemaSourceId: string;
+      schemaFingerprint: string;
+    }
   ) => {
     const orientationPolicy =
       orientationPolicyOverride || inferDefaultOrientationPolicy(landmarkTemplate);
@@ -433,7 +608,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       models: [],
       imageCount: 0,
       annotationCount: 0,
-      createdAt: new Date(),
+      createdAt: new Date().toISOString(),
     };
 
     dispatch(addSpecies(newSpecies));
@@ -444,7 +619,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         speciesId,
         name,
         landmarkTemplate,
-        orientationPolicy
+        orientationPolicy,
+        schemaMetadata
       );
     } catch (err) {
       console.error("Failed to create session on disk:", err);
@@ -454,48 +630,146 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     onNavigate("workspace");
   };
 
+  const handleLaunchCustomTemplate = async (schema: ReusableSchemaTemplate) => {
+    const schemaFingerprint = computeSchemaFingerprint(schema.landmarks);
+    const schemaSourceId = schema.id;
+    const baseSessionId = customSchemaBaseSessionId(schema.id);
+    const preferredSessionId = buildForkedSessionId(baseSessionId, schemaFingerprint);
+    const resolved = await resolveSchemaSession({
+      schemaKind: "custom",
+      schemaSourceId,
+      schemaFingerprint,
+      baseSessionId,
+      preferredSessionId,
+    });
+
+    if (resolved.exists) {
+      await beginResumeWithOrientationCheck(resolved.speciesId, schema.name, schema.landmarks, {
+        schemaKind: "custom",
+        schemaSourceId,
+        schemaFingerprint,
+      });
+    } else {
+      openOrientationDialogForLaunch({
+        type: "create",
+        speciesId: resolved.speciesId,
+        name: schema.name,
+        landmarkTemplate: schema.landmarks,
+        orientationPolicy: schema.orientationPolicy,
+        schemaKind: "custom",
+        schemaSourceId,
+        schemaFingerprint,
+      });
+    }
+  };
+
   /** Schema selected: resume the existing session for this schema, or create a new one */
-  const handleSchemaSelect = async (schema: LandmarkSchema | "custom") => {
+  const handleSchemaSelect = async (schema: LandmarkSchema | ReusableSchemaTemplate | "custom") => {
     if (schema === "custom") {
       setSchemaDialogOpen(false);
+      setSchemaEditorMode("create");
+      setSchemaEditorInitial(null);
       setCustomSchemaDialogOpen(true);
+      return;
+    }
+
+    if ("kind" in schema && schema.kind === "custom") {
+      setSchemaDialogOpen(false);
+      await handleLaunchCustomTemplate(schema);
       return;
     }
 
     setSchemaDialogOpen(false);
 
-    const sessionId = schemaToSessionId(schema);
-    const existingSession = sessions.find((s) => s.speciesId === sessionId);
+    const schemaFingerprint = computeSchemaFingerprint(schema.landmarks);
+    const baseSessionId = schemaToSessionId(schema);
+    const preferredSessionId = buildForkedSessionId(baseSessionId, schemaFingerprint);
+    const resolved = await resolveSchemaSession({
+      schemaKind: "default",
+      schemaSourceId: schema.id,
+      schemaFingerprint,
+      baseSessionId,
+      preferredSessionId,
+    });
 
-    if (existingSession) {
-      await beginResumeWithOrientationCheck(sessionId, schema.name, schema.landmarks);
+    if (resolved.exists) {
+      await beginResumeWithOrientationCheck(resolved.speciesId, schema.name, schema.landmarks, {
+        schemaKind: "default",
+        schemaSourceId: schema.id,
+        schemaFingerprint,
+      });
     } else {
       openOrientationDialogForLaunch({
         type: "create",
-        speciesId: sessionId,
+        speciesId: resolved.speciesId,
         name: schema.name,
         landmarkTemplate: schema.landmarks,
+        schemaKind: "default",
+        schemaSourceId: schema.id,
+        schemaFingerprint,
       });
     }
   };
 
-  /** Custom schema submitted: resume if a session with this name exists, or create new */
-  const handleCustomSchemaSubmit = async (schema: LandmarkSchema) => {
+  /** Custom schema submitted: save/update reusable template, then resume or create a session */
+  const handleCustomSchemaSubmit = async (schema: EditableSchemaDraft) => {
     setCustomSchemaDialogOpen(false);
+    try {
+      const result =
+        schemaEditorMode === "edit-custom" && schema.id
+          ? await window.api.schemaUpdateCustomTemplate(schema.id, {
+              name: schema.name,
+              description: schema.description,
+              landmarks: schema.landmarks,
+              orientationPolicy: schema.orientationPolicy,
+              sourcePresetId: schema.sourcePresetId,
+            })
+          : await window.api.schemaSaveCustomTemplate({
+              name: schema.name,
+              description: schema.description,
+              landmarks: schema.landmarks,
+              orientationPolicy: schema.orientationPolicy,
+              sourcePresetId: schema.sourcePresetId,
+            });
 
-    const sessionId = customSchemaToSessionId(schema.name);
-    const existingSession = sessions.find((s) => s.speciesId === sessionId);
+      if (!result.ok || !result.template) {
+        toast.error(result.error || "Failed to save custom schema.");
+        return;
+      }
 
-    if (existingSession) {
-      await beginResumeWithOrientationCheck(sessionId, schema.name, schema.landmarks);
-    } else {
-      openOrientationDialogForLaunch({
-        type: "create",
-        speciesId: sessionId,
-        name: schema.name,
-        landmarkTemplate: schema.landmarks,
-      });
+      upsertCustomTemplate(result.template);
+      await handleLaunchCustomTemplate(result.template);
+    } catch (error) {
+      console.error("Failed to save custom schema:", error);
+      toast.error("Failed to save custom schema.");
     }
+  };
+
+  const handleEditDefaultSchema = (schema: LandmarkSchema) => {
+    setSchemaDialogOpen(false);
+    setSchemaEditorMode("edit-default");
+    setSchemaEditorInitial({
+      name: schema.name,
+      description: schema.description,
+      landmarks: schema.landmarks,
+      sourcePresetId: schema.id,
+      orientationPolicy: inferDefaultOrientationPolicy(schema.landmarks),
+    });
+    setCustomSchemaDialogOpen(true);
+  };
+
+  const handleEditCustomSchema = (schema: ReusableSchemaTemplate) => {
+    setSchemaDialogOpen(false);
+    setSchemaEditorMode("edit-custom");
+    setSchemaEditorInitial({
+      id: schema.id,
+      name: schema.name,
+      description: schema.description,
+      landmarks: schema.landmarks,
+      sourcePresetId: schema.sourcePresetId,
+      orientationPolicy: schema.orientationPolicy,
+    });
+    setCustomSchemaDialogOpen(true);
   };
 
   const menuItems = [
@@ -530,7 +804,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
   return (
     <>
-      <div className="flex h-screen w-screen flex-col items-center bg-background p-8 overflow-y-auto">
+      <div className="flex h-screen w-screen flex-col items-center bg-background p-8 overflow-y-auto scrollbar-app">
         {/* Settings button */}
         <div className="absolute right-4 top-4">
           <motion.div {...buttonHover} {...buttonTap}>
@@ -692,8 +966,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           <div className="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
             <p>
               The OBB detector levels each specimen crop to a canonical orientation before
-              landmark prediction. class_id (0 = canonical, 1 = mirrored) is computed from head/tail
-              landmark positions at annotation time and flows through training and inference automatically.
+              landmark prediction. For directional schemas, class_id tracks left/right; for
+              bilateral it tracks up/down; axial and invariant detector export stay one-class.
               Invariant schemas skip orientation enforcement and rely on broad augmentation instead.
             </p>
           </div>
@@ -718,11 +992,16 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       <HelpPanel open={helpOpen} onOpenChange={setHelpOpen} />
       <SchemaSelector
         open={schemaDialogOpen}
+        customSchemas={customSchemaTemplates}
         onSelect={handleSchemaSelect}
+        onEditDefault={handleEditDefaultSchema}
+        onEditCustom={handleEditCustomSchema}
         onCancel={() => setSchemaDialogOpen(false)}
       />
       <CustomSchemaEditor
         open={customSchemaDialogOpen}
+        mode={schemaEditorMode}
+        initialSchema={schemaEditorInitial}
         onSave={handleCustomSchemaSubmit}
         onCancel={() => setCustomSchemaDialogOpen(false)}
       />

@@ -8,6 +8,7 @@ import { Progress } from "@/Components/ui/progress";
 import { ScrollArea } from "@/Components/ui/scroll-area";
 import { Slider } from "@/Components/ui/slider";
 import { Switch } from "@/Components/ui/switch";
+import type { ObbTrainProgressEvent, ObbTrainingSettings } from "@/types/Image";
 import {
   Dialog,
   DialogContent,
@@ -42,8 +43,10 @@ interface TrainModelDialogProps {
   isTrainingObb?: boolean;
   handleTrainObbDetector?: () => Promise<void>;
   obbTrainingMessage?: string;
-  obbHyperparams?: { iou: number; cls: number; box: number };
-  onObbHyperparamsChange?: (v: { iou: number; cls: number; box: number }) => void;
+  obbTrainingProgress?: ObbTrainProgressEvent | null;
+  obbTrainingSettings?: ObbTrainingSettings;
+  obbTrainingRecommendation?: string;
+  onObbTrainingSettingsChange?: (v: ObbTrainingSettings) => void;
   cnnVariants?: {
     id: string;
     label: string;
@@ -112,8 +115,10 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   isTrainingObb = false,
   handleTrainObbDetector,
   obbTrainingMessage,
-  obbHyperparams = { iou: 0.3, cls: 1.5, box: 5.0 },
-  onObbHyperparamsChange,
+  obbTrainingProgress = null,
+  obbTrainingSettings = { iou: 0.3, cls: 1.5, box: 5.0 },
+  obbTrainingRecommendation,
+  onObbTrainingSettingsChange,
 }) => {
   const [touched, setTouched] = useState(false);
 
@@ -218,6 +223,43 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     if (Number.isFinite(eta) && eta >= 0) return `ETA ${Math.round(eta)}s`;
     return null;
   }, [progressDetails]);
+  const obbProgressDetails = obbTrainingProgress?.details ?? null;
+  const obbProgressEpochLabel = useMemo(() => {
+    if (!obbProgressDetails) return null;
+    const epoch = Number(obbProgressDetails.epoch);
+    const epochs = Number(obbProgressDetails.epochs);
+    if (Number.isFinite(epoch) && Number.isFinite(epochs) && epochs > 0) {
+      return `Epoch ${Math.round(epoch)}/${Math.round(epochs)}`;
+    }
+    return null;
+  }, [obbProgressDetails]);
+  const obbProgressBatchLabel = useMemo(() => {
+    if (!obbProgressDetails) return null;
+    const batch = Number(obbProgressDetails.batch);
+    const batches = Number(obbProgressDetails.batches);
+    if (Number.isFinite(batch) && Number.isFinite(batches) && batches > 0) {
+      return `Batch ${Math.round(batch)}/${Math.round(batches)}`;
+    }
+    return null;
+  }, [obbProgressDetails]);
+  const obbProgressLossLabel = useMemo(() => {
+    if (!obbProgressDetails) return null;
+    const loss = Number(obbProgressDetails.loss);
+    if (Number.isFinite(loss)) return `Loss ${loss.toFixed(4)}`;
+    return null;
+  }, [obbProgressDetails]);
+  const obbProgressLrLabel = useMemo(() => {
+    if (!obbProgressDetails) return null;
+    const lr = Number(obbProgressDetails.lr);
+    if (Number.isFinite(lr) && lr > 0) return `LR ${lr.toExponential(2)}`;
+    return null;
+  }, [obbProgressDetails]);
+  const obbProgressEtaLabel = useMemo(() => {
+    if (!obbProgressDetails) return null;
+    const eta = Number(obbProgressDetails.eta_sec);
+    if (Number.isFinite(eta) && eta >= 0) return `ETA ${Math.round(eta)}s`;
+    return null;
+  }, [obbProgressDetails]);
   const cnnSupported = useMemo(
     () => cnnVariants.length === 0 || cnnVariants.some((v) => v.selectable),
     [cnnVariants]
@@ -393,9 +435,11 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                   {obbDetectorReady ? "✓ Step 1: OBB Detector — ready" : "Step 1: Train OBB Detector"}
                 </p>
                 <p className="text-[11px] text-muted-foreground">
-                  {obbDetectorReady
-                    ? (obbTrainingMessage ?? "Retrain to update with new annotations.")
-                    : (obbTrainingMessage ?? "Train the orientation detector before landmarking.")}
+                  {isTrainingObb
+                    ? (obbTrainingProgress?.message ?? obbTrainingMessage ?? "OBB detector training in progress.")
+                    : obbDetectorReady
+                      ? (obbTrainingMessage ?? "Retrain to update with new annotations.")
+                      : (obbTrainingMessage ?? "Train the orientation detector before landmarking.")}
                 </p>
               </div>
               {handleTrainObbDetector && (
@@ -413,49 +457,138 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
               )}
             </div>
             {/* Advanced OBB hyperparameters accordion */}
-            {onObbHyperparamsChange && (
+            {onObbTrainingSettingsChange && (
               <details className="mt-2 rounded-md border border-border/60 bg-muted/20">
                 <summary className="cursor-pointer px-3 py-2 text-xs font-semibold select-none">
                   Advanced Training Hyperparameters
                 </summary>
                 <div className="flex flex-col gap-3 px-3 pb-3 pt-1">
+                  {obbTrainingRecommendation && (
+                    <p className="text-[11px] text-muted-foreground">
+                      {obbTrainingRecommendation}
+                    </p>
+                  )}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="flex flex-col gap-1">
+                      <Label className="text-xs text-muted-foreground">Model tier</Label>
+                      <select
+                        value={obbTrainingSettings.modelTier ?? "medium"}
+                        onChange={(e) => onObbTrainingSettingsChange({ ...obbTrainingSettings, modelTier: e.target.value as "nano" | "small" | "medium" | "large" })}
+                        disabled={isTrainingObb || isTraining}
+                        className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+                      >
+                        <option value="nano">Nano</option>
+                        <option value="small">Small</option>
+                        <option value="medium">Medium</option>
+                        <option value="large">Large</option>
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <Label className="text-xs text-muted-foreground">Training resolution</Label>
+                      <select
+                        value={obbTrainingSettings.imgsz ?? 640}
+                        onChange={(e) => onObbTrainingSettingsChange({ ...obbTrainingSettings, imgsz: Number(e.target.value) as 640 | 960 | 1280 })}
+                        disabled={isTrainingObb || isTraining}
+                        className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+                      >
+                        <option value={640}>640</option>
+                        <option value={960}>960</option>
+                        <option value={1280}>1280</option>
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <Label className="text-xs text-muted-foreground">Epochs</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={500}
+                        value={obbTrainingSettings.epochs ?? ""}
+                        onChange={(e) => onObbTrainingSettingsChange({ ...obbTrainingSettings, epochs: e.target.value ? Number(e.target.value) : undefined })}
+                        disabled={isTrainingObb || isTraining}
+                        className="h-8 text-xs"
+                        placeholder="Auto"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <Label className="text-xs text-muted-foreground">Batch size</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={128}
+                        value={obbTrainingSettings.batch ?? ""}
+                        onChange={(e) => onObbTrainingSettingsChange({ ...obbTrainingSettings, batch: e.target.value ? Number(e.target.value) : undefined })}
+                        disabled={isTrainingObb || isTraining}
+                        className="h-8 text-xs"
+                        placeholder="Auto"
+                      />
+                    </div>
+                  </div>
                   <div className="flex flex-col gap-1">
                     <Label className="text-xs text-muted-foreground">
-                      NMS IoU threshold: {obbHyperparams.iou.toFixed(2)}
+                      NMS IoU threshold: {(obbTrainingSettings.iou ?? 0.3).toFixed(2)}
                       <span className="ml-1 text-[10px] opacity-60">(lower = suppress more overlapping boxes)</span>
                     </Label>
                     <Slider
-                      value={[obbHyperparams.iou]}
-                      onValueChange={([v]) => onObbHyperparamsChange({ ...obbHyperparams, iou: v })}
+                      value={[obbTrainingSettings.iou ?? 0.3]}
+                      onValueChange={([v]) => onObbTrainingSettingsChange({ ...obbTrainingSettings, iou: v })}
                       min={0.1} max={0.9} step={0.05}
                       disabled={isTrainingObb || isTraining}
                     />
                   </div>
                   <div className="flex flex-col gap-1">
                     <Label className="text-xs text-muted-foreground">
-                      Classification loss weight: {obbHyperparams.cls.toFixed(1)}
+                      Classification loss weight: {(obbTrainingSettings.cls ?? 1.5).toFixed(1)}
                       <span className="ml-1 text-[10px] opacity-60">(higher = sharper confidence scores)</span>
                     </Label>
                     <Slider
-                      value={[obbHyperparams.cls]}
-                      onValueChange={([v]) => onObbHyperparamsChange({ ...obbHyperparams, cls: v })}
+                      value={[obbTrainingSettings.cls ?? 1.5]}
+                      onValueChange={([v]) => onObbTrainingSettingsChange({ ...obbTrainingSettings, cls: v })}
                       min={0.1} max={3.0} step={0.1}
                       disabled={isTrainingObb || isTraining}
                     />
                   </div>
                   <div className="flex flex-col gap-1">
                     <Label className="text-xs text-muted-foreground">
-                      Box regression loss weight: {obbHyperparams.box.toFixed(1)}
+                      Box regression loss weight: {(obbTrainingSettings.box ?? 5.0).toFixed(1)}
                     </Label>
                     <Slider
-                      value={[obbHyperparams.box]}
-                      onValueChange={([v]) => onObbHyperparamsChange({ ...obbHyperparams, box: v })}
+                      value={[obbTrainingSettings.box ?? 5.0]}
+                      onValueChange={([v]) => onObbTrainingSettingsChange({ ...obbTrainingSettings, box: v })}
                       min={1.0} max={10.0} step={0.5}
                       disabled={isTrainingObb || isTraining}
                     />
                   </div>
                 </div>
               </details>
+            )}
+            {obbTrainingProgress && (
+              <div className="mt-2 space-y-2 rounded-md border border-border/60 bg-background/80 p-3">
+                <div className="flex items-center justify-between text-xs">
+                  <p className="font-semibold text-foreground">
+                    {obbTrainingProgress.message || "OBB detector training in progress..."}
+                  </p>
+                  <span className="text-muted-foreground">
+                    {Math.max(0, Math.min(100, Math.round(obbTrainingProgress.percent ?? 0)))}%
+                  </span>
+                </div>
+                {obbTrainingProgress.stage && (
+                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                    Stage: {obbTrainingProgress.stage}
+                  </p>
+                )}
+                <Progress
+                  className="h-2"
+                  value={Math.max(0, Math.min(100, Math.round(obbTrainingProgress.percent ?? 0)))}
+                />
+                {(obbProgressEpochLabel || obbProgressBatchLabel || obbProgressLossLabel || obbProgressLrLabel || obbProgressEtaLabel) && (
+                  <div className="grid grid-cols-2 gap-1 text-[11px] text-muted-foreground">
+                    <span>{obbProgressEpochLabel || obbProgressBatchLabel || " "}</span>
+                    <span className="text-right">{obbProgressEtaLabel || " "}</span>
+                    <span>{obbProgressLossLabel || obbProgressBatchLabel || " "}</span>
+                    <span className="text-right">{obbProgressLrLabel || " "}</span>
+                  </div>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -581,6 +714,9 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                     <p className="text-[11px] text-muted-foreground">
                       Fast controlled-image fallback. Best when crops are highly standardized and appearance variation is limited.
                     </p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      System defaults now scale offline augmentation and oversampling with dataset size while keeping dlib rotation rules unchanged.
+                    </p>
                   </div>
                 </label>
                 <label
@@ -673,6 +809,9 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
               <div className="flex flex-col gap-3 px-3 pb-3 pt-1">
                 <p className="text-[11px] text-muted-foreground">
                   These controls affect CNN augmentation only. Shared session orientation settings are configured above.
+                </p>
+                <p className="text-[11px] text-muted-foreground">
+                  The system recommendation now scales CNN augmentation strength with dataset size, but any slider you change here overrides that default.
                 </p>
                 <div className="hidden">
                   <div>

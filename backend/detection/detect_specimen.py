@@ -5,6 +5,51 @@ import sys
 
 import numpy as np
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+from detection_utils import normalize_orientation_payload
+
+
+def _resolve_obb_detection_preset(conf_threshold=0.3, nms_iou=0.3, max_specimens=20, detection_preset="balanced", imgsz=None):
+    preset = str(detection_preset or "balanced").strip().lower()
+    conf = float(conf_threshold)
+    iou = float(nms_iou)
+    top_k = int(max_specimens)
+    resolved_imgsz = int(imgsz) if imgsz is not None else 640
+
+    if preset == "custom":
+        conf = min(max(conf, 0.01), 0.99)
+        iou = min(max(iou, 0.05), 0.95)
+        top_k = min(max(top_k, 1), 250)
+        resolved_imgsz = 1280 if resolved_imgsz >= 1280 else 960 if resolved_imgsz >= 960 else 640
+    elif preset == "precision":
+        conf = max(conf, 0.45)
+        top_k = min(top_k, 8)
+        resolved_imgsz = 640
+    elif preset == "recall":
+        conf = min(conf, 0.2)
+        top_k = max(top_k, 30)
+        resolved_imgsz = 960 if resolved_imgsz < 960 else resolved_imgsz
+    elif preset == "single_object":
+        conf = max(conf, 0.35)
+        top_k = 1
+        resolved_imgsz = 640
+    else:
+        preset = "balanced"
+        conf = max(0.3, min(conf, 0.9))
+        top_k = max(1, min(top_k, 25))
+        resolved_imgsz = 640 if resolved_imgsz not in (640, 960, 1280) else resolved_imgsz
+
+    return {
+        "preset": preset,
+        "conf": conf,
+        "iou": iou,
+        "top_k": max(1, top_k),
+        "imgsz": resolved_imgsz,
+    }
+
 
 def _build_canonical_obb_from_xywhr(cx, cy, width, height, angle_rad):
     cos_a = math.cos(float(angle_rad))
@@ -178,16 +223,18 @@ def _class_agnostic_dedup(boxes, iou_threshold=0.5):
     return kept
 
 
-def _build_orientation_hint(class_id, confidence):
-    orientation = "left" if int(class_id) == 0 else "right"
+def _build_orientation_hint(class_id, confidence, orientation_policy=None):
+    payload = normalize_orientation_payload(class_id, orientation_policy)
+    hint = payload.get("orientation_hint")
+    if not isinstance(hint, dict):
+        return None
     return {
-        "orientation": orientation,
+        **hint,
         "confidence": float(confidence),
-        "source": "obb_class_id",
     }
 
 
-def _parse_obb_boxes(result, margin=20, max_specimens=20):
+def _parse_obb_boxes(result, margin=20, max_specimens=20, orientation_policy=None):
     boxes_obj = getattr(result, "obb", None)
     if boxes_obj is None or len(boxes_obj) == 0:
         return []
@@ -208,6 +255,7 @@ def _parse_obb_boxes(result, margin=20, max_specimens=20):
         top = max(0, int(round(y1)) - int(margin))
         right = min(img_w, int(round(x2)) + int(margin))
         bottom = min(img_h, int(round(y2)) + int(margin))
+        orientation_hint = _build_orientation_hint(class_id, confidence, orientation_policy)
         parsed.append(
             {
                 "left": left,
@@ -222,13 +270,22 @@ def _parse_obb_boxes(result, margin=20, max_specimens=20):
                 "detection_method": "yolo_obb",
                 "obbCorners": corners,
                 "angle": angle_rad * 180.0 / math.pi,
-                "orientation_hint": _build_orientation_hint(class_id, confidence),
+                **({"orientation_hint": orientation_hint} if orientation_hint else {}),
             }
         )
     return _class_agnostic_dedup(parsed)
 
 
-def detect_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20):
+def detect_with_yolo(
+    image_path,
+    model_path,
+    conf_threshold=0.25,
+    margin=20,
+    orientation_policy=None,
+    nms_iou=None,
+    detection_preset="balanced",
+    imgsz=None,
+):
     try:
         from ultralytics import YOLO
     except Exception:
@@ -237,12 +294,31 @@ def detect_with_yolo(image_path, model_path, conf_threshold=0.25, margin=20):
     if not model_path or not os.path.exists(model_path):
         return None
 
+    resolved = _resolve_obb_detection_preset(
+        conf_threshold=conf_threshold,
+        nms_iou=0.3 if nms_iou is None else nms_iou,
+        max_specimens=1,
+        detection_preset=detection_preset,
+        imgsz=imgsz,
+    )
     model = YOLO(model_path)
-    results = model.predict(image_path, conf=float(conf_threshold), task="obb", verbose=False)
+    results = model.predict(
+        image_path,
+        conf=float(resolved["conf"]),
+        iou=float(resolved["iou"]),
+        imgsz=int(resolved["imgsz"]),
+        task="obb",
+        verbose=False,
+    )
     if not results:
         return None
 
-    boxes = _parse_obb_boxes(results[0], margin=margin, max_specimens=1)
+    boxes = _parse_obb_boxes(
+        results[0],
+        margin=margin,
+        max_specimens=1,
+        orientation_policy=orientation_policy,
+    )
     return boxes[0] if boxes else None
 
 
@@ -253,6 +329,9 @@ def detect_multiple_with_yolo(
     margin=20,
     max_specimens=20,
     nms_iou=None,
+    orientation_policy=None,
+    detection_preset="balanced",
+    imgsz=None,
 ):
     try:
         from ultralytics import YOLO
@@ -262,25 +341,54 @@ def detect_multiple_with_yolo(
     if not model_path or not os.path.exists(model_path):
         return None
 
-    predict_kwargs = {"conf": float(conf_threshold), "task": "obb", "verbose": False}
-    if nms_iou is not None:
-        predict_kwargs["iou"] = float(nms_iou)
+    resolved = _resolve_obb_detection_preset(
+        conf_threshold=conf_threshold,
+        nms_iou=0.3 if nms_iou is None else nms_iou,
+        max_specimens=max_specimens,
+        detection_preset=detection_preset,
+        imgsz=imgsz,
+    )
+    predict_kwargs = {
+        "conf": float(resolved["conf"]),
+        "iou": float(resolved["iou"]),
+        "imgsz": int(resolved["imgsz"]),
+        "task": "obb",
+        "verbose": False,
+    }
     model = YOLO(model_path)
     results = model.predict(image_path, **predict_kwargs)
     if not results:
         return None
 
-    boxes = _parse_obb_boxes(results[0], margin=margin, max_specimens=max_specimens)
+    boxes = _parse_obb_boxes(
+        results[0],
+        margin=margin,
+        max_specimens=resolved["top_k"],
+        orientation_policy=orientation_policy,
+    )
     boxes.sort(key=lambda item: (item["top"], item["left"]))
     return boxes
 
 
-def detect_specimen(image_path, margin=20, yolo_model_path=None):
+def detect_specimen(
+    image_path,
+    margin=20,
+    yolo_model_path=None,
+    orientation_policy=None,
+    conf_threshold=0.25,
+    nms_iou=None,
+    detection_preset="balanced",
+    imgsz=None,
+):
     return detect_with_yolo(
         image_path,
         yolo_model_path,
-        conf_threshold=0.25,
+        conf_threshold=conf_threshold,
         margin=margin,
+        orientation_policy=orientation_policy,
+        nms_iou=nms_iou,
+        detection_preset=detection_preset,
+        imgsz=imgsz,
     )
 
 
@@ -291,15 +399,22 @@ def detect_multiple_specimens(
     margin=20,
     max_specimens=20,
     nms_iou=None,
+    orientation_policy=None,
+    conf_threshold=0.25,
+    detection_preset="balanced",
+    imgsz=None,
 ):
     del min_area_ratio
     boxes = detect_multiple_with_yolo(
         image_path,
         yolo_model_path,
-        conf_threshold=0.25,
+        conf_threshold=conf_threshold,
         margin=margin,
         max_specimens=max_specimens,
         nms_iou=nms_iou,
+        orientation_policy=orientation_policy,
+        detection_preset=detection_preset,
+        imgsz=imgsz,
     )
     if boxes is None:
         return {
@@ -336,17 +451,62 @@ if __name__ == "__main__":
         sys.exit(0)
 
     yolo_model = None
+    conf_threshold = 0.25
+    nms_iou = None
+    max_specimens = 20
+    detection_preset = "balanced"
+    imgsz = None
     args = sys.argv[1:]
     if "--yolo-model" in args:
         idx = args.index("--yolo-model")
         if idx + 1 < len(args):
             yolo_model = args[idx + 1]
             args = args[:idx] + args[idx + 2:]
+    if "--conf" in args:
+        idx = args.index("--conf")
+        if idx + 1 < len(args):
+            conf_threshold = float(args[idx + 1])
+            args = args[:idx] + args[idx + 2:]
+    if "--nms-iou" in args:
+        idx = args.index("--nms-iou")
+        if idx + 1 < len(args):
+            nms_iou = float(args[idx + 1])
+            args = args[:idx] + args[idx + 2:]
+    if "--max-specimens" in args:
+        idx = args.index("--max-specimens")
+        if idx + 1 < len(args):
+            max_specimens = int(args[idx + 1])
+            args = args[:idx] + args[idx + 2:]
+    if "--detection-preset" in args:
+        idx = args.index("--detection-preset")
+        if idx + 1 < len(args):
+            detection_preset = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+    if "--imgsz" in args:
+        idx = args.index("--imgsz")
+        if idx + 1 < len(args):
+            imgsz = int(args[idx + 1])
+            args = args[:idx] + args[idx + 2:]
 
     image_path = args[0]
     if "--multi" in args:
-        result = detect_multiple_specimens(image_path, yolo_model_path=yolo_model)
+        result = detect_multiple_specimens(
+            image_path,
+            yolo_model_path=yolo_model,
+            conf_threshold=conf_threshold,
+            max_specimens=max_specimens,
+            nms_iou=nms_iou,
+            detection_preset=detection_preset,
+            imgsz=imgsz,
+        )
         print(json.dumps(result, indent=2))
     else:
-        result = detect_specimen(image_path, yolo_model_path=yolo_model)
+        result = detect_specimen(
+            image_path,
+            yolo_model_path=yolo_model,
+            conf_threshold=conf_threshold,
+            nms_iou=nms_iou,
+            detection_preset=detection_preset,
+            imgsz=imgsz,
+        )
         print(json.dumps(result))

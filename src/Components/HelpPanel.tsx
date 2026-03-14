@@ -216,14 +216,14 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Orientation Schemas</p>
                       <p>
-                        Directional is for strict head/tail objects. Bilateral is for paired left-right
-                        structures. Axial is for elongated rotating specimens. Invariant is for objects with
-                        no stable directional axis.
+                        Directional is for strict head/tail objects. Bilateral is for up/down symmetry
+                        along a primary biological axis. Axial is for elongated specimens with an axis but
+                        no true polarity. Invariant is for objects with no stable directional axis.
                       </p>
                       <p>
                         The OBB detector levels specimen crops to a canonical orientation before landmark
-                        prediction. class_id (0 = canonical, 1 = mirrored) is tagged at annotation time and
-                        applied again during training and inference.
+                        prediction. For directional schemas, class_id encodes left/right; for bilateral it
+                        encodes up/down; axial and invariant detector export stay one-class.
                       </p>
                     </div>
                   </div>

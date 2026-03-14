@@ -86,6 +86,18 @@ def infer_orientation_policy_from_template(
     has_head = _template_has_category(landmark_template, "head")
     has_tail = _template_has_category(landmark_template, "tail")
     has_caudal_tail = _template_has_category(landmark_template, "caudal-fin")
+    def _find_landmark_id(name: str) -> int | None:
+        if not isinstance(landmark_template, Sequence):
+            return None
+        target = str(name).strip().lower()
+        for lm in landmark_template:
+            try:
+                idx = int(lm.get("index"))
+            except Exception:
+                continue
+            if str(lm.get("name", "")).strip().lower() == target:
+                return idx
+        return None
     tail_categories: list[str] = []
     if has_tail:
         tail_categories.append("tail")
@@ -94,16 +106,40 @@ def infer_orientation_policy_from_template(
     if not tail_categories:
         tail_categories = ["tail"]
     if has_head or has_tail or has_caudal_tail:
+        snout_tip = _find_landmark_id("snout tip")
+        upper_caudal = _find_landmark_id("upper caudal peduncle")
+        lower_caudal = _find_landmark_id("lower caudal peduncle")
         return {
             "mode": "directional",
             "targetOrientation": "left",
             "headCategories": ["head"],
             "tailCategories": tail_categories,
-            "pcaLevelingMode": "auto",
+            "anteriorAnchorIds": [snout_tip] if snout_tip is not None else [],
+            "posteriorAnchorIds": [upper_caudal, lower_caudal]
+            if upper_caudal is not None and lower_caudal is not None
+            else [],
+            "obbLevelingMode": "on",
+        }
+    template_indices = set()
+    if isinstance(landmark_template, Sequence):
+        for lm in landmark_template:
+            try:
+                template_indices.add(int(lm.get("index")))
+            except Exception:
+                continue
+    if 3 in template_indices and 12 in template_indices:
+        return {
+            "mode": "bilateral",
+            "anteriorAnchorIds": [3],
+            "posteriorAnchorIds": [12],
+            "bilateralClassAxis": "vertical_obb",
+            "obbLevelingMode": "on",
         }
     return {
         "mode": "invariant",
-        "pcaLevelingMode": "off",
+        "anteriorAnchorIds": [],
+        "posteriorAnchorIds": [],
+        "obbLevelingMode": "on",
     }
 
 
@@ -124,9 +160,6 @@ def sanitize_orientation_policy(
     tail_categories = _safe_list_of_str(
         raw.get("tailCategories"), inferred.get("tailCategories", ["tail"])
     )
-    pca_mode = str(raw.get("pcaLevelingMode", inferred.get("pcaLevelingMode", "off"))).strip().lower()
-    if pca_mode not in ("off", "on", "auto"):
-        pca_mode = "off"
     direction_priority = _safe_direction_priority(raw.get("directionPriority", "auto"))
     try:
         min_moment_conf = max(0.0, float(raw.get("minMomentDirectionConfidence", 0.03)))
@@ -136,6 +169,28 @@ def sanitize_orientation_policy(
     training_prep_box_jitter = raw.get("trainingPrepBoxJitter", "auto")
     if not isinstance(training_prep_box_jitter, (dict, str, bool, int, float)):
         training_prep_box_jitter = "auto"
+
+    anterior_anchor_ids = []
+    raw_anterior_anchor_ids = raw.get("anteriorAnchorIds", inferred.get("anteriorAnchorIds", []))
+    if isinstance(raw_anterior_anchor_ids, (list, tuple)):
+        for item in raw_anterior_anchor_ids:
+            try:
+                value = int(item)
+            except Exception:
+                continue
+            if value > 0 and value not in anterior_anchor_ids:
+                anterior_anchor_ids.append(value)
+
+    posterior_anchor_ids = []
+    raw_posterior_anchor_ids = raw.get("posteriorAnchorIds", inferred.get("posteriorAnchorIds", []))
+    if isinstance(raw_posterior_anchor_ids, (list, tuple)):
+        for item in raw_posterior_anchor_ids:
+            try:
+                value = int(item)
+            except Exception:
+                continue
+            if value > 0 and value not in posterior_anchor_ids:
+                posterior_anchor_ids.append(value)
 
     bilateral_pairs: list[list[int]] = []
     if isinstance(raw.get("bilateralPairs"), (list, tuple)):
@@ -150,10 +205,12 @@ def sanitize_orientation_policy(
     obb_leveling_mode = str(raw.get("obbLevelingMode", "on")).strip().lower()
     if obb_leveling_mode not in ("on", "off"):
         obb_leveling_mode = "on"
+    bilateral_class_axis = "vertical_obb"
 
     out: dict[str, Any] = {
         "mode": mode,
-        "pcaLevelingMode": pca_mode,
+        "anteriorAnchorIds": anterior_anchor_ids,
+        "posteriorAnchorIds": posterior_anchor_ids,
         "obbLevelingMode": obb_leveling_mode,
         "directionPriority": direction_priority,
         "minMomentDirectionConfidence": float(min_moment_conf),
@@ -166,6 +223,8 @@ def sanitize_orientation_policy(
         out["tailCategories"] = tail_categories or ["tail"]
     if mode == "bilateral" and bilateral_pairs:
         out["bilateralPairs"] = bilateral_pairs
+    if mode == "bilateral":
+        out["bilateralClassAxis"] = bilateral_class_axis
     return out
 
 
@@ -463,6 +522,187 @@ def get_schema_augmentation_profile(
     raise ValueError(f"Unsupported engine '{engine}' for schema augmentation profile.")
 
 
+def get_training_capacity_tier(sample_count: int) -> str:
+    """Return the shared dataset-size bucket used by landmarker training."""
+    n = int(max(0, sample_count))
+    if n < 250:
+        return "starvation"
+    if n < 1000:
+        return "balanced"
+    return "deep"
+
+
+def get_landmark_training_augmentation_profile(
+    mode: str | None,
+    *,
+    engine: str,
+    dataset_size_bucket: str | None = None,
+    augmentation_override: dict | None = None,
+) -> dict[str, Any]:
+    """
+    Resolve landmarker-training augmentation defaults.
+
+    Rotation semantics stay schema-driven and unchanged. Dataset size only tunes
+    non-rotational intensity, and for dlib additionally bounds offline copy
+    budgets and effective training exposure.
+    """
+    base = get_schema_augmentation_profile(
+        mode,
+        engine=engine,
+        augmentation_override=augmentation_override,
+    )
+    bucket = str(dataset_size_bucket or get_training_capacity_tier(0)).strip().lower()
+    if bucket not in {"starvation", "balanced", "deep"}:
+        bucket = "balanced"
+    resolved_mode = _safe_orientation_mode(mode)
+    eng = str(engine or "").strip().lower()
+
+    if eng == "dlib":
+        tuned = {
+            "starvation": {
+                "photo_jitter_contrast_delta": 0.25,
+                "photo_jitter_brightness_delta": 40.0,
+                "photo_jitter_saturation_range": (0.70, 1.30),
+                "max_augmented_copies_per_image": 5,
+                "effective_training_exposure_target": 12000,
+            },
+            "balanced": {
+                "photo_jitter_contrast_delta": 0.18,
+                "photo_jitter_brightness_delta": 28.0,
+                "photo_jitter_saturation_range": (0.78, 1.22),
+                "max_augmented_copies_per_image": 2,
+                "effective_training_exposure_target": 16000,
+            },
+            "deep": {
+                "photo_jitter_contrast_delta": 0.12,
+                "photo_jitter_brightness_delta": 18.0,
+                "photo_jitter_saturation_range": (0.85, 1.15),
+                "max_augmented_copies_per_image": 1,
+                "effective_training_exposure_target": 24000,
+            },
+        }
+        profile = dict(base)
+        profile.update(tuned[bucket])
+        if augmentation_override:
+            if "photo_jitter_contrast_delta" in augmentation_override:
+                profile["photo_jitter_contrast_delta"] = float(augmentation_override["photo_jitter_contrast_delta"])
+            if "photo_jitter_brightness_delta" in augmentation_override:
+                profile["photo_jitter_brightness_delta"] = float(augmentation_override["photo_jitter_brightness_delta"])
+            if "photo_jitter_saturation_range" in augmentation_override:
+                sr = augmentation_override["photo_jitter_saturation_range"]
+                if isinstance(sr, (list, tuple)) and len(sr) == 2:
+                    profile["photo_jitter_saturation_range"] = (float(sr[0]), float(sr[1]))
+            if "max_augmented_copies_per_image" in augmentation_override:
+                profile["max_augmented_copies_per_image"] = max(0, int(augmentation_override["max_augmented_copies_per_image"]))
+            if "effective_training_exposure_target" in augmentation_override:
+                profile["effective_training_exposure_target"] = max(
+                    1,
+                    int(augmentation_override["effective_training_exposure_target"]),
+                )
+        return profile
+
+    if eng == "cnn":
+        by_mode = {
+            "directional": {
+                "starvation": {
+                    "flip_prob": 0.15,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.97, 1.03),
+                    "translate_ratio": 0.02,
+                    "occlusion_prob": 0.05,
+                },
+                "balanced": {
+                    "flip_prob": 0.25,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.95, 1.05),
+                    "translate_ratio": 0.03,
+                    "occlusion_prob": 0.10,
+                },
+                "deep": {
+                    "flip_prob": 0.35,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.93, 1.07),
+                    "translate_ratio": 0.04,
+                    "occlusion_prob": 0.15,
+                },
+            },
+            "bilateral": {
+                "starvation": {
+                    "flip_prob": 0.15,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.97, 1.03),
+                    "translate_ratio": 0.02,
+                    "occlusion_prob": 0.05,
+                },
+                "balanced": {
+                    "flip_prob": 0.25,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.95, 1.05),
+                    "translate_ratio": 0.03,
+                    "occlusion_prob": 0.10,
+                },
+                "deep": {
+                    "flip_prob": 0.35,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.93, 1.07),
+                    "translate_ratio": 0.04,
+                    "occlusion_prob": 0.15,
+                },
+            },
+            "axial": {
+                "starvation": {
+                    "flip_prob": 0.20,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.96, 1.04),
+                    "translate_ratio": 0.02,
+                    "occlusion_prob": 0.05,
+                },
+                "balanced": {
+                    "flip_prob": 0.30,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.94, 1.06),
+                    "translate_ratio": 0.03,
+                    "occlusion_prob": 0.10,
+                },
+                "deep": {
+                    "flip_prob": 0.35,
+                    "vertical_flip_prob": 0.0,
+                    "scale_range": (0.92, 1.08),
+                    "translate_ratio": 0.04,
+                    "occlusion_prob": 0.12,
+                },
+            },
+            "invariant": {
+                "starvation": {
+                    "flip_prob": 0.35,
+                    "vertical_flip_prob": 0.25,
+                    "scale_range": (0.90, 1.10),
+                    "translate_ratio": 0.05,
+                    "occlusion_prob": 0.08,
+                },
+                "balanced": {
+                    "flip_prob": 0.45,
+                    "vertical_flip_prob": 0.35,
+                    "scale_range": (0.86, 1.14),
+                    "translate_ratio": 0.08,
+                    "occlusion_prob": 0.12,
+                },
+                "deep": {
+                    "flip_prob": 0.50,
+                    "vertical_flip_prob": 0.50,
+                    "scale_range": (0.82, 1.18),
+                    "translate_ratio": 0.10,
+                    "occlusion_prob": 0.15,
+                },
+            },
+        }
+        profile = dict(base)
+        profile.update(by_mode.get(resolved_mode, by_mode["invariant"])[bucket])
+        return profile
+
+    raise ValueError(f"Unsupported engine '{engine}' for landmarker augmentation profile.")
+
+
 def resolve_session_augmentation_profile(
     session_dir: str,
     *,
@@ -755,151 +995,6 @@ def remap_landmarks_to_standard(
         y = max(0.0, min(float(STANDARD_SIZE - 1), float(y)))
         remapped.append({**lm, "x": x, "y": y})
     return remapped
-
-
-def _pca_angle(points_rc: np.ndarray) -> float:
-    """
-    Compute principal-axis angle from (row, col) points.
-    Returns angle in degrees in crop coordinate frame.
-    """
-    try:
-        from sklearn.decomposition import PCA as _PCA
-
-        pca = _PCA(n_components=2)
-        pca.fit(points_rc)
-        return float(np.degrees(np.arctan2(pca.components_[0, 1], pca.components_[0, 0])))
-    except Exception:
-        pass
-
-    pts = points_rc[:, ::-1].astype(np.float32).reshape(-1, 1, 2)
-    rect = cv2.minAreaRect(pts)
-    angle = float(rect[2])
-    return angle + 90.0 if angle < -45.0 else angle
-
-
-def pca_rotate_crop(
-    crop_512: np.ndarray,
-    mask_512: np.ndarray,
-    min_coverage: float = 0.05,
-    min_points: int = 10,
-) -> tuple[np.ndarray, float, dict[str, Any]]:
-    """
-    Rotate a STANDARD_SIZE crop using PCA axis estimated from a STANDARD_SIZE mask.
-    """
-    if mask_512 is None:
-        return crop_512, 0.0, {"applied": False, "reason": "no_mask"}
-
-    mask = (mask_512 > 0).astype(np.uint8)
-    points = np.column_stack(np.where(mask > 0))
-    coverage = float(np.count_nonzero(mask)) / float(STANDARD_SIZE * STANDARD_SIZE)
-
-    if coverage < float(min_coverage):
-        return crop_512, 0.0, {"applied": False, "reason": "low_coverage", "coverage": coverage}
-    if len(points) < int(min_points):
-        return crop_512, 0.0, {"applied": False, "reason": "too_few_points", "points": int(len(points))}
-
-    angle = _pca_angle(points)
-    center = (STANDARD_SIZE / 2.0, STANDARD_SIZE / 2.0)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(
-        crop_512,
-        M,
-        (STANDARD_SIZE, STANDARD_SIZE),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-    return rotated, float(angle), {"applied": True, "coverage": coverage}
-
-
-def _rotate_mask_512(mask_512: np.ndarray, angle_deg: float) -> np.ndarray:
-    center = (STANDARD_SIZE / 2.0, STANDARD_SIZE / 2.0)
-    M = cv2.getRotationMatrix2D(center, float(angle_deg), 1.0)
-    rotated = cv2.warpAffine(
-        (mask_512 > 0).astype(np.uint8),
-        M,
-        (STANDARD_SIZE, STANDARD_SIZE),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    return (rotated > 0).astype(np.uint8)
-
-
-
-
-def canonicalize_with_mask(
-    crop_512: np.ndarray,
-    mask_512: np.ndarray | None,
-    *,
-    policy: Mapping[str, Any] | None = None,
-    pca_mode: str = "auto",
-    orientation_hint: str | None = None,
-) -> tuple[np.ndarray, np.ndarray | None, dict[str, Any]]:
-    """
-    Canonicalize a standardized crop using SAM2 mask geometry.
-
-    Steps:
-      1) Optional PCA leveling (mode-dependent).
-      2) Optional canonical left/right flip for directional schemas.
-    """
-    policy_obj = dict(policy or {})
-    mode = _safe_orientation_mode(policy_obj.get("mode"))
-    target_orientation = _safe_orientation_target(policy_obj.get("targetOrientation", "left"))
-
-    req_pca_mode = str(pca_mode or "auto").strip().lower()
-    if req_pca_mode not in ("off", "on", "auto"):
-        req_pca_mode = "auto"
-    policy_pca_mode = str(policy_obj.get("pcaLevelingMode", "off")).strip().lower()
-    if policy_pca_mode not in ("off", "on", "auto"):
-        policy_pca_mode = "off"
-    eff_pca_mode = policy_pca_mode if req_pca_mode == "auto" else req_pca_mode
-
-    can_use_pca = bool(mask_512 is not None) and eff_pca_mode in ("on", "auto") and mode != "invariant"
-
-    out_img = crop_512
-    out_mask = (mask_512 > 0).astype(np.uint8) if mask_512 is not None else None
-    pca_meta: dict[str, Any] = {"applied": False, "reason": "disabled"}
-    angle = 0.0
-
-    if can_use_pca and out_mask is not None:
-        out_img, angle, pca_meta = pca_rotate_crop(out_img, out_mask)
-        if pca_meta.get("applied"):
-            out_mask = _rotate_mask_512(out_mask, angle)
-
-    direction_resolved = resolve_direction_with_fallback(
-        out_mask,
-        orientation_hint=orientation_hint,
-        template_direction=target_orientation if mode == "directional" else None,
-        direction_priority=policy_obj.get("directionPriority", "auto"),
-        template_fallback=bool(policy_obj.get("templateDirectionFallback", False)),
-    )
-    inferred_direction = direction_resolved.get("direction")
-    inferred_conf = float(direction_resolved.get("confidence", 0.0))
-    direction_source = str(direction_resolved.get("source", "none"))
-
-    canonical_flip_applied = False
-    if mode == "directional" and inferred_direction in ("left", "right"):
-        if inferred_direction != target_orientation:
-            out_img = cv2.flip(out_img, 1)
-            if out_mask is not None:
-                out_mask = cv2.flip(out_mask, 1)
-            canonical_flip_applied = True
-
-    return out_img, out_mask, {
-        "mode": mode,
-        "target_orientation": target_orientation,
-        "requested_pca_mode": req_pca_mode,
-        "effective_pca_mode": eff_pca_mode,
-        "pca_applied": bool(pca_meta.get("applied")),
-        "pca_rotation": float(angle),
-        "pca_meta": pca_meta,
-        "direction_source": direction_source,
-        "inferred_direction": inferred_direction,
-        "inferred_direction_confidence": float(inferred_conf),
-        "direction_confidence": float(inferred_conf),
-        "direction_debug": direction_resolved.get("debug"),
-        "canonical_flip_applied": bool(canonical_flip_applied),
-    }
 
 
 def resolve_direction_with_fallback(
@@ -1325,23 +1420,23 @@ def resolve_orientation_hint(
     min_dx_ratio: float = 0.05,
 ) -> str | None:
     """
-    Resolve a reliable left/right hint from detector metadata.
+    Resolve a reliable orientation hint from detector metadata.
 
     Accepts:
-      - "left" | "right"
+      - "left" | "right" | "up" | "down"
       - {"orientation": "...", "head_point": [x,y], "tail_point": [x,y], "confidence": ...}
 
     Returns None when the hint is ambiguous or low-confidence.
     """
     if isinstance(orientation_hint, str):
         v = orientation_hint.strip().lower()
-        return v if v in ("left", "right") else None
+        return v if v in ("left", "right", "up", "down") else None
 
     if not isinstance(orientation_hint, Mapping):
         return None
 
     raw_orientation = str(orientation_hint.get("orientation", "")).strip().lower()
-    if raw_orientation not in ("left", "right"):
+    if raw_orientation not in ("left", "right", "up", "down"):
         raw_orientation = ""
 
     # Optional confidence gate.
@@ -1361,22 +1456,41 @@ def resolve_orientation_hint(
         and len(tail) >= 2
     ):
         try:
-            hx, tx = float(head[0]), float(tail[0])
+            hx, hy = float(head[0]), float(head[1])
+            tx, ty = float(tail[0]), float(tail[1])
             dx = hx - tx
+            dy = hy - ty
 
             box_w = None
+            box_h = None
             if box_xyxy is not None and len(box_xyxy) >= 4:
                 try:
                     box_w = abs(float(box_xyxy[2]) - float(box_xyxy[0]))
+                    box_h = abs(float(box_xyxy[3]) - float(box_xyxy[1]))
                 except Exception:
                     box_w = None
+                    box_h = None
             if not box_w or box_w <= 1e-6:
                 box_w = float(STANDARD_SIZE)
+            if not box_h or box_h <= 1e-6:
+                box_h = float(STANDARD_SIZE)
 
-            if abs(dx) / box_w < float(min_dx_ratio):
-                return None
-
-            inferred = "left" if hx < tx else "right"
+            if raw_orientation in ("left", "right"):
+                if abs(dx) / box_w < float(min_dx_ratio):
+                    return None
+                inferred = "left" if hx < tx else "right"
+            elif raw_orientation in ("up", "down"):
+                if abs(dy) / box_h < float(min_dx_ratio):
+                    return None
+                inferred = "up" if hy < ty else "down"
+            else:
+                x_strength = abs(dx) / box_w
+                y_strength = abs(dy) / box_h
+                if x_strength < float(min_dx_ratio) and y_strength < float(min_dx_ratio):
+                    return None
+                inferred = "up" if y_strength > x_strength and hy < ty else (
+                    "down" if y_strength > x_strength else ("left" if hx < tx else "right")
+                )
             if raw_orientation and raw_orientation != inferred:
                 return None
             return inferred
@@ -1981,7 +2095,7 @@ def apply_obb_geometry(
     Args:
         crop_512: Deskewed 512×512 crop from extract_obb_crop().
         metadata: Crop metadata dict (modified in-place copy on flip).
-        class_id: 0 = left-facing, 1 = right-facing (from OBB detector).
+        class_id: schema-specific OBB orientation class (e.g. left/right, up/down).
         orientation_policy: Session orientation policy dict.
 
     Returns:
@@ -2004,12 +2118,26 @@ def apply_obb_geometry(
             debug["flip_reason"] = f"class_id={class_id} contradicts target={target}"
 
     elif mode == "bilateral":
-        # Always normalize to left-facing (class_id=0); record flip for coord mirroring
-        if class_id == 1:
-            crop_512 = cv2.flip(crop_512, 1)
-            metadata = {**metadata, "canonical_flip_applied": True, "bilateral_flip": True}
-            debug["flip_applied"] = True
-            debug["flip_reason"] = "bilateral normalization"
+        bilateral_axis = str(orientation_policy.get("bilateralClassAxis", "")).strip().lower()
+        if bilateral_axis == "vertical_obb":
+            if class_id == 1:
+                crop_512 = cv2.rotate(crop_512, cv2.ROTATE_180)
+                metadata = {
+                    **metadata,
+                    "canonical_flip_applied": True,
+                    "bilateral_flip": True,
+                    "rotated_180": True,
+                }
+                debug["flip_applied"] = True
+                debug["rotated_180"] = True
+                debug["flip_reason"] = "bilateral vertical normalization"
+        else:
+            # Legacy bilateral sessions normalize with the historical left/right flip.
+            if class_id == 1:
+                crop_512 = cv2.flip(crop_512, 1)
+                metadata = {**metadata, "canonical_flip_applied": True, "bilateral_flip": True}
+                debug["flip_applied"] = True
+                debug["flip_reason"] = "bilateral normalization"
 
     elif mode == "axial":
         # If OBB angle is significantly off from horizontal, rotate 180°

@@ -63,10 +63,7 @@ def _resolve_orientation_aug_policy(project_root):
 
 def _is_canonical_training_enabled(orientation_policy, orientation_mode):
     mode = str(orientation_mode or "").strip().lower()
-    pca_mode = str((orientation_policy or {}).get("pcaLevelingMode", "off")).strip().lower()
-    if pca_mode not in ("off", "on", "auto"):
-        pca_mode = "off"
-    return mode != "invariant" and pca_mode in ("on", "auto")
+    return mode != "invariant"
 
 
 def _tune_cnn_aug_profile_by_mode(
@@ -76,84 +73,14 @@ def _tune_cnn_aug_profile_by_mode(
     tier,
     canonical_training_enabled,
 ):
-    """Route CNN geometric augmentation by orientation mode.
-
-    directional / bilateral
-        Chirality (left/right semantics) must be preserved. Rotation is capped
-        at ±25° non-canonical (±16° canonical). 180° rotation disabled.
-        Starvation/balanced datasets get slightly expanded ranges for
-        regularisation because the model hasn't seen enough diversity.
-
-    axial
-        0° and 180° are biologically equivalent (pill-shaped / seed-shaped
-        specimens have no head/tail). rotate_180_prob=0.5 exploits that
-        equivalence. Translation jitter is kept tight to prevent the trees
-        from confusing which pole they are looking at.
-
-    invariant
-        Circular or amorphous objects — no chirality or polarity to protect.
-        Full 360° rotation, vertical + horizontal flips, large scale range.
-        The heavy augmentation acts as regularisation so starvation-tier
-        models can use lower dropout and larger batch (handled separately in
-        _resolve_cnn_training_profile).
-    """
-    profile = dict(base_profile or {})
-    mode = str(orientation_mode or "").strip().lower()
-
-    if mode in ("directional", "bilateral"):
-        tuned = (
-            {
-                "starvation": {"flip_prob": 0.15, "vertical_flip_prob": 0.0, "rotation_range": (-10.0, 10.0), "rotate_180_prob": 0.0, "scale_range": (0.97, 1.03), "translate_ratio": 0.02, "occlusion_prob": 0.05},
-                "balanced": {"flip_prob": 0.25, "vertical_flip_prob": 0.0, "rotation_range": (-12.0, 12.0), "rotate_180_prob": 0.0, "scale_range": (0.95, 1.05), "translate_ratio": 0.03, "occlusion_prob": 0.10},
-                "deep": {"flip_prob": 0.35, "vertical_flip_prob": 0.0, "rotation_range": (-15.0, 15.0), "rotate_180_prob": 0.0, "scale_range": (0.93, 1.07), "translate_ratio": 0.04, "occlusion_prob": 0.15},
-            }
-            if canonical_training_enabled
-            else {
-                "starvation": {"flip_prob": 0.20, "vertical_flip_prob": 0.0, "rotation_range": (-14.0, 14.0), "rotate_180_prob": 0.0, "scale_range": (0.95, 1.05), "translate_ratio": 0.03, "occlusion_prob": 0.08},
-                "balanced": {"flip_prob": 0.30, "vertical_flip_prob": 0.0, "rotation_range": (-18.0, 18.0), "rotate_180_prob": 0.0, "scale_range": (0.93, 1.07), "translate_ratio": 0.04, "occlusion_prob": 0.12},
-                "deep": {"flip_prob": 0.40, "vertical_flip_prob": 0.0, "rotation_range": (-22.0, 22.0), "rotate_180_prob": 0.0, "scale_range": (0.91, 1.09), "translate_ratio": 0.05, "occlusion_prob": 0.15},
-            }
-        )
-        profile.update(tuned.get(tier, tuned["balanced"]))
-
-    elif mode == "axial":
-        # Pole ambiguity: 0° == 180°, but heavy translation triggers pole flip.
-        profile.update({
-            "flip_prob": 0.5,
-            "vertical_flip_prob": 0.0,
-            "rotation_range": (-10.0, 10.0),
-            "rotate_180_prob": 0.5,    # semantically equivalent for axial
-            "scale_range": (0.90, 1.10),
-            "translate_ratio": 0.04,
-        })
-
-    elif mode == "invariant":
-        # No chirality or polarity — full geometric freedom.
-        profile.update({
-            "flip_prob": 0.5,
-            "vertical_flip_prob": 0.5,
-            "rotation_range": (-180.0, 180.0),
-            "rotate_180_prob": 0.0,    # redundant when range already covers ±180°
-            "scale_range": (0.80, 1.20),
-            "translate_ratio": 0.10,
-        })
-
-    if mode == "axial":
-        tuned = {
-            "starvation": {"flip_prob": 0.20, "vertical_flip_prob": 0.0, "rotation_range": (-8.0, 8.0), "rotate_180_prob": 0.5, "scale_range": (0.96, 1.04), "translate_ratio": 0.02, "occlusion_prob": 0.05},
-            "balanced": {"flip_prob": 0.30, "vertical_flip_prob": 0.0, "rotation_range": (-10.0, 10.0), "rotate_180_prob": 0.5, "scale_range": (0.94, 1.06), "translate_ratio": 0.03, "occlusion_prob": 0.10},
-            "deep": {"flip_prob": 0.35, "vertical_flip_prob": 0.0, "rotation_range": (-12.0, 12.0), "rotate_180_prob": 0.5, "scale_range": (0.92, 1.08), "translate_ratio": 0.04, "occlusion_prob": 0.12},
-        }
-        profile.update(tuned.get(tier, tuned["balanced"]))
-    elif mode == "invariant":
-        tuned = {
-            "starvation": {"flip_prob": 0.35, "vertical_flip_prob": 0.25, "rotation_range": (-90.0, 90.0), "rotate_180_prob": 0.0, "scale_range": (0.90, 1.10), "translate_ratio": 0.05, "occlusion_prob": 0.08},
-            "balanced": {"flip_prob": 0.45, "vertical_flip_prob": 0.35, "rotation_range": (-140.0, 140.0), "rotate_180_prob": 0.0, "scale_range": (0.86, 1.14), "translate_ratio": 0.08, "occlusion_prob": 0.12},
-            "deep": {"flip_prob": 0.50, "vertical_flip_prob": 0.50, "rotation_range": (-180.0, 180.0), "rotate_180_prob": 0.0, "scale_range": (0.82, 1.18), "translate_ratio": 0.10, "occlusion_prob": 0.15},
-        }
-        profile.update(tuned.get(tier, tuned["balanced"]))
-
-    return profile
+    """Resolve dataset-aware CNN augmentation while preserving existing rotation semantics."""
+    _ = canonical_training_enabled
+    return ou.get_landmark_training_augmentation_profile(
+        orientation_mode,
+        engine="cnn",
+        dataset_size_bucket=tier,
+        augmentation_override=base_profile or None,
+    )
 
 
 def _capacity_tier(n_raw: int) -> str:

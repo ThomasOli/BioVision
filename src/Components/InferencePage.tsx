@@ -22,6 +22,19 @@ import { toast } from "sonner";
 import { useDispatch, useSelector } from "react-redux";
 
 import { cn } from "@/lib/utils";
+import {
+  getBoxOrientationArrow,
+  getClassIdForOrientationLabel,
+  getDisplayOrientationLabel,
+  getOppositeOrientationLabel,
+  getOrientationLabelForClassId,
+  getOrientationLabelFromBox,
+  getOrientationOptionLabel,
+  getOrientationRenderMode,
+  getOrientationToggleLabel,
+  getPreviewOrientationArrow,
+  normalizeOrientationLabelForSession,
+} from "@/lib/orientationDisplay";
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
 import { Input } from "@/Components/ui/input";
@@ -41,8 +54,8 @@ import {
   DialogTitle,
 } from "@/Components/ui/dialog";
 import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
-import { TrainedModel, AppView } from "@/types/Image";
-import { setActiveSpecies, removeSpecies } from "@/state/speciesState/speciesSlice";
+import { AppView, OrientationLabel, StoredOrientationLabel, TrainedModel } from "@/types/Image";
+import { setActiveSpecies, removeSpecies, updateSpecies } from "@/state/speciesState/speciesSlice";
 import type { AppDispatch, RootState } from "@/state/store";
 
 const STAGE_LABELS: Record<string, string> = {
@@ -63,6 +76,7 @@ const SIDEBAR_WIDTH_STORAGE_KEY = "biovision.inference.sidebarWidth";
 interface InferencePageProps {
   onNavigate: (view: AppView) => void;
   initialModel?: string;
+  initialSpeciesId?: string;
   hasActivatedSchemaThisRun?: boolean;
 }
 
@@ -84,9 +98,9 @@ interface DetectedBox {
   confidence?: number;
   class_id?: number;
   class_name?: string;
-  orientation_override?: "left" | "right" | "uncertain";
+  orientation_override?: OrientationLabel;
   orientation_hint?: {
-    orientation?: "left" | "right";
+    orientation?: StoredOrientationLabel;
     confidence?: number;
     source?: string;
     head_point?: [number, number];
@@ -106,8 +120,6 @@ interface PredictedSpecimen {
   mask_outline?: [number, number][];
   inference_metadata?: {
     mask_source?: "sam2" | "rough_otsu" | string;
-    pca_rotation?: number;
-    pca_angle?: number;
     canonical_flip_applied?: boolean;
     direction_source?: string;
     inferred_direction?: "left" | "right" | null;
@@ -161,9 +173,9 @@ interface InferenceReviewDraft {
       class_name?: string;
       obbCorners?: [number, number][];
       angle?: number;
-      orientation_override?: "left" | "right" | "uncertain";
+      orientation_override?: OrientationLabel;
       orientation_hint?: {
-        orientation?: "left" | "right";
+        orientation?: StoredOrientationLabel;
         confidence?: number;
         source?: string;
         head_point?: [number, number];
@@ -222,6 +234,9 @@ interface InferenceSessionCard {
   schemaName: string;
   schemaImageCount: number;
   schemaUpdatedAt: string;
+  schemaGroupKey: string;
+  canonicalSpeciesId: string;
+  hiddenSessionCount?: number;
   exists: boolean;
   inferenceSessionId?: string;
   displayName?: string;
@@ -301,20 +316,52 @@ function getInferenceSignature(
 export const InferencePage: React.FC<InferencePageProps> = ({
   onNavigate,
   initialModel,
+  initialSpeciesId,
   hasActivatedSchemaThisRun = false,
 }) => {
   const dispatch = useDispatch<AppDispatch>();
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
-  const allSpecies = useSelector((state: RootState) => state.species.species);
   const [selectedInferenceSpeciesId, setSelectedInferenceSpeciesId] = useState<string | null>(null);
   const [showInferenceHub, setShowInferenceHub] = useState(true);
   // effectiveSessionId: use the user-selected inference session, or fall back to the globally active one
   const effectiveSessionId = showInferenceHub
     ? null
     : (selectedInferenceSpeciesId ?? activeSpeciesId);
-  const activeOrientationMode = useSelector((state: RootState) =>
-    state.species.species.find(s => s.id === (selectedInferenceSpeciesId ?? state.species.activeSpeciesId))?.orientationPolicy?.mode
+  const activeOrientationPolicy = useSelector((state: RootState) =>
+    state.species.species.find(s => s.id === (selectedInferenceSpeciesId ?? state.species.activeSpeciesId))?.orientationPolicy
   );
+  const activeOrientationMode = activeOrientationPolicy?.mode;
+  const activeBilateralClassAxis = activeOrientationPolicy?.bilateralClassAxis;
+  const orientationRenderMode = getOrientationRenderMode(activeOrientationMode);
+  const showOrientationControls = orientationRenderMode === "arrow";
+  const sessionDefaultOrientation =
+    getOrientationLabelForClassId(activeOrientationMode, 0, activeBilateralClassAxis) ?? "left";
+
+  // Keep orientation policy (incl. bilateralClassAxis) fresh from session.json whenever the
+  // active session changes. InferencePage only reads from Redux, so without this a stale Redux
+  // entry could omit bilateralClassAxis and cause arrows to point the wrong direction.
+  useEffect(() => {
+    const sid = selectedInferenceSpeciesId ?? activeSpeciesId;
+    if (!sid) return;
+    let cancelled = false;
+    window.api.sessionLoad(sid).then((result) => {
+      if (cancelled || !result?.ok) return;
+      const sessionPolicy = result.meta?.orientationPolicy;
+      const mode = sessionPolicy?.mode;
+      if (
+        mode === "directional" ||
+        mode === "bilateral" ||
+        mode === "axial" ||
+        mode === "invariant"
+      ) {
+        if (sessionPolicy && sessionPolicy.bilateralClassAxis !== activeBilateralClassAxis) {
+          dispatch(updateSpecies({ id: sid, updates: { orientationPolicy: sessionPolicy } }));
+        }
+      }
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [selectedInferenceSpeciesId, activeSpeciesId, activeBilateralClassAxis, dispatch]);
+
   const [models, setModels] = useState<TrainedModel[]>([]);
   const [selectedModelKey, setSelectedModelKey] = useState<string>("");
   const [images, setImages] = useState<InferenceImage[]>([]);
@@ -323,7 +370,8 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const [isSavingCorrections, setIsSavingCorrections] = useState(false);
   const [loadingModels, setLoadingModels] = useState(true);
   const [showBoundingBox, setShowBoundingBox] = useState(true);
-  const [showMaskOverlay, setShowMaskOverlay] = useState(false);
+
+  const [, setShowMaskOverlay] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     if (typeof window === "undefined") return SIDEBAR_DEFAULT_WIDTH;
     const raw = window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);
@@ -345,6 +393,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const [savedImageIndices, setSavedImageIndices] = useState<Set<number>>(new Set());
   const [reviewFinalizedImageIndices, setReviewFinalizedImageIndices] = useState<Set<number>>(new Set());
   const [committedImageIndices, setCommittedImageIndices] = useState<Set<number>>(new Set());
+  const [commitFailures, setCommitFailures] = useState<Map<string, string>>(new Map());
   const [isReviewStateHydrated, setIsReviewStateHydrated] = useState(false);
   const [selectedSpecimenIndex, setSelectedSpecimenIndex] = useState<number | null>(null);
   const [detectionRerunModelKey, setDetectionRerunModelKey] = useState<string | null>(null);
@@ -371,30 +420,15 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
 
   const schemaOptions = useMemo<SchemaOption[]>(() => {
-    const merged = new Map<string, SchemaOption>();
-
-    hubSessions.forEach((session) => {
-      if (!session?.speciesId) return;
-      merged.set(session.speciesId, {
+    return [...hubSessions]
+      .map((session) => ({
         id: session.speciesId,
         name: session.schemaName || session.speciesId,
-      });
-    });
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [hubSessions]);
 
-    allSpecies.forEach((species) => {
-      if (!species?.id) return;
-      const existing = merged.get(species.id);
-      merged.set(species.id, {
-        id: species.id,
-        name: species.name || existing?.name || species.id,
-      });
-    });
-
-    return Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [allSpecies, hubSessions]);
-
-  const hasKnownSchemas =
-    hubSessions.length > 0 || allSpecies.length > 0 || hasActivatedSchemaThisRun;
+  const hasKnownSchemas = hubSessions.length > 0 || hasActivatedSchemaThisRun;
   const isFirstTimeLocked = !loadingHubSessions && !hasKnownSchemas;
 
   const markImageEdited = useCallback((index: number) => {
@@ -465,11 +499,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   }, []);
 
   const preferredPredictorType = useMemo<TrainedModel["predictorType"]>(() => {
-    return (
+    const raw =
       inferenceSessionManifest?.preferences?.lastUsedPredictorType ||
       inferenceSessionManifest?.models?.landmark?.predictorType ||
-      "cnn"
-    );
+      "cnn";
+    return raw === "dlib" || raw === "cnn" ? raw : "cnn";
   }, [inferenceSessionManifest]);
 
   const stampInferenceResult = useCallback((
@@ -634,6 +668,26 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     [dispatch, isFirstTimeLocked, resetInferenceWorkspaceState]
   );
 
+  useEffect(() => {
+    if (!initialSpeciesId) return;
+    if (openingInferenceSessionSpeciesId === initialSpeciesId) return;
+    if (
+      !showInferenceHub &&
+      selectedInferenceSpeciesId === initialSpeciesId &&
+      inferenceSessionId
+    ) {
+      return;
+    }
+    void openInferenceSessionForSchema(initialSpeciesId);
+  }, [
+    inferenceSessionId,
+    initialSpeciesId,
+    openInferenceSessionForSchema,
+    openingInferenceSessionSpeciesId,
+    selectedInferenceSpeciesId,
+    showInferenceHub,
+  ]);
+
   const handleCreateInferenceSession = useCallback(async () => {
     if (isFirstTimeLocked) {
       toast.error("Create or resume your first schema session in Annotate first.");
@@ -689,9 +743,21 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     };
   } | null>(null);
   const [isDrawBoxMode, setIsDrawBoxMode] = useState(false);
-  const [drawDefaultOrientation, setDrawDefaultOrientation] = useState<"left" | "right">(() =>
-    ((typeof window !== "undefined" && window.localStorage.getItem("bv_draw_default_orientation")) as "left" | "right") ?? "left"
-  );
+  const [drawDefaultOrientation, setDrawDefaultOrientation] = useState<StoredOrientationLabel>("left");
+  useEffect(() => {
+    const stored =
+      typeof window !== "undefined"
+        ? window.localStorage.getItem("bv_draw_default_orientation")
+        : null;
+    const normalizedStored = normalizeOrientationLabelForSession(
+      activeOrientationMode,
+      stored,
+      activeBilateralClassAxis
+    );
+    setDrawDefaultOrientation(
+      normalizedStored !== "uncertain" ? normalizedStored : sessionDefaultOrientation
+    );
+  }, [activeBilateralClassAxis, activeOrientationMode, sessionDefaultOrientation]);
   const drawBoxRef = useRef<{
     start: { x: number; y: number };
     current: { x: number; y: number };
@@ -1250,63 +1316,30 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     reviewFinalizedImageIndices,
   ]);
 
-  const resolveOrientationLabelFromBox = useCallback((box?: DetectedBox): "left" | "right" | "uncertain" => {
-    if (!box) return "uncertain";
-    if (box.orientation_override === "left" || box.orientation_override === "right") {
-      return box.orientation_override;
-    }
-    if (box.orientation_override === "uncertain") {
-      return "uncertain";
-    }
-
-    const hintOrientationRaw = box.orientation_hint?.orientation;
-    const hintOrientation =
-      hintOrientationRaw === "left" || hintOrientationRaw === "right"
-        ? hintOrientationRaw
-        : null;
-    const hintConfidence = Number(box.orientation_hint?.confidence);
-    if (
-      hintOrientation &&
-      (!Number.isFinite(hintConfidence) || hintConfidence >= 0.35)
-    ) {
-      return hintOrientation;
-    }
-
-    // class_id fallback: only used when no hint exists (toggle value as last resort)
-    if (box.class_id === 0) return "left";
-    if (box.class_id === 1) return "right";
-
-    const classToken = String(box.class_name || "")
-      .trim()
-      .toLowerCase()
-      .replace(/[-\s]+/g, "_");
-    if (
-      classToken.endsWith("_left") ||
-      classToken === "left" ||
-      classToken.includes("_left_")
-    ) {
-      return "left";
-    }
-    if (
-      classToken.endsWith("_right") ||
-      classToken === "right" ||
-      classToken.includes("_right_")
-    ) {
-      return "right";
-    }
-    return "uncertain";
-  }, []);
+  const resolveOrientationLabelFromBox = useCallback((box?: DetectedBox): OrientationLabel => {
+    return getOrientationLabelFromBox(
+      activeOrientationMode,
+      box,
+      activeBilateralClassAxis
+    );
+  }, [activeBilateralClassAxis, activeOrientationMode]);
 
   const handleSetSpecimenOrientation = useCallback(
-    (specimenIndex: number, orientation: "left" | "right") => {
+    (specimenIndex: number, orientation: StoredOrientationLabel) => {
       const current = getSpecimensForImageIndex(currentIndex);
       if (specimenIndex < 0 || specimenIndex >= current.length) return;
       const updated = JSON.parse(JSON.stringify(current)) as PredictedSpecimen[];
       const target = updated[specimenIndex];
       if (!target?.box) return;
+      const classId = getClassIdForOrientationLabel(
+        activeOrientationMode,
+        orientation,
+        activeBilateralClassAxis
+      );
+      if (classId === null) return;
 
       target.box.orientation_override = orientation;
-      target.box.class_id = orientation === "left" ? 0 : 1;
+      target.box.class_id = classId;
       target.box.orientation_hint = {
         orientation,
         confidence: 1.0,
@@ -1327,7 +1360,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         committedAt: null,
       });
     },
-    [currentIndex, getSpecimensForImageIndex, markImageEdited, persistReviewDraft]
+    [
+      activeBilateralClassAxis,
+      activeOrientationMode,
+      currentIndex,
+      getSpecimensForImageIndex,
+      markImageEdited,
+      persistReviewDraft,
+    ]
   );
 
   useEffect(() => {
@@ -1411,7 +1451,45 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         // Orientation arrow inside box from OBB geometry.
         // Use the same resolver as labels/review controls so UI state and arrow never diverge.
         const orientationLabel = resolveOrientationLabelFromBox(specimen?.box);
-        const arrowPts: [number, number][] =
+        const displayOrientationLabel = getDisplayOrientationLabel(
+          activeOrientationMode,
+          orientationLabel,
+          activeBilateralClassAxis
+        );
+        const resolvedArrow = getBoxOrientationArrow(
+          activeOrientationMode,
+          box,
+          activeBilateralClassAxis
+        );
+        if (resolvedArrow) {
+          const [tailX, tailY, tipX, tipY] = resolvedArrow.points;
+          if (resolvedArrow.length >= 24) {
+            ctx.save();
+            ctx.globalAlpha = 0.85;
+            ctx.strokeStyle = color; ctx.fillStyle = color;
+            ctx.lineWidth = Math.max(1.5, lineWidth * 0.85);
+            ctx.beginPath();
+            ctx.moveTo(tailX, tailY);
+            if (resolvedArrow.renderMode === "arrow") {
+              const oHSizeLen = Math.min(Math.max(resolvedArrow.length * 0.20, 6), 10);
+              const oHSizeW   = Math.min(Math.max(resolvedArrow.length * 0.15, 5), 8);
+              const oNx = (tipX - tailX) / resolvedArrow.length;
+              const oNy = (tipY - tailY) / resolvedArrow.length;
+              ctx.lineTo(tipX - oNx*oHSizeLen, tipY - oNy*oHSizeLen);
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.moveTo(tipX, tipY);
+              ctx.lineTo(tipX - oNx*oHSizeLen + (-oNy)*oHSizeW*0.5, tipY - oNy*oHSizeLen + oNx*oHSizeW*0.5);
+              ctx.lineTo(tipX - oNx*oHSizeLen - (-oNy)*oHSizeW*0.5, tipY - oNy*oHSizeLen - oNx*oHSizeW*0.5);
+              ctx.closePath(); ctx.fill();
+            } else {
+              ctx.lineTo(tipX, tipY);
+              ctx.stroke();
+            }
+            ctx.restore();
+          }
+        }
+        /* const arrowPts: [number, number][] =
           obbPts && obbPts.length === 4
             ? (obbPts as [number, number][])
             : ([
@@ -1420,7 +1498,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                 [box.left + box.width, box.top + box.height],
                 [box.left, box.top + box.height],
               ] as [number, number][]);
-        if ((activeOrientationMode === "directional" || activeOrientationMode === "bilateral") && (orientationLabel === "left" || orientationLabel === "right")) {
+        if (false && (activeOrientationMode === "directional" || activeOrientationMode === "bilateral") && (orientationLabel === "left" || orientationLabel === "right")) {
           const [op0, op1, op2, op3] = arrowPts;
           const oIsLeft = orientationLabel === "left";
           const isBilateral = activeOrientationMode === "bilateral";
@@ -1464,6 +1542,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           }
         }
 
+        */
         ctx.fillStyle = color;
         ctx.font = `bold ${fontSize}px sans-serif`;
         // Compute tilt angle from OBB long axis, folded to [0ï¿½, 90ï¿½]
@@ -1481,7 +1560,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         }
         const isVectorOrUnset = !activeOrientationMode || activeOrientationMode === "directional" || activeOrientationMode === "bilateral";
         const orientationSuffix = isVectorOrUnset
-          ? ` \u00B7 ${orientationLabel}${angleSuffix}`
+          ? ` \u00B7 ${displayOrientationLabel}${angleSuffix}`
           : angleSuffix; // axial: angle only; invariant: empty (angleSuffix is "")
         const label = idx === selectedSpecimenIndex
           ? `Specimen ${idx + 1} (selected)${orientationSuffix}`
@@ -1573,7 +1652,37 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         ctx.font = `bold ${fontSize}px sans-serif`;
         ctx.fillText("New Box", x + 6, Math.max(fontSize + 2, y - 4));
         // Real-time orientation arrow in the preview box
-        const previewObbPts: [number,number][] = [[x,y],[x+w,y],[x+w,y+h],[x,y+h]];
+        const previewArrow = getPreviewOrientationArrow(
+          activeOrientationMode,
+          drawDefaultOrientation,
+          { left: x, top: y, width: w, height: h },
+          activeBilateralClassAxis
+        );
+        if (previewArrow && previewArrow.length >= 24) {
+          const [tailX, tailY, tipX, tipY] = previewArrow.points;
+          ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
+          ctx.fillStyle = "rgba(34, 197, 94, 0.95)";
+          ctx.lineWidth = Math.max(1.5, lineWidth * 0.85);
+          ctx.beginPath();
+          ctx.moveTo(tailX, tailY);
+          if (previewArrow.renderMode === "arrow") {
+            const dNx = (tipX - tailX) / previewArrow.length;
+            const dNy = (tipY - tailY) / previewArrow.length;
+            const dHSizeLen = Math.min(Math.max(previewArrow.length * 0.10, 6), 10);
+            const dHSizeW   = Math.min(Math.max(previewArrow.length * 0.07, 5), 8);
+            ctx.lineTo(tipX - dNx*dHSizeLen, tipY - dNy*dHSizeLen);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(tipX, tipY);
+            ctx.lineTo(tipX - dNx*dHSizeLen + (-dNy)*dHSizeW*0.5, tipY - dNy*dHSizeLen + dNx*dHSizeW*0.5);
+            ctx.lineTo(tipX - dNx*dHSizeLen - (-dNy)*dHSizeW*0.5, tipY - dNy*dHSizeLen - dNx*dHSizeW*0.5);
+            ctx.closePath(); ctx.fill();
+          } else {
+            ctx.lineTo(tipX, tipY);
+            ctx.stroke();
+          }
+        }
+        /* const previewObbPts: [number,number][] = [[x,y],[x+w,y],[x+w,y+h],[x,y+h]];
         const [dp0,dp1,dp2,dp3] = previewObbPts;
         const dLen01 = Math.hypot(dp1[0]-dp0[0], dp1[1]-dp0[1]);
         const dLen12 = Math.hypot(dp2[0]-dp1[0], dp2[1]-dp1[1]);
@@ -1585,12 +1694,15 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           dMidA = [(dp0[0]+dp1[0])/2, (dp0[1]+dp1[1])/2];
           dMidB = [(dp2[0]+dp3[0])/2, (dp2[1]+dp3[1])/2];
         }
-        const dIsLeft = drawDefaultOrientation === "left";
-        const [dLeftEnd, dRightEnd] = dMidA[0] <= dMidB[0] ? [dMidA, dMidB] : [dMidB, dMidA];
-        const dHead = dIsLeft ? dLeftEnd : dRightEnd;
-        const dTail = dIsLeft ? dRightEnd : dLeftEnd;
+        const dIsPrimary = drawDefaultOrientation === "left";
+        const isBilateralPreview = activeOrientationMode === "bilateral";
+        const [dPrimaryEnd, dSecondaryEnd] = isBilateralPreview
+          ? (dMidA[1] <= dMidB[1] ? [dMidA, dMidB] : [dMidB, dMidA])
+          : (dMidA[0] <= dMidB[0] ? [dMidA, dMidB] : [dMidB, dMidA]);
+        const dHead = dIsPrimary ? dPrimaryEnd : dSecondaryEnd;
+        const dTail = dIsPrimary ? dSecondaryEnd : dPrimaryEnd;
         const dAxisLen = Math.hypot(dHead[0]-dTail[0], dHead[1]-dTail[1]) || 1;
-        if (dAxisLen >= 24) {
+        if (false && dAxisLen >= 24) {
           const dNx = (dHead[0]-dTail[0])/dAxisLen, dNy = (dHead[1]-dTail[1])/dAxisLen;
           const arrowLen  = Math.min(Math.max(dAxisLen * 0.25, 14), 32);
           const dHSizeLen = Math.min(Math.max(dAxisLen * 0.10, 6), 10);
@@ -1610,10 +1722,17 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           ctx.lineTo(tipX - dNx*dHSizeLen - (-dNy)*dHSizeW*0.5, tipY - dNy*dHSizeLen - dNx*dHSizeW*0.5);
           ctx.closePath(); ctx.fill();
         }
-        ctx.restore();
+        ctx.restore(); */
       }
     }
-  }, [showBoundingBox, selectedSpecimenIndex, resolveOrientationLabelFromBox, drawDefaultOrientation, activeOrientationMode]);
+  }, [
+    showBoundingBox,
+    selectedSpecimenIndex,
+    resolveOrientationLabelFromBox,
+    drawDefaultOrientation,
+    activeOrientationMode,
+    activeBilateralClassAxis,
+  ]);
 
   // Sync effectiveSessionId with the globally active species on first mount
   useEffect(() => {
@@ -1728,7 +1847,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           setIsReviewStateHydrated(true);
           return;
         }
-        const loaded: InferenceImage[] = res.images.map((f) => {
+        const loaded: InferenceImage[] = res.images.map((f: { data: string; mimeType: string; path: string; name: string }) => {
           const bytes = Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0));
           const url = URL.createObjectURL(new Blob([bytes], { type: f.mimeType }));
           return { path: f.path, name: f.name, url };
@@ -2057,7 +2176,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           angle?: number;
           class_id?: number;
           orientation_hint?: {
-            orientation?: "left" | "right";
+            orientation?: StoredOrientationLabel;
             confidence?: number;
             source?: string;
           };
@@ -2082,7 +2201,10 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           ...(typeof s.box.angle === "number" ? { angle: s.box.angle } : {}),
           ...(s.box.class_id != null ? { class_id: s.box.class_id } : {}),
           orientation_hint:
-            s.box.orientation_override === "left" || s.box.orientation_override === "right"
+            s.box.orientation_override === "left" ||
+            s.box.orientation_override === "right" ||
+            s.box.orientation_override === "up" ||
+            s.box.orientation_override === "down"
               ? {
                   orientation: s.box.orientation_override,
                   confidence: 1.0,
@@ -2249,6 +2371,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     }
 
     setIsCommittingReview(true);
+    setCommitFailures(new Map());
     try {
       // Flush only edited targets; untouched drafts must keep their original updatedAt
       // so commit idempotency can skip already-committed unchanged items.
@@ -2276,12 +2399,28 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       const skipped = Number(commitRes.skipped || 0);
       const failed = Number(commitRes.failed || 0);
       await hydratePersistedReviewDrafts(images);
-      if (committed > 0) {
-        toast.success(
-          failed > 0
-            ? `Committed ${committed} image(s), ${failed} failed, ${skipped} skipped.`
-            : `Committed ${committed} image(s) to training data.`
-        );
+      const newFailures = new Map<string, string>();
+      (commitRes.failures || []).forEach((f) => {
+        if (f.filename) newFailures.set(f.filename.toLowerCase(), f.error || "Commit failed.");
+      });
+      if (newFailures.size > 0) setCommitFailures(newFailures);
+      if (committed > 0 || failed > 0) {
+        if (failed > 0) {
+          const names = (commitRes.failures || []).map((f) => f.filename);
+          const shown = names.slice(0, 3).join(", ");
+          const extra = names.length > 3 ? ` (+${names.length - 3} more)` : "";
+          const firstFailedIdx = images.findIndex(
+            (img) => newFailures.has((img.name || "").toLowerCase())
+          );
+          toast.warning(
+            `Committed ${committed} image(s), ${failed} failed: ${shown}${extra}`,
+            firstFailedIdx >= 0
+              ? { action: { label: "Go to first", onClick: () => setCurrentIndex(firstFailedIdx) } }
+              : undefined
+          );
+        } else {
+          toast.success(`Committed ${committed} image(s) to training data.`);
+        }
       } else if (skipped > 0) {
         toast.message(`No new changes to commit (${skipped} already up-to-date).`);
       } else {
@@ -2909,7 +3048,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           </Button>
         </div>
 
-        <div className="flex-1 overflow-auto p-6">
+        <div className="flex-1 overflow-auto p-6 scrollbar-app">
           {isFirstTimeLocked && (
             <Card className="mx-auto mb-6 max-w-2xl border-amber-500/40 bg-amber-500/5">
               <CardHeader>
@@ -3425,12 +3564,16 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                           <Square className="mr-2 h-4 w-4" />
                           {isDrawBoxMode ? "Drawing" : "Draw Box"}
                         </Button>
-                        {isDrawBoxMode && (
+                        {isDrawBoxMode && showOrientationControls && (
                           <Button
                             variant="outline"
                             size="sm"
                             onClick={() => {
-                              const next = drawDefaultOrientation === "left" ? "right" : "left";
+                              const next = getOppositeOrientationLabel(
+                                activeOrientationMode,
+                                drawDefaultOrientation,
+                                activeBilateralClassAxis
+                              );
                               setDrawDefaultOrientation(next);
                               window.localStorage.setItem("bv_draw_default_orientation", next);
                               if (
@@ -3444,7 +3587,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             title="Toggle head direction (selected box and new boxes)"
                             className="justify-start text-xs"
                           >
-                            {drawDefaultOrientation === "left" ? "\u2190 Head" : "Head \u2192"}
+                            {getOrientationToggleLabel(activeOrientationMode, drawDefaultOrientation, activeBilateralClassAxis)}
                           </Button>
                         )}
                         <Button
@@ -3460,7 +3603,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                         </Button>
                       </div>
 
-                      {currentSpecimenCount > 0 && selectedSpecimenResolvedIndex !== null && (
+                      {showOrientationControls && currentSpecimenCount > 0 && selectedSpecimenResolvedIndex !== null && (
                         <div className="space-y-2 rounded-md border border-border/70 bg-background/70 p-2">
                           <div className="flex items-center justify-between">
                             <span className="text-[11px] font-medium text-muted-foreground">
@@ -3499,32 +3642,50 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             </div>
                           </div>
                           <div className="grid grid-cols-2 gap-1">
+                            {(() => {
+                              const primaryOrientation =
+                                getOrientationLabelForClassId(
+                                  activeOrientationMode,
+                                  0,
+                                  activeBilateralClassAxis
+                                ) ?? "left";
+                              const secondaryOrientation =
+                                getOrientationLabelForClassId(
+                                  activeOrientationMode,
+                                  1,
+                                  activeBilateralClassAxis
+                                ) ?? "right";
+                              return (
+                                <>
                             <Button
-                              variant={selectedOrientation === "left" ? "default" : "outline"}
+                              variant={selectedOrientation === primaryOrientation ? "default" : "outline"}
                               size="sm"
                               className="h-7 px-2 text-[11px]"
                               onClick={() =>
                                 handleSetSpecimenOrientation(
                                   selectedSpecimenResolvedIndex,
-                                  "left"
+                                  primaryOrientation
                                 )
                               }
                             >
-                              Left
+                              {getOrientationOptionLabel(activeOrientationMode, primaryOrientation, activeBilateralClassAxis)}
                             </Button>
                             <Button
-                              variant={selectedOrientation === "right" ? "default" : "outline"}
+                              variant={selectedOrientation === secondaryOrientation ? "default" : "outline"}
                               size="sm"
                               className="h-7 px-2 text-[11px]"
                               onClick={() =>
                                 handleSetSpecimenOrientation(
                                   selectedSpecimenResolvedIndex,
-                                  "right"
+                                  secondaryOrientation
                                 )
                               }
                             >
-                              Right
+                              {getOrientationOptionLabel(activeOrientationMode, secondaryOrientation, activeBilateralClassAxis)}
                             </Button>
+                                </>
+                              );
+                            })()}
                           </div>
                         </div>
                       )}
@@ -3614,7 +3775,8 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                               idx !== currentIndex && img.results && !editedImageIndices.has(idx) && !savedImageIndices.has(idx) && "border-green-500/50",
                               idx !== currentIndex && editedImageIndices.has(idx) && "border-amber-500/60 bg-amber-500/5",
                               idx !== currentIndex && !editedImageIndices.has(idx) && savedImageIndices.has(idx) && "border-emerald-500/60 bg-emerald-500/5",
-                              img.error && "border-destructive/50"
+                              img.error && "border-destructive/50",
+                              commitFailures.has((img.name || "").toLowerCase()) && "border-red-500/60 bg-red-500/5"
                             )}
                             onClick={() => setCurrentIndex(idx)}
                           >
@@ -3649,6 +3811,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             {img.results && isReviewStateHydrated && !savedImageIndices.has(idx) && !editedImageIndices.has(idx) && (
                               <span className="shrink-0 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-blue-600">
                                 Ready
+                              </span>
+                            )}
+                            {commitFailures.has((img.name || "").toLowerCase()) && (
+                              <span
+                                className="shrink-0 rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-red-600"
+                                title={commitFailures.get((img.name || "").toLowerCase())}
+                              >
+                                Failed
                               </span>
                             )}
                             {img.error && (
@@ -3819,10 +3989,6 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             {currentSpecimens.map((specimen, idx) => {
                               const meta = specimen?.inference_metadata;
                               if (!meta) return null;
-                              const pcaAngle =
-                                typeof meta.pca_angle === "number"
-                                  ? meta.pca_angle
-                                  : meta.pca_rotation;
                               const dirConf =
                                 typeof meta.direction_confidence === "number"
                                   ? meta.direction_confidence
@@ -3835,8 +4001,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                                   : "n/a";
                               return (
                                 <p key={`inference-meta-${idx}`}>
-                                  #{idx + 1}: hint {detectorHint} ({detectorHintSource}) | mask {meta.mask_source ?? "none"} | pca{" "}
-                                  {typeof pcaAngle === "number" ? `${pcaAngle.toFixed(1)}ï¿½` : "n/a"} | canonical-flip {canonicalFlip} | dir{" "}
+                                  #{idx + 1}: hint {detectorHint} ({detectorHintSource}) | mask {meta.mask_source ?? "none"} | canonical-flip {canonicalFlip} | dir{" "}
                                   {meta.direction_source ?? "n/a"}
                                   {typeof dirConf === "number" ? ` (${dirConf.toFixed(2)})` : ""} | flip{" "}
                                   {meta.was_flipped ? "yes" : "no"}

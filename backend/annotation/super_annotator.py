@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import traceback
+import time
 from datetime import datetime
 
 import numpy as np
@@ -59,11 +60,23 @@ def send(obj):
 _current_request_id = None
 
 
-def send_progress(message, percent, stage="processing"):
+def send_progress(message, percent, stage="processing", details=None):
     obj = {"status": "progress", "message": message, "percent": percent, "stage": stage}
+    if details and isinstance(details, dict):
+        obj["details"] = details
     if _current_request_id:
         obj["_request_id"] = _current_request_id
     send(obj)
+
+
+def send_obb_progress(message, percent, stage="training", details=None):
+    obj = {"status": "progress", "message": message, "percent": percent, "stage": stage}
+    if details and isinstance(details, dict):
+        obj["details"] = details
+    if _current_request_id:
+        obj["_request_id"] = _current_request_id
+    sys.stderr.write("__BV_OBB_PROGRESS__" + json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stderr.flush()
 
 
 def send_response(result):
@@ -195,17 +208,23 @@ class SuperAnnotator:
         return (class_name or "object").strip().lower().replace(" ", "_")
 
     @staticmethod
-    def _resolve_detection_preset(conf_threshold, nms_iou, max_objects, detection_preset, task="generic"):
+    def _resolve_detection_preset(conf_threshold, nms_iou, max_objects, detection_preset, task="generic", imgsz=None):
         preset = (detection_preset or "balanced").strip().lower()
         conf = float(conf_threshold)
         iou = float(nms_iou)
         top_k = int(max_objects)
         resolved_task = str(task or "generic").strip().lower()
-        imgsz = 640 if resolved_task == "obb" else 1280
+        imgsz = int(imgsz) if imgsz is not None else (640 if resolved_task == "obb" else 1280)
         allow_relaxed_retry = True
 
         if resolved_task == "obb":
-            if preset == "precision":
+            if preset == "custom":
+                conf = max(0.01, min(conf, 0.99))
+                iou = max(0.05, min(iou, 0.95))
+                top_k = max(1, min(top_k, 250))
+                imgsz = 1280 if imgsz >= 1280 else 960 if imgsz >= 960 else 640
+                allow_relaxed_retry = False
+            elif preset == "precision":
                 conf = max(conf, 0.45)
                 top_k = min(top_k, 8)
                 allow_relaxed_retry = False
@@ -224,7 +243,13 @@ class SuperAnnotator:
                 top_k = max(1, min(top_k, 25))
                 allow_relaxed_retry = False
         else:
-            if preset == "precision":
+            if preset == "custom":
+                conf = max(0.01, min(conf, 0.99))
+                iou = max(0.05, min(iou, 0.95))
+                top_k = max(1, min(top_k, 250))
+                imgsz = 1280 if imgsz >= 1280 else 960 if imgsz >= 960 else 640
+                allow_relaxed_retry = False
+            elif preset == "precision":
                 conf = max(conf, 0.45)
                 iou = min(iou, 0.55)
                 top_k = min(top_k, 8)
@@ -566,7 +591,7 @@ class SuperAnnotator:
         return binary
 
 
-    def save_segments_for_boxes(self, image_path, boxes, session_dir, iterative=False, expand_ratio=0.10):
+    def save_segments_for_boxes(self, image_path, boxes, session_dir, iterative=False, expand_ratio=0.10, allow_rectangle_fallback=True):
         """Save SAM2 mask crops to session_dir/segments/ for each accepted box.
 
         Called by Electron after the user finalizes accepted boxes so that
@@ -576,11 +601,17 @@ class SuperAnnotator:
         import json as _json
 
         if not boxes:
-            return {"status": "ok", "saved": 0, "requested": 0}
+            return {"status": "ok", "saved": 0, "requested": 0, "details": []}
 
         image = cv2.imread(image_path)
         if image is None:
-            return {"status": "error", "error": f"Could not load image: {image_path}"}
+            return {
+                "status": "error",
+                "error": f"could_not_load_image:{image_path}",
+                "saved": 0,
+                "requested": len(boxes),
+                "details": [],
+            }
         img_h, img_w = image.shape[:2]
 
         path_hash = hashlib.md5(image_path.encode()).hexdigest()[:10]
@@ -604,16 +635,20 @@ class SuperAnnotator:
                 cached_lookup[key] = mask
 
         saved = 0
+        details = []
         for idx, box_xyxy in enumerate(boxes):
             x1 = max(0, int(box_xyxy[0]))
             y1 = max(0, int(box_xyxy[1]))
             x2 = min(img_w, int(box_xyxy[2]))
             y2 = min(img_h, int(box_xyxy[3]))
             if x2 <= x1 or y2 <= y1:
+                details.append({"index": idx, "status": "failed", "reason": "invalid_or_empty_crop"})
                 continue
 
             mask = cached_lookup.get((x1, y1, x2, y2))
             save_x1, save_y1, save_x2, save_y2 = x1, y1, x2, y2
+            mask_source = "cached_sam2" if mask is not None else None
+            failure_reason = None
 
             # Fall back to fresh SAM2 inference if no cached mask.
             if mask is None and self.sam2_model is not None:
@@ -628,12 +663,17 @@ class SuperAnnotator:
                         )
                         if expanded_xyxy:
                             save_x1, save_y1, save_x2, save_y2 = [int(v) for v in expanded_xyxy]
+                        mask_source = "sam2_iterative"
                     else:
                         results = self.sam2_model.predict(
                             image, bboxes=[[x1, y1, x2, y2]], verbose=False)
                         mask = (results[0].masks.data[0].cpu().numpy() > 0.5).astype(np.uint8)
+                        mask_source = "sam2"
                 except Exception as e:
                     logger.warning(f"SAM2 failed for box {idx}: {e}")
+                    failure_reason = f"sam2_inference_failed:{e}"
+            elif mask is None and self.sam2_model is None:
+                failure_reason = "sam2_unavailable"
 
             # Fallback: solid rectangle mask (not accepted Ã¢â‚¬â€ poisoned background)
             if mask is not None:
@@ -649,11 +689,18 @@ class SuperAnnotator:
                 save_y1 = max(0, int(geometry["box_xyxy"][1]))
                 save_x2 = min(img_w, int(geometry["box_xyxy"][2]))
                 save_y2 = min(img_h, int(geometry["box_xyxy"][3]))
-                mask_source = "sam2_iterative" if iterative else "sam2"
             else:
                 mask = None
 
             if mask is None:
+                if not allow_rectangle_fallback:
+                    details.append({
+                        "index": idx,
+                        "status": "failed",
+                        "maskSource": mask_source,
+                        "reason": failure_reason or "no_usable_sam_mask",
+                    })
+                    continue
                 mask = np.zeros((img_h, img_w), dtype=np.uint8)
                 mask[y1:y2, x1:x2] = 1
                 mask_source = "rectangle_fallback"
@@ -662,6 +709,12 @@ class SuperAnnotator:
             crop_img  = image[save_y1:save_y2, save_x1:save_x2]
             crop_mask = mask[save_y1:save_y2, save_x1:save_x2]
             if crop_img.size == 0:
+                details.append({
+                    "index": idx,
+                    "status": "failed",
+                    "maskSource": mask_source,
+                    "reason": "empty_crop_after_geometry",
+                })
                 continue
 
             if crop_mask.shape != crop_img.shape[:2]:
@@ -671,6 +724,12 @@ class SuperAnnotator:
 
             crop_mask = self._normalize_segment_mask_polarity(crop_mask)
             if crop_mask is None or np.count_nonzero(crop_mask) < 20:
+                details.append({
+                    "index": idx,
+                    "status": "failed",
+                    "maskSource": mask_source,
+                    "reason": "mask_too_small_after_normalization",
+                })
                 continue
 
             alpha = (crop_mask * 255).astype(np.uint8)
@@ -696,10 +755,11 @@ class SuperAnnotator:
                 _json.dump(meta, f)
 
             saved += 1
+            details.append({"index": idx, "status": "saved", "maskSource": mask_source})
 
         logger.info(
             f"save_segments_for_boxes: saved {saved}/{len(boxes)} segments Ã¢â€ â€™ {seg_dir}")
-        return {"status": "ok", "saved": saved, "requested": len(boxes)}
+        return {"status": "ok", "saved": saved, "requested": len(boxes), "details": details}
 
     # ------------------------------------------------------------------
     # Stage B: Normalization (The "Standardizer")
@@ -754,7 +814,7 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     # Fine-tuned YOLOv8 detection (OBB-aware)
     # ------------------------------------------------------------------
-    def detect_finetuned(self, image, finetuned_path, class_name, conf_threshold=0.5, top_k=10, nms_iou=0.3):
+    def detect_finetuned(self, image, finetuned_path, class_name, conf_threshold=0.5, top_k=10, nms_iou=0.3, imgsz=640):
         """Run detection with a fine-tuned YOLOv8 OBB model."""
         from ultralytics import YOLO
         ft_model = YOLO(finetuned_path)
@@ -762,7 +822,7 @@ class SuperAnnotator:
             image,
             conf=conf_threshold,
             iou=float(nms_iou),
-            imgsz=640,
+            imgsz=int(imgsz),
             task="obb",
             verbose=False,
         )
@@ -886,6 +946,8 @@ class SuperAnnotator:
         conf_threshold = options.get("conf_threshold", 0.3)
         sam_enabled = options.get("sam_enabled", False)
         max_objects = options.get("max_objects", 10)
+        requested_nms_iou = options.get("nms_iou", 0.3)
+        requested_imgsz = options.get("imgsz")
         finetuned_model = options.get("finetuned_model")
         orientation_policy = options.get("orientation_policy") or {}
         orientation_schema = str(orientation_policy.get("mode", "invariant")).strip().lower()
@@ -893,10 +955,11 @@ class SuperAnnotator:
         use_obb_detector = bool(finetuned_model and os.path.exists(finetuned_model))
         resolved = self._resolve_detection_preset(
             conf_threshold=conf_threshold,
-            nms_iou=0.3,
+            nms_iou=requested_nms_iou,
             max_objects=max_objects,
             detection_preset=detection_preset,
             task="obb" if use_obb_detector else "generic",
+            imgsz=requested_imgsz,
         )
         conf_threshold = resolved["conf"]
         max_objects = resolved["top_k"]
@@ -909,9 +972,9 @@ class SuperAnnotator:
         send_progress("Detecting objects...", 15, "detection")
         if use_obb_detector:
             import json as _json_inf
-            obb_nms_iou = 0.3
+            obb_nms_iou = float(resolved["iou"])
             obb_cfg = os.path.join(os.path.dirname(os.path.dirname(finetuned_model)), "obb_config.json")
-            if os.path.exists(obb_cfg):
+            if options.get("nms_iou") is None and os.path.exists(obb_cfg):
                 try:
                     with open(obb_cfg, "r", encoding="utf-8") as handle:
                         obb_nms_iou = float(_json_inf.load(handle).get("nms_iou", 0.3))
@@ -925,6 +988,7 @@ class SuperAnnotator:
                 conf_threshold,
                 top_k=max_objects,
                 nms_iou=obb_nms_iou,
+                imgsz=resolved["imgsz"],
             )
             detection_method = "yolo_obb"
         else:
@@ -1047,8 +1111,15 @@ class SuperAnnotator:
             }
             orientation_hint = None
             if class_id is not None and orientation_schema in ("directional", "bilateral"):
+                bilateral_axis = str(
+                    (orientation_policy or {}).get("bilateralClassAxis", "")
+                ).strip().lower()
+                if orientation_schema == "bilateral" and bilateral_axis == "vertical_obb":
+                    orientation = "up" if int(class_id) == 0 else "down"
+                else:
+                    orientation = "left" if int(class_id) == 0 else "right"
                 orientation_hint = {
-                    "orientation": "left" if class_id == 0 else "right",
+                    "orientation": orientation,
                     "confidence": float(box_data.get("confidence", 0.0)),
                     "source": "obb_class_id",
                 }
@@ -1188,7 +1259,13 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     # OBB dataset export
     # ------------------------------------------------------------------
-    def export_obb_dataset(self, session_dir, generate_synthetic=True, orientation_schema="invariant"):
+    def export_obb_dataset(
+        self,
+        session_dir,
+        generate_synthetic=True,
+        orientation_schema="invariant",
+        progress_callback=None,
+    ):
         """
         Export OBB-format YOLO dataset from session annotations.
         All exported boxes must already carry valid OBB corners.
@@ -1203,8 +1280,12 @@ class SuperAnnotator:
         if "data.export_yolo_dataset" in sys.modules:
             importlib.reload(sys.modules["data.export_yolo_dataset"])
         from data.export_yolo_dataset import export_obb_dataset as _export_obb
-        result = _export_obb(session_dir, generate_synthetic=generate_synthetic,
-                             orientation_schema=orientation_schema)
+        result = _export_obb(
+            session_dir,
+            generate_synthetic=generate_synthetic,
+            orientation_schema=orientation_schema,
+            progress_callback=progress_callback,
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -1212,6 +1293,7 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     def train_yolo_obb(self, session_dir, epochs=None, model_tier="nano",
                        device="cpu", sam2_enabled=True,
+                       batch=None, imgsz=None,
                        iou_loss=0.3, cls_loss=1.5, box_loss=5.0,
                        orientation_schema="invariant"):
         """
@@ -1237,17 +1319,43 @@ class SuperAnnotator:
             default_batch = 6
 
         resolved_epochs = epochs if (epochs is not None and epochs != 50) else default_epochs
-        resolved_batch = default_batch  # Always explicit; avoid YOLO autotune on CPU
+        resolved_batch = int(batch) if batch is not None else default_batch
+        resolved_imgsz = int(imgsz) if imgsz is not None else 640
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        is_windows = sys.platform.startswith("win")
+        resolved_amp = bool(device == "cuda" and not is_windows)
+        resolved_plots = True
+        if is_windows:
+            if device == "cuda":
+                resolved_workers = 0
+            else:
+                resolved_workers = 0
+        elif device == "cuda":
+            resolved_workers = min(8, max(2, cpu_count // 2))
+        elif device == "mps":
+            resolved_workers = min(4, max(1, cpu_count // 4))
+        else:
+            resolved_workers = 0
 
         logger.info(
-            "OBB training: device=%s, epochs=%d, batch=%d, sam2=%s",
-            device, resolved_epochs, resolved_batch, sam2_enabled,
+            "OBB training profile: device=%s, platform=%s, epochs=%d, batch=%d, imgsz=%d, workers=%d, amp=%s, plots=%s, sam2=%s",
+            device, sys.platform, resolved_epochs, resolved_batch, resolved_imgsz, resolved_workers, resolved_amp, resolved_plots, sam2_enabled,
         )
 
-        # Refresh segment pool while SAM2 is still loaded: prune stale entries and
-        # populate missing ones via SAM2 before releasing GPU memory for training.
-        send_progress("Refreshing segment pool...", 3, "training")
-        self._refresh_segments(session_dir, sam2_enabled=sam2_enabled)
+        if sam2_enabled:
+            send_obb_progress(
+                "SAM2 enabled: using existing segment pool only...",
+                3,
+                "training",
+                {"workers": resolved_workers, "device": device, "platform": sys.platform, "amp_enabled": resolved_amp},
+            )
+        else:
+            send_obb_progress(
+                "SAM2 disabled: training without synthetic segment augmentation...",
+                3,
+                "training",
+                {"workers": resolved_workers, "device": device, "platform": sys.platform, "amp_enabled": resolved_amp},
+            )
 
         # Unload large models before training to reclaim memory
         if self.yolo_model is not None:
@@ -1265,11 +1373,37 @@ class SuperAnnotator:
             pass
 
         # Export OBB dataset Ã¢â‚¬â€ pass sam2_enabled to control synthetic generation
-        send_progress("Exporting OBB dataset...", 5, "training")
-        export_result = self.export_obb_dataset(session_dir, generate_synthetic=sam2_enabled,
-                                                orientation_schema=orientation_schema)
+        send_obb_progress("Exporting OBB dataset...", 5, "training")
+
+        last_export_progress_at = 0.0
+
+        def on_export_progress(message, percent, details=None):
+            nonlocal last_export_progress_at
+            now = time.time()
+            pct = max(5, min(9, int(percent)))
+            if pct < 9 and now - last_export_progress_at < 0.5:
+                return
+            last_export_progress_at = now
+            merged_details = dict(details or {})
+            merged_details.setdefault("workers", resolved_workers)
+            merged_details.setdefault("device", device)
+            merged_details.setdefault("platform", sys.platform)
+            merged_details.setdefault("amp_enabled", resolved_amp)
+            send_obb_progress(message, pct, "export", merged_details)
+
+        export_result = self.export_obb_dataset(
+            session_dir,
+            generate_synthetic=sam2_enabled,
+            orientation_schema=orientation_schema,
+            progress_callback=on_export_progress,
+        )
         if not export_result.get("ok"):
             return {"status": "error", "error": export_result.get("error", "OBB dataset export failed")}
+
+        warnings = list(export_result.get("warnings", []))
+        synthetic_stats = export_result.get("synthetic", {}) if isinstance(export_result.get("synthetic"), dict) else {}
+        if sam2_enabled and int(synthetic_stats.get("segments_total", 0)) <= 0:
+            warnings.append("No usable finalized SAM2 segments found; continued with finalized OBB data only.")
 
         resolved_mode, _orientation_policy, _augmentation_policy, aug_profile = (
             resolve_session_augmentation_profile(
@@ -1302,46 +1436,198 @@ class SuperAnnotator:
             "nano": "yolov8n-obb.pt",
             "small": "yolov8s-obb.pt",
             "medium": "yolov8m-obb.pt",
+            "large": "yolov8l-obb.pt",
         }
         base_model = base_map.get(model_tier, "yolov8n-obb.pt")
         freeze_layers = 14 if model_tier == "nano" else 0
 
-        send_progress(f"Starting YOLOv8-OBB training ({model_tier}, {device})...", 10, "training")
+        send_obb_progress(
+            f"Preparing YOLOv8-OBB training runtime ({model_tier}, {device})...",
+            10,
+            "pretrain_setup",
+            {
+                "workers": resolved_workers,
+                "device": device,
+                "platform": sys.platform,
+                "amp_enabled": resolved_amp,
+            },
+        )
         from ultralytics import YOLO
         model = YOLO(base_model)
+
+        trainer_class = None
+        original_plot_training_labels = None
+        original_plot_training_samples = None
+        try:
+            trainer_class = model._smart_load("trainer")
+        except Exception:
+            trainer_class = None
+        if trainer_class is not None:
+            original_plot_training_labels = getattr(trainer_class, "plot_training_labels", None)
+            original_plot_training_samples = getattr(trainer_class, "plot_training_samples", None)
+            if callable(original_plot_training_labels):
+                def _skip_plot_training_labels(self):
+                    return None
+                trainer_class.plot_training_labels = _skip_plot_training_labels
+            if callable(original_plot_training_samples):
+                def _skip_plot_training_samples(self, batch, ni):
+                    return None
+                trainer_class.plot_training_samples = _skip_plot_training_samples
+
+        train_started_at = time.time()
+        last_batch_heartbeat_at = 0.0
+
+        def _safe_float(value):
+            try:
+                if value is None:
+                    return None
+                if hasattr(value, "item"):
+                    return float(value.item())
+                return float(value)
+            except Exception:
+                return None
+
+        def _extract_loss(trainer):
+            candidates = []
+            for attr_name in ("loss", "tloss", "loss_items"):
+                value = getattr(trainer, attr_name, None)
+                if value is None:
+                    continue
+                if hasattr(value, "detach"):
+                    try:
+                        value = value.detach().cpu().numpy()
+                    except Exception:
+                        pass
+                if isinstance(value, (list, tuple)):
+                    values = [_safe_float(v) for v in value]
+                    values = [v for v in values if v is not None]
+                    if values:
+                        candidates.append(sum(values))
+                        continue
+                if hasattr(value, "tolist"):
+                    try:
+                        listed = value.tolist()
+                    except Exception:
+                        listed = None
+                    if isinstance(listed, list):
+                        values = [_safe_float(v) for v in listed]
+                        values = [v for v in values if v is not None]
+                        if values:
+                            candidates.append(sum(values))
+                            continue
+                numeric = _safe_float(value)
+                if numeric is not None:
+                    candidates.append(numeric)
+            return candidates[0] if candidates else None
+
+        def _extract_lr(trainer):
+            optimizer = getattr(trainer, "optimizer", None)
+            param_groups = getattr(optimizer, "param_groups", None)
+            if not param_groups:
+                return None
+            try:
+                return _safe_float(param_groups[0].get("lr"))
+            except Exception:
+                return None
+
+        def _send_training_heartbeat(trainer, *, message, percent_override=None):
+            epoch_zero = max(0, int(getattr(trainer, "epoch", 0)))
+            total_epochs = max(1, int(getattr(trainer, "epochs", resolved_epochs) or resolved_epochs))
+            batches_total = max(1, int(len(getattr(trainer, "train_loader", []) or [])))
+            batch_zero = max(0, int(getattr(trainer, "batch_i", 0)))
+            batch_one = min(batches_total, batch_zero + 1)
+            progress_ratio = ((epoch_zero * batches_total) + batch_one) / max(1, total_epochs * batches_total)
+            percent = percent_override if percent_override is not None else 10 + int(80 * max(0.0, min(1.0, progress_ratio)))
+            elapsed_sec = max(0.0, time.time() - train_started_at)
+            eta_sec = None
+            if progress_ratio > 1e-6:
+                remaining_ratio = max(0.0, 1.0 - progress_ratio)
+                eta_sec = int((elapsed_sec / progress_ratio) * remaining_ratio)
+            details = {
+                "epoch": epoch_zero + 1,
+                "epochs": total_epochs,
+                "batch": batch_one,
+                "batches": batches_total,
+                "loss": _extract_loss(trainer),
+                "lr": _extract_lr(trainer),
+                "elapsed_sec": int(elapsed_sec),
+                "eta_sec": eta_sec,
+                "workers": resolved_workers,
+                "device": device,
+                "platform": sys.platform,
+                "amp_enabled": resolved_amp,
+            }
+            send_obb_progress(message, percent, "training", details)
+
+        def on_train_start(trainer):
+            _send_training_heartbeat(
+                trainer,
+                message="OBB training loop entered. Waiting for the first batches...",
+                percent_override=12,
+            )
 
         def on_train_epoch_end(trainer):
             epoch = trainer.epoch + 1
             total = trainer.epochs
             pct = 10 + int(80 * (epoch / total))
-            send_progress(f"OBB training epoch {epoch}/{total}...", pct, "training")
+            _send_training_heartbeat(
+                trainer,
+                message=f"OBB training epoch {epoch}/{total}...",
+                percent_override=pct,
+            )
 
+        def on_train_batch_end(trainer):
+            nonlocal last_batch_heartbeat_at
+            now = time.time()
+            if now - last_batch_heartbeat_at < 15.0:
+                return
+            last_batch_heartbeat_at = now
+            _send_training_heartbeat(
+                trainer,
+                message=(
+                    f"OBB training epoch {int(getattr(trainer, 'epoch', 0)) + 1}/"
+                    f"{int(getattr(trainer, 'epochs', resolved_epochs) or resolved_epochs)}..."
+                ),
+            )
+
+        model.add_callback("on_train_start", on_train_start)
         model.add_callback("on_train_epoch_end", on_train_epoch_end)
+        model.add_callback("on_train_batch_end", on_train_batch_end)
 
         output_dir = os.path.join(session_dir, "models", "obb_training")
-        model.train(
-            data=dataset_yaml,
-            epochs=resolved_epochs,
-            imgsz=640,
-            batch=resolved_batch,
-            device=device,
-            freeze=freeze_layers,
-            project=output_dir,
-            name="session_obb",
-            exist_ok=True,
-            verbose=False,
-            task="obb",
-            fliplr=0.0,         # horizontal flip corrupts orientation labels (left vs right class)
-            flipud=0.0,         # biological specimens should not train on upside-down flips
-            degrees=resolved_degrees,
-            iou=float(iou_loss),   # NMS IoU threshold for validation during training
-            cls=float(cls_loss),   # classification loss gain
-            box=float(box_loss),   # box regression loss gain
-            patience=20 if device in ("cuda", "mps") else 10,  # stop if no mAP50-95 gain for N epochs
-            cos_lr=True,        # cosine LR decay avoids late-epoch plateau oscillation
-            mosaic=0.0,         # disable mosaic entirely: pretrained fine-tune on small bio data
-            close_mosaic=0,
-        )
+        try:
+            model.train(
+                data=dataset_yaml,
+                epochs=resolved_epochs,
+                imgsz=resolved_imgsz,
+                batch=resolved_batch,
+                workers=resolved_workers,
+                device=device,
+                freeze=freeze_layers,
+                project=output_dir,
+                name="session_obb",
+                exist_ok=True,
+                verbose=False,
+                task="obb",
+                fliplr=0.0,         # horizontal flip corrupts orientation labels (left vs right class)
+                flipud=0.0,         # biological specimens should not train on upside-down flips
+                degrees=resolved_degrees,
+                iou=float(iou_loss),   # NMS IoU threshold for validation during training
+                cls=float(cls_loss),   # classification loss gain
+                box=float(box_loss),   # box regression loss gain
+                patience=20 if device in ("cuda", "mps") else 10,  # stop if no mAP50-95 gain for N epochs
+                cos_lr=True,        # cosine LR decay avoids late-epoch plateau oscillation
+                mosaic=0.0,         # disable mosaic entirely: pretrained fine-tune on small bio data
+                close_mosaic=0,
+                amp=resolved_amp,
+                plots=resolved_plots,
+            )
+        finally:
+            if trainer_class is not None:
+                if callable(original_plot_training_labels):
+                    trainer_class.plot_training_labels = original_plot_training_labels
+                if callable(original_plot_training_samples):
+                    trainer_class.plot_training_samples = original_plot_training_samples
 
         # Save NMS IoU preference alongside the run so detect_finetuned() can restore it.
         import json as _json_obb
@@ -1361,25 +1647,27 @@ class SuperAnnotator:
         dest = os.path.join(models_dir, "session_obb_detector.pt")
         shutil.copy2(best_pt, dest)
 
-        send_progress("OBB detector training complete", 100, "done")
+        send_obb_progress("OBB detector training complete", 100, "done")
         return {
             "status": "result",
             "ok": True,
             "model_path": dest,
-            "warnings": export_result.get("warnings", []),
+            "warnings": warnings,
         }
 
     # ------------------------------------------------------------------
     # OBB inference
     # ------------------------------------------------------------------
     def detect_obb(self, image_path, model_path, conf=0.3, nms_iou=None,
-                   detection_preset="balanced", max_objects=20):
+                   detection_preset="balanced", max_objects=20, imgsz=None,
+                   orientation_policy=None):
         """
         Run the trained session OBB detector on an image.
         Returns list of detections: [{corners, angle, class_id, confidence}]
         """
         import json as _json_obb
         from ultralytics import YOLO
+        from detection.detection_utils import normalize_orientation_payload
 
         # Load the NMS IoU that was saved when this model was trained.
         # The sidecar lives at {models_dir}/obb_training/session_obb/obb_config.json.
@@ -1400,6 +1688,7 @@ class SuperAnnotator:
             max_objects=max_objects,
             detection_preset=detection_preset,
             task="obb",
+            imgsz=imgsz,
         )
 
         model = YOLO(model_path)
@@ -1431,11 +1720,17 @@ class SuperAnnotator:
                     class_id = int(r.obb.cls[i])
                     confidence = float(r.obb.conf[i])
                     angle_deg = angle_rad * 180.0 / _math.pi
+                    normalized_orientation = normalize_orientation_payload(class_id, orientation_policy)
                     detections.append({
                         "corners": corners,
                         "angle": angle_deg,
-                        "class_id": class_id,
+                        "class_id": int(normalized_orientation.get("class_id", class_id)),
                         "confidence": confidence,
+                        **(
+                            {"orientation_hint": normalized_orientation["orientation_hint"]}
+                            if "orientation_hint" in normalized_orientation
+                            else {}
+                        ),
                     })
                 except Exception as e:
                     logger.warning(f"OBB detection parse error at index {i}: {e}")
@@ -1448,17 +1743,21 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     def tag_class_ids(self, session_dir, boxes, orientation_policy=None):
         """
-        Compute class_id for each box from placed head/tail landmark coordinates.
+        Compute class_id for each box from placed landmarks / anchor geometry.
 
         class_id encoding:
           directional: 0=left-facing (canonical), 1=right-facing
-          bilateral:   0=canonical, 1=flipped (same X-based logic as directional)
+          bilateral:   0=up-facing (canonical), 1=down-facing
           axial:        0=up-facing (canonical), 1=down-facing (triggers 180Ã‚Â° spin)
           invariant:   always 0
 
         Returns list of {"id": ..., "class_id": 0|1}.
         """
-        from data.export_yolo_dataset import _load_head_tail_ids, _compute_box_orientation
+        from data.export_yolo_dataset import (
+            _load_head_tail_ids,
+            _resolve_landmark_centroid,
+            _resolve_obb_class_id,
+        )
 
         mode = str((orientation_policy or {}).get("mode", "invariant")).strip().lower()
 
@@ -1466,16 +1765,30 @@ class SuperAnnotator:
             return [{"id": b.get("id"), "class_id": 0} for b in boxes]
 
         head_id, tail_id = _load_head_tail_ids(session_dir)
-        if head_id is None or tail_id is None:
-            return [{"id": b.get("id"), "class_id": 0} for b in boxes]
 
         result = []
         for b in boxes:
             if mode in ("directional", "bilateral"):
-                orientation = _compute_box_orientation(b, head_id, tail_id)
-                class_id = 1 if orientation == "right" else 0
+                class_id = _resolve_obb_class_id(
+                    b,
+                    orientation_class_enabled=True,
+                    head_id=head_id,
+                    tail_id=tail_id,
+                    orientation_policy=orientation_policy,
+                )
             else:
-                # Axial: determine up/down from head vs tail Y coordinate
+                # Axial: determine up/down from configured anchor centroids first,
+                # then fall back to legacy category-derived head/tail IDs.
+                anterior_ids = set((orientation_policy or {}).get("anteriorAnchorIds") or [])
+                posterior_ids = set((orientation_policy or {}).get("posteriorAnchorIds") or [])
+                head_xy = _resolve_landmark_centroid(b, anterior_ids)
+                tail_xy = _resolve_landmark_centroid(b, posterior_ids)
+                if head_xy is not None and tail_xy is not None:
+                    class_id = 1 if float(head_xy[1]) > float(tail_xy[1]) else 0
+                    result.append({"id": b.get("id"), "class_id": class_id})
+                    continue
+
+                # Legacy axial fallback using category-derived head/tail IDs.
                 landmarks = [
                     lm for lm in b.get("landmarks", [])
                     if not lm.get("isSkipped")
@@ -1662,6 +1975,8 @@ def main():
                     model_tier=cmd.get("model_tier", "nano"),
                     device=cmd.get("device", "cpu"),
                     sam2_enabled=cmd.get("sam2_enabled", True),
+                    batch=cmd.get("batch"),
+                    imgsz=cmd.get("imgsz"),
                     iou_loss=cmd.get("iou_loss", 0.3),
                     cls_loss=cmd.get("cls_loss", 1.5),
                     box_loss=cmd.get("box_loss", 5.0),
@@ -1677,6 +1992,8 @@ def main():
                     nms_iou=cmd.get("nms_iou"),   # None Ã¢â€ â€™ auto-load from sidecar
                     detection_preset=cmd.get("detection_preset", "balanced"),
                     max_objects=cmd.get("max_objects", 20),
+                    imgsz=cmd.get("imgsz"),
+                    orientation_policy=cmd.get("orientation_policy"),
                 )
                 send_response({"status": "result", "detections": detections})
 
@@ -1695,6 +2012,7 @@ def main():
                     session_dir=cmd["session_dir"],
                     iterative=cmd.get("iterative", False),
                     expand_ratio=cmd.get("expand_ratio", 0.10),
+                    allow_rectangle_fallback=cmd.get("allow_rectangle_fallback", True),
                 )
                 send_response(result)
 

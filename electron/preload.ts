@@ -49,7 +49,7 @@ interface PredictOptions {
     angle?: number;
     class_id?: number;
     orientation_hint?: {
-      orientation?: "left" | "right";
+      orientation?: "left" | "right" | "up" | "down";
       confidence?: number;
       source?: string;
       head_point?: [number, number];
@@ -112,14 +112,16 @@ contextBridge.exposeInMainWorld("api", {
   deleteModel: (
     modelName: string,
     speciesId?: string,
-    predictorType?: "dlib" | "cnn" | "yolo_pose"
-  ) => ipcRenderer.invoke("ml:delete-model", modelName, speciesId, predictorType),
+    predictorType?: "dlib" | "cnn",
+    modelKind?: "landmark" | "obb_detector"
+  ) => ipcRenderer.invoke("ml:delete-model", modelName, speciesId, predictorType, modelKind),
   renameModel: (
     oldName: string,
     newName: string,
     speciesId?: string,
-    predictorType?: "dlib" | "cnn" | "yolo_pose"
-  ) => ipcRenderer.invoke("ml:rename-model", oldName, newName, speciesId, predictorType),
+    predictorType?: "dlib" | "cnn",
+    modelKind?: "landmark" | "obb_detector"
+  ) => ipcRenderer.invoke("ml:rename-model", oldName, newName, speciesId, predictorType, modelKind),
   selectImages: () => ipcRenderer.invoke("select-images"),
   selectFolderPath: () => ipcRenderer.invoke("select-folder-path"),
   selectAnnotationFile: () => ipcRenderer.invoke("select-annotation-file"),
@@ -142,12 +144,34 @@ contextBridge.exposeInMainWorld("api", {
     speciesId: string,
     name: string,
     landmarkTemplate: any[],
-    orientationPolicy?: OrientationPolicy
-  ) => ipcRenderer.invoke("session:create", { speciesId, name, landmarkTemplate, orientationPolicy }),
+    orientationPolicy?: OrientationPolicy,
+    schemaMetadata?: {
+      schemaKind?: "default" | "custom";
+      schemaSourceId?: string;
+      schemaFingerprint?: string;
+    }
+  ) => ipcRenderer.invoke("session:create", {
+    speciesId,
+    name,
+    landmarkTemplate,
+    orientationPolicy,
+    schemaKind: schemaMetadata?.schemaKind,
+    schemaSourceId: schemaMetadata?.schemaSourceId,
+    schemaFingerprint: schemaMetadata?.schemaFingerprint,
+  }),
   sessionUpdateOrientationPolicy: (speciesId: string, orientationPolicy: OrientationPolicy) =>
     ipcRenderer.invoke("session:update-orientation-policy", { speciesId, orientationPolicy }),
   sessionUpdateAugmentation: (speciesId: string, augmentationPolicy: Record<string, unknown>) =>
     ipcRenderer.invoke("session:update-augmentation", { speciesId, augmentationPolicy }),
+  sessionUpdateObbDetectorSettings: (
+    speciesId: string,
+    settings: {
+      obbTrainingSettings?: Record<string, unknown>;
+      obbDetectionSettings?: Record<string, unknown>;
+      obbTrainingSettingsCustomized?: boolean;
+      obbDetectionSettingsCustomized?: boolean;
+    }
+  ) => ipcRenderer.invoke("session:update-obb-detector-settings", { speciesId, ...settings }),
   sessionSaveImage: (speciesId: string, imageData: string, filename: string, mimeType: string) =>
     ipcRenderer.invoke("session:save-image", { speciesId, imageData, filename, mimeType }),
   sessionSaveAnnotations: (speciesId: string, filename: string, boxes: any[]) =>
@@ -160,10 +184,26 @@ contextBridge.exposeInMainWorld("api", {
       top: number;
       width: number;
       height: number;
+      orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
+      obbCorners?: [number, number][];
+      angle?: number;
+      class_id?: number;
+      orientation_hint?: {
+        orientation?: "left" | "right" | "up" | "down";
+        confidence?: number;
+        source?: string;
+      };
       landmarks?: { id: number; x: number; y: number; isSkipped?: boolean }[];
     }[],
-    imagePath?: string
-  ) => ipcRenderer.invoke("session:finalize-accepted-boxes", { speciesId, filename, boxes, imagePath }),
+    imagePath?: string,
+    generateSegments?: boolean
+  ) => ipcRenderer.invoke("session:finalize-accepted-boxes", {
+    speciesId,
+    filename,
+    boxes,
+    imagePath,
+    generateSegments,
+  }),
   sessionUnfinalizeImage: (
     speciesId: string,
     filename: string,
@@ -195,6 +235,21 @@ contextBridge.exposeInMainWorld("api", {
   sessionDeleteImage: (speciesId: string, filename: string) =>
     ipcRenderer.invoke("session:delete-image", { speciesId, filename }),
   sessionDeleteAllImages: (speciesId: string) => ipcRenderer.invoke("session:delete-all-images", { speciesId }),
+  schemaListTemplates: () => ipcRenderer.invoke("schema:list-templates"),
+  schemaSaveCustomTemplate: (template: {
+    name: string;
+    description: string;
+    landmarks: any[];
+    orientationPolicy?: any;
+    sourcePresetId?: string;
+  }) => ipcRenderer.invoke("schema:save-custom-template", template),
+  schemaUpdateCustomTemplate: (templateId: string, updates: {
+    name: string;
+    description: string;
+    landmarks: any[];
+    orientationPolicy?: any;
+    sourcePresetId?: string;
+  }) => ipcRenderer.invoke("schema:update-custom-template", { templateId, updates }),
   // SuperAnnotator pipeline
   superAnnotate: (
     imagePath: string,
@@ -205,7 +260,9 @@ contextBridge.exposeInMainWorld("api", {
       maxObjects?: number;
       detectionMode?: string;
       detectionPreset?: string;
-      pcaMode?: "off" | "on" | "auto";
+      conf?: number;
+      nmsIou?: number;
+      imgsz?: 640 | 960 | 1280;
       useOrientationHint?: boolean;
     },
     speciesId?: string
@@ -218,7 +275,16 @@ contextBridge.exposeInMainWorld("api", {
   ) => ipcRenderer.invoke("ml:resegment-box", { imagePath, boxXyxy, iterative }),
   trainObbDetector: (
     speciesId: string,
-    options?: { epochs?: number; modelTier?: "nano" | "small"; iou?: number; cls?: number; box?: number }
+    options?: {
+      epochs?: number;
+      batch?: number;
+      modelTier?: "nano" | "small" | "medium" | "large";
+      imgsz?: 640 | 960 | 1280;
+      iou?: number;
+      cls?: number;
+      box?: number;
+      samEnabled?: boolean;
+    }
   ) =>
     ipcRenderer.invoke("ml:train-obb-detector", speciesId, options),
   onSuperAnnotateProgress: (callback: (data: any) => void) => {
@@ -247,15 +313,26 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.on("ml:train-progress", handler);
     return () => { ipcRenderer.removeListener("ml:train-progress", handler); };
   },
+  onObbTrainProgress: (callback: (data: {
+    percent: number;
+    stage: string;
+    message: string;
+    details?: Record<string, unknown>;
+  }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on("ml:obb-train-progress", handler);
+    return () => { ipcRenderer.removeListener("ml:obb-train-progress", handler); };
+  },
   onSegmentSaveStatus: (callback: (data: {
     speciesId: string;
     filename: string;
-    state: "idle" | "queued" | "running" | "saved" | "skipped" | "failed";
+    state: "idle" | "queued" | "running" | "saved" | "already_finalized" | "finalized_without_segments" | "skipped" | "failed";
     signature?: string;
     updatedAt: string;
     reason?: string;
     expectedCount?: number;
     savedCount?: number;
+    details?: import("../src/types/Image").FinalizeFailureDetail[];
   }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on("session:segment-save-status", handler);
@@ -312,9 +389,9 @@ contextBridge.exposeInMainWorld("api", {
         class_name?: string;
         obbCorners?: [number, number][];
         angle?: number;
-        orientation_override?: "left" | "right" | "uncertain";
+        orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
         orientation_hint?: {
-          orientation?: "left" | "right";
+          orientation?: "left" | "right" | "up" | "down";
           confidence?: number;
           source?: string;
           head_point?: [number, number];

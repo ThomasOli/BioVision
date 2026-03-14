@@ -19,20 +19,29 @@ STANDARD_SIZE = 512
 import numpy as np
 
 
-def _apply_photo_jitter(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Apply aggressive brightness/contrast/saturation jitter for offline dlib augmentation.
-
-    Dlib rotation angles are kept tight (±5°) to preserve mean-shape stability, so the
-    augmentation burden shifts to pixel intensities to prevent memorization of lighting
-    and slide backgrounds.
-    """
+def _apply_photo_jitter(
+    img: np.ndarray,
+    rng: np.random.Generator,
+    profile: dict | None = None,
+) -> np.ndarray:
+    """Apply dataset-aware brightness/contrast/saturation jitter for offline dlib augmentation."""
     assert img.ndim == 3 and img.shape[2] == 3, "Expected 3-channel BGR image"
-    alpha = 1.0 + rng.uniform(-0.25, 0.25)   # contrast multiplier — was ±0.15
-    beta  = rng.uniform(-40.0, 40.0)           # brightness offset (pixels) — was ±20
+    jitter_profile = dict(profile or {})
+    contrast_delta = float(jitter_profile.get("photo_jitter_contrast_delta", 0.25))
+    brightness_delta = float(jitter_profile.get("photo_jitter_brightness_delta", 40.0))
+    saturation_range = jitter_profile.get("photo_jitter_saturation_range", (0.7, 1.3))
+    if not isinstance(saturation_range, (list, tuple)) or len(saturation_range) != 2:
+        saturation_range = (0.7, 1.3)
+    sat_lo = float(saturation_range[0])
+    sat_hi = float(saturation_range[1])
+    if sat_hi < sat_lo:
+        sat_lo, sat_hi = sat_hi, sat_lo
+
+    alpha = 1.0 + rng.uniform(-contrast_delta, contrast_delta)
+    beta = rng.uniform(-brightness_delta, brightness_delta)
     img = np.clip(img.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
-    # Saturation jitter via HSV to combat lab-lighting and slide-background memorization
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * rng.uniform(0.7, 1.3), 0, 255)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * rng.uniform(sat_lo, sat_hi), 0, 255)
     return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 
@@ -125,6 +134,8 @@ def augment_training_data(
     aug_angles=None,
     add_flip=False,
     name_swap_map=None,
+    max_augmented_copies_per_image=None,
+    photo_jitter_profile=None,
 ):
     """
     Pre-augment a dlib training XML by generating rotated (and optionally flipped)
@@ -178,42 +189,78 @@ def augment_training_data(
 
         base = os.path.splitext(os.path.basename(img_file))[0]
 
+        candidate_specs = []
         for angle in aug_angles:
-            M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
-            rotated = cv2.warpAffine(img, M, (STANDARD_SIZE, STANDARD_SIZE),
-                                     borderMode=cv2.BORDER_REPLICATE)
-            rotated = _apply_photo_jitter(rotated, rng)
-            rot_parts = [
-                (name, *_rotate_point(x, y, cx, cy, angle))
-                for name, x, y in parts
-            ]
             angle_tag = str(angle).replace("-", "m")
-            out_path = os.path.join(aug_dir, f"{base}_aug_r{angle_tag}.png")
-            cv2.imwrite(out_path, rotated)
-            augmented_entries.append((out_path, rot_parts))
-
+            candidate_specs.append({
+                "kind": "rotate",
+                "angle": float(angle),
+                "flip": False,
+                "suffix": f"_aug_r{angle_tag}",
+            })
             if add_flip:
-                # Also include mirrored rotated variants to cover diagonal-right poses.
-                rot_flip = cv2.flip(rotated, 1)
-                rot_flip = _apply_photo_jitter(rot_flip, rng)
-                rot_flip_parts = [
-                    (name_swap_map.get(name, name), float(STANDARD_SIZE - 1 - rx), float(ry))
-                    for name, rx, ry in rot_parts
-                ]
-                out_path_rf = os.path.join(aug_dir, f"{base}_aug_r{angle_tag}_flip.png")
-                cv2.imwrite(out_path_rf, rot_flip)
-                augmented_entries.append((out_path_rf, rot_flip_parts))
+                candidate_specs.append({
+                    "kind": "rotate",
+                    "angle": float(angle),
+                    "flip": True,
+                    "suffix": f"_aug_r{angle_tag}_flip",
+                })
 
         if add_flip:
-            flipped = cv2.flip(img, 1)
-            flipped = _apply_photo_jitter(flipped, rng)
-            flip_parts = [
-                (name_swap_map.get(name, name), float(STANDARD_SIZE - 1 - x), float(y))
-                for name, x, y in parts
-            ]
-            out_path = os.path.join(aug_dir, f"{base}_aug_flip.png")
-            cv2.imwrite(out_path, flipped)
-            augmented_entries.append((out_path, flip_parts))
+            candidate_specs.append({
+                "kind": "flip",
+                "flip": True,
+                "suffix": "_aug_flip",
+            })
+
+        if not candidate_specs:
+            continue
+
+        max_copies = None if max_augmented_copies_per_image is None else max(0, int(max_augmented_copies_per_image))
+        if max_copies == 0:
+            continue
+        if max_copies is not None and len(candidate_specs) > max_copies:
+            selected_indices = sorted(
+                int(i) for i in rng.choice(len(candidate_specs), size=max_copies, replace=False).tolist()
+            )
+            selected_specs = [candidate_specs[i] for i in selected_indices]
+        else:
+            selected_specs = candidate_specs
+
+        for spec in selected_specs:
+            kind = str(spec.get("kind", ""))
+            if kind == "rotate":
+                angle = float(spec.get("angle", 0.0))
+                M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+                aug_img = cv2.warpAffine(
+                    img,
+                    M,
+                    (STANDARD_SIZE, STANDARD_SIZE),
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+                aug_parts = [
+                    (name, *_rotate_point(x, y, cx, cy, angle))
+                    for name, x, y in parts
+                ]
+                if bool(spec.get("flip", False)):
+                    aug_img = cv2.flip(aug_img, 1)
+                    aug_parts = [
+                        (name_swap_map.get(name, name), float(STANDARD_SIZE - 1 - rx), float(ry))
+                        for name, rx, ry in aug_parts
+                    ]
+            elif kind == "flip":
+                aug_img = cv2.flip(img, 1)
+                aug_parts = [
+                    (name_swap_map.get(name, name), float(STANDARD_SIZE - 1 - x), float(y))
+                    for name, x, y in parts
+                ]
+            else:
+                continue
+
+            aug_img = _apply_photo_jitter(aug_img, rng, photo_jitter_profile)
+            out_path = os.path.join(aug_dir, f"{base}{spec.get('suffix', '_aug')}.png")
+            cv2.imwrite(out_path, aug_img)
+            augmented_entries.append((out_path, aug_parts))
 
     if not augmented_entries:
         return train_xml_path  # no augmentation produced
@@ -259,6 +306,20 @@ def _capacity_tier(n_raw: int) -> str:
     if n < 1000:
         return "balanced"
     return "deep"
+
+
+def _resolve_dlib_oversampling_amount(
+    base_oversampling_amount: int,
+    *,
+    effective_num_images: int,
+    effective_training_exposure_target: int,
+) -> int:
+    """Cap dlib oversampling so offline augmentation and oversampling do not explode together."""
+    base = max(1, int(base_oversampling_amount))
+    effective_images = max(1, int(effective_num_images))
+    target = max(1, int(effective_training_exposure_target))
+    capped = max(1, target // effective_images)
+    return min(base, capped)
 
 
 def get_training_options(num_images, num_landmarks, orientation_mode="invariant"):
@@ -554,17 +615,20 @@ def train_shape_model(project_root, tag, custom_options=None,
         file=sys.stderr,
     )
 
-    orientation_mode = _resolve_orientation_mode(project_root, tag)
-    aug_override = ou.load_augmentation_policy(project_root)
-    aug_profile = ou.get_schema_augmentation_profile(
-        orientation_mode, engine="dlib", augmentation_override=aug_override or None
-    )
-    if aug_flip is None:
-        aug_flip = bool(aug_profile.get("flip", ou.default_allow_flip_augmentation(orientation_mode)))
-
     # Count raw train samples before augmentation so bucket selection is not
     # biased upward by synthetic/rotated copies.
     raw_num_images, raw_num_landmarks = count_landmarks_in_xml(train_xml)
+    orientation_mode = _resolve_orientation_mode(project_root, tag)
+    size_bucket = ou.get_training_capacity_tier(raw_num_images)
+    aug_override = ou.load_augmentation_policy(project_root)
+    aug_profile = ou.get_landmark_training_augmentation_profile(
+        orientation_mode,
+        engine="dlib",
+        dataset_size_bucket=size_bucket,
+        augmentation_override=aug_override or None,
+    )
+    if aug_flip is None:
+        aug_flip = bool(aug_profile.get("flip", ou.default_allow_flip_augmentation(orientation_mode)))
 
     # ── Pre-training augmentation ──────────────────────────────────────────────
     # Augmentation Router: model-aware angle selection.
@@ -588,6 +652,8 @@ def train_shape_model(project_root, tag, custom_options=None,
             aug_angles,
             aug_flip,
             name_swap_map=name_swap_map,
+            max_augmented_copies_per_image=aug_profile.get("max_augmented_copies_per_image"),
+            photo_jitter_profile=aug_profile,
         )
 
     # Count effective images/landmarks after augmentation
@@ -601,11 +667,32 @@ def train_shape_model(project_root, tag, custom_options=None,
         raw_num_landmarks,
         orientation_mode=orientation_mode,
     )
+    effective_training_exposure_target = int(aug_profile.get("effective_training_exposure_target", 16000))
+    base_oversampling_amount = int(options.oversampling_amount)
+    resolved_oversampling_amount = _resolve_dlib_oversampling_amount(
+        base_oversampling_amount,
+        effective_num_images=num_images,
+        effective_training_exposure_target=effective_training_exposure_target,
+    )
+    options.oversampling_amount = resolved_oversampling_amount
+    effective_training_exposure = int(num_images * max(1, int(options.oversampling_amount)))
     print(
         f"Resolved dlib preset bucket: {size_bucket} "
         f"(orientation_mode={orientation_mode}, raw_images={raw_num_images}, effective_images={num_images})",
         file=sys.stderr,
     )
+    print(
+        f"Resolved dlib augmentation budget: max_augmented_copies_per_image={int(aug_profile.get('max_augmented_copies_per_image', 0))}, "
+        f"base_oversampling={base_oversampling_amount}, resolved_oversampling={resolved_oversampling_amount}, "
+        f"effective_training_exposure={effective_training_exposure}",
+        file=sys.stderr,
+    )
+    if effective_training_exposure > int(round(effective_training_exposure_target * 1.25)):
+        print(
+            "WARNING: dlib effective training exposure exceeds the dataset-aware target; "
+            "manual overrides may be causing excessive sample multiplication.",
+            file=sys.stderr,
+        )
 
     # Apply custom options if provided
     if custom_options:
@@ -631,6 +718,7 @@ def train_shape_model(project_root, tag, custom_options=None,
         "feature_pool_size": options.feature_pool_size,
         "num_trees_per_cascade_level": options.num_trees_per_cascade_level,
         "num_test_splits": options.num_test_splits,
+        "base_oversampling_amount": base_oversampling_amount,
         "oversampling_amount": options.oversampling_amount,
         "oversampling_translation_jitter": options.oversampling_translation_jitter,
         "feature_pool_region_padding": options.feature_pool_region_padding,
@@ -638,6 +726,8 @@ def train_shape_model(project_root, tag, custom_options=None,
         "aug_angles": aug_angles,
         "aug_flip": aug_flip,
         "aug_profile": aug_profile,
+        "effective_training_exposure_target": effective_training_exposure_target,
+        "effective_training_exposure": effective_training_exposure,
         "bilateral_name_swaps": name_swap_map,
         "orientation_mode": orientation_mode,
         "augmented_xml": actual_train_xml if actual_train_xml != train_xml else None,
@@ -669,11 +759,14 @@ def train_shape_model(project_root, tag, custom_options=None,
                 "stage": "training",
                 "substage": "fit",
                 "message": (
-                    f"Training dlib predictor (images={num_images}, landmarks={num_landmarks}, "
+                    f"Training dlib predictor (raw={raw_num_images}, augmented={num_images}, "
+                    f"effective≈{effective_training_exposure}, landmarks={num_landmarks}, "
                     f"tree_depth={options.tree_depth}, cascade_depth={options.cascade_depth})"
                 ),
+                "raw_images": int(raw_num_images),
                 "num_images": int(num_images),
                 "num_landmarks": int(num_landmarks),
+                "effective_training_exposure": int(effective_training_exposure),
                 "tree_depth": int(options.tree_depth),
                 "cascade_depth": int(options.cascade_depth),
             }

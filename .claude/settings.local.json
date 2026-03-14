@@ -25,7 +25,10 @@
       "Bash(cat \"c:\\\\Users\\\\yupin\\\\Downloads\\\\BioVision\\\\models\\\\sessions\\\\schema-fish-morphometrics\\\\obb_dataset\\\\labels\\\\val\"/*.txt)",
       "Bash(cat \"c:\\\\Users\\\\yupin\\\\Downloads\\\\BioVision\\\\models\\\\sessions\\\\schema-fish-morphometrics\\\\obb_dataset\\\\labels\\\\train\"/*.txt)",
       "Bash(cat /c/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics/obb_dataset/labels/val/*.txt)",
-      "Bash(head -3 /c/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics/obb_dataset/labels/train/*.txt)"
+      "Bash(head -3 /c/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics/obb_dataset/labels/train/*.txt)",
+      "Bash(sort -t. -k1 -n)",
+      "Read(//c/Users/yupin/Downloads/BioVision/**)",
+      "Bash(ls c:/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics/ find c:/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics -name *.json)"
     ]
   }
 }

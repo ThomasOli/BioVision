@@ -3,8 +3,20 @@ import { Stage, Layer, Image as KonvaImage, Circle, Text, Rect, Line, Transforme
 import useImageLoader from "../hooks/useImageLoader";
 import { KonvaEventObject } from "konva/lib/Node";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
-import { BoundingBox } from "../types/Image";
+import { BoundingBox, StoredOrientationLabel } from "../types/Image";
 import { DetectionMode } from "./DetectionModeSelector";
+import {
+  getBoxOrientationArrow,
+  getClassIdForOrientationLabel,
+  getOppositeOrientationLabel,
+  getOrientationHintForClassId,
+  getOrientationLabelForClassId,
+  getOrientationLabelFromBox,
+  getOrientationRenderMode,
+  getOrientationToggleLabel,
+  getPreviewOrientationArrow,
+  normalizeOrientationLabelForSession,
+} from "@/lib/orientationDisplay";
 import Konva from "konva";
 
 // ── OBB / Transformer helpers ─────────────────────────────────────────────
@@ -125,6 +137,7 @@ interface ImageLabelerProps {
   hideSegmentOutlines?: boolean; // Hide SAM2 mask overlays (e.g. after finalize)
   lockBoxes?: boolean;           // Prevent drawing/adding new boxes (landmark-only mode)
   orientationMode?: "directional" | "bilateral" | "axial" | "invariant";
+  bilateralClassAxis?: "vertical_obb";
   onFlipAll?: () => void;        // Flip orientation of all boxes in the entire dataset
 }
 
@@ -140,6 +153,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   hideSegmentOutlines = false,
   lockBoxes = false,
   orientationMode,
+  bilateralClassAxis,
   onFlipAll,
 }) => {
   const {
@@ -194,9 +208,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   const pendingDrawMove = useRef<{ x: number; y: number } | null>(null);
   const drawMoveRafRef = useRef<number | null>(null);
   const [isRedrawingSelected, setIsRedrawingSelected] = useState(false);
-  const [drawDefaultOrientation, setDrawDefaultOrientation] = useState<"left" | "right">(() =>
-    ((typeof window !== "undefined" && window.localStorage.getItem("bv_draw_default_orientation")) as "left" | "right") ?? "left"
-  );
+  const [drawDefaultOrientation, setDrawDefaultOrientation] = useState<StoredOrientationLabel>("left");
 
   // Track if we just created a box to avoid double-adding landmarks
   const pendingBoxRef = useRef<{ x: number; y: number } | null>(null);
@@ -449,6 +461,11 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         if (detectionMode === "manual") {
           const bLeft = Math.round(left), bTop = Math.round(top);
           const bRight = bLeft + Math.round(width), bBottom = bTop + Math.round(height);
+          const defaultClassId = getClassIdForOrientationLabel(
+            normalizedOrientationMode,
+            drawDefaultOrientation,
+            effectiveBilateralClassAxis
+          );
           addBox({
             left: bLeft,
             top: bTop,
@@ -456,7 +473,17 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
             height: Math.round(height),
             obbCorners: [[bLeft, bTop], [bRight, bTop], [bRight, bBottom], [bLeft, bBottom]],
             angle: 0,
-            class_id: drawDefaultOrientation === "left" ? 0 : 1,
+            class_id: defaultClassId ?? 0,
+            orientation_hint: {
+              orientation:
+                getOrientationHintForClassId(
+                  normalizedOrientationMode,
+                  defaultClassId ?? 0,
+                  effectiveBilateralClassAxis
+                ) ?? drawDefaultOrientation,
+              confidence: 1.0,
+              source: "user_draw_default",
+            },
             source: "manual",
           });
           pendingSelectRef.current = true;
@@ -604,20 +631,42 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
   const normalizedOrientationMode = typeof orientationMode === "string"
     ? orientationMode.trim().toLowerCase()
     : undefined;
-  // Gate orientation arrows on vector schemas (directional + bilateral).
-  // Unknown/unset mode defaults to showing arrows.
-  const showOrientationArrow =
-    !normalizedOrientationMode ||
-    normalizedOrientationMode === "directional" ||
-    normalizedOrientationMode === "bilateral";
-  const isVectorSchema = showOrientationArrow; // same condition
+  // For bilateral mode, undefined axis defaults to vertical_obb (the current standard).
+  const effectiveBilateralClassAxis =
+    bilateralClassAxis ??
+    (normalizedOrientationMode === "bilateral" ? "vertical_obb" : undefined);
+  const orientationRenderMode = getOrientationRenderMode(normalizedOrientationMode);
+  const isVectorSchema = orientationRenderMode === "arrow";
 
   // Derive active orientation from selected box (reflects its class_id or hint)
   const selectedBox = selectedBoxId !== null ? boxes.find(b => b.id === selectedBoxId) ?? null : null;
-  const activeOrientation: "left" | "right" = selectedBox
-    ? (selectedBox.class_id === 0 ? "left"
-       : selectedBox.class_id === 1 ? "right"
-       : selectedBox.orientation_hint?.orientation === "right" ? "right" : "left")
+  const sessionDefaultOrientation =
+    getOrientationLabelForClassId(normalizedOrientationMode, 0, effectiveBilateralClassAxis) ?? "left";
+  useEffect(() => {
+    const stored =
+      typeof window !== "undefined"
+        ? window.localStorage.getItem("bv_draw_default_orientation")
+        : null;
+    const normalizedStored = normalizeOrientationLabelForSession(
+      normalizedOrientationMode,
+      stored,
+      effectiveBilateralClassAxis
+    );
+    setDrawDefaultOrientation(
+      normalizedStored !== "uncertain" ? normalizedStored : sessionDefaultOrientation
+    );
+  }, [effectiveBilateralClassAxis, normalizedOrientationMode, sessionDefaultOrientation]);
+
+  const activeOrientation: StoredOrientationLabel = selectedBox
+    ? (() => {
+        const resolved = getOrientationLabelFromBox(
+          normalizedOrientationMode,
+          selectedBox,
+          effectiveBilateralClassAxis,
+          0
+        );
+        return resolved !== "uncertain" ? resolved : drawDefaultOrientation;
+      })()
     : drawDefaultOrientation;
 
   // Colors for boxes
@@ -638,18 +687,36 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
             onClick={() => {
               if (selectedBox) {
                 // Per-box toggle only — do not change drawDefaultOrientation
-                const nextClassId = activeOrientation === "left" ? 1 : 0;
+                const nextOrientation = getOppositeOrientationLabel(
+                  normalizedOrientationMode,
+                  activeOrientation,
+                  effectiveBilateralClassAxis
+                );
+                const nextClassId = getClassIdForOrientationLabel(
+                  normalizedOrientationMode,
+                  nextOrientation,
+                  effectiveBilateralClassAxis
+                );
+                if (nextClassId === null) return;
                 updateBox(selectedBox.id, {
                   class_id: nextClassId,
                   orientation_hint: {
-                    orientation: nextClassId === 0 ? "left" : "right",
+                    orientation: getOrientationHintForClassId(
+                      normalizedOrientationMode,
+                      nextClassId,
+                      effectiveBilateralClassAxis
+                    ) ?? nextOrientation,
                     confidence: 1.0,
                     source: "user_toggle",
                   },
                 });
               } else {
                 // No box selected — change default for future new boxes only
-                const next = drawDefaultOrientation === "left" ? "right" : "left";
+                const next = getOppositeOrientationLabel(
+                  normalizedOrientationMode,
+                  drawDefaultOrientation,
+                  effectiveBilateralClassAxis
+                );
                 setDrawDefaultOrientation(next);
                 window.localStorage.setItem("bv_draw_default_orientation", next);
               }
@@ -658,9 +725,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
               ? "Toggle orientation of selected box"
               : "Set default orientation for new boxes"}
           >
-            {normalizedOrientationMode === "bilateral"
-              ? (activeOrientation === "left" ? "\u2191 Head" : "Head \u2193")
-              : (activeOrientation === "left" ? "\u2190 Head" : "Head \u2192")}
+            {getOrientationToggleLabel(normalizedOrientationMode, activeOrientation, effectiveBilateralClassAxis)}
           </button>
           {onFlipAll && (
             <button
@@ -703,12 +768,13 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
               {/* Draw preview rectangle during drag */}
               {drawPreview && (() => {
                 const { x: px, y: py, width: pw, height: ph } = drawPreview;
-                const arrowIsLeft = drawDefaultOrientation === "left";
                 const maxDim = Math.max(pw, ph);
-                const arrowLen = Math.min(Math.max(maxDim * 0.25, 14), 32);
-                const midY = py + ph / 2;
-                const tipX  = arrowIsLeft ? px : px + pw;
-                const tailX = arrowIsLeft ? px + arrowLen : px + pw - arrowLen;
+                const previewArrow = getPreviewOrientationArrow(
+                  normalizedOrientationMode,
+                  drawDefaultOrientation,
+                  { left: px, top: py, width: pw, height: ph },
+                  effectiveBilateralClassAxis
+                );
                 return (
                   <>
                     <Rect
@@ -719,17 +785,27 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                       dash={[8, 4]}
                       fill="rgba(59, 130, 246, 0.08)"
                     />
-                    {maxDim >= 24 && (
-                      <Arrow
-                        points={[tailX, midY, tipX, midY]}
-                        pointerLength={Math.min(Math.max(maxDim * 0.10, 6), 10)}
-                        pointerWidth={Math.min(Math.max(maxDim * 0.07, 5), 8)}
-                        fill="#3b82f6"
-                        stroke="#3b82f6"
-                        strokeWidth={Math.max(1.5, boxStrokeWidth * 0.85)}
-                        opacity={0.9}
-                        listening={false}
-                      />
+                    {maxDim >= 24 && previewArrow && (
+                      previewArrow.renderMode === "arrow" ? (
+                        <Arrow
+                          points={previewArrow.points}
+                          pointerLength={Math.min(Math.max(maxDim * 0.10, 6), 10)}
+                          pointerWidth={Math.min(Math.max(maxDim * 0.07, 5), 8)}
+                          fill="#3b82f6"
+                          stroke="#3b82f6"
+                          strokeWidth={Math.max(1.5, boxStrokeWidth * 0.85)}
+                          opacity={0.9}
+                          listening={false}
+                        />
+                      ) : (
+                        <Line
+                          points={previewArrow.points}
+                          stroke="#3b82f6"
+                          strokeWidth={Math.max(1.5, boxStrokeWidth * 0.85)}
+                          opacity={0.9}
+                          listening={false}
+                        />
+                      )
                     )}
                   </>
                 );
@@ -893,7 +969,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                             [box.left, box.top + box.height],
                           ] as [number, number][]);
                       if (normalizedOrientationMode === "invariant") return null;
-                      const [cp0, cp1, cp2, cp3] = corners;
+                      const [cp0, cp1, , cp3] = corners;
                       // Tilt angle (schema-independent, only needs corners)
                       const adx1 = cp1[0]-cp0[0], ady1 = cp1[1]-cp0[1];
                       const adx3 = cp3[0]-cp0[0], ady3 = cp3[1]-cp0[1];
@@ -903,54 +979,42 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
                       if (adeg > 90) adeg = 180 - adeg;
                       // Arrow (vector schemas only)
                       let arrowEl = null;
-                      if (showOrientationArrow) {
-                        const hintOrientation = box.orientation_hint?.orientation;
-                        const effectiveClassId =
-                          box.class_id === 0 || box.class_id === 1
-                            ? box.class_id
-                            : hintOrientation === "right"
-                              ? 1
-                              : 0; // default left; no fallback to global drawDefaultOrientation
-                        const isLeft = effectiveClassId === 0;
-                        const isBilateral = normalizedOrientationMode === "bilateral";
-                        // Canonical edge midpoints (from buildObbCorners order):
-                        // LEFT=cp3→cp0, RIGHT=cp1→cp2, TOP=cp0→cp1, BOTTOM=cp2→cp3
-                        let emX: number, emY: number;
-                        if (!isBilateral) {
-                          [emX, emY] = isLeft
-                            ? [(cp3[0]+cp0[0])/2, (cp3[1]+cp0[1])/2]
-                            : [(cp1[0]+cp2[0])/2, (cp1[1]+cp2[1])/2];
-                        } else {
-                          [emX, emY] = isLeft
-                            ? [(cp0[0]+cp1[0])/2, (cp0[1]+cp1[1])/2]
-                            : [(cp2[0]+cp3[0])/2, (cp2[1]+cp3[1])/2];
+                        const arrow = getBoxOrientationArrow(
+                          normalizedOrientationMode,
+                          box,
+                          effectiveBilateralClassAxis,
+                          0
+                        );
+                        if (arrow) {
+                          if (arrow.renderMode === "arrow") {
+                            const cHSizeLen = Math.min(Math.max(arrow.length * 0.20, 6), 10);
+                            const cHSizeW   = Math.min(Math.max(arrow.length * 0.15, 5), 8);
+                            arrowEl = (
+                              <Arrow
+                                key={`orient-arrow-${box.id}`}
+                                points={arrow.points}
+                                pointerLength={cHSizeLen}
+                                pointerWidth={cHSizeW}
+                                fill={boxColor}
+                                stroke={boxColor}
+                                strokeWidth={Math.max(1.5, boxStrokeWidth * 0.85)}
+                                opacity={isSelected ? 0.95 : 0.85}
+                                listening={false}
+                              />
+                            );
+                          } else {
+                            arrowEl = (
+                              <Line
+                                key={`orient-centerline-${box.id}`}
+                                points={arrow.points}
+                                stroke={boxColor}
+                                strokeWidth={Math.max(1.5, boxStrokeWidth * 0.85)}
+                                opacity={isSelected ? 0.95 : 0.85}
+                                listening={false}
+                              />
+                            );
+                          }
                         }
-                        const ccx = (cp0[0]+cp1[0]+cp2[0]+cp3[0])/4;
-                        const ccy = (cp0[1]+cp1[1]+cp2[1]+cp3[1])/4;
-                        const outLen = Math.hypot(emX-ccx, emY-ccy) || 1;
-                        const nx = (emX-ccx)/outLen, ny = (emY-ccy)/outLen;
-                        const arrowLen = Math.min(Math.max(outLen * 0.6, 14), 40);
-                        const tipX = emX + nx * 4, tipY = emY + ny * 4;
-                        const tailX = emX - nx * arrowLen, tailY = emY - ny * arrowLen;
-                        const fullLen = Math.hypot(tipX-tailX, tipY-tailY);
-                        if (fullLen >= 24) {
-                          const cHSizeLen = Math.min(Math.max(fullLen * 0.20, 6), 10);
-                          const cHSizeW   = Math.min(Math.max(fullLen * 0.15, 5), 8);
-                          arrowEl = (
-                            <Arrow
-                              key={`orient-arrow-${box.id}`}
-                              points={[tailX, tailY, tipX, tipY]}
-                              pointerLength={cHSizeLen}
-                              pointerWidth={cHSizeW}
-                              fill={boxColor}
-                              stroke={boxColor}
-                              strokeWidth={Math.max(1.5, boxStrokeWidth * 0.85)}
-                              opacity={isSelected ? 0.95 : 0.85}
-                              listening={false}
-                            />
-                          );
-                        }
-                      }
                       return (
                         <>
                           {arrowEl}

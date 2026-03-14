@@ -5,18 +5,32 @@ import { ChevronLeft, ChevronRight, Trash2, ZoomIn, Loader2, Sparkles, PencilRul
 import { toast } from "sonner";
 
 import ImageLabeler from "./ImageLabeler";
-import { DetectionMode, DetectionPreset } from "./DetectionModeSelector";
+import { DetectionMode } from "./DetectionModeSelector";
 import MagnifiedImageLabeler from "./MagnifiedZoomLabeler";
 import { UndoRedoClearContext } from "./UndoRedoClearContext";
 
 import { AppDispatch, RootState } from "../state/store";
 import {
+  clearFinalizePhaseForImages,
+  isFinalizeInFlight as isSharedFinalizeInFlight,
+  isTerminalFinalizeState,
+  normalizeFinalizeFilename,
   removeFile,
-  updateBoxes,
+  setFinalizePhaseForImage,
   setImageFinalized,
   setImagesUnfinalized,
+  updateBoxes,
 } from "../state/filesState/fileSlice";
-import { AnnotatedImage, BoundingBox } from "../types/Image";
+import {
+  AnnotatedImage,
+  BoundingBox,
+  FinalizeFailureDetail,
+  FinalizePhaseMetadata,
+  ObbDetectionSettings,
+  OrientationPolicy,
+} from "../types/Image";
+import { updateSpecies } from "@/state/speciesState/speciesSlice";
+import { normalizeObbDetectionSettings } from "@/lib/obbDetectorSettings";
 
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent } from "@/Components/ui/card";
@@ -40,7 +54,7 @@ interface ImageLabelerCarouselProps {
   opacity: number;
   isSwitchOn: boolean;
   detectionMode?: DetectionMode;
-  detectionPreset?: DetectionPreset;
+  obbDetectionSettings?: ObbDetectionSettings;
   className?: string;
   samEnabled?: boolean;
 }
@@ -50,7 +64,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   opacity,
   isSwitchOn,
   detectionMode = "manual",
-  detectionPreset = "balanced",
+  obbDetectionSettings,
   className = "",
   samEnabled = false,
 }) => {
@@ -76,13 +90,16 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   const [autoDetectProgress, setAutoDetectProgress] = useState<{ message: string; percent: number } | null>(null);
   const [isAutoBoxCorrection, setIsAutoBoxCorrection] = useState(false);
   const [isBulkFinalizing, setIsBulkFinalizing] = useState(false);
+  const [bulkFinalizeProgress, setBulkFinalizeProgress] = useState<{ current: number; total: number } | null>(null);
   const [isUnfinalizingCurrent, setIsUnfinalizingCurrent] = useState(false);
   const [isBulkUnfinalizing, setIsBulkUnfinalizing] = useState(false);
   const [finalizedBoxSignatureByImageId, setFinalizedBoxSignatureByImageId] = useState<Record<number, string>>({});
-  // Tracks which image IDs have been explicitly finalized by the user
-  const [finalizedImageIds, setFinalizedImageIds] = useState<Set<number>>(new Set());
-  const [finalizingImageIds, setFinalizingImageIds] = useState<Set<number>>(new Set());
   const [annotationHydratedIds, setAnnotationHydratedIds] = useState<Set<number>>(new Set());
+  const [sessionOrientationPolicy, setSessionOrientationPolicy] = useState<OrientationPolicy | undefined>(undefined);
+  const resolvedDetectionSettings = useMemo(
+    () => normalizeObbDetectionSettings(obbDetectionSettings),
+    [obbDetectionSettings]
+  );
   const annotationLoadInFlight = useRef<Set<number>>(new Set());
   const recentlyUnfinalizedIds = useRef<Set<number>>(new Set());
 
@@ -114,6 +131,10 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     const safeIndex = Math.min(Math.max(currentIndex, 0), totalImages - 1);
     return images[safeIndex] ?? null;
   }, [images, currentIndex, totalImages]);
+  const reduxImagesById = useMemo(
+    () => new Map(reduxFileArray.map((image) => [image.id, image])),
+    [reduxFileArray]
+  );
 
   const hasAnnotations = Boolean(current?.boxes?.length);
   const hasFinalizableBoxes = Boolean(
@@ -131,6 +152,21 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         top: Math.round(b.top),
         width: Math.round(b.width),
         height: Math.round(b.height),
+        ...(Array.isArray(b.obbCorners) && b.obbCorners.length === 4
+          ? {
+              obbCorners: b.obbCorners.map((point) => [
+                Number(Number(point?.[0] || 0).toFixed(3)),
+                Number(Number(point?.[1] || 0).toFixed(3)),
+              ]),
+            }
+          : {}),
+        ...(typeof b.angle === "number" && Number.isFinite(b.angle)
+          ? { angle: Number(Number(b.angle).toFixed(3)) }
+          : {}),
+        ...(typeof b.class_id === "number" && Number.isFinite(b.class_id)
+          ? { class_id: Math.round(Number(b.class_id)) }
+          : {}),
+        ...(b.orientation_override ? { orientation_override: b.orientation_override } : {}),
       }))
       .sort((a, b) =>
         a.left - b.left ||
@@ -141,6 +177,27 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     return JSON.stringify(reduced);
   }, [current?.boxes]);
 
+  const getResolvedImage = useCallback(
+    (image: AnnotatedImage | null | undefined) => {
+      if (!image) return null;
+      return reduxImagesById.get(image.id) ?? image;
+    },
+    [reduxImagesById]
+  );
+
+  const isTerminalFinalizeSuccess = useCallback(
+    (image: AnnotatedImage | null | undefined) => {
+      const resolved = getResolvedImage(image);
+      return Boolean(resolved && isTerminalFinalizeState(resolved));
+    },
+    [getResolvedImage]
+  );
+
+  const isFinalizeInFlight = useCallback(
+    (image: AnnotatedImage | null | undefined) => Boolean(image && isSharedFinalizeInFlight(getResolvedImage(image) ?? image)),
+    [getResolvedImage]
+  );
+
   // isCurrentFinalized: true if the user finalized this session OR the session was restored from disk as finalized.
   // Belt-and-suspenders: also check Redux directly by image id in case the context sync missed the update.
   const isCurrentFinalizedInRedux = useMemo(() => {
@@ -149,10 +206,11 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     return Boolean(reduxImage?.isFinalized);
   }, [reduxFileArray, current]);
 
+  const currentHasTerminalSuccess = isTerminalFinalizeSuccess(current);
   const isCurrentFinalized = current
-    ? (finalizedImageIds.has(current.id) || Boolean(current.isFinalized) || isCurrentFinalizedInRedux)
+    ? (!isFinalizeInFlight(current) && (currentHasTerminalSuccess || Boolean(current.isFinalized) || isCurrentFinalizedInRedux))
     : false;
-  const isCurrentFinalizing = current ? finalizingImageIds.has(current.id) : false;
+  const isCurrentFinalizing = current ? isFinalizeInFlight(current) : false;
 
   const isFinalizePending = Boolean(
     current &&
@@ -166,6 +224,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     () =>
       images.map((img) => ({
         id: img.id,
+        speciesId: img.speciesId,
         filename: img.filename,
         isFinalized: Boolean(img.isFinalized),
       })),
@@ -190,25 +249,17 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         const finalizedNames = new Set(
           result.images
             .filter((img) => Boolean(img.finalized))
-            .map((img) => img.filename)
+            .map((img) => normalizeFinalizeFilename(img.filename))
         );
         if (finalizedNames.size === 0) return;
 
         const candidates = finalizationCandidatesRef.current;
-        setFinalizedImageIds((prev) => {
-          const next = new Set(prev);
-          candidates.forEach((img) => {
-            if (!recentlyUnfinalizedIds.current.has(img.id) && finalizedNames.has(img.filename)) {
-              next.add(img.id);
-            }
-          });
-          return next;
-        });
-
         candidates.forEach((img) => {
+          const localPhase = reduxImagesById.get(img.id)?.finalizePhase?.state;
+          if (localPhase === "queued" || localPhase === "running") return;
           if (
             !recentlyUnfinalizedIds.current.has(img.id) &&
-            finalizedNames.has(img.filename) &&
+            finalizedNames.has(normalizeFinalizeFilename(img.filename)) &&
             !img.isFinalized
           ) {
             dispatch(setImageFinalized({ id: img.id }));
@@ -223,7 +274,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [activeSpeciesId, dispatch]);
+  }, [activeSpeciesId, dispatch, reduxImagesById]);
 
   useEffect(() => {
     if (detectionMode !== "auto") {
@@ -251,9 +302,8 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       .then((result) => {
         if (cancelled || !result.ok) return;
         dispatch(updateBoxes({ id: current.id, boxes: result.boxes || [] }));
-        if (result.finalized) {
+        if (result.finalized && !isFinalizeInFlight(current)) {
           dispatch(setImageFinalized({ id: current.id }));
-          setFinalizedImageIds((prev) => new Set([...prev, current.id]));
         }
       })
       .catch((err) => {
@@ -269,7 +319,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [current, annotationHydratedIds, dispatch]);
+  }, [current, annotationHydratedIds, dispatch, isFinalizeInFlight]);
 
   const handleDeleteImage = useCallback(() => {
     if (!current) return;
@@ -318,9 +368,8 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         if (!result.ok) return image.boxes || [];
         const loadedBoxes = result.boxes || [];
         dispatch(updateBoxes({ id: image.id, boxes: loadedBoxes }));
-        if (result.finalized) {
+        if (result.finalized && !isFinalizeInFlight(image)) {
           dispatch(setImageFinalized({ id: image.id }));
-          setFinalizedImageIds((prev) => new Set([...prev, image.id]));
         }
         setAnnotationHydratedIds((prev) => new Set([...prev, image.id]));
         return loadedBoxes;
@@ -331,24 +380,78 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         annotationLoadInFlight.current.delete(image.id);
       }
     },
-    [dispatch]
+    [dispatch, isFinalizeInFlight]
   );
 
   const getMatchingImageIds = useCallback((speciesId?: string, filename?: string): number[] => {
-    const safeSpeciesId = String(speciesId || "");
-    const safeFilename = String(filename || "").toLowerCase();
+    const safeSpeciesId = String(speciesId || "").trim();
+    const safeFilename = normalizeFinalizeFilename(filename);
     return images
       .filter(
         (img) =>
-          String(img.speciesId || "") === safeSpeciesId &&
-          String(img.filename || "").toLowerCase() === safeFilename
+          String(img.speciesId || "").trim() === safeSpeciesId &&
+          normalizeFinalizeFilename(img.filename) === safeFilename
       )
       .map((img) => img.id);
   }, [images]);
 
+  const setFinalizePhase = useCallback((
+    speciesId: string,
+    filename: string,
+    phase: FinalizePhaseMetadata,
+    isFinalized?: boolean
+  ) => {
+    dispatch(setFinalizePhaseForImage({
+      speciesId,
+      filename,
+      finalizePhase: phase,
+      ...(typeof isFinalized === "boolean" ? { isFinalized } : {}),
+    }));
+  }, [dispatch]);
+
+  const markTerminalFinalizeSuccess = useCallback((
+    speciesId: string,
+    filename: string,
+    phaseState: Omit<FinalizePhaseMetadata, "state" | "updatedAt"> & {
+      state: "saved" | "already_finalized" | "finalized_without_segments";
+    }
+  ): number[] => {
+    const matchingIds = getMatchingImageIds(speciesId, filename);
+    setFinalizePhase(speciesId, filename, {
+      state: phaseState.state,
+      signature: phaseState.signature,
+      reason: phaseState.reason,
+      expectedCount: phaseState.expectedCount,
+      savedCount: phaseState.savedCount,
+      details: phaseState.details,
+      updatedAt: new Date().toISOString(),
+    }, true);
+    if (phaseState.signature) {
+      setFinalizedBoxSignatureByImageId((prev) => {
+        const next = { ...prev };
+        matchingIds.forEach((id) => {
+          next[id] = phaseState.signature as string;
+        });
+        return next;
+      });
+    }
+    matchingIds.forEach((id) => dispatch(setImageFinalized({ id })));
+    return matchingIds;
+  }, [dispatch, getMatchingImageIds, setFinalizePhase]);
+
   const finalizeImageSegments = useCallback(async (
     image: AnnotatedImage | null
-  ): Promise<{ ok: boolean; speciesId?: string; filename?: string; signature?: string; error?: string }> => {
+  ): Promise<{
+    ok: boolean;
+    speciesId?: string;
+    filename?: string;
+    signature?: string;
+    state?: "queued" | "running" | "saved" | "already_finalized" | "finalized_without_segments";
+    expectedCount?: number;
+    savedCount?: number;
+    details?: FinalizeFailureDetail[];
+    error?: string;
+  }> => {
     if (!image?.speciesId || !image?.filename) {
       return { ok: false, error: "No active image." };
     }
@@ -361,6 +464,23 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         top: Math.round(b.top),
         width: Math.round(b.width),
         height: Math.round(b.height),
+        ...(b.orientation_override ? { orientation_override: b.orientation_override } : {}),
+        ...(Array.isArray(b.obbCorners) && b.obbCorners.length === 4
+          ? { obbCorners: b.obbCorners.map((point) => [Number(point[0]), Number(point[1])] as [number, number]) }
+          : {}),
+        ...(typeof b.angle === "number" && Number.isFinite(b.angle) ? { angle: Number(b.angle) } : {}),
+        ...(typeof b.class_id === "number" && Number.isFinite(b.class_id) ? { class_id: Math.round(Number(b.class_id)) } : {}),
+        ...(b.orientation_hint?.orientation
+          ? {
+              orientation_hint: {
+                orientation: b.orientation_hint.orientation,
+                ...(typeof b.orientation_hint.confidence === "number" && Number.isFinite(b.orientation_hint.confidence)
+                  ? { confidence: Number(b.orientation_hint.confidence) }
+                  : {}),
+                ...(b.orientation_hint.source ? { source: b.orientation_hint.source } : {}),
+              },
+            }
+          : {}),
         landmarks: (b.landmarks || [])
           .filter((lm) => Number.isFinite(Number(lm?.id)))
           .map((lm) => ({
@@ -371,29 +491,72 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
           })),
       }));
 
-    const imageId = image.id;
     try {
       const result = await window.api.sessionFinalizeAcceptedBoxes(
         image.speciesId,
         image.filename,
         acceptedBoxes,
-        image.path
+        image.path,
+        samEnabled
       );
-      if (result.ok && result.segmentQueueState === "queued" && result.signature) {
-        const matchingIds = getMatchingImageIds(image.speciesId, image.filename);
-        setFinalizingImageIds((prev) => new Set([...prev, ...(matchingIds.length ? matchingIds : [imageId])]));
+      if (
+        result.ok &&
+        result.signature &&
+        (result.segmentQueueState === "queued" || result.segmentQueueState === "running")
+      ) {
+        setFinalizePhase(image.speciesId, image.filename, {
+          state: result.segmentQueueState,
+          signature: result.signature,
+          updatedAt: new Date().toISOString(),
+          reason: result.reason,
+          expectedCount: result.expectedCount,
+          savedCount: result.savedCount,
+          details: result.details,
+        });
         return {
           ok: true,
           speciesId: image.speciesId,
           filename: image.filename,
           signature: result.signature,
+          state: result.segmentQueueState,
+          expectedCount: result.expectedCount,
+          savedCount: result.savedCount,
+          details: result.details,
+        };
+      }
+      if (
+        result.ok &&
+        result.signature &&
+        (
+          result.segmentQueueState === "saved" ||
+          result.segmentQueueState === "already_finalized" ||
+          result.segmentQueueState === "finalized_without_segments"
+        )
+      ) {
+        markTerminalFinalizeSuccess(image.speciesId, image.filename, {
+          state: result.segmentQueueState,
+          signature: result.signature,
+          reason: result.reason,
+          expectedCount: result.expectedCount,
+          savedCount: result.savedCount,
+          details: result.details,
+        });
+        return {
+          ok: true,
+          speciesId: image.speciesId,
+          filename: image.filename,
+          signature: result.signature,
+          state: result.segmentQueueState,
+          expectedCount: result.expectedCount,
+          savedCount: result.savedCount,
+          details: result.details,
         };
       }
       return {
         ok: false,
         speciesId: image.speciesId,
         filename: image.filename,
-        error: result.error || "Segment finalization was not queued.",
+        error: result.error || result.reason || "Segment finalization was not queued.",
       };
     } catch (err) {
       console.error("Failed to finalize accepted boxes:", err);
@@ -404,20 +567,15 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         error: err instanceof Error ? err.message : "Failed to finalize accepted boxes.",
       };
     }
-  }, [ensureImageBoxesLoaded, getMatchingImageIds]);
+  }, [ensureImageBoxesLoaded, markTerminalFinalizeSuccess, samEnabled, setFinalizePhase]);
 
-  const finalizeCurrentImageSegments = useCallback(async (): Promise<{ ok: boolean; speciesId?: string; filename?: string; signature?: string; error?: string }> => {
+  const finalizeCurrentImageSegments = useCallback(async () => {
     return finalizeImageSegments(current);
   }, [current, finalizeImageSegments]);
 
-  const clearFinalizedLocalState = useCallback((imageIds: number[]) => {
+  const clearFinalizeSignatureLocalState = useCallback((imageIds: number[]) => {
     if (!imageIds.length) return;
     const idSet = new Set(imageIds);
-    setFinalizedImageIds((prev) => {
-      const next = new Set(prev);
-      imageIds.forEach((id) => next.delete(id));
-      return next;
-    });
     setFinalizedBoxSignatureByImageId((prev) => {
       const next = { ...prev };
       idSet.forEach((id) => {
@@ -427,21 +585,38 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     });
   }, []);
 
-  const clearFinalizingLocalState = useCallback((imageIds: number[]) => {
+  const clearFinalizeLocalState = useCallback((imageIds: number[]) => {
     if (!imageIds.length) return;
-    setFinalizingImageIds((prev) => {
-      const next = new Set(prev);
-      imageIds.forEach((id) => next.delete(id));
-      return next;
-    });
+    clearFinalizeSignatureLocalState(imageIds);
+    dispatch(clearFinalizePhaseForImages({ ids: imageIds }));
+  }, [clearFinalizeSignatureLocalState, dispatch]);
+
+  const summarizeFinalizeReason = useCallback((
+    reason?: string,
+    details?: FinalizeFailureDetail[]
+  ): string | undefined => {
+    if (details && details.length > 0) {
+      const firstFailure = details.find((detail) => detail.status === "failed" && detail.reason);
+      if (firstFailure?.reason) {
+        return firstFailure.reason.replace(/_/g, " ");
+      }
+    }
+    if (!reason) return undefined;
+    return reason.replace(/^partial_segment_save:/, "partial segment save: ").replace(/_/g, " ");
   }, []);
 
   const waitForSegmentSaveOutcome = useCallback(async (
     speciesId: string,
     filename: string,
-    signature?: string
+    signature?: string,
+    options?: { bulkSequential?: boolean }
   ) => {
-    const isTerminal = (state: string) => state === "saved" || state === "skipped" || state === "failed";
+    const isTerminal = (state: string) =>
+      state === "saved" ||
+      state === "already_finalized" ||
+      state === "finalized_without_segments" ||
+      state === "skipped" ||
+      state === "failed";
     try {
       const initial = await window.api.sessionGetSegmentSaveStatus(speciesId, filename);
       if (
@@ -459,13 +634,33 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     return await new Promise<{
       speciesId: string;
       filename: string;
-      state: "idle" | "queued" | "running" | "saved" | "skipped" | "failed";
+      state: "idle" | "queued" | "running" | "saved" | "already_finalized" | "finalized_without_segments" | "skipped" | "failed";
       signature?: string;
       updatedAt: string;
       reason?: string;
       expectedCount?: number;
       savedCount?: number;
+      details?: FinalizeFailureDetail[];
     }>((resolve) => {
+      let resolved = false;
+      let pollCancelled = false;
+      const finish = (payload: {
+        speciesId: string;
+        filename: string;
+        state: "idle" | "queued" | "running" | "saved" | "already_finalized" | "finalized_without_segments" | "skipped" | "failed";
+        signature?: string;
+        updatedAt: string;
+        reason?: string;
+        expectedCount?: number;
+        savedCount?: number;
+        details?: FinalizeFailureDetail[];
+      }) => {
+        if (resolved) return;
+        resolved = true;
+        pollCancelled = true;
+        unsub();
+        resolve(payload);
+      };
       const unsub = window.api.onSegmentSaveStatus((data) => {
         if (
           data.speciesId === speciesId &&
@@ -473,20 +668,42 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
           (!signature || data.signature === signature) &&
           isTerminal(data.state)
         ) {
-          unsub();
-          resolve(data);
+          finish(data);
         }
       });
-      setTimeout(() => {
-        unsub();
-        resolve({
-          speciesId,
-          filename,
-          state: "failed",
-          updatedAt: new Date().toISOString(),
-          reason: "timeout",
-        });
-      }, 120_000);
+      const timeoutMs = options?.bulkSequential ? 30 * 60_000 : 120_000;
+      const timeoutAt = Date.now() + timeoutMs;
+      const poll = async () => {
+        while (!pollCancelled) {
+          await new Promise((pollResolve) => setTimeout(pollResolve, 2000));
+          if (pollCancelled) return;
+          try {
+            const status = await window.api.sessionGetSegmentSaveStatus(speciesId, filename);
+            if (status.ok && status.status && (!signature || status.status.signature === signature)) {
+              if (isTerminal(status.status.state)) {
+                finish({ speciesId, filename, ...status.status });
+                return;
+              }
+              if (options?.bulkSequential && (status.status.state === "queued" || status.status.state === "running")) {
+                continue;
+              }
+            }
+          } catch {
+            // keep polling until timeout
+          }
+          if (Date.now() >= timeoutAt) {
+            finish({
+              speciesId,
+              filename,
+              state: "failed",
+              updatedAt: new Date().toISOString(),
+              reason: "finalize_timeout_waiting_for_backend_terminal_status",
+            });
+            return;
+          }
+        }
+      };
+      void poll();
     });
   }, []);
 
@@ -494,33 +711,63 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     const unsub = window.api.onSegmentSaveStatus((data) => {
       const matchingIds = getMatchingImageIds(data.speciesId, data.filename);
       if (matchingIds.length === 0) return;
+      const localPhase = reduxFileArray.find((image) => matchingIds.includes(image.id))?.finalizePhase;
+      if (
+        localPhase?.signature &&
+        data.signature &&
+        localPhase.signature !== data.signature &&
+        (localPhase.state === "queued" || localPhase.state === "running")
+      ) {
+        return;
+      }
 
-      if (data.state === "saved") {
-        clearFinalizingLocalState(matchingIds);
-        setFinalizedImageIds((prev) => new Set([...prev, ...matchingIds]));
-        if (data.signature) {
-          setFinalizedBoxSignatureByImageId((prev) => {
-            const next = { ...prev };
-            matchingIds.forEach((id) => {
-              next[id] = data.signature as string;
-            });
-            return next;
-          });
-        }
-        matchingIds.forEach((id) => dispatch(setImageFinalized({ id })));
+      if (data.state === "queued" || data.state === "running") {
+        setFinalizePhase(data.speciesId, data.filename, {
+          state: data.state,
+          signature: data.signature,
+          updatedAt: data.updatedAt,
+          reason: data.reason,
+          expectedCount: data.expectedCount,
+          savedCount: data.savedCount,
+          details: data.details,
+        });
+        return;
+      }
+
+      if (
+        data.state === "saved" ||
+        data.state === "already_finalized" ||
+        data.state === "finalized_without_segments"
+      ) {
+        markTerminalFinalizeSuccess(data.speciesId, data.filename, {
+          state: data.state,
+          signature: data.signature,
+          reason: data.reason,
+          expectedCount: data.expectedCount,
+          savedCount: data.savedCount,
+          details: data.details,
+        });
         return;
       }
 
       if (data.state === "failed" || data.state === "skipped") {
-        clearFinalizingLocalState(matchingIds);
-        clearFinalizedLocalState(matchingIds);
+        setFinalizePhase(data.speciesId, data.filename, {
+          state: "failed",
+          signature: data.signature,
+          updatedAt: data.updatedAt,
+          reason: data.reason,
+          expectedCount: data.expectedCount,
+          savedCount: data.savedCount,
+          details: data.details,
+        });
+        clearFinalizeSignatureLocalState(matchingIds);
         dispatch(setImagesUnfinalized({ ids: matchingIds }));
       }
     });
     return () => {
       unsub();
     };
-  }, [clearFinalizedLocalState, clearFinalizingLocalState, dispatch, getMatchingImageIds]);
+  }, [clearFinalizeSignatureLocalState, dispatch, getMatchingImageIds, markTerminalFinalizeSuccess, reduxFileArray, setFinalizePhase]);
 
   const handleUnfinalizeCurrentImage = useCallback(async () => {
     if (!current?.speciesId || !current?.filename) return;
@@ -547,8 +794,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 
       const idsToClear = matchingIds.length > 0 ? matchingIds : [current.id];
       idsToClear.forEach((id) => recentlyUnfinalizedIds.current.add(id));
-      clearFinalizedLocalState(idsToClear);
-      clearFinalizingLocalState(idsToClear);
+      clearFinalizeLocalState(idsToClear);
       dispatch(setImagesUnfinalized({ ids: idsToClear }));
 
       if (!result.removedFromList && !result.hadFinalizedDetection) {
@@ -562,7 +808,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     } finally {
       setIsUnfinalizingCurrent(false);
     }
-  }, [clearFinalizedLocalState, clearFinalizingLocalState, current, dispatch, images]);
+  }, [clearFinalizeLocalState, current, dispatch, images]);
 
   const finalizableImages = useMemo(() => {
     return images.filter((img) => {
@@ -570,19 +816,21 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         (img.boxes || []).some((b) => b.width > 0 && b.height > 0) ||
         Boolean(img.hasBoxes);
       if (!hasValidBoxes || !img.speciesId || !img.filename) return false;
-      const finalized = Boolean(img.isFinalized) || finalizedImageIds.has(img.id);
-      const finalizing = finalizingImageIds.has(img.id);
+      const finalized =
+        !isFinalizeInFlight(img) &&
+        (isTerminalFinalizeSuccess(img) || Boolean(img.isFinalized));
+      const finalizing = isFinalizeInFlight(img);
       return !finalized && !finalizing;
     });
-  }, [images, finalizedImageIds, finalizingImageIds]);
+  }, [images, isFinalizeInFlight, isTerminalFinalizeSuccess]);
 
   const finalizableImageCount = finalizableImages.length;
   const finalizedImages = useMemo(() => {
     return images.filter((img) => {
       if (!img.speciesId || !img.filename) return false;
-      return Boolean(img.isFinalized) || finalizedImageIds.has(img.id);
+      return !isFinalizeInFlight(img) && (isTerminalFinalizeSuccess(img) || Boolean(img.isFinalized));
     });
-  }, [images, finalizedImageIds]);
+  }, [images, isFinalizeInFlight, isTerminalFinalizeSuccess]);
   const finalizedImageCount = finalizedImages.length;
 
   const handleUnfinalizeAllFinalized = useCallback(async () => {
@@ -610,8 +858,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         .map((img) => img.id);
 
       succeededIds.forEach((id) => recentlyUnfinalizedIds.current.add(id));
-      clearFinalizedLocalState(succeededIds);
-      clearFinalizingLocalState(succeededIds);
+      clearFinalizeLocalState(succeededIds);
       dispatch(setImagesUnfinalized({ ids: succeededIds }));
 
       if (result.failed === 0) {
@@ -625,7 +872,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     } finally {
       setIsBulkUnfinalizing(false);
     }
-  }, [activeSpeciesId, clearFinalizedLocalState, clearFinalizingLocalState, dispatch, finalizedImages]);
+  }, [activeSpeciesId, clearFinalizeLocalState, dispatch, finalizedImages]);
 
   const handleNext = useCallback(() => {
     if (totalImages <= 1) return;
@@ -672,9 +919,12 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     try {
       const result = await window.api.superAnnotate(current.path, promptClass, undefined, {
         samEnabled,
-        maxObjects: 25,
+        maxObjects: resolvedDetectionSettings.maxObjects,
         detectionMode: "auto",
-        detectionPreset,
+        detectionPreset: resolvedDetectionSettings.detectionPreset,
+        conf: resolvedDetectionSettings.conf,
+        nmsIou: resolvedDetectionSettings.nmsIou,
+        imgsz: resolvedDetectionSettings.imgsz,
         useOrientationHint: true,
       }, current.speciesId);
 
@@ -698,25 +948,45 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       setIsDetecting(false);
       setAutoDetectProgress(null);
     }
-  }, [current, className, samEnabled, detectionPreset, setBoxesFromSuperAnnotation]);
+  }, [current, className, resolvedDetectionSettings, samEnabled, setBoxesFromSuperAnnotation]);
 
   const handleAutoDetectOrFinalize = useCallback(async () => {
     if (isFinalizePending) {
-      const queued = await finalizeCurrentImageSegments();
-      if (!queued.ok || !queued.speciesId || !queued.filename) {
-        toast.error(queued.error || "Failed to finalize accepted boxes.");
+      const request = await finalizeCurrentImageSegments();
+      if (!request.ok || !request.speciesId || !request.filename) {
+        toast.error(request.error || "Failed to finalize accepted boxes.");
+        return;
+      }
+      if (
+        request.state === "saved" ||
+        request.state === "already_finalized" ||
+        request.state === "finalized_without_segments"
+      ) {
+        if (request.state === "finalized_without_segments") {
+          toast.warning(
+            summarizeFinalizeReason(undefined, request.details) ||
+              "Detection finalized without segments for this image."
+          );
+        } else {
+          toast.success("Finalized accepted boxes for this image.");
+        }
         return;
       }
       const outcome = await waitForSegmentSaveOutcome(
-        queued.speciesId,
-        queued.filename,
-        queued.signature
+        request.speciesId,
+        request.filename,
+        request.signature
       );
-      if (outcome.state === "saved") {
+      if (outcome.state === "saved" || outcome.state === "already_finalized") {
         toast.success("Finalized accepted boxes for this image.");
+      } else if (outcome.state === "finalized_without_segments") {
+        toast.warning(
+          summarizeFinalizeReason(outcome.reason, outcome.details) ||
+            "Detection finalized without segments for this image."
+        );
       } else {
         toast.error(
-          outcome.reason ||
+          summarizeFinalizeReason(outcome.reason, outcome.details) ||
             (outcome.expectedCount != null && outcome.savedCount != null
               ? `Saved ${outcome.savedCount}/${outcome.expectedCount} segments.`
               : "Failed to finalize accepted boxes.")
@@ -725,7 +995,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
       return;
     }
     await handleAutoDetect();
-  }, [handleAutoDetect, finalizeCurrentImageSegments, isFinalizePending, waitForSegmentSaveOutcome]);
+  }, [finalizeCurrentImageSegments, handleAutoDetect, isFinalizePending, summarizeFinalizeReason, waitForSegmentSaveOutcome]);
 
   const handleFinalizeAllWithBoxes = useCallback(async () => {
     if (finalizableImageCount === 0) {
@@ -734,18 +1004,55 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     }
 
     setIsBulkFinalizing(true);
-    const pendingRequests: Array<{ speciesId: string; filename: string; signature?: string }> = [];
+    setBulkFinalizeProgress({ current: 0, total: finalizableImages.length });
+    let successCount = 0;
     let failCount = 0;
+    let detectionOnlyCount = 0;
 
     try {
-      for (const image of finalizableImages) {
+      for (let index = 0; index < finalizableImages.length; index += 1) {
+        const image = finalizableImages[index];
+        setBulkFinalizeProgress({ current: index + 1, total: finalizableImages.length });
         const request = await finalizeImageSegments(image);
-        if (request.ok && request.speciesId && request.filename) {
-          pendingRequests.push({
-            speciesId: request.speciesId,
-            filename: request.filename,
-            signature: request.signature,
-          });
+        if (
+          request.ok &&
+          (
+            request.state === "saved" ||
+            request.state === "already_finalized" ||
+            request.state === "finalized_without_segments"
+          )
+        ) {
+          successCount += 1;
+          if (request.state === "finalized_without_segments") {
+            detectionOnlyCount += 1;
+          }
+          continue;
+        }
+
+        if (
+          request.ok &&
+          request.speciesId &&
+          request.filename &&
+          (request.state === "queued" || request.state === "running")
+        ) {
+          const outcome = await waitForSegmentSaveOutcome(
+            request.speciesId,
+            request.filename,
+            request.signature,
+            { bulkSequential: true }
+          );
+          if (
+            outcome.state === "saved" ||
+            outcome.state === "already_finalized" ||
+            outcome.state === "finalized_without_segments"
+          ) {
+            successCount += 1;
+            if (outcome.state === "finalized_without_segments") {
+              detectionOnlyCount += 1;
+            }
+          } else {
+            failCount += 1;
+          }
         } else {
           failCount += 1;
         }
@@ -753,28 +1060,29 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     } catch (err) {
       console.error("Finalize-all error:", err);
       setIsBulkFinalizing(false);
+      setBulkFinalizeProgress(null);
       toast.error("Failed to finalize images with boxes.");
       return;
     }
 
-    if (pendingRequests.length === 0) {
+    if (successCount === 0) {
       setIsBulkFinalizing(false);
+      setBulkFinalizeProgress(null);
       toast.error("Failed to finalize images with boxes.");
       return;
     }
-
-    const outcomes = await Promise.all(
-      pendingRequests.map((request) =>
-        waitForSegmentSaveOutcome(request.speciesId, request.filename, request.signature)
-      )
-    );
-    const successCount = outcomes.filter((outcome) => outcome.state === "saved").length;
-    failCount += outcomes.length - successCount;
 
     setIsBulkFinalizing(false);
+    setBulkFinalizeProgress(null);
 
     if (successCount > 0 && failCount === 0) {
-      toast.success(`Finalized ${successCount} image(s) with accepted boxes.`);
+      if (detectionOnlyCount > 0) {
+        toast.warning(
+          `Finalized ${successCount} image(s); ${detectionOnlyCount} finished without segments.`
+        );
+      } else {
+        toast.success(`Finalized ${successCount} image(s) with accepted boxes.`);
+      }
     } else if (successCount > 0) {
       toast.warning(`Finalized ${successCount} image(s), ${failCount} failed.`);
     } else {
@@ -822,7 +1130,59 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         landmarks: activeSpeciesForSchema.landmarkTemplate,
       }
     : undefined;
-  const activeOrientationMode = activeSpeciesForSchema?.orientationPolicy?.mode;
+  const activeSpeciesForSchemaId = activeSpeciesForSchema?.id;
+  const reduxOrientationPolicy = activeSpeciesForSchema?.orientationPolicy;
+
+  useEffect(() => {
+    const speciesId = current?.speciesId || activeSpeciesForSchemaId;
+    if (!speciesId) {
+      setSessionOrientationPolicy(undefined);
+      return;
+    }
+
+    let cancelled = false;
+    window.api.sessionLoad(speciesId).then((result) => {
+      if (cancelled || !result?.ok) return;
+      const sessionPolicy = result.meta?.orientationPolicy;
+      const sessionMode = sessionPolicy?.mode;
+      if (
+        sessionMode === "directional" ||
+        sessionMode === "bilateral" ||
+        sessionMode === "axial" ||
+        sessionMode === "invariant"
+      ) {
+        setSessionOrientationPolicy(sessionPolicy);
+        if (
+          sessionPolicy &&
+          (
+            sessionMode !== reduxOrientationPolicy?.mode ||
+            sessionPolicy.bilateralClassAxis !== reduxOrientationPolicy?.bilateralClassAxis
+          )
+        ) {
+          dispatch(
+            updateSpecies({
+              id: speciesId,
+              updates: {
+                orientationPolicy: sessionPolicy,
+              },
+            })
+          );
+        }
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setSessionOrientationPolicy(undefined);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSpeciesForSchemaId, current?.speciesId, dispatch, reduxOrientationPolicy?.bilateralClassAxis, reduxOrientationPolicy?.mode]);
+
+  const activeOrientationPolicy = sessionOrientationPolicy ?? reduxOrientationPolicy;
+  const activeOrientationMode = activeOrientationPolicy?.mode;
+  const activeBilateralClassAxis = activeOrientationPolicy?.bilateralClassAxis;
 
   const exportCurrent = useCallback(async () => {
     if (!current || !current.boxes?.length) return;
@@ -1051,7 +1411,9 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 {isBulkFinalizing ? (
                   <>
                     <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                    Finalizing...
+                    {bulkFinalizeProgress
+                      ? `Finalizing ${bulkFinalizeProgress.current} of ${bulkFinalizeProgress.total}...`
+                      : "Finalizing..."}
                   </>
                 ) : (
                   <>
@@ -1202,6 +1564,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 hideSegmentOutlines={isCurrentFinalized}
                 lockBoxes={isCurrentFinalized || isCurrentFinalizing}
                 orientationMode={activeOrientationMode}
+                bilateralClassAxis={activeBilateralClassAxis}
                 onFlipAll={flipAllBoxOrientations}
               />
               {/* Finalized overlay banner */}
@@ -1280,6 +1643,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
             hideSegmentOutlines={isCurrentFinalized}
             lockBoxes={isCurrentFinalized || isCurrentFinalizing}
             orientationMode={activeOrientationMode}
+            bilateralClassAxis={activeBilateralClassAxis}
           />
         )}
       </Card>

@@ -8,10 +8,26 @@ import { toast } from "sonner";
 import UploadImages from "./UploadImages";
 import type { RootState } from "../state/store";
 import store from "../state/store";
-import { clearFiles } from "../state/filesState/fileSlice";
+import {
+  clearFiles,
+  selectHasTerminalFinalizedBoxes,
+  selectTerminalFinalizedImageCount,
+} from "../state/filesState/fileSlice";
 import Landmark from "./Landmark";
 import { TrainModelDialog } from "./PopUp";
-import { DetectionModeSelector, DetectionMode, DetectionPreset } from "./DetectionModeSelector";
+import { DetectionModeSelector, DetectionMode } from "./DetectionModeSelector";
+import type {
+  ObbDetectionSettings,
+  ObbTrainProgressEvent,
+  ObbTrainingSettings,
+  RepresentativeImageDimensions,
+} from "@/types/Image";
+import {
+  areObbTrainingSettingsEqual,
+  DEFAULT_OBB_TRAINING_SETTINGS,
+  getRecommendedObbTrainingSettings,
+  normalizeObbTrainingSettings,
+} from "@/lib/obbDetectorSettings";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
@@ -34,8 +50,10 @@ interface MenuProps {
   // Detection mode
   detectionMode?: DetectionMode;
   onDetectionModeChange?: (mode: DetectionMode) => void;
-  detectionPreset?: DetectionPreset;
-  onDetectionPresetChange?: (preset: DetectionPreset) => void;
+  obbDetectionSettings?: ObbDetectionSettings;
+  obbDetectionRecommendation?: string;
+  representativeImageDimensions?: RepresentativeImageDimensions;
+  onObbDetectionSettingsChange?: (settings: ObbDetectionSettings) => void;
   // Auto mode class name
   className?: string;
   onClassNameChange?: (name: string) => void;
@@ -88,8 +106,10 @@ const Menu: React.FC<MenuProps> = ({
   onTrainDialogOpened,
   detectionMode = "manual",
   onDetectionModeChange,
-  detectionPreset = "balanced",
-  onDetectionPresetChange,
+  obbDetectionSettings,
+  obbDetectionRecommendation,
+  representativeImageDimensions,
+  onObbDetectionSettingsChange,
   className = "",
   onClassNameChange,
   samEnabled = false,
@@ -143,23 +163,22 @@ const Menu: React.FC<MenuProps> = ({
   const [obbDetectorReady, setObbDetectorReady] = useState(false);
   const [isTrainingObb, setIsTrainingObb] = useState(false);
   const [obbTrainingMessage, setObbTrainingMessage] = useState<string>("");
-  const [obbHyperparams, setObbHyperparams] = useState({ iou: 0.3, cls: 1.5, box: 5.0 });
+  const [obbTrainingProgress, setObbTrainingProgress] = useState<ObbTrainProgressEvent | null>(null);
+  const [obbTrainingSettings, setObbTrainingSettings] = useState<ObbTrainingSettings>(DEFAULT_OBB_TRAINING_SETTINGS);
+  const [obbTrainingSettingsCustomized, setObbTrainingSettingsCustomized] = useState(false);
   const [augmentationPolicy, setAugmentationPolicy] = useState<AugmentationPolicy | undefined>(undefined);
   const [orientationMode, setOrientationMode] = useState<string | undefined>(undefined);
   const [sessionImageCountHint, setSessionImageCountHint] = useState(0);
 
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
+  const hardware = useSelector((state: RootState) => state.hardware);
   const workspaceImageCount = useSelector((state: RootState) => state.files.fileArray.length);
-  const finalizedImageCount = useSelector((state: RootState) =>
-    state.files.fileArray.filter((img) => img.isFinalized === true).length
-  );
+  const finalizedImageCount = useSelector(selectTerminalFinalizedImageCount);
   const hasWorkspaceData = workspaceImageCount > 0;
 
   // showObbStep: unlocks the "Train OBB Detector" step only once the user has
   // finalized at least one image (clicked "Finalize This Image").
-  const hasFinalizedBoxes = useSelector((state: RootState) =>
-    state.files.fileArray.some((img) => img.isFinalized === true)
-  );
+  const hasFinalizedBoxes = useSelector(selectHasTerminalFinalizedBoxes);
   const canTrain = hasFinalizedBoxes && !isTraining;
   const showObbStep = hasFinalizedBoxes;
 
@@ -175,25 +194,6 @@ const Menu: React.FC<MenuProps> = ({
     };
     fetchProjectRoot();
   }, []);
-
-  // Load augmentationPolicy and orientationMode from session when the train dialog opens
-  useEffect(() => {
-    if (!openTrainDialog || !activeSpeciesId) return;
-    setCnnVariantTouched(false);
-    window.api.sessionLoad(activeSpeciesId).then((result) => {
-      if (result?.ok) {
-        if (result.meta?.augmentationPolicy) {
-          setAugmentationPolicy(result.meta.augmentationPolicy as AugmentationPolicy);
-        }
-        const mode = result.meta?.orientationPolicy?.mode;
-        if (typeof mode === "string") setOrientationMode(mode);
-        setObbDetectorReady(Boolean(result.meta?.obbDetectorReady));
-        setSessionImageCountHint(
-          typeof result.meta?.imageCount === "number" ? result.meta.imageCount : 0
-        );
-      }
-    }).catch(() => {/* ignore */});
-  }, [openTrainDialog, activeSpeciesId]);
 
   useEffect(() => {
     const loadCnnVariants = async () => {
@@ -257,6 +257,51 @@ const Menu: React.FC<MenuProps> = ({
     () => getRecommendedCnnVariantId(cnnDatasetBucket),
     [cnnDatasetBucket]
   );
+  const obbTrainingRecommendation = useMemo(
+    () => getRecommendedObbTrainingSettings(datasetSizeCount, hardware, representativeImageDimensions),
+    [datasetSizeCount, hardware, representativeImageDimensions]
+  );
+
+  // Load augmentationPolicy and orientationMode from session when the train dialog opens
+  useEffect(() => {
+    if (!openTrainDialog || !activeSpeciesId) return;
+    setCnnVariantTouched(false);
+    window.api.sessionLoad(activeSpeciesId).then((result) => {
+      if (result?.ok) {
+        if (result.meta?.augmentationPolicy) {
+          setAugmentationPolicy(result.meta.augmentationPolicy as AugmentationPolicy);
+        }
+        const mode = result.meta?.orientationPolicy?.mode;
+        if (typeof mode === "string") setOrientationMode(mode);
+        setObbDetectorReady(Boolean(result.meta?.obbDetectorReady));
+        setSessionImageCountHint(
+          typeof result.meta?.imageCount === "number" ? result.meta.imageCount : 0
+        );
+        setObbTrainingSettingsCustomized(Boolean(result.meta?.obbTrainingSettingsCustomized));
+        setObbTrainingSettings(
+          result.meta?.obbTrainingSettingsCustomized
+            ? normalizeObbTrainingSettings(
+              result.meta?.obbTrainingSettings as ObbTrainingSettings | undefined,
+              obbTrainingRecommendation.settings
+            )
+            : obbTrainingRecommendation.settings
+        );
+      } else {
+        setObbTrainingSettingsCustomized(false);
+        setObbTrainingSettings(obbTrainingRecommendation.settings);
+      }
+    }).catch(() => {/* ignore */});
+  }, [openTrainDialog, activeSpeciesId, obbTrainingRecommendation]);
+
+  useEffect(() => {
+    if (!activeSpeciesId || obbTrainingSettingsCustomized) return;
+    if (areObbTrainingSettingsEqual(obbTrainingSettings, obbTrainingRecommendation.settings)) return;
+    setObbTrainingSettings(obbTrainingRecommendation.settings);
+    window.api.sessionUpdateObbDetectorSettings(activeSpeciesId, {
+      obbTrainingSettings: obbTrainingRecommendation.settings,
+      obbTrainingSettingsCustomized: false,
+    }).catch(() => {/* ignore */});
+  }, [activeSpeciesId, obbTrainingRecommendation.settings, obbTrainingSettings, obbTrainingSettingsCustomized]);
 
   const recommendedSelectableCnnVariantId = useMemo(() => {
     const preferredIdx = CNN_VARIANT_LIGHT_TO_HEAVY.indexOf(
@@ -332,13 +377,34 @@ const Menu: React.FC<MenuProps> = ({
 
   const handleTrainObbDetector = async () => {
     if (!activeSpeciesId || isTrainingObb) return;
+    let unsubscribeObbTrainProgress: (() => void) | null = null;
     setIsTrainingObb(true);
     setObbTrainingMessage("Exporting OBB dataset and starting training…");
+    setObbTrainingProgress({
+      percent: 0,
+      stage: "training",
+      message: "Exporting OBB dataset and starting training…",
+    });
     try {
+      unsubscribeObbTrainProgress = window.api.onObbTrainProgress((data) => {
+        setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => {
+          const prevPct = Number(prev?.percent ?? 0);
+          const nextPct = Number(data?.percent ?? 0);
+          return {
+            ...data,
+            percent: Math.max(0, Math.min(100, Math.max(prevPct, nextPct))),
+          };
+        });
+      });
       const result = await window.api.trainObbDetector(activeSpeciesId, {
-        iou: obbHyperparams.iou,
-        cls: obbHyperparams.cls,
-        box: obbHyperparams.box,
+        epochs: obbTrainingSettings.epochs,
+        batch: obbTrainingSettings.batch,
+        modelTier: obbTrainingSettings.modelTier,
+        imgsz: obbTrainingSettings.imgsz,
+        iou: obbTrainingSettings.iou,
+        cls: obbTrainingSettings.cls,
+        box: obbTrainingSettings.box,
+        samEnabled,
       });
       if (result?.ok) {
         setObbDetectorReady(true);
@@ -347,16 +413,40 @@ const Menu: React.FC<MenuProps> = ({
           ? ` Warnings: ${result.warnings.join(" ")}`
           : "";
         setObbTrainingMessage(`OBB detector trained${mapStr} — ready.${warningText}`);
+        setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
+          percent: 100,
+          stage: "done",
+          message: "OBB detector training complete",
+          details: prev?.details,
+        }));
       } else {
         setObbTrainingMessage(`OBB training failed: ${result?.error ?? "unknown error"}`);
+        setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
+          percent: prev?.percent ?? 0,
+          stage: "error",
+          message: result?.error ?? "OBB detector training failed",
+          details: prev?.details,
+        }));
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setObbTrainingMessage(`OBB training error: ${message}`);
+      setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
+        percent: prev?.percent ?? 0,
+        stage: "error",
+        message,
+        details: prev?.details,
+      }));
     } finally {
+      unsubscribeObbTrainProgress?.();
       setIsTrainingObb(false);
     }
   };
+
+  useEffect(() => {
+    if (openTrainDialog) return;
+    setObbTrainingProgress(null);
+  }, [openTrainDialog]);
 
   const handleSelectModelPath = async () => {
     try {
@@ -534,8 +624,20 @@ const Menu: React.FC<MenuProps> = ({
           isTrainingObb={isTrainingObb}
           handleTrainObbDetector={handleTrainObbDetector}
           obbTrainingMessage={obbTrainingMessage}
-          obbHyperparams={obbHyperparams}
-          onObbHyperparamsChange={setObbHyperparams}
+          obbTrainingProgress={obbTrainingProgress}
+          obbTrainingSettings={obbTrainingSettings}
+          obbTrainingRecommendation={obbTrainingRecommendation.summary}
+          onObbTrainingSettingsChange={(settings) => {
+            const normalized = normalizeObbTrainingSettings(settings, obbTrainingRecommendation.settings);
+            setObbTrainingSettings(normalized);
+            setObbTrainingSettingsCustomized(true);
+            if (activeSpeciesId) {
+              window.api.sessionUpdateObbDetectorSettings(activeSpeciesId, {
+                obbTrainingSettings: normalized,
+                obbTrainingSettingsCustomized: true,
+              }).catch(() => {/* ignore */});
+            }
+          }}
           speciesId={activeSpeciesId ?? undefined}
           augmentationPolicy={augmentationPolicy}
           onAugmentationPolicyChange={(policy) => {
@@ -547,7 +649,7 @@ const Menu: React.FC<MenuProps> = ({
           orientationMode={orientationMode}
         />
 
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto scrollbar-app">
           <motion.div
             variants={sidebarContainer}
             initial="hidden"
@@ -724,8 +826,16 @@ const Menu: React.FC<MenuProps> = ({
                       <DetectionModeSelector
                         mode={detectionMode}
                         onModeChange={onDetectionModeChange}
-                        detectionPreset={detectionPreset}
-                        onDetectionPresetChange={onDetectionPresetChange}
+                        detectionPreset={obbDetectionSettings?.detectionPreset ?? "balanced"}
+                        onDetectionPresetChange={(preset) => {
+                          onObbDetectionSettingsChange?.({
+                            ...obbDetectionSettings,
+                            detectionPreset: preset,
+                          });
+                        }}
+                        obbDetectionSettings={obbDetectionSettings}
+                        onObbDetectionSettingsChange={onObbDetectionSettingsChange}
+                        obbDetectionRecommendation={obbDetectionRecommendation}
                         className={className}
                         onClassNameChange={onClassNameChange}
                         samEnabled={samEnabled}
