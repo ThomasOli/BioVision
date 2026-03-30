@@ -5,28 +5,25 @@ import { LandmarkSchema } from "../types/Image";
  */
 export const DEFAULT_SCHEMAS: LandmarkSchema[] = [
   {
-    id: "butterfly-wing",
-    name: "Butterfly Wing Morphometrics",
-    description: "Standard 18-point schema for butterfly wing analysis",
+    id: "fly-wing",
+    name: "Fly Wing (Drosophila) Landmarks",
+    description: "12-point schema for Drosophila wing morphometric analysis",
     landmarks: [
-      { index: 0, name: "Left Forewing Apex", description: "Tip of left forewing", category: "forewing" },
-      { index: 1, name: "Right Forewing Apex", description: "Tip of right forewing", category: "forewing" },
-      { index: 2, name: "Left Forewing Base", description: "Attachment point of left forewing", category: "forewing" },
-      { index: 3, name: "Right Forewing Base", description: "Attachment point of right forewing", category: "forewing" },
-      { index: 4, name: "Left Hindwing Apex", description: "Tip of left hindwing", category: "hindwing" },
-      { index: 5, name: "Right Hindwing Apex", description: "Tip of right hindwing", category: "hindwing" },
-      { index: 6, name: "Left Hindwing Base", description: "Attachment point of left hindwing", category: "hindwing" },
-      { index: 7, name: "Right Hindwing Base", description: "Attachment point of right hindwing", category: "hindwing" },
-      { index: 8, name: "Left Wing Vein R1", description: "Radial vein 1 on left wing", category: "veins" },
-      { index: 9, name: "Right Wing Vein R1", description: "Radial vein 1 on right wing", category: "veins" },
-      { index: 10, name: "Left Wing Vein M1", description: "Medial vein 1 on left wing", category: "veins" },
-      { index: 11, name: "Right Wing Vein M1", description: "Medial vein 1 on right wing", category: "veins" },
-      { index: 12, name: "Left Wing Vein Cu1", description: "Cubital vein 1 on left wing", category: "veins" },
-      { index: 13, name: "Right Wing Vein Cu1", description: "Cubital vein 1 on right wing", category: "veins" },
-      { index: 14, name: "Body Anterior", description: "Head attachment point", category: "body" },
-      { index: 15, name: "Body Posterior", description: "Abdomen tip", category: "body" },
-      { index: 16, name: "Left Antenna Tip", description: "Tip of left antenna", category: "antennae" },
-      { index: 17, name: "Right Antenna Tip", description: "Tip of right antenna", category: "antennae" },
+      // Margin Intersections (1–6)
+      { index: 1,  name: "L5 × Posterior Margin", description: "Intersection of longitudinal vein 5 (L5) and the posterior wing margin", category: "margin" },
+      { index: 2,  name: "L4 × Posterior Margin", description: "Intersection of longitudinal vein 4 (L4) and the posterior wing margin", category: "margin" },
+      { index: 3,  name: "L3 × Distal Margin",    description: "Intersection of longitudinal vein 3 (L3) and the distal wing margin",   category: "margin" },
+      { index: 4,  name: "L2 × Anterior Margin",  description: "Intersection of longitudinal vein 2 (L2) and the anterior wing margin", category: "margin" },
+      { index: 5,  name: "L1 × Anterior Margin",  description: "Intersection of longitudinal vein 1 (L1) and the anterior wing margin", category: "margin" },
+      { index: 6,  name: "Costal Break",           description: "Notch on the anterior margin at the base of the wing",                 category: "margin" },
+      // Crossvein Intersections (7–10)
+      { index: 7,  name: "pcv × L5",              description: "Intersection of the posterior crossvein (pcv) and L5",                 category: "crossvein" },
+      { index: 8,  name: "pcv × L4",              description: "Intersection of the posterior crossvein (pcv) and L4",                 category: "crossvein" },
+      { index: 9,  name: "acv × L4",              description: "Intersection of the anterior crossvein (acv) and L4",                  category: "crossvein" },
+      { index: 10, name: "acv × L3",              description: "Intersection of the anterior crossvein (acv) and L3",                  category: "crossvein" },
+      // Vein Branching Points (11–12)
+      { index: 11, name: "L2/L3 Bifurcation",     description: "Branching point (bifurcation) of veins L2 and L3",                    category: "branch" },
+      { index: 12, name: "L4/L5 Bifurcation",     description: "Branching point at the base of veins L4 and L5",                     category: "branch" },
     ],
   },
   {

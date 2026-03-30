@@ -1,7 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol } from "electron";
 import fs from "fs";
 import * as path from "path";
-import * as os from "os";
 import { spawn, ChildProcess } from "child_process";
 import { createInterface, Interface as ReadlineInterface } from "readline";
 
@@ -11,6 +10,7 @@ let mainWindow: BrowserWindow | null;
 const userDataDir = app.getPath("userData");
 const defaultProjectRoot = path.join(userDataDir, "training-model");
 const configPath = path.join(userDataDir, "biovision-config.json");
+const customSchemaLibraryPath = path.join(userDataDir, "biovision-schema-library.json");
 
 function loadProjectRoot() {
   try {
@@ -33,6 +33,43 @@ function persistProjectRoot(root: string) {
 let projectRoot = loadProjectRoot();
 fs.mkdirSync(projectRoot, { recursive: true });
 const finalizedSegmentSignatureCache = new Map<string, string>();
+type SegmentQueueState =
+  | "idle"
+  | "queued"
+  | "running"
+  | "saved"
+  | "already_finalized"
+  | "finalized_without_segments"
+  | "skipped"
+  | "failed";
+type SegmentSaveDetail = {
+  index: number;
+  status: "saved" | "failed";
+  maskSource?: string;
+  reason?: string;
+};
+type SegmentQueueJob = {
+  queueKey: string;
+  sessionKey: string;
+  speciesId: string;
+  filename: string;
+  sessionDir: string;
+  imagePath?: string;
+  acceptedBoxes: FinalizedAcceptedBox[];
+  signature: string;
+};
+type SegmentQueueStatusEntry = {
+  state: SegmentQueueState;
+  signature?: string;
+  updatedAt: string;
+  reason?: string;
+  expectedCount?: number;
+  savedCount?: number;
+  details?: SegmentSaveDetail[];
+};
+const segmentSaveQueues = new Map<string, SegmentQueueJob[]>();
+const segmentQueueRunningSessions = new Set<string>();
+const segmentQueueStatusByImage = new Map<string, SegmentQueueStatusEntry>();
 let sam2CompatibilityCache:
   | {
       ok: boolean;
@@ -85,7 +122,7 @@ function createWindow() {
     width: 800,
     height: 600,
     webPreferences: {
-      contextIsolation: true, // ← REQUIRED
+      contextIsolation: true, // Ã¢â€ Â REQUIRED
       nodeIntegration: false,
       preload: path.join(__dirname, "preload.js"),
     },
@@ -121,23 +158,39 @@ app.on("ready", () => {
   createWindow();
 });
 
-function getPythonPath(): string {
+function getPythonResolution(): { pythonPath: string; usingRepoVenv: boolean } {
   // Windows: venv\Scripts\python.exe
   const venvWin = path.join(__dirname, "..", "venv", "Scripts", "python.exe");
-  if (fs.existsSync(venvWin)) return venvWin;
+  if (fs.existsSync(venvWin)) return { pythonPath: venvWin, usingRepoVenv: true };
 
   // Unix/macOS: venv/bin/python
   const venvUnix = path.join(__dirname, "..", "venv", "bin", "python");
-  if (fs.existsSync(venvUnix)) return venvUnix;
+  if (fs.existsSync(venvUnix)) return { pythonPath: venvUnix, usingRepoVenv: true };
 
   // Fall back to system Python
-  return "python";
+  return { pythonPath: "python", usingRepoVenv: false };
+}
+
+function getPythonPath(): string {
+  return getPythonResolution().pythonPath;
+}
+
+let warnedAboutSystemPythonFallback = false;
+
+function warnIfUsingSystemPython(pythonResolution = getPythonResolution()): void {
+  if (pythonResolution.usingRepoVenv || warnedAboutSystemPythonFallback) return;
+  warnedAboutSystemPythonFallback = true;
+  console.warn(
+    `[Python] Repo venv not found. Falling back to "${pythonResolution.pythonPath}". ` +
+      "Hardware probes may report CPU-only if this interpreter is missing torch or psutil."
+  );
 }
 
 function runPython(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const pyPath = getPythonPath();
-    const proc = spawn(pyPath, args);
+    const pythonResolution = getPythonResolution();
+    warnIfUsingSystemPython(pythonResolution);
+    const proc = spawn(pythonResolution.pythonPath, args);
 
     let out = "";
     let err = "";
@@ -159,8 +212,9 @@ function runPythonWithProgress(
   onProgress?: (percent: number, stage: string, details?: Record<string, unknown>) => void
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const pyPath = getPythonPath();
-    const proc = spawn(pyPath, args);
+    const pythonResolution = getPythonResolution();
+    warnIfUsingSystemPython(pythonResolution);
+    const proc = spawn(pythonResolution.pythonPath, args);
     let out = "";
     let err = "";
 
@@ -206,9 +260,11 @@ function runPythonWithProgress(
 }
 
 // ---------------------------------------------------------------------------
-// Hardware capability probe — called once at app startup from React
+// Hardware capability probe Ã¢â‚¬â€ called once at app startup from React
 // ---------------------------------------------------------------------------
 ipcMain.handle("system:probe-hardware", async () => {
+  const pythonResolution = getPythonResolution();
+  warnIfUsingSystemPython(pythonResolution);
   try {
     const script = path.join(__dirname, "../backend/hardware_probe.py");
     const out = await runPython([script]);
@@ -217,11 +273,23 @@ ipcMain.handle("system:probe-hardware", async () => {
       device: parsed.device ?? "cpu",
       gpuName: parsed.gpu_name ?? null,
       ramGb: parsed.ram_gb ?? null,
+      runtimeState: getSuperAnnotatorRuntimeState(),
+      statusSource: "python_probe" as CapabilityStatusSource,
+      pythonPath: pythonResolution.pythonPath,
+      usingRepoVenv: pythonResolution.usingRepoVenv,
     };
   } catch (err) {
     console.warn("Hardware probe failed:", err);
-    // Safe fallback — treat as CPU-only
-    return { device: "cpu", gpuName: null, ramGb: null };
+    // Safe fallback Ã¢â‚¬â€ treat as CPU-only
+    return {
+      device: "cpu",
+      gpuName: null,
+      ramGb: null,
+      runtimeState: "failed" as SuperAnnotatorRuntimeState,
+      statusSource: "local_estimate" as CapabilityStatusSource,
+      pythonPath: pythonResolution.pythonPath,
+      usingRepoVenv: pythonResolution.usingRepoVenv,
+    };
   }
 });
 
@@ -249,8 +317,230 @@ ipcMain.handle("ml:select-project-root", async () => {
 const DATASET_IMAGE_EXTS = /\.(jpg|jpeg|png|gif|bmp|webp|tiff|tif)$/i;
 const MODEL_NAME_RE = /^[a-zA-Z0-9._-]+$/;
 
+function sanitizeSpeciesId(speciesId?: string): string {
+  return String(speciesId || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "_") || "default";
+}
+
+function getSessionsRoot(): string {
+  return path.resolve(projectRoot, "sessions");
+}
+
 function getEffectiveRoot(speciesId?: string): string {
-  return speciesId ? path.join(projectRoot, "sessions", speciesId) : projectRoot;
+  return speciesId ? getSessionDir(speciesId) : path.resolve(projectRoot);
+}
+
+type SessionSchemaKind = "default" | "custom";
+type ReusableSchemaTemplateRecord = {
+  id: string;
+  kind: "custom";
+  name: string;
+  description: string;
+  landmarks: Array<{ index: number; name: string; description?: string; category?: string }>;
+  orientationPolicy?: NormalizedOrientationPolicy;
+  sourcePresetId?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ReusableSchemaLibrary = {
+  version: 1;
+  templates: ReusableSchemaTemplateRecord[];
+};
+
+function normalizeSchemaComponent(value: unknown): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeSchemaSlug(value: string): string {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function normalizeLandmarkTemplate(
+  landmarkTemplate: unknown
+): Array<{ index: number; name: string; description?: string; category?: string }> {
+  if (!Array.isArray(landmarkTemplate)) return [];
+  return landmarkTemplate.map((entry: any, position: number) => {
+    const normalizedIndex = Number.isFinite(Number(entry?.index))
+      ? Math.max(1, Math.round(Number(entry.index)))
+      : position + 1;
+    return {
+      index: normalizedIndex,
+      name: String(entry?.name || `Landmark ${normalizedIndex}`).trim() || `Landmark ${normalizedIndex}`,
+      ...(String(entry?.description || "").trim()
+        ? { description: String(entry.description).trim() }
+        : {}),
+      ...(String(entry?.category || "").trim()
+        ? { category: String(entry.category).trim() }
+        : {}),
+    };
+  });
+}
+
+function normalizeSchemaFingerprintTemplate(
+  landmarkTemplate: unknown
+): Array<{ index: number; name: string; category: string }> {
+  return normalizeLandmarkTemplate(landmarkTemplate).map((entry, position) => ({
+    index: Number.isFinite(Number(entry?.index)) ? Number(entry.index) : position + 1,
+    name: normalizeSchemaComponent(entry?.name),
+    category: normalizeSchemaComponent(entry?.category),
+  }));
+}
+
+function computeSchemaFingerprint(landmarkTemplate: unknown): string {
+  const normalized = normalizeSchemaFingerprintTemplate(landmarkTemplate);
+  const input = JSON.stringify(normalized);
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function normalizeSessionSchemaKind(value: unknown): SessionSchemaKind | undefined {
+  return value === "default" || value === "custom" ? value : undefined;
+}
+
+function normalizeSessionSchemaSourceId(value: unknown): string | undefined {
+  const normalized = String(value || "").trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function readReusableSchemaLibrary(): ReusableSchemaLibrary {
+  if (!fs.existsSync(customSchemaLibraryPath)) {
+    return { version: 1, templates: [] };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(customSchemaLibraryPath, "utf-8"));
+    const templates = Array.isArray(parsed?.templates)
+      ? parsed.templates
+          .map((entry: any) => normalizeReusableSchemaTemplate(entry))
+          .filter(Boolean) as ReusableSchemaTemplateRecord[]
+      : [];
+    return { version: 1, templates };
+  } catch (error) {
+    console.warn("Failed to read schema library:", error);
+    return { version: 1, templates: [] };
+  }
+}
+
+function writeReusableSchemaLibrary(library: ReusableSchemaLibrary): void {
+  fs.mkdirSync(path.dirname(customSchemaLibraryPath), { recursive: true });
+  fs.writeFileSync(customSchemaLibraryPath, JSON.stringify(library, null, 2), "utf-8");
+}
+
+function normalizeReusableSchemaTemplate(entry: any): ReusableSchemaTemplateRecord | null {
+  const id = String(entry?.id || "").trim();
+  const name = String(entry?.name || "").trim();
+  if (!id || !name) return null;
+  const normalizedLandmarks = normalizeLandmarkTemplate(entry?.landmarks);
+  if (normalizedLandmarks.length === 0) return null;
+  const createdAt = String(entry?.createdAt || "").trim() || new Date().toISOString();
+  const updatedAt = String(entry?.updatedAt || "").trim() || createdAt;
+  return {
+    id,
+    kind: "custom",
+    name,
+    description: String(entry?.description || "").trim() || `Custom schema with ${normalizedLandmarks.length} landmarks`,
+    landmarks: normalizedLandmarks,
+    ...(entry?.orientationPolicy && typeof entry.orientationPolicy === "object"
+      ? { orientationPolicy: normalizeOrientationPolicy(entry.orientationPolicy, normalizedLandmarks) }
+      : {}),
+    ...(String(entry?.sourcePresetId || "").trim()
+      ? { sourcePresetId: String(entry.sourcePresetId).trim() }
+      : {}),
+    createdAt,
+    updatedAt,
+  };
+}
+
+function buildLegacyCustomTemplateId(sessionMeta: any): string {
+  const sourceId = normalizeSessionSchemaSourceId(sessionMeta?.schemaSourceId);
+  if (sourceId) return sourceId;
+  const slug = normalizeSchemaSlug(String(sessionMeta?.name || ""));
+  const fingerprint = computeSchemaFingerprint(sessionMeta?.landmarkTemplate || []);
+  return `legacy-custom-${slug || "untitled"}-${String(fingerprint).slice(0, 8)}`;
+}
+
+function bootstrapReusableSchemasFromSessions(
+  library: ReusableSchemaLibrary
+): ReusableSchemaLibrary {
+  const sessionsDir = path.join(projectRoot, "sessions");
+  if (!fs.existsSync(sessionsDir)) return library;
+
+  const existingIds = new Set(library.templates.map((template) => template.id));
+  let changed = false;
+  const nextTemplates = [...library.templates];
+
+  for (const entry of fs.readdirSync(sessionsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const sessionJsonPath = path.join(sessionsDir, entry.name, "session.json");
+    if (!fs.existsSync(sessionJsonPath)) continue;
+    try {
+      const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+      const schemaKind = normalizeSessionSchemaKind(meta?.schemaKind);
+      const normalizedLandmarks = normalizeLandmarkTemplate(meta?.landmarkTemplate);
+      if (schemaKind !== "custom" || normalizedLandmarks.length === 0) continue;
+
+      const templateId = buildLegacyCustomTemplateId(meta);
+      if (existingIds.has(templateId)) continue;
+
+      nextTemplates.push({
+        id: templateId,
+        kind: "custom",
+        name: String(meta?.name || entry.name).trim() || entry.name,
+        description:
+          String(meta?.description || "").trim() ||
+          `Imported from custom session ${String(meta?.name || entry.name).trim() || entry.name}`,
+        landmarks: normalizedLandmarks,
+        ...(meta?.orientationPolicy && typeof meta.orientationPolicy === "object"
+          ? { orientationPolicy: normalizeOrientationPolicy(meta.orientationPolicy, normalizedLandmarks) }
+          : {}),
+        createdAt: String(meta?.createdAt || "").trim() || new Date().toISOString(),
+        updatedAt:
+          String(meta?.lastModified || meta?.createdAt || "").trim() || new Date().toISOString(),
+      });
+      existingIds.add(templateId);
+      changed = true;
+    } catch {
+      // ignore malformed legacy sessions
+    }
+  }
+
+  if (!changed) return library;
+  const nextLibrary = { version: 1 as const, templates: nextTemplates };
+  writeReusableSchemaLibrary(nextLibrary);
+  return nextLibrary;
+}
+
+function listReusableSchemaTemplates(): ReusableSchemaTemplateRecord[] {
+  const library = bootstrapReusableSchemasFromSessions(readReusableSchemaLibrary());
+  return [...library.templates].sort((a, b) => {
+    return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+  });
+}
+
+function resolveSessionSchemaMetadata(meta: any): {
+  schemaFingerprint: string;
+  schemaKind?: SessionSchemaKind;
+  schemaSourceId?: string;
+} {
+  const landmarkTemplate = Array.isArray(meta?.landmarkTemplate) ? meta.landmarkTemplate : [];
+  return {
+    schemaFingerprint: computeSchemaFingerprint(landmarkTemplate),
+    ...(normalizeSessionSchemaKind(meta?.schemaKind)
+      ? { schemaKind: normalizeSessionSchemaKind(meta?.schemaKind) }
+      : {}),
+    ...(normalizeSessionSchemaSourceId(meta?.schemaSourceId)
+      ? { schemaSourceId: normalizeSessionSchemaSourceId(meta?.schemaSourceId) }
+      : {}),
+  };
 }
 
 function ensureTrainingLayout(root: string): void {
@@ -264,15 +554,44 @@ function isFiniteNumber(value: unknown): boolean {
 }
 
 type OrientationMode = "directional" | "bilateral" | "axial" | "invariant";
-type PcaLevelingMode = "off" | "on" | "auto";
+type BilateralClassAxis = "vertical_obb";
+type ObbModelTier = "nano" | "small" | "medium" | "large";
+type ObbImageSize = 640 | 960 | 1280;
+type ObbDetectionPreset =
+  | "balanced"
+  | "precision"
+  | "recall"
+  | "single_object"
+  | "custom";
 
 type NormalizedOrientationPolicy = {
   mode: OrientationMode;
   targetOrientation?: "left" | "right";
   headCategories: string[];
   tailCategories: string[];
+  anteriorAnchorIds: number[];
+  posteriorAnchorIds: number[];
   bilateralPairs: [number, number][];
-  pcaLevelingMode: PcaLevelingMode;
+  bilateralClassAxis: BilateralClassAxis;
+  obbLevelingMode: "on" | "off";
+};
+
+type NormalizedObbTrainingSettings = {
+  modelTier?: ObbModelTier;
+  imgsz?: ObbImageSize;
+  epochs?: number;
+  batch?: number;
+  iou: number;
+  cls: number;
+  box: number;
+};
+
+type NormalizedObbDetectionSettings = {
+  detectionPreset: ObbDetectionPreset;
+  conf: number;
+  nmsIou: number;
+  maxObjects: number;
+  imgsz: ObbImageSize;
 };
 
 type ModelTrainingProfile = {
@@ -282,18 +601,21 @@ type ModelTrainingProfile = {
   orientationPolicy: NormalizedOrientationPolicy;
   canonicalTrainingEnabled: boolean;
   trainedWithSam2Segments: boolean;
-  canonicalMaskSource: "none" | "segments" | "rough_otsu" | "mixed" | "unknown";
+  canonicalMaskSource: "none" | "segments" | "rough_otsu" | "mixed" | "unknown" | "obb_geometry";
   canonicalMaskStats: {
     total: number;
     segments: number;
     roughOtsu: number;
     unknown: number;
   };
-  pcaLevelingMode: PcaLevelingMode;
   targetOrientation?: "left" | "right";
   headCategories: string[];
   tailCategories: string[];
+  anteriorAnchorIds: number[];
+  posteriorAnchorIds: number[];
   bilateralPairs: [number, number][];
+  bilateralClassAxis: BilateralClassAxis;
+  obbLevelingMode: "on" | "off";
   metadataSources: string[];
 };
 
@@ -315,7 +637,7 @@ type ModelCompatibilityResult = {
     sam2Ready: boolean;
     sam2Required: boolean;
     requirementSource?: string;
-    trainedMaskSource?: "none" | "segments" | "rough_otsu" | "mixed" | "unknown";
+    trainedMaskSource?: "none" | "segments" | "rough_otsu" | "mixed" | "unknown" | "obb_geometry";
     checkedAt: string;
     error?: string;
   };
@@ -330,7 +652,6 @@ const COMPAT_ORIENTATION_MODES = new Set<OrientationMode>([
   "axial",
   "invariant",
 ]);
-const COMPAT_PCA_MODES = new Set<PcaLevelingMode>(["off", "on", "auto"]);
 const SAM2_COMPATIBILITY_CACHE_TTL_MS = 2 * 60 * 1000;
 
 function safeReadJson(filePath: string): any | null {
@@ -346,7 +667,7 @@ function summarizeCanonicalMaskUsageFromCropMetadata(
   effectiveRoot: string,
   modelName: string
 ): {
-  source: "none" | "segments" | "rough_otsu" | "mixed" | "unknown";
+  source: "none" | "segments" | "rough_otsu" | "mixed" | "unknown" | "obb_geometry";
   total: number;
   segments: number;
   roughOtsu: number;
@@ -367,6 +688,7 @@ function summarizeCanonicalMaskUsageFromCropMetadata(
   let total = 0;
   let segments = 0;
   let roughOtsu = 0;
+  let obbGeometry = 0;
   let unknown = 0;
 
   raw.forEach((entry) => {
@@ -377,19 +699,28 @@ function summarizeCanonicalMaskUsageFromCropMetadata(
       return;
     }
     total += 1;
-    const source = String((entry as any).canonical_mask_source || "")
+    const rawMaskSource = String((entry as any).canonical_mask_source || "")
       .trim()
       .toLowerCase();
+    const rawCanonicalizationSource = String((entry as any).canonicalization_source || "")
+      .trim()
+      .toLowerCase();
+    const source =
+      rawMaskSource === "obb"
+        ? "obb_geometry"
+        : rawMaskSource || rawCanonicalizationSource;
     if (source === "segments") {
       segments += 1;
     } else if (source === "rough_otsu") {
       roughOtsu += 1;
+    } else if (source === "obb_geometry" || source === "none") {
+      obbGeometry += 1;
     } else {
       unknown += 1;
     }
   });
 
-  let resolved: "none" | "segments" | "rough_otsu" | "mixed" | "unknown" = "unknown";
+  let resolved: "none" | "segments" | "rough_otsu" | "mixed" | "unknown" | "obb_geometry" = "unknown";
   if (total === 0) {
     resolved = "none";
   } else if (segments > 0 && roughOtsu > 0) {
@@ -398,6 +729,8 @@ function summarizeCanonicalMaskUsageFromCropMetadata(
     resolved = "segments";
   } else if (roughOtsu > 0) {
     resolved = "rough_otsu";
+  } else if (obbGeometry > 0 && unknown === 0) {
+    resolved = "obb_geometry";
   }
 
   return {
@@ -427,42 +760,209 @@ function normalizeOrientationMode(value: unknown): OrientationMode {
   return "invariant";
 }
 
-function normalizePcaLevelingMode(value: unknown): PcaLevelingMode {
-  const mode = String(value || "").trim().toLowerCase();
-  if (COMPAT_PCA_MODES.has(mode as PcaLevelingMode)) {
-    return mode as PcaLevelingMode;
+function normalizeAnchorIdList(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<number>();
+  const out: number[] = [];
+  value.forEach((item) => {
+    const id = Math.round(Number(item));
+    if (!Number.isFinite(id) || id < 1 || seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  });
+  out.sort((a, b) => a - b);
+  return out;
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function normalizeOptionalPositiveInt(
+  value: unknown,
+  minimum: number,
+  maximum: number
+): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const numeric = Math.round(Number(value));
+  if (!Number.isFinite(numeric)) return undefined;
+  return Math.min(maximum, Math.max(minimum, numeric));
+}
+
+function normalizeObbModelTier(value: unknown): ObbModelTier | undefined {
+  return value === "nano" || value === "small" || value === "medium" || value === "large"
+    ? value
+    : undefined;
+}
+
+function normalizeObbImageSize(value: unknown, fallback: ObbImageSize): ObbImageSize {
+  const numeric = Math.round(Number(value));
+  if (numeric === 960) return 960;
+  if (numeric === 1280) return 1280;
+  if (numeric === 640) return 640;
+  return fallback;
+}
+
+function normalizeObbDetectionPreset(value: unknown): ObbDetectionPreset {
+  if (
+    value === "balanced" ||
+    value === "precision" ||
+    value === "recall" ||
+    value === "single_object" ||
+    value === "custom"
+  ) {
+    return value;
   }
-  return "off";
+  return "balanced";
+}
+
+function normalizeObbTrainingSettings(rawSettings: unknown): NormalizedObbTrainingSettings {
+  const raw = rawSettings && typeof rawSettings === "object"
+    ? (rawSettings as Record<string, unknown>)
+    : {};
+  return {
+    ...(normalizeObbModelTier(raw.modelTier) ? { modelTier: normalizeObbModelTier(raw.modelTier) } : {}),
+    ...(raw.imgsz !== undefined ? { imgsz: normalizeObbImageSize(raw.imgsz, 640) } : {}),
+    ...(normalizeOptionalPositiveInt(raw.epochs, 1, 500) !== undefined
+      ? { epochs: normalizeOptionalPositiveInt(raw.epochs, 1, 500) }
+      : {}),
+    ...(normalizeOptionalPositiveInt(raw.batch, 1, 128) !== undefined
+      ? { batch: normalizeOptionalPositiveInt(raw.batch, 1, 128) }
+      : {}),
+    iou: clampNumber(raw.iou, 0.3, 0.05, 0.95),
+    cls: clampNumber(raw.cls, 1.5, 0.1, 10.0),
+    box: clampNumber(raw.box, 5.0, 0.1, 20.0),
+  };
+}
+
+function buildInferenceSchemaGroupKey(speciesId: string, meta: any): string {
+  const schemaKind = normalizeSessionSchemaKind(meta?.schemaKind);
+  const schemaSourceId = normalizeSessionSchemaSourceId(meta?.schemaSourceId);
+  if (schemaKind && schemaSourceId) {
+    return `${schemaKind}:${normalizeSchemaSlug(schemaSourceId) || schemaSourceId}`;
+  }
+
+  const schemaName = String(meta?.name || "").trim();
+  const normalizedName = normalizeSchemaSlug(schemaName);
+  if (normalizedName) {
+    return `name:${normalizedName}`;
+  }
+
+  return `species:${speciesId}`;
+}
+
+type InferenceSessionListEntry = {
+  speciesId: string;
+  schemaName: string;
+  schemaImageCount: number;
+  schemaUpdatedAt: string;
+  schemaGroupKey: string;
+  canonicalSpeciesId: string;
+  hiddenSessionCount?: number;
+  exists: boolean;
+  inferenceSessionId?: string;
+  displayName?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  migratedFrom?: string;
+};
+
+function parseSortableTimestamp(...values: Array<string | undefined>): number {
+  for (const value of values) {
+    if (!value) continue;
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function normalizeObbDetectionSettings(rawSettings: unknown): NormalizedObbDetectionSettings {
+  const raw = rawSettings && typeof rawSettings === "object"
+    ? (rawSettings as Record<string, unknown>)
+    : {};
+  return {
+    detectionPreset: normalizeObbDetectionPreset(raw.detectionPreset),
+    conf: clampNumber(raw.conf, 0.3, 0.01, 0.99),
+    nmsIou: clampNumber(raw.nmsIou, 0.3, 0.05, 0.95),
+    maxObjects: Math.round(clampNumber(raw.maxObjects, 20, 1, 250)),
+    imgsz: normalizeObbImageSize(raw.imgsz, 640),
+  };
 }
 
 function inferOrientationPolicyFromTemplate(landmarkTemplate: unknown): NormalizedOrientationPolicy {
+  const normalizedLandmarks = normalizeLandmarkTemplate(landmarkTemplate);
   const categories = new Set<string>();
-  if (Array.isArray(landmarkTemplate)) {
-    landmarkTemplate.forEach((lm: any) => {
+  normalizedLandmarks.forEach((lm: any) => {
       const cat = String(lm?.category || "").trim().toLowerCase();
       if (cat) categories.add(cat);
-    });
-  }
+  });
   const hasHead = categories.has("head");
   const inferredTail = ["tail", "caudal-fin"].filter((cat) => categories.has(cat));
   const tailCategories = inferredTail.length > 0 ? inferredTail : ["tail", "caudal-fin"];
+  const findByName = (name: string) =>
+    normalizedLandmarks.find((lm) => String(lm?.name || "").trim().toLowerCase() === name)?.index;
   if (hasHead || inferredTail.length > 0) {
+    const snoutTip = findByName("snout tip");
+    const upperCaudal = findByName("upper caudal peduncle");
+    const lowerCaudal = findByName("lower caudal peduncle");
     return {
       mode: "directional",
       targetOrientation: "left",
       headCategories: hasHead ? ["head"] : [],
       tailCategories,
+      anteriorAnchorIds: Number.isFinite(Number(snoutTip)) ? [Number(snoutTip)] : [],
+      posteriorAnchorIds:
+        Number.isFinite(Number(upperCaudal)) && Number.isFinite(Number(lowerCaudal))
+          ? [Number(upperCaudal), Number(lowerCaudal)]
+          : [],
       bilateralPairs: [],
-      pcaLevelingMode: "auto",
+      bilateralClassAxis: "vertical_obb",
+      obbLevelingMode: "on",
+    };
+  }
+  const bryozoanTop = normalizedLandmarks.find((lm) => Number(lm.index) === 3)?.index;
+  const bryozoanBottom = normalizedLandmarks.find((lm) => Number(lm.index) === 12)?.index;
+  if (Number.isFinite(Number(bryozoanTop)) && Number.isFinite(Number(bryozoanBottom))) {
+    return {
+      mode: "bilateral",
+      headCategories: [],
+      tailCategories: [],
+      anteriorAnchorIds: [Number(bryozoanTop)],
+      posteriorAnchorIds: [Number(bryozoanBottom)],
+      bilateralPairs: [],
+      bilateralClassAxis: "vertical_obb",
+      obbLevelingMode: "on",
     };
   }
   return {
     mode: "invariant",
     headCategories: [],
     tailCategories: [],
+    anteriorAnchorIds: [],
+    posteriorAnchorIds: [],
     bilateralPairs: [],
-    pcaLevelingMode: "off",
+    bilateralClassAxis: "vertical_obb",
+    obbLevelingMode: "on",
   };
+}
+
+function normalizeBilateralClassAxis(
+  value: unknown,
+  mode: OrientationMode
+): BilateralClassAxis {
+  if (
+    mode === "bilateral" &&
+    value != null &&
+    String(value).trim() !== "" &&
+    String(value).trim().toLowerCase() !== "vertical_obb"
+  ) {
+    console.warn(
+      `[Session] Unsupported bilateralClassAxis "${String(value)}" encountered; normalizing to vertical_obb.`
+    );
+  }
+  return "vertical_obb";
 }
 
 function normalizeOrientationPolicy(
@@ -473,7 +973,6 @@ function normalizeOrientationPolicy(
   const raw = rawPolicy && typeof rawPolicy === "object" ? (rawPolicy as Record<string, unknown>) : {};
 
   const mode = normalizeOrientationMode(raw.mode ?? inferred.mode);
-  const pcaLevelingMode = normalizePcaLevelingMode(raw.pcaLevelingMode ?? inferred.pcaLevelingMode);
   const rawTarget = String(raw.targetOrientation || inferred.targetOrientation || "left").trim().toLowerCase();
   const targetOrientation = rawTarget === "right" ? "right" : "left";
 
@@ -482,6 +981,9 @@ function normalizeOrientationPolicy(
     inferred.tailCategories.length > 0 ? inferred.tailCategories : ["tail", "caudal-fin"];
   const headCategories = normalizeCategoryList(raw.headCategories);
   const tailCategories = normalizeCategoryList(raw.tailCategories);
+
+  const anteriorAnchorIds = normalizeAnchorIdList(raw.anteriorAnchorIds ?? inferred.anteriorAnchorIds);
+  const posteriorAnchorIds = normalizeAnchorIdList(raw.posteriorAnchorIds ?? inferred.posteriorAnchorIds);
 
   const normalizedPairs: [number, number][] = [];
   if (Array.isArray(raw.bilateralPairs)) {
@@ -498,17 +1000,59 @@ function normalizeOrientationPolicy(
     });
   }
 
+  const rawObbLevelingMode = String(raw.obbLevelingMode || inferred.obbLevelingMode || "on").trim().toLowerCase();
   const policy: NormalizedOrientationPolicy = {
     mode,
-    pcaLevelingMode,
     headCategories: mode === "directional" ? (headCategories.length > 0 ? headCategories : headFallback) : [],
     tailCategories: mode === "directional" ? (tailCategories.length > 0 ? tailCategories : tailFallback) : [],
+    anteriorAnchorIds,
+    posteriorAnchorIds,
     bilateralPairs: mode === "bilateral" ? normalizedPairs : [],
+    bilateralClassAxis: normalizeBilateralClassAxis(raw.bilateralClassAxis, mode),
+    obbLevelingMode: rawObbLevelingMode === "off" ? "off" : "on",
   };
   if (mode === "directional") {
     policy.targetOrientation = targetOrientation;
   }
   return policy;
+}
+
+function readNormalizedSessionObbTrainingSettings(sessionMeta: unknown): NormalizedObbTrainingSettings {
+  const raw = sessionMeta && typeof sessionMeta === "object"
+    ? (sessionMeta as Record<string, unknown>).obbTrainingSettings
+    : undefined;
+  return normalizeObbTrainingSettings(raw);
+}
+
+function readNormalizedSessionObbDetectionSettings(sessionMeta: unknown): NormalizedObbDetectionSettings {
+  const raw = sessionMeta && typeof sessionMeta === "object"
+    ? (sessionMeta as Record<string, unknown>).obbDetectionSettings
+    : undefined;
+  return normalizeObbDetectionSettings(raw);
+}
+
+function readSessionObbTrainingSettingsCustomized(sessionMeta: unknown): boolean {
+  const raw = sessionMeta && typeof sessionMeta === "object"
+    ? (sessionMeta as Record<string, unknown>)
+    : {};
+  if (typeof raw.obbTrainingSettingsCustomized === "boolean") {
+    return raw.obbTrainingSettingsCustomized;
+  }
+  const normalized = normalizeObbTrainingSettings(raw.obbTrainingSettings);
+  const defaults = normalizeObbTrainingSettings(undefined);
+  return JSON.stringify(normalized) !== JSON.stringify(defaults);
+}
+
+function readSessionObbDetectionSettingsCustomized(sessionMeta: unknown): boolean {
+  const raw = sessionMeta && typeof sessionMeta === "object"
+    ? (sessionMeta as Record<string, unknown>)
+    : {};
+  if (typeof raw.obbDetectionSettingsCustomized === "boolean") {
+    return raw.obbDetectionSettingsCustomized;
+  }
+  const normalized = normalizeObbDetectionSettings(raw.obbDetectionSettings);
+  const defaults = normalizeObbDetectionSettings(undefined);
+  return JSON.stringify(normalized) !== JSON.stringify(defaults);
 }
 
 function loadSessionOrientationPolicyForCompatibility(
@@ -548,7 +1092,6 @@ function loadModelTrainingProfileForCompatibility(
         orientation_mode: cnnTrainParamsRaw.orientation_mode,
         orientation_policy: cnnTrainParamsRaw.orientation_policy,
         canonical_training_enabled: cnnTrainParamsRaw.canonical_training_enabled,
-        pca_leveling_mode: cnnTrainParamsRaw.pca_leveling_mode,
         target_orientation: cnnTrainParamsRaw.target_orientation,
       };
       metadataSources.push(cnnTrainParamsPath);
@@ -568,9 +1111,6 @@ function loadModelTrainingProfileForCompatibility(
   const orientationMode = normalizeOrientationMode(
     rawTrainingConfig.orientation_mode ?? trainingPolicy.mode
   );
-  const pcaLevelingMode = normalizePcaLevelingMode(
-    rawTrainingConfig.pca_leveling_mode ?? trainingPolicy.pcaLevelingMode
-  );
   const rawTarget = String(
     rawTrainingConfig.target_orientation ??
       trainingPolicy.targetOrientation ??
@@ -583,7 +1123,7 @@ function loadModelTrainingProfileForCompatibility(
   const canonicalTrainingEnabled =
     typeof rawTrainingConfig.canonical_training_enabled === "boolean"
       ? rawTrainingConfig.canonical_training_enabled
-      : orientationMode !== "invariant" && pcaLevelingMode !== "off";
+      : orientationMode !== "invariant";
   const maskUsage = summarizeCanonicalMaskUsageFromCropMetadata(effectiveRoot, modelName);
   const trainedWithSam2Segments =
     Boolean(canonicalTrainingEnabled) && maskUsage.segments > 0;
@@ -595,7 +1135,6 @@ function loadModelTrainingProfileForCompatibility(
     orientationPolicy: {
       ...trainingPolicy,
       mode: orientationMode,
-      pcaLevelingMode,
       ...(orientationMode === "directional" ? { targetOrientation } : {}),
     },
     canonicalTrainingEnabled: Boolean(canonicalTrainingEnabled),
@@ -607,7 +1146,6 @@ function loadModelTrainingProfileForCompatibility(
       roughOtsu: maskUsage.roughOtsu,
       unknown: maskUsage.unknown,
     },
-    pcaLevelingMode,
     targetOrientation: orientationMode === "directional" ? targetOrientation : undefined,
     headCategories:
       orientationMode === "directional"
@@ -617,10 +1155,14 @@ function loadModelTrainingProfileForCompatibility(
       orientationMode === "directional"
         ? normalizeCategoryList(trainingPolicy.tailCategories)
         : [],
+    anteriorAnchorIds: normalizeAnchorIdList(trainingPolicy.anteriorAnchorIds),
+    posteriorAnchorIds: normalizeAnchorIdList(trainingPolicy.posteriorAnchorIds),
     bilateralPairs:
       orientationMode === "bilateral"
         ? (trainingPolicy.bilateralPairs || []).map((pair) => [pair[0], pair[1]] as [number, number])
         : [],
+    bilateralClassAxis: trainingPolicy.bilateralClassAxis,
+    obbLevelingMode: trainingPolicy.obbLevelingMode,
     metadataSources,
   };
 }
@@ -724,6 +1266,13 @@ async function evaluateModelCompatibility(args: {
     }
 
     if (profile.orientationMode === "bilateral" && session.policy.mode === "bilateral") {
+      if (profile.bilateralClassAxis !== session.policy.bilateralClassAxis) {
+        issues.push({
+          code: "bilateral_class_axis_mismatch",
+          severity: "error",
+          message: `Model bilateral class axis is "${profile.bilateralClassAxis}" but session uses "${session.policy.bilateralClassAxis}".`,
+        });
+      }
       if (profile.bilateralPairs.length > 0 && session.policy.bilateralPairs.length === 0) {
         issues.push({
           code: "bilateral_pairs_missing",
@@ -741,14 +1290,7 @@ async function evaluateModelCompatibility(args: {
           message: "Model expects canonicalized orientation flow but session is configured as invariant.",
         });
       }
-      if (session.policy.pcaLevelingMode === "off") {
-        issues.push({
-          code: "pca_disabled_mismatch",
-          severity: "error",
-          message: "Model was trained with PCA/canonicalization enabled but session PCA leveling is OFF.",
-        });
-      }
-      if (profile.canonicalMaskSource === "unknown" || profile.canonicalMaskSource === "none") {
+      if (profile.canonicalMaskSource === "unknown") {
         issues.push({
           code: "canonical_mask_source_unknown",
           severity: "warning",
@@ -756,12 +1298,6 @@ async function evaluateModelCompatibility(args: {
             "Training mask source metadata is missing/unknown; SAM2 parity requirements cannot be fully verified.",
         });
       }
-    } else if (session.policy.mode !== "invariant" && session.policy.pcaLevelingMode === "on") {
-      issues.push({
-        code: "canonicalization_training_gap",
-        severity: "warning",
-        message: "Session requests forced PCA leveling, but model metadata indicates non-canonical training.",
-      });
     }
 
     let runtime: ModelCompatibilityResult["runtime"] | undefined;
@@ -788,10 +1324,10 @@ async function evaluateModelCompatibility(args: {
         });
       } else if (!sam2.ok && profile.canonicalTrainingEnabled) {
         issues.push({
-          code: "sam2_unavailable_using_rough_mask_fallback",
+          code: "sam2_unavailable_masks_disabled",
           severity: "warning",
           message:
-            "SAM2 is unavailable; inference will use rough-mask PCA fallback instead of SAM2 masks.",
+            "SAM2 is unavailable; mask refinement will be disabled at inference.",
         });
       }
     }
@@ -844,7 +1380,15 @@ type FinalizedAcceptedBox = {
   top: number;
   width: number;
   height: number;
-  orientation_override?: "left" | "right" | "uncertain";
+  orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
+  orientation_hint?: {
+    orientation?: "left" | "right" | "up" | "down";
+    confidence?: number;
+    source?: string;
+  };
+  obbCorners?: [number, number][];
+  angle?: number;
+  class_id?: number;
   landmarks?: FinalizedAcceptedLandmark[];
 };
 
@@ -854,7 +1398,15 @@ function normalizeFinalizedAcceptedBoxes(
     top: number;
     width: number;
     height: number;
-    orientation_override?: "left" | "right" | "uncertain";
+    orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
+    orientation_hint?: {
+      orientation?: "left" | "right" | "up" | "down";
+      confidence?: number;
+      source?: string;
+    };
+    obbCorners?: [number, number][];
+    angle?: number;
+    class_id?: number;
     landmarks?: Array<{ id: number; x: number; y: number; isSkipped?: boolean }>;
   }>
 ): FinalizedAcceptedBox[] {
@@ -871,9 +1423,39 @@ function normalizeFinalizedAcceptedBoxes(
     if (
       raw?.orientation_override === "left" ||
       raw?.orientation_override === "right" ||
+      raw?.orientation_override === "up" ||
+      raw?.orientation_override === "down" ||
       raw?.orientation_override === "uncertain"
     ) {
       box.orientation_override = raw.orientation_override;
+    }
+    if (
+      raw?.orientation_hint?.orientation === "left" ||
+      raw?.orientation_hint?.orientation === "right" ||
+      raw?.orientation_hint?.orientation === "up" ||
+      raw?.orientation_hint?.orientation === "down"
+    ) {
+      box.orientation_hint = {
+        orientation: raw.orientation_hint.orientation,
+        ...(isFiniteNumber(raw?.orientation_hint?.confidence)
+          ? { confidence: Number(raw.orientation_hint.confidence) }
+          : {}),
+        ...(typeof raw?.orientation_hint?.source === "string" && raw.orientation_hint.source.trim()
+          ? { source: raw.orientation_hint.source.trim() }
+          : {}),
+      };
+    }
+    if (Array.isArray(raw?.obbCorners) && raw.obbCorners.length === 4) {
+      box.obbCorners = raw.obbCorners.map((point: any) => [
+        Number(point?.[0]) || 0,
+        Number(point?.[1]) || 0,
+      ]) as [number, number][];
+    }
+    if (isFiniteNumber(raw?.angle)) {
+      box.angle = Number(raw.angle);
+    }
+    if (isFiniteNumber(raw?.class_id)) {
+      box.class_id = Math.round(Number(raw.class_id));
     }
     if (Array.isArray(raw?.landmarks) && raw.landmarks.length > 0) {
       try {
@@ -906,13 +1488,33 @@ function normalizeFinalizedAcceptedBoxes(
   return accepted;
 }
 
-function buildAcceptedBoxesSignature(boxes: Array<{ left: number; top: number; width: number; height: number }>): string {
+function buildAcceptedBoxesSignature(boxes: Array<{
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  obbCorners?: [number, number][];
+  angle?: number;
+  class_id?: number;
+  orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
+}>): string {
   const reduced = (boxes || [])
     .map((b) => ({
       left: Math.round(Number(b.left) || 0),
       top: Math.round(Number(b.top) || 0),
       width: Math.round(Number(b.width) || 0),
       height: Math.round(Number(b.height) || 0),
+      ...(Array.isArray(b.obbCorners) && b.obbCorners.length === 4
+        ? {
+            obbCorners: b.obbCorners.map((point) => [
+              Number(Number(point?.[0] || 0).toFixed(3)),
+              Number(Number(point?.[1] || 0).toFixed(3)),
+            ]),
+          }
+        : {}),
+      ...(isFiniteNumber(b.angle) ? { angle: Number(Number(b.angle).toFixed(3)) } : {}),
+      ...(isFiniteNumber(b.class_id) ? { class_id: Math.round(Number(b.class_id)) } : {}),
+      ...(b.orientation_override ? { orientation_override: b.orientation_override } : {}),
     }))
     .filter((b) => b.width > 0 && b.height > 0)
     .sort(
@@ -923,6 +1525,53 @@ function buildAcceptedBoxesSignature(boxes: Array<{ left: number; top: number; w
         a.height - b.height
     );
   return JSON.stringify(reduced);
+}
+
+function buildSegmentQueueImageKey(speciesId: string, filename: string): string {
+  return `${String(speciesId || "").trim()}::${path.basename(String(filename || "").trim()).toLowerCase()}`;
+}
+
+function setSegmentQueueStatus(
+  speciesId: string,
+  filename: string,
+  state: SegmentQueueState,
+  signature?: string,
+  reason?: string,
+  counts?: { expectedCount?: number; savedCount?: number },
+  details?: SegmentSaveDetail[]
+): void {
+  const key = buildSegmentQueueImageKey(speciesId, filename);
+  const entry: SegmentQueueStatusEntry = {
+    state,
+    updatedAt: new Date().toISOString(),
+    ...(signature ? { signature } : {}),
+    ...(reason ? { reason } : {}),
+    ...(counts?.expectedCount != null ? { expectedCount: counts.expectedCount } : {}),
+    ...(counts?.savedCount != null ? { savedCount: counts.savedCount } : {}),
+    ...(details?.length ? { details } : {}),
+  };
+  segmentQueueStatusByImage.set(key, entry);
+  mainWindow?.webContents.send("session:segment-save-status", {
+    speciesId,
+    filename,
+    ...entry,
+  });
+}
+
+function getSegmentQueueStatus(speciesId: string, filename: string): SegmentQueueStatusEntry {
+  return (
+    segmentQueueStatusByImage.get(buildSegmentQueueImageKey(speciesId, filename)) ?? {
+      state: "idle",
+      updatedAt: new Date().toISOString(),
+    }
+  );
+}
+
+function summarizeSegmentSaveDetails(details?: SegmentSaveDetail[]): string | undefined {
+  if (!details || details.length === 0) return undefined;
+  const firstFailure = details.find((detail) => detail.status === "failed" && detail.reason);
+  if (!firstFailure?.reason) return undefined;
+  return String(firstFailure.reason).trim();
 }
 
 function getImageDimensions(imagePath: string): { width: number; height: number } | null {
@@ -938,15 +1587,54 @@ function getImageDimensions(imagePath: string): { width: number; height: number 
   return null;
 }
 
+function summarizeRepresentativeImageDimensions(
+  imagePaths: string[],
+  maxSamples = 12
+): { width: number; height: number; sampleCount: number; megapixels: number } | undefined {
+  const widths: number[] = [];
+  const heights: number[] = [];
+
+  for (const imagePath of imagePaths.slice(0, maxSamples)) {
+    const dims = getImageDimensions(imagePath);
+    if (!dims || dims.width <= 0 || dims.height <= 0) continue;
+    widths.push(Math.round(dims.width));
+    heights.push(Math.round(dims.height));
+  }
+
+  if (widths.length === 0 || heights.length === 0) return undefined;
+
+  const medianValue = (values: number[]) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    if (sorted.length % 2 === 1) return sorted[mid];
+    return Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+  };
+
+  const width = medianValue(widths);
+  const height = medianValue(heights);
+  return {
+    width,
+    height,
+    sampleCount: widths.length,
+    megapixels: Number(((width * height) / 1_000_000).toFixed(2)),
+  };
+}
+
 function normalizeLandmarks(
   rawLandmarks: any[],
-  context: string
+  context: string,
+  options?: NormalizeLandmarkOptions
 ): Array<{ id: number; x: number; y: number; isSkipped?: boolean }> {
   const normalized: Array<{ id: number; x: number; y: number; isSkipped?: boolean }> = [];
   rawLandmarks.forEach((landmark: any, landmarkIndex: number) => {
     const skipped = Boolean(landmark?.isSkipped);
     const rawId = landmark?.id;
-    const id = isFiniteNumber(rawId) ? Number(rawId) : landmarkIndex;
+    const fallbackTemplateIndex = Number(options?.fallbackLandmarkTemplate?.[landmarkIndex]?.index);
+    const id = isFiniteNumber(rawId)
+      ? Number(rawId)
+      : isFiniteNumber(fallbackTemplateIndex)
+        ? fallbackTemplateIndex
+        : landmarkIndex + 1;
     const x = Number(landmark?.x);
     const y = Number(landmark?.y);
 
@@ -963,8 +1651,1211 @@ function normalizeLandmarks(
       y: skipped ? -1 : y,
       ...(skipped ? { isSkipped: true } : {}),
     });
+    if (!isFiniteNumber(rawId) && options?.metadata) {
+      options.metadata.missingLandmarkIdsMappedFromSchemaOrder += 1;
+    }
   });
   return normalized;
+}
+
+type ImportedLandmark = { id: number; x: number; y: number; isSkipped?: boolean };
+type ImportedObbCorners = [number, number][];
+
+type ImportedRawBox = {
+  left?: number;
+  top?: number;
+  width?: number;
+  height?: number;
+  obbCorners?: ImportedObbCorners;
+  angle?: number;
+  class_id?: number;
+  landmarks?: any[];
+};
+
+type ImportedNormalizedBox = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  landmarks: ImportedLandmark[];
+  maskOutline?: [number, number][];
+  obbCorners?: ImportedObbCorners;
+  angle?: number;
+  class_id?: number;
+  orientation_hint?: {
+    orientation?: "left" | "right" | "up" | "down";
+    confidence?: number;
+    source?: string;
+  };
+  geometryOrigin?: "source" | "derived";
+};
+
+type ImportGeometryConfig = {
+  axisMode: "auto" | "manual_anchors";
+  anchorLandmarkIds?: {
+    anteriorIds: number[];
+    posteriorIds: number[];
+  };
+  paddingMode: "tight" | "asymmetric";
+  paddingProfile?: {
+    forwardPct: number;
+    backwardPct: number;
+    topPct: number;
+    bottomPct: number;
+  };
+};
+
+type NormalizedImportGeometryConfig = {
+  axisMode: "auto" | "manual_anchors";
+  anchorLandmarkIds?: {
+    anteriorIds: number[];
+    posteriorIds: number[];
+  };
+  paddingMode: "tight" | "asymmetric";
+  paddingProfile: {
+    forward: number;
+    backward: number;
+    top: number;
+    bottom: number;
+  };
+};
+
+type ImportGeometrySummary = {
+  sourceObbPreserved: number;
+  sourceObbReorientedToAnchors: number;
+  translatedToFitImage: number;
+  manualAnchorDerived: number;
+  autoDerived: number;
+  fallbackBoxes: number;
+  usedAsymmetricPadding: boolean;
+  xmlLandmarkIdsPreservedAsSchemaIndexed: number;
+  xmlLandmarkIdsShiftedToOneBased: number;
+  xmlLandmarkIdsAmbiguous: number;
+  missingLandmarkIdsMappedFromSchemaOrder: number;
+};
+
+type NormalizeLandmarkOptions = {
+  fallbackLandmarkTemplate?: Array<{ index?: number }>;
+  metadata?: {
+    missingLandmarkIdsMappedFromSchemaOrder: number;
+  };
+};
+
+function getValidImportedLandmarks(landmarks: ImportedLandmark[]): Array<{ id: number; x: number; y: number }> {
+  return landmarks
+    .filter((lm) => !lm.isSkipped && isFiniteNumber(lm.x) && isFiniteNumber(lm.y))
+    .map((lm) => ({ id: Number(lm.id), x: Number(lm.x), y: Number(lm.y) }));
+}
+
+function buildImportedObbCorners(
+  cx: number,
+  cy: number,
+  width: number,
+  height: number,
+  angleDeg: number
+): ImportedObbCorners {
+  const r = angleDeg * (Math.PI / 180);
+  const cos = Math.cos(r);
+  const sin = Math.sin(r);
+  const hw = width / 2;
+  const hh = height / 2;
+  return [
+    [cx + cos * (-hw) - sin * (-hh), cy + sin * (-hw) + cos * (-hh)],
+    [cx + cos * hw - sin * (-hh), cy + sin * hw + cos * (-hh)],
+    [cx + cos * hw - sin * hh, cy + sin * hw + cos * hh],
+    [cx + cos * (-hw) - sin * hh, cy + sin * (-hw) + cos * hh],
+  ] as ImportedObbCorners;
+}
+
+function getImportedObbBounds(
+  corners: ImportedObbCorners
+): { minX: number; maxX: number; minY: number; maxY: number } {
+  const xs = corners.map(([x]) => Number(x));
+  const ys = corners.map(([, y]) => Number(y));
+  return {
+    minX: Math.min(...xs),
+    maxX: Math.max(...xs),
+    minY: Math.min(...ys),
+    maxY: Math.max(...ys),
+  };
+}
+
+function isImportedPointInsideObb(
+  point: { x: number; y: number },
+  corners: ImportedObbCorners,
+  tolerance = 1e-6
+): boolean {
+  if (!corners || corners.length !== 4) return false;
+  const cp0 = corners[0];
+  const hAxisX = Number(corners[1][0]) - Number(cp0[0]);
+  const hAxisY = Number(corners[1][1]) - Number(cp0[1]);
+  const vAxisX = Number(corners[3][0]) - Number(cp0[0]);
+  const vAxisY = Number(corners[3][1]) - Number(cp0[1]);
+  const widthSq = hAxisX * hAxisX + hAxisY * hAxisY;
+  const heightSq = vAxisX * vAxisX + vAxisY * vAxisY;
+  if (widthSq <= tolerance || heightSq <= tolerance) return false;
+  const relX = Number(point.x) - Number(cp0[0]);
+  const relY = Number(point.y) - Number(cp0[1]);
+  const hProj = (relX * hAxisX + relY * hAxisY) / widthSq;
+  const vProj = (relX * vAxisX + relY * vAxisY) / heightSq;
+  return hProj >= -tolerance && hProj <= 1 + tolerance && vProj >= -tolerance && vProj <= 1 + tolerance;
+}
+
+function importedObbContainsAllLandmarks(
+  corners: ImportedObbCorners,
+  landmarks: ImportedLandmark[]
+): boolean {
+  const valid = getValidImportedLandmarks(landmarks);
+  return valid.every((landmark) => isImportedPointInsideObb(landmark, corners));
+}
+
+function fitImportedObbCornersRigidly(
+  corners: ImportedObbCorners,
+  imageDims: { width: number; height: number } | null,
+  landmarks: ImportedLandmark[] = []
+): { corners: ImportedObbCorners; translated: boolean } {
+  if (!imageDims) {
+    return { corners, translated: false };
+  }
+  const maxXBound = Math.max(0, Number(imageDims.width) - 1);
+  const maxYBound = Math.max(0, Number(imageDims.height) - 1);
+  let resolvedCorners = corners.map(([x, y]) => [Number(x), Number(y)] as [number, number]) as ImportedObbCorners;
+  let translated = false;
+
+  const fittedBounds = getImportedObbBounds(resolvedCorners);
+  let dx = 0;
+  let dy = 0;
+  if (fittedBounds.minX < 0) dx = -fittedBounds.minX;
+  if (fittedBounds.maxX + dx > maxXBound) {
+    dx += maxXBound - (fittedBounds.maxX + dx);
+  }
+  if (fittedBounds.minY < 0) dy = -fittedBounds.minY;
+  if (fittedBounds.maxY + dy > maxYBound) {
+    dy += maxYBound - (fittedBounds.maxY + dy);
+  }
+  if (Math.abs(dx) > 1e-6 || Math.abs(dy) > 1e-6) {
+    const translatedCorners = resolvedCorners.map(([x, y]) => ([Number(x) + dx, Number(y) + dy])) as ImportedObbCorners;
+    if (landmarks.length === 0 || importedObbContainsAllLandmarks(translatedCorners, landmarks)) {
+      resolvedCorners = translatedCorners;
+      translated = true;
+    }
+  }
+
+  return { corners: resolvedCorners, translated };
+}
+
+function normalizeImportedObbCorners(
+  rawCorners: unknown,
+  _imageDims: { width: number; height: number } | null
+): ImportedObbCorners | undefined {
+  if (!Array.isArray(rawCorners) || rawCorners.length !== 4) return undefined;
+  const corners: ImportedObbCorners = [];
+  rawCorners.forEach((point) => {
+    if (!Array.isArray(point) || point.length < 2) return;
+    const x = Number(point[0]);
+    const y = Number(point[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    corners.push([x, y]);
+  });
+  if (corners.length !== 4) return undefined;
+  return corners as ImportedObbCorners;
+}
+
+function importedCornersToAabb(
+  corners: ImportedObbCorners,
+  _imageDims: { width: number; height: number } | null
+): { left: number; top: number; width: number; height: number } {
+  const xs = corners.map((c) => Number(c[0]));
+  const ys = corners.map((c) => Number(c[1]));
+  const left = Math.min(...xs);
+  const top = Math.min(...ys);
+  const right = Math.max(...xs);
+  const bottom = Math.max(...ys);
+  const width = right - left;
+  const height = bottom - top;
+  if (!(width > 1 && height > 1)) {
+    throw new Error("derived bounding box is too small/invalid.");
+  }
+  return { left, top, width, height };
+}
+
+function getImportedObbDimensions(corners: ImportedObbCorners): { width: number; height: number } {
+  const edgeWidthA = Math.hypot(
+    Number(corners[1][0]) - Number(corners[0][0]),
+    Number(corners[1][1]) - Number(corners[0][1])
+  );
+  const edgeWidthB = Math.hypot(
+    Number(corners[2][0]) - Number(corners[3][0]),
+    Number(corners[2][1]) - Number(corners[3][1])
+  );
+  const edgeHeightA = Math.hypot(
+    Number(corners[2][0]) - Number(corners[1][0]),
+    Number(corners[2][1]) - Number(corners[1][1])
+  );
+  const edgeHeightB = Math.hypot(
+    Number(corners[3][0]) - Number(corners[0][0]),
+    Number(corners[3][1]) - Number(corners[0][1])
+  );
+  return {
+    width: Math.max(2, (edgeWidthA + edgeWidthB) / 2),
+    height: Math.max(2, (edgeHeightA + edgeHeightB) / 2),
+  };
+}
+
+function buildImportSam2PromptBox(
+  box: ImportedNormalizedBox,
+  imageDims: { width: number; height: number } | null,
+  geometryConfig?: ImportGeometryConfig
+): [number, number, number, number] {
+  if (box.geometryOrigin !== "source") {
+    return [
+      Math.round(box.left),
+      Math.round(box.top),
+      Math.round(box.left + box.width),
+      Math.round(box.top + box.height),
+    ];
+  }
+
+  const resolvedGeometry = normalizeImportGeometryConfig(geometryConfig);
+  if (box.obbCorners && box.obbCorners.length === 4 && isFiniteNumber(box.angle)) {
+    const { width, height } = getImportedObbDimensions(box.obbCorners);
+    const padForward = width * resolvedGeometry.paddingProfile.forward;
+    const padBackward = width * resolvedGeometry.paddingProfile.backward;
+    const padTop = height * resolvedGeometry.paddingProfile.top;
+    const padBottom = height * resolvedGeometry.paddingProfile.bottom;
+    const centerX = box.obbCorners.reduce((sum, point) => sum + Number(point[0]), 0) / 4;
+    const centerY = box.obbCorners.reduce((sum, point) => sum + Number(point[1]), 0) / 4;
+    const angle = Number(box.angle);
+    const radians = angle * (Math.PI / 180);
+    const ux = Math.cos(radians);
+    const uy = Math.sin(radians);
+    const vx = -Math.sin(radians);
+    const vy = Math.cos(radians);
+    const expandedCenterX = centerX + ux * ((padBackward - padForward) / 2) + vx * ((padBottom - padTop) / 2);
+    const expandedCenterY = centerY + uy * ((padBackward - padForward) / 2) + vy * ((padBottom - padTop) / 2);
+    const expandedCorners = fitImportedObbCornersRigidly(
+      buildImportedObbCorners(
+        expandedCenterX,
+        expandedCenterY,
+        width + padForward + padBackward,
+        height + padTop + padBottom,
+        angle
+      ),
+      imageDims
+    ).corners;
+    const expandedAabb = importedCornersToAabb(expandedCorners, imageDims);
+    return [
+      Math.round(expandedAabb.left),
+      Math.round(expandedAabb.top),
+      Math.round(expandedAabb.left + expandedAabb.width),
+      Math.round(expandedAabb.top + expandedAabb.height),
+    ];
+  }
+
+  const padLeft = box.width * resolvedGeometry.paddingProfile.forward;
+  const padRight = box.width * resolvedGeometry.paddingProfile.backward;
+  const padTop = box.height * resolvedGeometry.paddingProfile.top;
+  const padBottom = box.height * resolvedGeometry.paddingProfile.bottom;
+  const left = Math.max(0, box.left - padLeft);
+  const top = Math.max(0, box.top - padTop);
+  const right = imageDims ? Math.min(imageDims.width, box.left + box.width + padRight) : box.left + box.width + padRight;
+  const bottom = imageDims ? Math.min(imageDims.height, box.top + box.height + padBottom) : box.top + box.height + padBottom;
+  return [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)];
+}
+
+function resolveTemplateLandmarkId(landmarkTemplate: any[], categories: string[]): number | null {
+  if (!Array.isArray(landmarkTemplate) || !Array.isArray(categories) || categories.length === 0) {
+    return null;
+  }
+  const normalizedCategories = new Set(
+    categories.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
+  );
+  const matches = landmarkTemplate
+    .map((lm: any) => ({
+      index: Number(lm?.index),
+      category: String(lm?.category || "").trim().toLowerCase(),
+    }))
+    .filter((lm) => Number.isFinite(lm.index) && normalizedCategories.has(lm.category))
+    .map((lm) => Math.round(lm.index));
+  return matches.length > 0 ? Math.min(...matches) : null;
+}
+
+function resolveHeadTailLandmarkIdsForImport(
+  orientationPolicy: NormalizedOrientationPolicy,
+  landmarkTemplate: any[]
+): { headId: number | null; tailId: number | null } {
+  return {
+    headId: resolveTemplateLandmarkId(landmarkTemplate, orientationPolicy.headCategories),
+    tailId: resolveTemplateLandmarkId(landmarkTemplate, orientationPolicy.tailCategories),
+  };
+}
+
+function findImportedLandmarkById(landmarks: ImportedLandmark[], id: number | null): ImportedLandmark | null {
+  if (id == null) return null;
+  return landmarks.find((lm) => !lm.isSkipped && Number(lm.id) === Number(id)) ?? null;
+}
+
+function resolveImportedAnchorCentroid(
+  landmarks: ImportedLandmark[],
+  ids: number[] | undefined
+): { id: number; x: number; y: number } | null {
+  const normalizedIds = normalizeAnchorIdList(ids);
+  if (normalizedIds.length === 0) return null;
+  const points = normalizedIds
+    .map((id) => findImportedLandmarkById(landmarks, id))
+    .filter(Boolean) as ImportedLandmark[];
+  if (points.length === 0) return null;
+  return {
+    id: normalizedIds[0],
+    x: points.reduce((sum, point) => sum + Number(point.x), 0) / points.length,
+    y: points.reduce((sum, point) => sum + Number(point.y), 0) / points.length,
+  };
+}
+
+function resolveImportedSemanticAnchors(
+  landmarks: ImportedLandmark[],
+  orientationPolicy: NormalizedOrientationPolicy,
+  landmarkTemplate: any[],
+  geometryConfig?: ImportGeometryConfig
+): { head: { id: number; x: number; y: number } | null; tail: { id: number; x: number; y: number } | null; source: "manual_anchors" | "schema_anchors" | "head_tail" | "none" } {
+  const resolvedGeometry = normalizeImportGeometryConfig(geometryConfig);
+  if (resolvedGeometry.axisMode === "manual_anchors") {
+    const head = resolveImportedAnchorCentroid(landmarks, resolvedGeometry.anchorLandmarkIds?.anteriorIds);
+    const tail = resolveImportedAnchorCentroid(landmarks, resolvedGeometry.anchorLandmarkIds?.posteriorIds);
+    if (head && tail) return { head, tail, source: "manual_anchors" };
+  }
+
+  const schemaHead = resolveImportedAnchorCentroid(landmarks, orientationPolicy.anteriorAnchorIds);
+  const schemaTail = resolveImportedAnchorCentroid(landmarks, orientationPolicy.posteriorAnchorIds);
+  if (schemaHead && schemaTail) {
+    return { head: schemaHead, tail: schemaTail, source: "schema_anchors" };
+  }
+
+  const { headId, tailId } = resolveHeadTailLandmarkIdsForImport(orientationPolicy, landmarkTemplate);
+  const head = findImportedLandmarkById(landmarks, headId);
+  const tail = findImportedLandmarkById(landmarks, tailId);
+  if (head && tail) return { head, tail, source: "head_tail" };
+  return { head: null, tail: null, source: "none" };
+}
+
+function normalizeImportedAngle360(angleDeg: number): number {
+  let angle = Number(angleDeg) % 360;
+  if (angle < 0) angle += 360;
+  return angle;
+}
+
+function normalizeImportedAngleSigned(angleDeg: number): number {
+  let angle = normalizeImportedAngle360(angleDeg);
+  if (angle > 180) angle -= 360;
+  if (angle <= -180) angle += 360;
+  if (Math.abs(angle + 180) <= 1e-6) return 180;
+  return angle;
+}
+
+function importedAngularDistanceDeg(a: number, b: number): number {
+  return Math.abs((((Number(a) - Number(b)) + 180) % 360 + 360) % 360 - 180);
+}
+
+function snapDerivedImportedAngle(angleDeg: number, mode: OrientationMode, toleranceDeg = 5.0): number {
+  if (mode === "invariant") return 0;
+  const angle360 = normalizeImportedAngle360(angleDeg);
+  const targets =
+    mode === "directional"
+      ? [0, 180]
+      : mode === "bilateral"
+      ? [90, 270]
+      : [0, 90, 180, 270];
+  let bestTarget = angle360;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  targets.forEach((target) => {
+    const distance = importedAngularDistanceDeg(angle360, target);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestTarget = target;
+    }
+  });
+  if (bestDistance <= toleranceDeg) {
+    return normalizeImportedAngleSigned(bestTarget);
+  }
+  return normalizeImportedAngleSigned(angle360);
+}
+
+function getImportedQuartileBucketSize(count: number): number {
+  return Math.max(1, Math.ceil(Number(count) * 0.25));
+}
+
+function getImportedCentroid(points: Array<{ x: number; y: number }>): { x: number; y: number } {
+  const count = Math.max(1, points.length);
+  return {
+    x: points.reduce((sum, point) => sum + Number(point.x), 0) / count,
+    y: points.reduce((sum, point) => sum + Number(point.y), 0) / count,
+  };
+}
+
+function deriveImportedBiCentroidAxis(
+  valid: Array<{ id: number; x: number; y: number }>,
+  axis: "horizontal" | "vertical"
+): { ux: number; uy: number; separation: number } {
+  if (valid.length < 2) {
+    throw new Error("need at least two landmarks for bi-centroid axis");
+  }
+  const key = axis === "horizontal" ? "x" : "y";
+  const sorted = [...valid].sort((a, b) => Number(a[key]) - Number(b[key]));
+  const bucketSize = getImportedQuartileBucketSize(sorted.length);
+  const start = sorted.slice(0, bucketSize);
+  const end = sorted.slice(sorted.length - bucketSize);
+  const startCentroid = getImportedCentroid(start);
+  const endCentroid = getImportedCentroid(end);
+  const dx = Number(endCentroid.x) - Number(startCentroid.x);
+  const dy = Number(endCentroid.y) - Number(startCentroid.y);
+  const separation = Math.hypot(dx, dy);
+  if (separation <= 1e-6) {
+    throw new Error("bi-centroid buckets collapse to the same centroid");
+  }
+  return { ux: dx / separation, uy: dy / separation, separation };
+}
+
+function normalizeImportGeometryConfig(raw?: ImportGeometryConfig | null): NormalizedImportGeometryConfig {
+  const axisMode = raw?.axisMode === "manual_anchors" ? "manual_anchors" : "auto";
+  const paddingMode = raw?.paddingMode === "asymmetric" ? "asymmetric" : "tight";
+  const anteriorIds = normalizeAnchorIdList(raw?.anchorLandmarkIds?.anteriorIds);
+  const posteriorIds = normalizeAnchorIdList(raw?.anchorLandmarkIds?.posteriorIds);
+  const anchorLandmarkIds =
+    axisMode === "manual_anchors" &&
+    anteriorIds.length > 0 &&
+    posteriorIds.length > 0 &&
+    anteriorIds.every((id) => !posteriorIds.includes(id))
+      ? {
+          anteriorIds,
+          posteriorIds,
+        }
+      : undefined;
+
+  const pct = (value: unknown) => Math.max(0, Number(value) || 0) / 100;
+  const paddingProfile = {
+    forward: paddingMode === "asymmetric" ? pct(raw?.paddingProfile?.forwardPct) : 0.1,
+    backward: paddingMode === "asymmetric" ? pct(raw?.paddingProfile?.backwardPct) : 0.1,
+    top: paddingMode === "asymmetric" ? pct(raw?.paddingProfile?.topPct) : 0.1,
+    bottom: paddingMode === "asymmetric" ? pct(raw?.paddingProfile?.bottomPct) : 0.1,
+  };
+
+  return {
+    axisMode,
+    ...(anchorLandmarkIds ? { anchorLandmarkIds } : {}),
+    paddingMode,
+    paddingProfile,
+  };
+}
+
+function normalizeImportedVector(x: number, y: number): { x: number; y: number } | null {
+  const mag = Math.hypot(Number(x), Number(y));
+  if (mag <= 1e-6) return null;
+  return { x: Number(x) / mag, y: Number(y) / mag };
+}
+
+function usesImportedVerticalSemanticAxis(
+  orientationPolicy: NormalizedOrientationPolicy
+): boolean {
+  return (
+    orientationPolicy.mode === "axial" ||
+    (
+      orientationPolicy.mode === "bilateral" &&
+      orientationPolicy.bilateralClassAxis === "vertical_obb"
+    )
+  );
+}
+
+function resolveImportedObbAxes(
+  semanticAxisX: number,
+  semanticAxisY: number,
+  orientationPolicy: NormalizedOrientationPolicy
+): { hx: number; hy: number; vx: number; vy: number } {
+  const axis = normalizeImportedVector(semanticAxisX, semanticAxisY) ?? { x: 1, y: 0 };
+  if (usesImportedVerticalSemanticAxis(orientationPolicy)) {
+    // Vertical schemas treat the semantic axis as biological top -> bottom.
+    return {
+      hx: axis.y,
+      hy: -axis.x,
+      vx: axis.x,
+      vy: axis.y,
+    };
+  }
+  // Horizontal schemas treat the semantic axis as biological left -> right.
+  return {
+    hx: axis.x,
+    hy: axis.y,
+    vx: -axis.y,
+    vy: axis.x,
+  };
+}
+
+function buildImportedObbCornersFromAxes(
+  cx: number,
+  cy: number,
+  width: number,
+  height: number,
+  hx: number,
+  hy: number,
+  vx: number,
+  vy: number
+): ImportedObbCorners {
+  const hw = width / 2;
+  const hh = height / 2;
+  return [
+    [cx - hw * hx - hh * vx, cy - hw * hy - hh * vy],
+    [cx + hw * hx - hh * vx, cy + hw * hy - hh * vy],
+    [cx + hw * hx + hh * vx, cy + hw * hy + hh * vy],
+    [cx - hw * hx + hh * vx, cy - hw * hy + hh * vy],
+  ] as ImportedObbCorners;
+}
+
+function buildImportedObbFromSemanticAxis(
+  centerX: number,
+  centerY: number,
+  width: number,
+  height: number,
+  semanticAxisX: number,
+  semanticAxisY: number,
+  orientationPolicy: NormalizedOrientationPolicy
+): { obbCorners: ImportedObbCorners; angle: number } {
+  const { hx, hy } = resolveImportedObbAxes(
+    semanticAxisX,
+    semanticAxisY,
+    orientationPolicy
+  );
+  const snappedAngle = snapDerivedImportedAngle(
+    Math.atan2(hy, hx) * 180 / Math.PI,
+    orientationPolicy.mode
+  );
+  const angleRad = snappedAngle * (Math.PI / 180);
+  const cos = Math.cos(angleRad);
+  const sin = Math.sin(angleRad);
+  const snappedHx = cos;
+  const snappedHy = sin;
+  const snappedVx = -sin;
+  const snappedVy = cos;
+  return {
+    obbCorners: buildImportedObbCornersFromAxes(
+      centerX,
+      centerY,
+      width,
+      height,
+      snappedHx,
+      snappedHy,
+      snappedVx,
+      snappedVy
+    ),
+    angle: normalizeImportedAngleSigned(snappedAngle),
+  };
+}
+
+function validateImportedVerticalAnchorAlignment(
+  head: ImportedLandmark | null,
+  tail: ImportedLandmark | null,
+  obbCorners?: ImportedObbCorners | null
+): boolean {
+  if (!head || !tail || !obbCorners || obbCorners.length !== 4) return true;
+  const [cp0, cp1, cp2, cp3] = obbCorners;
+  const topMidX = (cp0[0] + cp1[0]) / 2;
+  const topMidY = (cp0[1] + cp1[1]) / 2;
+  const bottomMidX = (cp2[0] + cp3[0]) / 2;
+  const bottomMidY = (cp2[1] + cp3[1]) / 2;
+  const headToTop = Math.hypot(Number(head.x) - topMidX, Number(head.y) - topMidY);
+  const headToBottom = Math.hypot(Number(head.x) - bottomMidX, Number(head.y) - bottomMidY);
+  const tailToBottom = Math.hypot(Number(tail.x) - bottomMidX, Number(tail.y) - bottomMidY);
+  const tailToTop = Math.hypot(Number(tail.x) - topMidX, Number(tail.y) - topMidY);
+  return headToTop <= headToBottom && tailToBottom <= tailToTop;
+}
+
+function maybeFlipImportedObbForVerticalCanonical(
+  head: ImportedLandmark | null,
+  tail: ImportedLandmark | null,
+  centerX: number,
+  centerY: number,
+  width: number,
+  height: number,
+  semanticAxisX: number,
+  semanticAxisY: number,
+  orientationPolicy: NormalizedOrientationPolicy
+): { obbCorners: ImportedObbCorners; angle: number } {
+  const built = buildImportedObbFromSemanticAxis(
+    centerX,
+    centerY,
+    width,
+    height,
+    semanticAxisX,
+    semanticAxisY,
+    orientationPolicy
+  );
+  if (
+    usesImportedVerticalSemanticAxis(orientationPolicy) &&
+    !validateImportedVerticalAnchorAlignment(head, tail, built.obbCorners)
+  ) {
+    const flipped = buildImportedObbFromSemanticAxis(
+      centerX,
+      centerY,
+      width,
+      height,
+      -semanticAxisX,
+      -semanticAxisY,
+      orientationPolicy
+    );
+    return { obbCorners: flipped.obbCorners, angle: flipped.angle };
+  }
+  return { obbCorners: built.obbCorners, angle: built.angle };
+}
+
+function deriveImportedBilateralVerticalClassId(
+  head: ImportedLandmark,
+  tail: ImportedLandmark,
+  obbCorners?: ImportedObbCorners | null
+): number {
+  if (!obbCorners || obbCorners.length !== 4) {
+    return Number(head.y) < Number(tail.y) ? 0 : 1;
+  }
+  const [cp0, cp1, cp2, cp3] = obbCorners;
+  const centerX = (cp0[0] + cp1[0] + cp2[0] + cp3[0]) / 4;
+  const centerY = (cp0[1] + cp1[1] + cp2[1] + cp3[1]) / 4;
+  const topMidX = (cp0[0] + cp1[0]) / 2;
+  const topMidY = (cp0[1] + cp1[1]) / 2;
+  const upX = topMidX - centerX;
+  const upY = topMidY - centerY;
+  const magnitude = Math.hypot(upX, upY);
+  if (magnitude <= 1e-6) {
+    return Number(head.y) < Number(tail.y) ? 0 : 1;
+  }
+  const normX = upX / magnitude;
+  const normY = upY / magnitude;
+  const headProjection = (Number(head.x) - centerX) * normX + (Number(head.y) - centerY) * normY;
+  const tailProjection = (Number(tail.x) - centerX) * normX + (Number(tail.y) - centerY) * normY;
+  if (Math.abs(headProjection - tailProjection) <= 1e-6) {
+    return Number(head.y) < Number(tail.y) ? 0 : 1;
+  }
+  return headProjection > tailProjection ? 0 : 1;
+}
+
+function deriveImportedDirectionalClassId(
+  head: ImportedLandmark,
+  tail: ImportedLandmark,
+  obbCorners?: ImportedObbCorners | null
+): number {
+  if (!obbCorners || obbCorners.length !== 4) {
+    return Number(head.x) < Number(tail.x) ? 0 : 1;
+  }
+  const [cp0, cp1, cp2, cp3] = obbCorners;
+  const centerX = (cp0[0] + cp1[0] + cp2[0] + cp3[0]) / 4;
+  const centerY = (cp0[1] + cp1[1] + cp2[1] + cp3[1]) / 4;
+  const rightMidX = (cp1[0] + cp2[0]) / 2;
+  const rightMidY = (cp1[1] + cp2[1]) / 2;
+  const rightX = rightMidX - centerX;
+  const rightY = rightMidY - centerY;
+  const magnitude = Math.hypot(rightX, rightY);
+  if (magnitude <= 1e-6) {
+    return Number(head.x) < Number(tail.x) ? 0 : 1;
+  }
+  const normX = rightX / magnitude;
+  const normY = rightY / magnitude;
+  const headProjection = (Number(head.x) - centerX) * normX + (Number(head.y) - centerY) * normY;
+  const tailProjection = (Number(tail.x) - centerX) * normX + (Number(tail.y) - centerY) * normY;
+  if (Math.abs(headProjection - tailProjection) <= 1e-6) {
+    return Number(head.x) < Number(tail.x) ? 0 : 1;
+  }
+  return headProjection < tailProjection ? 0 : 1;
+}
+
+function getImportedOrientationLabelForClassId(
+  orientationPolicy: NormalizedOrientationPolicy,
+  classId: number | undefined | null
+): "left" | "right" | "up" | "down" | undefined {
+  if (classId !== 0 && classId !== 1) return undefined;
+  if (orientationPolicy.mode === "invariant") return undefined;
+  if (orientationPolicy.mode === "axial") {
+    return classId === 0 ? "up" : "down";
+  }
+  if (
+    orientationPolicy.mode === "bilateral" &&
+    orientationPolicy.bilateralClassAxis === "vertical_obb"
+  ) {
+    return classId === 0 ? "up" : "down";
+  }
+  return classId === 0 ? "left" : "right";
+}
+
+function buildImportedOrientationHint(
+  orientationPolicy: NormalizedOrientationPolicy,
+  classId: number | undefined | null,
+  source: "manual_anchors" | "schema_anchors" | "canonical_default" | "imported_class_id"
+): ImportedNormalizedBox["orientation_hint"] | undefined {
+  const orientation = getImportedOrientationLabelForClassId(orientationPolicy, classId);
+  if (!orientation) return undefined;
+  return {
+    orientation,
+    confidence: 1,
+    source,
+  };
+}
+
+function createImportGeometrySummary(): ImportGeometrySummary {
+  return {
+    sourceObbPreserved: 0,
+    sourceObbReorientedToAnchors: 0,
+    translatedToFitImage: 0,
+    manualAnchorDerived: 0,
+    autoDerived: 0,
+    fallbackBoxes: 0,
+    usedAsymmetricPadding: false,
+    xmlLandmarkIdsPreservedAsSchemaIndexed: 0,
+    xmlLandmarkIdsShiftedToOneBased: 0,
+    xmlLandmarkIdsAmbiguous: 0,
+    missingLandmarkIdsMappedFromSchemaOrder: 0,
+  };
+}
+
+function summarizeImportGeometry(summary: ImportGeometrySummary, unmatchedCount = 0): string[] {
+  const warnings: string[] = [];
+  if (summary.manualAnchorDerived > 0) {
+    warnings.push(`Derived OBBs and orientation from configured anchor centroids for ${summary.manualAnchorDerived} box${summary.manualAnchorDerived === 1 ? "" : "es"}.`);
+  } else if (summary.autoDerived > 0) {
+    warnings.push(`Derived OBBs automatically for ${summary.autoDerived} box${summary.autoDerived === 1 ? "" : "es"}.`);
+    warnings.push(`Used category or bi-centroid fallback for ${summary.autoDerived} box${summary.autoDerived === 1 ? "" : "es"} because configured anchors were unavailable.`);
+  }
+  if (summary.sourceObbReorientedToAnchors > 0) {
+    warnings.push(`Reoriented ${summary.sourceObbReorientedToAnchors} imported source OBB${summary.sourceObbReorientedToAnchors === 1 ? "" : "s"} to match the selected anchor axis.`);
+  }
+  if (summary.translatedToFitImage > 0) {
+    warnings.push(`Translated ${summary.translatedToFitImage} imported OBB${summary.translatedToFitImage === 1 ? "" : "s"} inward while preserving landmark coverage.`);
+  }
+  if (summary.xmlLandmarkIdsPreservedAsSchemaIndexed > 0) {
+    warnings.push(`Preserved ${summary.xmlLandmarkIdsPreservedAsSchemaIndexed} XML landmark id${summary.xmlLandmarkIdsPreservedAsSchemaIndexed === 1 ? "" : "s"} because they already matched the schema's 1-based indexing.`);
+  }
+  if (summary.xmlLandmarkIdsShiftedToOneBased > 0) {
+    warnings.push(`Shifted ${summary.xmlLandmarkIdsShiftedToOneBased} XML landmark id${summary.xmlLandmarkIdsShiftedToOneBased === 1 ? "" : "s"} from 0-based to schema 1-based indexing.`);
+  }
+  if (summary.xmlLandmarkIdsAmbiguous > 0) {
+    warnings.push(`Left ${summary.xmlLandmarkIdsAmbiguous} XML landmark id${summary.xmlLandmarkIdsAmbiguous === 1 ? "" : "s"} unchanged because the source indexing did not safely match either schema 1-based ids or a clean 0-based offset.`);
+  }
+  if (summary.missingLandmarkIdsMappedFromSchemaOrder > 0) {
+    warnings.push(`Mapped ${summary.missingLandmarkIdsMappedFromSchemaOrder} imported landmark id${summary.missingLandmarkIdsMappedFromSchemaOrder === 1 ? "" : "s"} from schema order because the source annotation omitted explicit ids.`);
+  }
+  if (summary.usedAsymmetricPadding) {
+    warnings.push("Applied custom specimen padding during import.");
+  }
+  if (summary.fallbackBoxes > 0) {
+    warnings.push(`${summary.fallbackBoxes} box${summary.fallbackBoxes === 1 ? "" : "es"} used a simple fallback because the selected anchors or landmark geometry were insufficient.`);
+  }
+  if (unmatchedCount > 0) {
+    warnings.push(`${unmatchedCount} image${unmatchedCount === 1 ? "" : "s"} had no matching annotation.`);
+  }
+  return warnings;
+}
+
+function deriveImportedClassId(
+  landmarks: ImportedLandmark[],
+  orientationPolicy: NormalizedOrientationPolicy,
+  landmarkTemplate: any[],
+  geometryConfig?: ImportGeometryConfig,
+  obbCorners?: ImportedObbCorners | null
+): number | undefined {
+  if (orientationPolicy.mode === "invariant") return 0;
+  const { head, tail } = resolveImportedSemanticAnchors(
+    landmarks,
+    orientationPolicy,
+    landmarkTemplate,
+    geometryConfig
+  );
+  if (!head || !tail) return 0;
+  if (orientationPolicy.mode === "axial") {
+    return Number(head.y) < Number(tail.y) ? 0 : 1;
+  }
+  if (
+    orientationPolicy.mode === "bilateral" &&
+    orientationPolicy.bilateralClassAxis === "vertical_obb"
+  ) {
+    return deriveImportedBilateralVerticalClassId(head, tail, obbCorners);
+  }
+  return deriveImportedDirectionalClassId(head, tail, obbCorners);
+}
+
+function deriveImportedObbFromLandmarks(
+  landmarks: ImportedLandmark[],
+  imageDims: { width: number; height: number } | null,
+  orientationPolicy: NormalizedOrientationPolicy,
+  landmarkTemplate: any[],
+  geometryConfig?: ImportGeometryConfig
+): {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  obbCorners: ImportedObbCorners;
+  angle: number;
+  class_id?: number;
+  derivation:
+    | "head_tail"
+    | "directional_bi_centroid"
+    | "bilateral_bi_centroid"
+    | "axial_axis_snapped"
+    | "invariant_axis_aligned"
+    | "fallback";
+} {
+  const resolvedGeometry = normalizeImportGeometryConfig(geometryConfig);
+  const valid = getValidImportedLandmarks(landmarks);
+  if (valid.length === 0) {
+    throw new Error("cannot derive OBB from landmarks: no valid non-skipped landmarks.");
+  }
+
+  const uniquePoints = new Set(valid.map((lm) => `${Math.round(lm.x * 1000)}:${Math.round(lm.y * 1000)}`));
+  if (uniquePoints.size < 2) {
+    const aabb = deriveBoxFromLandmarks(landmarks, imageDims);
+    const cx = aabb.left + aabb.width / 2;
+    const cy = aabb.top + aabb.height / 2;
+    const obbCorners = fitImportedObbCornersRigidly(
+      buildImportedObbCorners(cx, cy, aabb.width, aabb.height, 0),
+      imageDims,
+      landmarks
+    ).corners;
+    return {
+      ...importedCornersToAabb(obbCorners, imageDims),
+      obbCorners,
+      angle: 0,
+      class_id: deriveImportedClassId(landmarks, orientationPolicy, landmarkTemplate, geometryConfig, obbCorners),
+      derivation: "fallback",
+    };
+  }
+
+  const { head, tail } = resolveImportedSemanticAnchors(
+    landmarks,
+    orientationPolicy,
+    landmarkTemplate,
+    geometryConfig
+  );
+  let ux = 1;
+  let uy = 0;
+  let derivation:
+    | "head_tail"
+    | "directional_bi_centroid"
+    | "bilateral_bi_centroid"
+    | "axial_axis_snapped"
+    | "invariant_axis_aligned"
+    | "fallback" = "fallback";
+
+  if (orientationPolicy.mode === "invariant") {
+    const aabb = deriveBoxFromLandmarks(landmarks, imageDims);
+    const cx = aabb.left + aabb.width / 2;
+    const cy = aabb.top + aabb.height / 2;
+    const obbCorners = fitImportedObbCornersRigidly(
+      buildImportedObbCorners(cx, cy, aabb.width, aabb.height, 0),
+      imageDims,
+      landmarks
+    ).corners;
+    return {
+      ...importedCornersToAabb(obbCorners, imageDims),
+      obbCorners,
+      angle: 0,
+      class_id: deriveImportedClassId(landmarks, orientationPolicy, landmarkTemplate, geometryConfig, obbCorners),
+      derivation: "invariant_axis_aligned",
+    };
+  }
+
+  if (head && tail) {
+    const dx = Number(tail.x) - Number(head.x);
+    const dy = Number(tail.y) - Number(head.y);
+    const norm = Math.hypot(dx, dy);
+    if (norm > 1e-6) {
+      ux = dx / norm;
+      uy = dy / norm;
+      derivation = "head_tail";
+    }
+  }
+
+  if (
+    resolvedGeometry.axisMode === "manual_anchors" &&
+    derivation !== "head_tail"
+  ) {
+    const aabb = deriveBoxFromLandmarks(landmarks, imageDims);
+    const cx = aabb.left + aabb.width / 2;
+    const cy = aabb.top + aabb.height / 2;
+    const obbCorners = fitImportedObbCornersRigidly(
+      buildImportedObbCorners(cx, cy, aabb.width, aabb.height, 0),
+      imageDims,
+      landmarks
+    ).corners;
+    return {
+      ...importedCornersToAabb(obbCorners, imageDims),
+      obbCorners,
+      angle: 0,
+      class_id: deriveImportedClassId(landmarks, orientationPolicy, landmarkTemplate, geometryConfig, obbCorners),
+      derivation: "fallback",
+    };
+  }
+
+  if (derivation !== "head_tail") {
+    if (orientationPolicy.mode === "directional") {
+      try {
+        const axis = deriveImportedBiCentroidAxis(valid, "horizontal");
+        ux = axis.ux;
+        uy = axis.uy;
+        derivation = "directional_bi_centroid";
+      } catch {
+        derivation = "fallback";
+      }
+    } else if (orientationPolicy.mode === "bilateral") {
+      try {
+        const axis = deriveImportedBiCentroidAxis(valid, "vertical");
+        ux = axis.ux;
+        uy = axis.uy;
+        derivation = "bilateral_bi_centroid";
+      } catch {
+        derivation = "fallback";
+      }
+    } else {
+      const candidates: Array<{ ux: number; uy: number; separation: number }> = [];
+      try {
+        candidates.push(deriveImportedBiCentroidAxis(valid, "horizontal"));
+      } catch {}
+      try {
+        candidates.push(deriveImportedBiCentroidAxis(valid, "vertical"));
+      } catch {}
+      if (candidates.length > 0) {
+        const axis = candidates.reduce((best, current) =>
+          current.separation > best.separation ? current : best
+        );
+        ux = axis.ux;
+        uy = axis.uy;
+        derivation = "axial_axis_snapped";
+      } else {
+        derivation = "fallback";
+      }
+    }
+  }
+
+  const { hx, hy, vx, vy } = resolveImportedObbAxes(ux, uy, orientationPolicy);
+  const hValues = valid.map((lm) => lm.x * hx + lm.y * hy);
+  const vValues = valid.map((lm) => lm.x * vx + lm.y * vy);
+  const minH = Math.min(...hValues);
+  const maxH = Math.max(...hValues);
+  const minV = Math.min(...vValues);
+  const maxV = Math.max(...vValues);
+  const rawWidth = Math.max(2, maxH - minH);
+  const rawHeight = Math.max(2, maxV - minV);
+  const padForward = Math.max(4, rawWidth * resolvedGeometry.paddingProfile.forward);
+  const padBackward = Math.max(4, rawWidth * resolvedGeometry.paddingProfile.backward);
+  const padTop = Math.max(4, rawHeight * resolvedGeometry.paddingProfile.top);
+  const padBottom = Math.max(4, rawHeight * resolvedGeometry.paddingProfile.bottom);
+  const minHWithPad = minH - padForward;
+  const maxHWithPad = maxH + padBackward;
+  const minVWithPad = minV - padTop;
+  const maxVWithPad = maxV + padBottom;
+  const centerH = (minHWithPad + maxHWithPad) / 2;
+  const centerV = (minVWithPad + maxVWithPad) / 2;
+  const centerX = centerH * hx + centerV * vx;
+  const centerY = centerH * hy + centerV * vy;
+  const width = maxHWithPad - minHWithPad;
+  const height = maxVWithPad - minVWithPad;
+  const canonicalObb = maybeFlipImportedObbForVerticalCanonical(
+    head,
+    tail,
+    centerX,
+    centerY,
+    width,
+    height,
+    ux,
+    uy,
+    orientationPolicy
+  );
+  const obbCorners = fitImportedObbCornersRigidly(canonicalObb.obbCorners, imageDims, landmarks).corners;
+  return {
+    ...importedCornersToAabb(obbCorners, imageDims),
+    obbCorners,
+    angle: canonicalObb.angle,
+    class_id: deriveImportedClassId(landmarks, orientationPolicy, landmarkTemplate, geometryConfig, obbCorners),
+    derivation,
+  };
+}
+
+function normalizeImportedBoxGeometry(
+  rawBox: ImportedRawBox,
+  normalizedLandmarks: ImportedLandmark[],
+  imageDims: { width: number; height: number } | null,
+  context: string,
+  orientationPolicy: NormalizedOrientationPolicy,
+  landmarkTemplate: any[],
+  warnings: string[],
+  geometryConfig?: ImportGeometryConfig,
+  summary?: ImportGeometrySummary
+): ImportedNormalizedBox {
+  const resolvedGeometry = normalizeImportGeometryConfig(geometryConfig);
+  const semanticAnchors = resolveImportedSemanticAnchors(
+    normalizedLandmarks,
+    orientationPolicy,
+    landmarkTemplate,
+    geometryConfig
+  );
+  const sourceObbCorners = normalizeImportedObbCorners(rawBox?.obbCorners, imageDims);
+  if (sourceObbCorners) {
+    if (summary) {
+      summary.sourceObbPreserved += 1;
+    }
+    let resolvedObbCorners = sourceObbCorners;
+    let angle = isFiniteNumber(rawBox?.angle)
+      ? Number(rawBox?.angle)
+      : Math.atan2(
+          Number(sourceObbCorners[1][1]) - Number(sourceObbCorners[0][1]),
+          Number(sourceObbCorners[1][0]) - Number(sourceObbCorners[0][0])
+        ) * 180 / Math.PI;
+    if (semanticAnchors.head && semanticAnchors.tail) {
+      const head = semanticAnchors.head;
+      const tail = semanticAnchors.tail;
+      if (semanticAnchors.source !== "head_tail" || resolvedGeometry.axisMode === "manual_anchors") {
+        if (head && tail) {
+          const semanticAxisX = Number(tail.x) - Number(head.x);
+          const semanticAxisY = Number(tail.y) - Number(head.y);
+          // Center from corner average — corner-order independent
+          const srcCX = (Number(sourceObbCorners[0][0]) + Number(sourceObbCorners[1][0]) + Number(sourceObbCorners[2][0]) + Number(sourceObbCorners[3][0])) / 4;
+          const srcCY = (Number(sourceObbCorners[0][1]) + Number(sourceObbCorners[1][1]) + Number(sourceObbCorners[2][1]) + Number(sourceObbCorners[3][1])) / 4;
+          // Compute edge vectors and lengths (consecutive corners always form perpendicular edges)
+          const e01x = Number(sourceObbCorners[1][0]) - Number(sourceObbCorners[0][0]);
+          const e01y = Number(sourceObbCorners[1][1]) - Number(sourceObbCorners[0][1]);
+          const e12x = Number(sourceObbCorners[2][0]) - Number(sourceObbCorners[1][0]);
+          const e12y = Number(sourceObbCorners[2][1]) - Number(sourceObbCorners[1][1]);
+          const edge01Len = Math.max(2, Math.hypot(e01x, e01y));
+          const edge12Len = Math.max(2, Math.hypot(e12x, e12y));
+          // Determine which edge is more aligned with the biological (semantic) axis via dot product
+          const semanticLen = Math.hypot(semanticAxisX, semanticAxisY);
+          const ux = semanticLen > 0 ? semanticAxisX / semanticLen : 0;
+          const uy = semanticLen > 0 ? semanticAxisY / semanticLen : 1;
+          const dot01 = Math.abs(e01x * ux + e01y * uy) / edge01Len;
+          // edge01 more aligned with semantic axis → height (along lm3→lm12); other edge → width
+          const axisHeight = dot01 > 0.5 ? edge01Len : edge12Len;
+          const axisWidth  = dot01 > 0.5 ? edge12Len : edge01Len;
+          const rebuilt = maybeFlipImportedObbForVerticalCanonical(
+            head,
+            tail,
+            srcCX,
+            srcCY,
+            axisWidth,
+            axisHeight,
+            semanticAxisX,
+            semanticAxisY,
+            orientationPolicy
+          );
+          resolvedObbCorners = fitImportedObbCornersRigidly(rebuilt.obbCorners, imageDims, normalizedLandmarks).corners;
+          angle = rebuilt.angle;
+          if (summary) {
+            summary.sourceObbReorientedToAnchors += 1;
+          }
+          warnings.push(`${context}: reoriented source OBB to match ${semanticAnchors.source === "manual_anchors" ? "manual" : "schema"} anchors.`);
+        }
+      }
+    }
+    const fittedSourceObb = fitImportedObbCornersRigidly(resolvedObbCorners, imageDims, normalizedLandmarks);
+    resolvedObbCorners = fittedSourceObb.corners;
+    if (summary) {
+      if (fittedSourceObb.translated) summary.translatedToFitImage += 1;
+    }
+    const aabb = importedCornersToAabb(resolvedObbCorners, imageDims);
+    const derivedClassId = deriveImportedClassId(
+      normalizedLandmarks,
+      orientationPolicy,
+      landmarkTemplate,
+      geometryConfig,
+      resolvedObbCorners
+    );
+    const classId = derivedClassId;
+    const orientationHint = buildImportedOrientationHint(
+      orientationPolicy,
+      classId,
+      semanticAnchors.source === "manual_anchors"
+        ? "manual_anchors"
+        : semanticAnchors.source === "schema_anchors"
+        ? "schema_anchors"
+        : "canonical_default"
+    );
+    return {
+      ...aabb,
+      landmarks: normalizedLandmarks,
+      obbCorners: resolvedObbCorners,
+      angle,
+      geometryOrigin: "source",
+      ...(classId != null ? { class_id: classId } : {}),
+      ...(orientationHint ? { orientation_hint: orientationHint } : {}),
+    };
+  }
+
+  const derived = deriveImportedObbFromLandmarks(
+    normalizedLandmarks,
+    imageDims,
+    orientationPolicy,
+    landmarkTemplate,
+    geometryConfig
+  );
+  if (summary) {
+    if (resolvedGeometry.paddingMode === "asymmetric") {
+      summary.usedAsymmetricPadding = true;
+    }
+    const fittedDerivedObb = fitImportedObbCornersRigidly(derived.obbCorners, imageDims, normalizedLandmarks);
+    derived.obbCorners = fittedDerivedObb.corners;
+    if (fittedDerivedObb.translated) summary.translatedToFitImage += 1;
+    if (derived.derivation === "fallback") {
+      summary.fallbackBoxes += 1;
+    } else if (semanticAnchors.source === "manual_anchors" || semanticAnchors.source === "schema_anchors") {
+      summary.manualAnchorDerived += 1;
+    } else {
+      summary.autoDerived += 1;
+    }
+    const fittedAabb = importedCornersToAabb(derived.obbCorners, imageDims);
+    derived.left = fittedAabb.left;
+    derived.top = fittedAabb.top;
+    derived.width = fittedAabb.width;
+    derived.height = fittedAabb.height;
+  } else {
+    const fittedDerivedObb = fitImportedObbCornersRigidly(derived.obbCorners, imageDims, normalizedLandmarks);
+    derived.obbCorners = fittedDerivedObb.corners;
+    const fittedAabb = importedCornersToAabb(derived.obbCorners, imageDims);
+    derived.left = fittedAabb.left;
+    derived.top = fittedAabb.top;
+    derived.width = fittedAabb.width;
+    derived.height = fittedAabb.height;
+  }
+  warnings.push(
+    derived.derivation === "fallback"
+      ? `${context}: ${
+          resolvedGeometry.axisMode === "manual_anchors"
+            ? "manual anchor landmarks were missing or degenerate; saved a fallback OBB."
+            : "landmarks were insufficient for stable orientation; saved a fallback OBB."
+        }`
+      : `${context}: derived OBB from ${
+          resolvedGeometry.axisMode === "manual_anchors" ? "manual anchors" : "landmarks"
+        }${resolvedGeometry.paddingMode === "asymmetric" ? " with custom padding" : ""}.`
+  );
+  return {
+    left: derived.left,
+    top: derived.top,
+    width: derived.width,
+    height: derived.height,
+    landmarks: normalizedLandmarks,
+    obbCorners: derived.obbCorners,
+    angle: derived.angle,
+    geometryOrigin: "derived",
+    ...(derived.class_id != null ? { class_id: derived.class_id } : {}),
+    ...(buildImportedOrientationHint(
+      orientationPolicy,
+      derived.class_id,
+      resolvedGeometry.axisMode === "manual_anchors" ? "manual_anchors" : "canonical_default"
+    )
+      ? {
+          orientation_hint: buildImportedOrientationHint(
+            orientationPolicy,
+            derived.class_id,
+            semanticAnchors.source === "manual_anchors"
+              ? "manual_anchors"
+              : semanticAnchors.source === "schema_anchors"
+              ? "schema_anchors"
+              : "canonical_default"
+          ),
+        }
+      : {}),
+  };
 }
 
 function deriveBoxFromLandmarks(
@@ -1007,11 +2898,52 @@ function deriveBoxFromLandmarks(
   return { left: minX, top: minY, width, height };
 }
 
-// ── Annotation file parsers ──
+function boxHasAuthoritativeObb(rawBox: any): boolean {
+  return (
+    Array.isArray(rawBox?.obbCorners) &&
+    rawBox.obbCorners.length === 4 &&
+    rawBox.obbCorners.every(
+      (point: any) =>
+        Array.isArray(point) &&
+        point.length >= 2 &&
+        Number.isFinite(Number(point[0])) &&
+        Number.isFinite(Number(point[1]))
+    ) &&
+    Number.isFinite(Number(rawBox?.angle))
+  );
+}
+
+function sessionContainsLegacyNonObbLabels(sessionDir: string): boolean {
+  const labelsDir = path.join(sessionDir, "labels");
+  if (!fs.existsSync(labelsDir)) return false;
+
+  for (const labelName of fs.readdirSync(labelsDir).filter((name) => name.endsWith(".json"))) {
+    const raw = safeReadJson(path.join(labelsDir, labelName));
+    if (!raw || typeof raw !== "object") continue;
+
+    const boxLists = [
+      Array.isArray((raw as any).boxes) ? (raw as any).boxes : [],
+      Array.isArray((raw as any)?.finalizedDetection?.acceptedBoxes)
+        ? (raw as any).finalizedDetection.acceptedBoxes
+        : [],
+    ];
+    for (const list of boxLists) {
+      for (const box of list) {
+        const hasLandmarks = Array.isArray(box?.landmarks) && box.landmarks.length > 0;
+        if (hasLandmarks && !boxHasAuthoritativeObb(box)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+// Ã¢â€â‚¬Ã¢â€â‚¬ Annotation file parsers Ã¢â€â‚¬Ã¢â€â‚¬
 
 type AnnotationEntry = {
-  box: { left: number; top: number; width: number; height: number };
-  landmarks: Array<{ id: number; x: number; y: number }>;
+  boxes: ImportedRawBox[];
 };
 
 const MATCHABLE_IMAGE_EXTS = new Set([
@@ -1070,7 +3002,7 @@ function buildMatchableKeys(fileToken: string): string[] {
 
 function parseXmlAttrs(str: string): Record<string, string> {
   const attrs: Record<string, string> = {};
-  // Handle quoted values (single or double quotes) — paths may contain slashes
+  // Handle quoted values (single or double quotes) Ã¢â‚¬â€ paths may contain slashes
   const re = /(\w+)=(?:'([^']*)'|"([^"]*)")/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(str)) !== null) {
@@ -1079,13 +3011,51 @@ function parseXmlAttrs(str: string): Record<string, string> {
   return attrs;
 }
 
+function classifyXmlLandmarkIdStrategy(
+  observedIds: number[],
+  landmarkTemplate?: Array<{ index?: number }>
+): "preserve" | "shift_to_one_based" | "ambiguous" {
+  const templateIds = new Set(
+    (Array.isArray(landmarkTemplate) ? landmarkTemplate : [])
+      .map((landmark) => Number(landmark?.index))
+      .filter((value) => Number.isFinite(value))
+  );
+  if (observedIds.length === 0 || templateIds.size === 0) {
+    return "preserve";
+  }
+  const uniqueObserved = [...new Set(observedIds.filter((value) => Number.isFinite(value)).map((value) => Math.round(value)))];
+  if (uniqueObserved.length === 0) {
+    return "preserve";
+  }
+  const rawMatchesSchema = uniqueObserved.every((value) => templateIds.has(value));
+  const shiftedMatchesSchema = uniqueObserved.every((value) => templateIds.has(value + 1));
+  if (uniqueObserved.some((value) => value === 0) && shiftedMatchesSchema) {
+    return "shift_to_one_based";
+  }
+  if (rawMatchesSchema) {
+    return "preserve";
+  }
+  if (shiftedMatchesSchema) {
+    return "shift_to_one_based";
+  }
+  return "ambiguous";
+}
+
 /**
  * Parse an imglab-format dlib XML annotation file.
- * Returns a Map keyed by image basename → { box, landmarks[] }.
+ * Returns a Map keyed by image basename Ã¢â€ â€™ { box, landmarks[] }.
  */
-function parseImglabXml(filePath: string): Map<string, AnnotationEntry> {
+function parseImglabXml(
+  filePath: string,
+  landmarkTemplate?: Array<{ index?: number }>,
+  summary?: Pick<
+    ImportGeometrySummary,
+    "xmlLandmarkIdsPreservedAsSchemaIndexed" | "xmlLandmarkIdsShiftedToOneBased" | "xmlLandmarkIdsAmbiguous"
+  >
+): Map<string, AnnotationEntry> {
   const content = fs.readFileSync(filePath, "utf-8");
   const result = new Map<string, AnnotationEntry>();
+  const observedXmlIds: number[] = [];
 
   // Match each <image ...> block
   const imageRe = /<image\s([^>]+)>([\s\S]*?)<\/image>/g;
@@ -1099,36 +3069,67 @@ function parseImglabXml(filePath: string): Map<string, AnnotationEntry> {
     if (keys.length === 0) continue;
     const body = imgMatch[2];
 
-    // Parse <box ...>
-    const boxTagMatch = body.match(/<box\s([^>]+)>/);
-    if (!boxTagMatch) continue;
-    const boxAttrs = parseXmlAttrs(boxTagMatch[1]);
-    const box = {
-      left: parseFloat(boxAttrs["left"] ?? "0"),
-      top: parseFloat(boxAttrs["top"] ?? "0"),
-      width: parseFloat(boxAttrs["width"] ?? "0"),
-      height: parseFloat(boxAttrs["height"] ?? "0"),
-    };
-
-    // Parse all <part name=N x=X y=Y/>
-    const landmarks: Array<{ id: number; x: number; y: number }> = [];
-    const partRe = /<part\s([^>]+?)\/>/g;
-    let partMatch: RegExpExecArray | null;
-    while ((partMatch = partRe.exec(body)) !== null) {
-      const pa = parseXmlAttrs(partMatch[1]);
-      if (pa["name"] !== undefined && pa["x"] !== undefined && pa["y"] !== undefined) {
-        landmarks.push({
-          id: parseInt(pa["name"], 10),
-          x: parseFloat(pa["x"]),
-          y: parseFloat(pa["y"]),
-        });
+    const boxes: ImportedRawBox[] = [];
+    const boxRe = /<box\s([^>]+)>([\s\S]*?)<\/box>/g;
+    let boxMatch: RegExpExecArray | null;
+    while ((boxMatch = boxRe.exec(body)) !== null) {
+      const boxAttrs = parseXmlAttrs(boxMatch[1]);
+      const landmarks: Array<{ id: number; x: number; y: number }> = [];
+      const partRe = /<part\s([^>]+?)\/>/g;
+      let partMatch: RegExpExecArray | null;
+      while ((partMatch = partRe.exec(boxMatch[2])) !== null) {
+        const pa = parseXmlAttrs(partMatch[1]);
+        if (pa["name"] !== undefined && pa["x"] !== undefined && pa["y"] !== undefined) {
+          const parsedId = parseInt(pa["name"], 10);
+          if (Number.isFinite(parsedId)) {
+            observedXmlIds.push(parsedId);
+          }
+          landmarks.push({
+            id: parsedId,
+            x: parseFloat(pa["x"]),
+            y: parseFloat(pa["y"]),
+          });
+        }
       }
+      landmarks.sort((a, b) => a.id - b.id);
+      if (landmarks.length === 0) continue;
+      boxes.push({
+        left: parseFloat(boxAttrs["left"] ?? "0"),
+        top: parseFloat(boxAttrs["top"] ?? "0"),
+        width: parseFloat(boxAttrs["width"] ?? "0"),
+        height: parseFloat(boxAttrs["height"] ?? "0"),
+        landmarks,
+      });
     }
-    landmarks.sort((a, b) => a.id - b.id);
-    const entry = { box, landmarks };
+    if (boxes.length === 0) continue;
+    const entry = { boxes };
     for (const key of keys) {
       result.set(key, entry);
     }
+  }
+
+  const xmlIdStrategy = classifyXmlLandmarkIdStrategy(observedXmlIds, landmarkTemplate);
+  if (xmlIdStrategy !== "preserve" || summary) {
+    result.forEach((entry) => {
+      entry.boxes.forEach((box) => {
+        if (!Array.isArray(box.landmarks)) return;
+        box.landmarks = box.landmarks.map((landmark) => {
+          if (!Number.isFinite(Number(landmark?.id))) return landmark;
+          const id = Number(landmark.id);
+          const normalizedId = xmlIdStrategy === "shift_to_one_based" ? id + 1 : id;
+          if (summary) {
+            if (xmlIdStrategy === "shift_to_one_based") {
+              summary.xmlLandmarkIdsShiftedToOneBased += 1;
+            } else if (xmlIdStrategy === "ambiguous") {
+              summary.xmlLandmarkIdsAmbiguous += 1;
+            } else {
+              summary.xmlLandmarkIdsPreservedAsSchemaIndexed += 1;
+            }
+          }
+          return { ...landmark, id: normalizedId };
+        });
+      });
+    });
   }
 
   return result;
@@ -1137,7 +3138,7 @@ function parseImglabXml(filePath: string): Map<string, AnnotationEntry> {
 /**
  * Parse a BioVision JSON annotation file.
  * Accepts a single object { imageFilename, boxes[] } or an array of such objects.
- * Returns a Map keyed by image filename → { box, landmarks[] }.
+ * Returns a Map keyed by image filename Ã¢â€ â€™ { box, landmarks[] }.
  */
 function parseBioVisionJson(filePath: string): Map<string, AnnotationEntry> {
   const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
@@ -1148,28 +3149,33 @@ function parseBioVisionJson(filePath: string): Map<string, AnnotationEntry> {
     const imageFilename: string = record?.imageFilename;
     if (!imageFilename) continue;
 
-    const boxes: any[] = record?.boxes ?? [];
-    if (!boxes.length) continue;
+    const rawBoxes: any[] = Array.isArray(record?.boxes) ? record.boxes : [];
+    const topLevelLandmarks: any[] = Array.isArray(record?.landmarks)
+      ? record.landmarks
+      : Array.isArray(record?.annotations)
+      ? record.annotations
+      : [];
+    const boxes: ImportedRawBox[] = [];
+    if (rawBoxes.length > 0) {
+      rawBoxes.forEach((box: any) => {
+        if (!Array.isArray(box?.landmarks) || box.landmarks.length === 0) return;
+        boxes.push({
+          left: Number(box?.left ?? 0),
+          top: Number(box?.top ?? 0),
+          width: Number(box?.width ?? 0),
+          height: Number(box?.height ?? 0),
+          obbCorners: Array.isArray(box?.obbCorners) ? box.obbCorners : undefined,
+          angle: isFiniteNumber(box?.angle) ? Number(box?.angle) : undefined,
+          class_id: isFiniteNumber(box?.class_id) ? Math.round(Number(box?.class_id)) : undefined,
+          landmarks: box.landmarks,
+        });
+      });
+    } else if (topLevelLandmarks.length > 0) {
+      boxes.push({ landmarks: topLevelLandmarks });
+    }
+    if (boxes.length === 0) continue;
 
-    // Use the first box
-    const firstBox = boxes[0];
-    const box = {
-      left: Number(firstBox.left ?? 0),
-      top: Number(firstBox.top ?? 0),
-      width: Number(firstBox.width ?? 0),
-      height: Number(firstBox.height ?? 0),
-    };
-
-    const rawLandmarks: any[] = firstBox?.landmarks ?? [];
-    const landmarks = rawLandmarks
-      .filter((lm: any) => !lm?.isSkipped)
-      .map((lm: any, i: number) => ({
-        id: Number(lm?.id ?? i),
-        x: Number(lm?.x ?? 0),
-        y: Number(lm?.y ?? 0),
-      }));
-
-    const entry = { box, landmarks };
+    const entry = { boxes };
     const keys = buildMatchableKeys(imageFilename);
     if (keys.length === 0) continue;
     for (const key of keys) {
@@ -1185,23 +3191,24 @@ interface PreAnnotatedRecord {
   imageFilename: string;
   normalizedLabel: {
     imageFilename: string;
-    boxes: Array<{
-      left: number;
-      top: number;
-      width: number;
-      height: number;
-      landmarks: Array<{
-        x: number;
-        y: number;
-        id: number;
-        isSkipped?: boolean;
-      }>;
-    }>;
+    boxes: ImportedNormalizedBox[];
   };
 }
 
-function collectPreAnnotatedRecords(datasetDir: string): { records: PreAnnotatedRecord[]; warnings: string[] } {
+function collectPreAnnotatedRecords(
+  datasetDir: string,
+  speciesId?: string,
+  geometryConfig?: ImportGeometryConfig
+): { records: PreAnnotatedRecord[]; warnings: string[]; detailedWarnings: string[]; summary: ImportGeometrySummary } {
   const warnings: string[] = [];
+  const detailedWarnings: string[] = [];
+  const summary = createImportGeometrySummary();
+  const importContext = speciesId
+    ? loadSessionOrientationPolicyForCompatibility(speciesId)
+    : {
+        policy: normalizeOrientationPolicy(undefined, []),
+        landmarkTemplate: [],
+      };
   const labelDirCandidates = [
     path.join(datasetDir, "labels"),
     path.join(datasetDir, "Labels"),
@@ -1245,7 +3252,7 @@ function collectPreAnnotatedRecords(datasetDir: string): { records: PreAnnotated
     }
     const imageFilename = path.basename(imageFilenameRaw.trim());
     if (!DATASET_IMAGE_EXTS.test(imageFilename)) {
-      warnings.push(`${path.basename(labelPath)} references a non-standard image extension: ${imageFilename}`);
+      detailedWarnings.push(`${path.basename(labelPath)} references a non-standard image extension: ${imageFilename}`);
     }
 
     const imageCandidates = [
@@ -1265,7 +3272,7 @@ function collectPreAnnotatedRecords(datasetDir: string): { records: PreAnnotated
 
     const imageDims = getImageDimensions(imageSourcePath);
     if (!imageDims) {
-      warnings.push(`${path.basename(labelPath)}: could not read image dimensions; derived boxes won't be clamped.`);
+      detailedWarnings.push(`${path.basename(labelPath)}: could not read image dimensions; derived boxes won't be clamped.`);
     }
 
     const boxes = Array.isArray(parsed?.boxes) ? parsed.boxes : [];
@@ -1280,73 +3287,62 @@ function collectPreAnnotatedRecords(datasetDir: string): { records: PreAnnotated
       throw new Error(`${path.basename(labelPath)} has no boxes and no top-level landmarks/annotations to derive a box.`);
     }
 
+    const rawBoxes: ImportedRawBox[] = hasBoxes
+      ? boxes.map((box: any) => ({
+          left: box?.left,
+          top: box?.top,
+          width: box?.width,
+          height: box?.height,
+          obbCorners: box?.obbCorners,
+          angle: box?.angle,
+          class_id: box?.class_id,
+          landmarks: Array.isArray(box?.landmarks) ? box.landmarks : [],
+        }))
+      : [{ landmarks: topLevelLandmarks }];
     const normalizedBoxes: PreAnnotatedRecord["normalizedLabel"]["boxes"] = [];
     const landmarkIds = new Set<number>();
     let validLandmarkCount = 0;
-    if (hasBoxes) {
-      boxes.forEach((box: any, boxIndex: number) => {
-        const landmarks = Array.isArray(box?.landmarks) ? box.landmarks : [];
-        if (landmarks.length === 0) {
-          throw new Error(`${path.basename(labelPath)} box ${boxIndex} has no landmarks.`);
-        }
+    rawBoxes.forEach((box: ImportedRawBox, boxIndex: number) => {
+      const landmarks = Array.isArray(box?.landmarks) ? box.landmarks : [];
+      if (landmarks.length === 0) {
+        throw new Error(`${path.basename(labelPath)} box ${boxIndex} has no landmarks.`);
+      }
 
-        const normalizedLandmarks = normalizeLandmarks(
-          landmarks,
-          `${path.basename(labelPath)} box ${boxIndex}`
-        );
-        normalizedLandmarks.forEach((lm) => {
-          if (!lm.isSkipped) {
-            landmarkIds.add(lm.id);
-            validLandmarkCount += 1;
-          }
-        });
-
-        let left = Number(box?.left);
-        let top = Number(box?.top);
-        let width = Number(box?.width);
-        let height = Number(box?.height);
-        const hasValidBox = [left, top, width, height].every(isFiniteNumber) && width > 0 && height > 0;
-
-        if (!hasValidBox) {
-          const derived = deriveBoxFromLandmarks(normalizedLandmarks, imageDims);
-          left = derived.left;
-          top = derived.top;
-          width = derived.width;
-          height = derived.height;
-          warnings.push(
-            `${path.basename(labelPath)} box ${boxIndex}: missing/invalid box dimensions; derived from landmarks.`
-          );
-        }
-
-        normalizedBoxes.push({
-          left,
-          top,
-          width,
-          height,
-          landmarks: normalizedLandmarks,
-        });
-      });
-    } else {
+      const normalizedLandmarkMetadata = {
+        missingLandmarkIdsMappedFromSchemaOrder: 0,
+      };
       const normalizedLandmarks = normalizeLandmarks(
-        topLevelLandmarks,
-        `${path.basename(labelPath)}`
+        landmarks,
+        `${path.basename(labelPath)} box ${boxIndex}`,
+        {
+          fallbackLandmarkTemplate: importContext.landmarkTemplate,
+          metadata: normalizedLandmarkMetadata,
+        }
       );
+      summary.missingLandmarkIdsMappedFromSchemaOrder +=
+        normalizedLandmarkMetadata.missingLandmarkIdsMappedFromSchemaOrder;
       normalizedLandmarks.forEach((lm) => {
         if (!lm.isSkipped) {
           landmarkIds.add(lm.id);
           validLandmarkCount += 1;
         }
       });
-
-      const derived = deriveBoxFromLandmarks(normalizedLandmarks, imageDims);
-      normalizedBoxes.push({
-        left: derived.left,
-        top: derived.top,
-        width: derived.width,
-        height: derived.height,
-        landmarks: normalizedLandmarks,
-      });
-      warnings.push(`${path.basename(labelPath)}: no boxes found; derived 1 bounding box from landmarks.`);
+      normalizedBoxes.push(
+        normalizeImportedBoxGeometry(
+          box,
+          normalizedLandmarks,
+          imageDims,
+          `${path.basename(labelPath)} box ${boxIndex}`,
+          importContext.policy,
+          importContext.landmarkTemplate,
+          detailedWarnings,
+          geometryConfig,
+          summary
+        )
+      );
+    });
+    if (!hasBoxes) {
+      detailedWarnings.push(`${path.basename(labelPath)}: no boxes found; derived 1 OBB from landmarks.`);
     }
 
     if (validLandmarkCount === 0) {
@@ -1379,12 +3375,12 @@ function collectPreAnnotatedRecords(datasetDir: string): { records: PreAnnotated
       }
     }
     if (common.size === 0) {
-      warnings.push("No common landmark IDs across imported samples. prepare_dataset may fail.");
+      detailedWarnings.push("No common landmark IDs across imported samples. prepare_dataset may fail.");
     } else {
       const uniqueAll = new Set<number>();
       idSets.forEach((ids) => ids.forEach((id) => uniqueAll.add(id)));
       if (common.size < uniqueAll.size) {
-        warnings.push(
+        detailedWarnings.push(
           `Landmark IDs are inconsistent across files. Common IDs retained for training: ${[...common]
             .sort((a, b) => a - b)
             .join(", ")}`
@@ -1393,7 +3389,8 @@ function collectPreAnnotatedRecords(datasetDir: string): { records: PreAnnotated
     }
   }
 
-  return { records, warnings };
+  warnings.push(...summarizeImportGeometry(summary));
+  return { records, warnings, detailedWarnings, summary };
 }
 
 function summarizeValidationErrors(validation: any): string {
@@ -1851,7 +3848,6 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       const epochsRaw = Number(options?.customOptions?.epochs);
       const lrRaw = Number((options as any)?.customOptions?.lr);
       const batchRaw = Number((options as any)?.customOptions?.batch ?? (options as any)?.customOptions?.batch_size);
-      const skipParity = Boolean((options as any)?.customOptions?.skip_parity);
       const cnnArgs = [
         path.join(__dirname, "../backend/training/train_cnn_model.py"),
         effectiveRoot,
@@ -1883,9 +3879,6 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       if (Number.isFinite(batchRaw) && batchRaw > 0) {
         cnnArgs.push("--batch-size", String(Math.round(batchRaw)));
       }
-      if (skipParity) {
-        cnnArgs.push("--skip-parity");
-      }
       emitTrainProgress(42, "training", "Training CNN model...");
       out = await runPythonWithProgress(cnnArgs, (pct, stage, details) => {
         const scaled = 42 + Math.round((Math.max(0, Math.min(100, pct)) / 100) * 50);
@@ -1913,20 +3906,28 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
 
     emitTrainProgress(95, "evaluation", "Evaluating trained model...");
 
-    // Parse output for train/test errors
-    const trainErrorMatch = out.match(/TRAIN_ERROR\s+([\d.]+)/);
-    const testErrorMatch = out.match(/TEST_ERROR\s+([\d.]+)/);
+    // Parse output for train/test errors (mean and median)
+    const trainErrorMatch       = out.match(/TRAIN_ERROR\s+([\d.]+)/);
+    const testErrorMatch        = out.match(/TEST_ERROR\s+([\d.]+)/);
+    const trainMedianErrorMatch = out.match(/TRAIN_MEDIAN_ERROR\s+([\d.e+-]+)/);
+    const testMedianErrorMatch  = out.match(/TEST_MEDIAN_ERROR\s+([\d.e+-]+)/);
     const modelPathMatch = out.match(/MODEL_PATH\s+(.+)/);
+
+    syncLandmarkModelRegistry(effectiveRoot, {
+      setActive: { name: modelName, predictorType },
+    });
 
     emitTrainProgress(100, "done", "Training complete.");
 
     return {
       ok: true,
       output: out,
-      trainError: trainErrorMatch ? parseFloat(trainErrorMatch[1]) : null,
-      testError: testErrorMatch ? parseFloat(testErrorMatch[1]) : null,
-      modelPath: modelPathMatch ? modelPathMatch[1].trim() : null,
-      auditReport: auditReport ?? undefined,
+      trainError:       trainErrorMatch       ? parseFloat(trainErrorMatch[1])       : null,
+      testError:        testErrorMatch        ? parseFloat(testErrorMatch[1])        : null,
+      trainMedianError: trainMedianErrorMatch ? parseFloat(trainMedianErrorMatch[1]) : null,
+      testMedianError:  testMedianErrorMatch  ? parseFloat(testMedianErrorMatch[1])  : null,
+      modelPath:        modelPathMatch        ? modelPathMatch[1].trim()             : null,
+      auditReport:      auditReport ?? undefined,
     };
   } catch (e: any) {
     emitTrainProgress(100, "error", `Training failed: ${e.message}`);
@@ -1935,7 +3936,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
   }
 });
 
-ipcMain.handle("ml:import-preannotated-dataset", async (_event, args?: { speciesId?: string }) => {
+ipcMain.handle("ml:import-preannotated-dataset", async (_event, args?: { speciesId?: string; geometryConfig?: ImportGeometryConfig }) => {
   try {
     const picker = await dialog.showOpenDialog({
       properties: ["openDirectory"],
@@ -1946,7 +3947,14 @@ ipcMain.handle("ml:import-preannotated-dataset", async (_event, args?: { species
     }
 
     const sourceDir = picker.filePaths[0];
-    const { records, warnings } = collectPreAnnotatedRecords(sourceDir);
+    const { records, warnings, detailedWarnings, summary } = collectPreAnnotatedRecords(
+      sourceDir,
+      args?.speciesId,
+      args?.geometryConfig
+    );
+    if (detailedWarnings.length > 0) {
+      console.warn("[ml:import-preannotated-dataset] import details:", detailedWarnings.slice(0, 50));
+    }
 
     const effectiveRoot = getEffectiveRoot(args?.speciesId);
     ensureTrainingLayout(effectiveRoot);
@@ -1973,7 +3981,20 @@ ipcMain.handle("ml:import-preannotated-dataset", async (_event, args?: { species
       }
 
       if (fs.existsSync(labelDest)) overwrittenLabels += 1;
-      fs.writeFileSync(labelDest, JSON.stringify(record.normalizedLabel, null, 2));
+      fs.writeFileSync(
+        labelDest,
+        JSON.stringify(
+          {
+            ...record.normalizedLabel,
+            boxes: record.normalizedLabel.boxes.map((box, index) => {
+              const { geometryOrigin, ...persistedBox } = box;
+              return { id: index, ...persistedBox };
+            }),
+          },
+          null,
+          2
+        )
+      );
       importedLabels += 1;
     }
 
@@ -1986,6 +4007,7 @@ ipcMain.handle("ml:import-preannotated-dataset", async (_event, args?: { species
       overwrittenImages,
       overwrittenLabels,
       warnings,
+      importSummary: summary,
     };
   } catch (e: any) {
     console.error("Import pre-annotated dataset failed:", e);
@@ -2165,8 +4187,11 @@ interface PredictOptions {
     height: number;
     right?: number;
     bottom?: number;
+    obbCorners?: [number, number][];
+    angle?: number;
+    class_id?: number;
     orientation_hint?: {
-      orientation?: "left" | "right";
+      orientation?: "left" | "right" | "up" | "down";
       confidence?: number;
       source?: string;
       head_point?: [number, number];
@@ -2175,41 +4200,52 @@ interface PredictOptions {
   }>;
 }
 
-ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string, speciesId?: string, options?: PredictOptions) => {
+interface PredictBatchItem {
+  batchIndex: number;
+  imagePath: string;
+  filename?: string;
+  boxes: NonNullable<PredictOptions["boxes"]>;
+}
+
+interface PredictBatchArgs {
+  speciesId?: string;
+  modelName: string;
+  predictorType?: "dlib" | "cnn";
+  allowIncompatible?: boolean;
+  items: PredictBatchItem[];
+}
+
+async function runPredictionRequest(args: {
+  imagePath: string;
+  tag: string;
+  speciesId?: string;
+  options?: PredictOptions;
+  onProgress?: (percent: number, stage: string, details?: Record<string, unknown>) => void;
+}): Promise<any> {
   let tempFile: string | null = null;
   let tempBoxesFile: string | null = null;
-  let obbJsonFile: string | null = null;
   try {
-    const modelRoot = getEffectiveRoot(speciesId);
-
-    // Paths containing non-ASCII characters (e.g. macOS narrow no-break space U+202F
-    // in screenshot names) can get corrupted when passed as spawn() argv on Windows.
-    // Copy to a temp file with an ASCII-safe name to avoid the encoding issue.
-    let effectivePath = imagePath;
-    if (/[^\x00-\x7F]/.test(imagePath)) {
-      const ext = path.extname(imagePath);
+    const modelRoot = getEffectiveRoot(args.speciesId);
+    let effectivePath = args.imagePath;
+    if (/[^\x00-\x7F]/.test(args.imagePath)) {
+      const ext = path.extname(args.imagePath);
       tempFile = path.join(app.getPath("temp"), `bv_infer_${Date.now()}${ext}`);
-      fs.copyFileSync(imagePath, tempFile);
+      fs.copyFileSync(args.imagePath, tempFile);
       effectivePath = tempFile;
     }
 
-    // Wire in session YOLO detection model so inference uses the same detector
-    // that was trained for this session (falls back to OpenCV if none found).
-    const yoloModel = getSessionYoloModel(speciesId);
-
-    // Respect explicit predictor choice, otherwise auto-detect.
-    const cnnModelPath = path.join(modelRoot, "models", `cnn_${tag}.pth`);
-    const dlibModelPath = path.join(modelRoot, "models", `predictor_${tag}.dat`);
-    const requestedPredictor = options?.predictorType;
+    const cnnModelPath = path.join(modelRoot, "models", `cnn_${args.tag}.pth`);
+    const dlibModelPath = path.join(modelRoot, "models", `predictor_${args.tag}.dat`);
+    const requestedPredictor = args.options?.predictorType;
     let predictorType: "dlib" | "cnn";
     if (requestedPredictor === "cnn") {
       if (!fs.existsSync(cnnModelPath)) {
-        throw new Error(`CNN model not found for "${tag}".`);
+        throw new Error(`CNN model not found for "${args.tag}".`);
       }
       predictorType = "cnn";
     } else if (requestedPredictor === "dlib") {
       if (!fs.existsSync(dlibModelPath)) {
-        throw new Error(`dlib model not found for "${tag}".`);
+        throw new Error(`dlib model not found for "${args.tag}".`);
       }
       predictorType = "dlib";
     } else {
@@ -2217,18 +4253,15 @@ ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string, spec
     }
 
     const compatibility = await evaluateModelCompatibility({
-      speciesId,
-      modelName: tag,
+      speciesId: args.speciesId,
+      modelName: args.tag,
       predictorType,
       includeRuntime: true,
     });
     if (!compatibility.ok) {
-      throw new Error(
-        compatibility.error ||
-          "Model/session compatibility check failed."
-      );
+      throw new Error(compatibility.error || "Model/session compatibility check failed.");
     }
-    if (compatibility.blocking && !options?.allowIncompatible) {
+    if (compatibility.blocking && !args.options?.allowIncompatible) {
       throw new Error(
         `Inference blocked by compatibility checks. ${formatCompatibilityErrorSummary(
           compatibility.issues
@@ -2236,84 +4269,219 @@ ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string, spec
       );
     }
 
-    // OBB detect-first: if session_obb_detector.pt exists and no boxes were
-    // already provided by the caller, run the OBB detector on the image first
-    // and pass the best detection as --obb-json so predict.py uses the
-    // geometry engine instead of the PCA fallback.
     const obbDetectorPath = compatibility.obbDetectorPath;
-    if (obbDetectorPath && superAnnotator && !options?.boxes?.length) {
-      try {
-        const obbResult = await superAnnotator.send({
-          cmd: "detect_obb",
-          image_path: effectivePath,
-          model_path: obbDetectorPath,
-          conf: 0.35,
-        });
-        const detections: Array<{ corners: [number,number][]; angle: number; class_id: number; confidence: number }> =
-          Array.isArray(obbResult) ? obbResult : (obbResult?.detections ?? []);
-        if (detections.length > 0) {
-          // Pick the highest-confidence detection
-          const best = detections.reduce((a, b) => (a.confidence >= b.confidence ? a : b));
-          obbJsonFile = path.join(
-            app.getPath("temp"),
-            `bv_obb_${Date.now()}_${Math.random().toString(16).slice(2)}.json`
-          );
-          fs.writeFileSync(obbJsonFile, JSON.stringify({
-            obbCorners: best.corners,
-            angle: best.angle,
-            class_id: best.class_id,
-            confidence: best.confidence,
-          }));
-        }
-      } catch (obbErr) {
-        console.warn("OBB detection failed (non-fatal), falling back to standard crop:", obbErr);
-      }
+    const hasProvidedBoxes = Array.isArray(args.options?.boxes) && args.options!.boxes.length > 0;
+    if (!hasProvidedBoxes && !obbDetectorPath) {
+      throw new Error(
+        "OBB detector required for inference when no oriented boxes are provided. Train the session OBB detector first."
+      );
     }
 
     const pythonArgs = [
       path.join(__dirname, "../backend/inference/predict.py"),
       modelRoot,
-      tag,
+      args.tag,
       effectivePath,
-      "--predictor-type", predictorType,
+      "--predictor-type",
+      predictorType,
     ];
-    if (obbJsonFile) {
-      pythonArgs.push("--obb-json", obbJsonFile);
-    }
-    if (options?.multiSpecimen) {
+    if (args.options?.multiSpecimen) {
       pythonArgs.push("--multi");
     }
-    if (yoloModel) {
-      pythonArgs.push("--yolo-model", yoloModel);
+    if (obbDetectorPath) {
+      pythonArgs.push("--yolo-model", obbDetectorPath);
     }
-    let boxesForInference: PredictOptions["boxes"] =
-      Array.isArray(options?.boxes) && options!.boxes.length > 0 ? options!.boxes : undefined;
+    const boxesForInference =
+      Array.isArray(args.options?.boxes) && args.options!.boxes.length > 0 ? args.options!.boxes : undefined;
 
     if (Array.isArray(boxesForInference) && boxesForInference.length > 0) {
-      tempBoxesFile = path.join(app.getPath("temp"), `bv_boxes_${Date.now()}_${Math.random().toString(16).slice(2)}.json`);
+      tempBoxesFile = path.join(
+        app.getPath("temp"),
+        `bv_boxes_${Date.now()}_${Math.random().toString(16).slice(2)}.json`
+      );
       fs.writeFileSync(tempBoxesFile, JSON.stringify(boxesForInference));
       pythonArgs.push("--boxes-json", tempBoxesFile);
     }
 
-    const out = await runPythonWithProgress(pythonArgs, (percent, stage) => {
-      mainWindow?.webContents.send("ml:predict-progress", { percent, stage });
-    });
+    const out = await runPythonWithProgress(pythonArgs, args.onProgress);
+    return JSON.parse(out);
+  } finally {
+    if (tempFile) {
+      try {
+        fs.unlinkSync(tempFile);
+      } catch {}
+    }
+    if (tempBoxesFile) {
+      try {
+        fs.unlinkSync(tempBoxesFile);
+      } catch {}
+    }
+  }
+}
 
-    const data = JSON.parse(out);
+ipcMain.handle("ml:predict", async (_event, imagePath: string, tag: string, speciesId?: string, options?: PredictOptions) => {
+  try {
+    const data = await runPredictionRequest({
+      imagePath,
+      tag,
+      speciesId,
+      options,
+      onProgress: (percent, stage) => {
+        mainWindow?.webContents.send("ml:predict-progress", { percent, stage });
+      },
+    });
     return { ok: true, data };
   } catch (e: any) {
     console.error("Prediction failed:", e);
     return { ok: false, error: e.message };
-  } finally {
-    if (tempFile) {
-      try { fs.unlinkSync(tempFile); } catch {}
+  }
+});
+
+ipcMain.handle("ml:predict-batch", async (_event, args: PredictBatchArgs) => {
+  try {
+    if (!args?.modelName) {
+      throw new Error("modelName is required.");
     }
-    if (tempBoxesFile) {
-      try { fs.unlinkSync(tempBoxesFile); } catch {}
+    if (!Array.isArray(args.items) || args.items.length === 0) {
+      return { ok: true, results: [] };
     }
-    if (obbJsonFile) {
-      try { fs.unlinkSync(obbJsonFile); } catch {}
+
+    const speciesId = args.speciesId;
+    const modelRoot = getEffectiveRoot(speciesId);
+    const requestedPredictor = args.predictorType === "cnn" ? "cnn" : "dlib";
+    const total = args.items.length;
+
+    mainWindow?.webContents.send("ml:predict-progress", {
+      percent: 4,
+      stage: "checking_compatibility",
+      currentIndex: 0,
+      total,
+    });
+
+    const compatibility = await evaluateModelCompatibility({
+      speciesId,
+      modelName: args.modelName,
+      predictorType: requestedPredictor,
+      includeRuntime: true,
+    });
+    if (!compatibility.ok) {
+      throw new Error(compatibility.error || "Model/session compatibility check failed.");
     }
+    if (compatibility.blocking && !args.allowIncompatible) {
+      throw new Error(
+        `Inference blocked by compatibility checks. ${formatCompatibilityErrorSummary(
+          compatibility.issues
+        )} Use override to continue.`
+      );
+    }
+
+    mainWindow?.webContents.send("ml:predict-progress", {
+      percent: 8,
+      stage: "preparing_worker",
+      currentIndex: 0,
+      total,
+    });
+
+    const results: Array<{
+      batchIndex: number;
+      imagePath: string;
+      filename?: string;
+      ok: boolean;
+      data?: any;
+      error?: string;
+    }> = [];
+
+    for (let idx = 0; idx < args.items.length; idx++) {
+      const item = args.items[idx];
+      const batchIndex = Number(item.batchIndex);
+      const currentIndex = idx + 1;
+      try {
+        mainWindow?.webContents.send("ml:predict-progress", {
+          percent: 10 + Math.round(((currentIndex - 1) / total) * 80),
+          stage: idx === 0 ? "loading_model" : "predicting",
+          currentIndex,
+          total,
+          imagePath: item.imagePath,
+        });
+
+        let data: any;
+        try {
+          data = await landmarkInferenceWorker.predict(
+            {
+              project_root: modelRoot,
+              tag: args.modelName,
+              predictor_type: requestedPredictor,
+              image_path: item.imagePath,
+              boxes: item.boxes,
+            },
+            (progress) => {
+              const base = (currentIndex - 1) / total;
+              const span = 1 / total;
+              const overall = 10 + Math.round((base + (Math.max(0, Math.min(100, progress.percent)) / 100) * span) * 80);
+              mainWindow?.webContents.send("ml:predict-progress", {
+                percent: overall,
+                stage: progress.stage,
+                currentIndex,
+                total,
+                imagePath: item.imagePath,
+              });
+            }
+          );
+        } catch (workerError) {
+          console.warn("Landmark worker predict failed, falling back to one-shot path:", workerError);
+          data = await runPredictionRequest({
+            imagePath: item.imagePath,
+            tag: args.modelName,
+            speciesId,
+            options: {
+              multiSpecimen: true,
+              predictorType: requestedPredictor,
+              allowIncompatible: true,
+              boxes: item.boxes,
+            },
+            onProgress: (percent, stage) => {
+              const base = (currentIndex - 1) / total;
+              const span = 1 / total;
+              const overall = 10 + Math.round((base + (Math.max(0, Math.min(100, percent)) / 100) * span) * 80);
+              mainWindow?.webContents.send("ml:predict-progress", {
+                percent: overall,
+                stage,
+                currentIndex,
+                total,
+                imagePath: item.imagePath,
+              });
+            },
+          });
+        }
+
+        results.push({
+          batchIndex,
+          imagePath: item.imagePath,
+          filename: item.filename,
+          ok: true,
+          data,
+        });
+      } catch (error: any) {
+        results.push({
+          batchIndex,
+          imagePath: item.imagePath,
+          filename: item.filename,
+          ok: false,
+          error: error?.message || "Landmark inference failed",
+        });
+      }
+    }
+
+    mainWindow?.webContents.send("ml:predict-progress", {
+      percent: 100,
+      stage: "done",
+      currentIndex: total,
+      total,
+    });
+    return { ok: true, results };
+  } catch (e: any) {
+    console.error("Batch prediction failed:", e);
+    return { ok: false, error: e.message };
   }
 });
 
@@ -2419,17 +4587,39 @@ ipcMain.handle(
   "ml:load-annotated-folder",
   async (
     _event,
-    args: { imageFolderPath: string; annotationFilePath: string; speciesId: string }
+    args: {
+      imageFolderPath: string;
+      annotationFilePath: string;
+      speciesId: string;
+      geometryConfig?: ImportGeometryConfig;
+      useSam2BoxDerivation?: boolean;
+    }
   ) => {
     try {
       const { imageFolderPath, annotationFilePath, speciesId } = args;
+      const importContext = loadSessionOrientationPolicyForCompatibility(speciesId);
+      const supplementalWarnings: string[] = [];
+      const summary = createImportGeometrySummary();
+      const useSam2BoxDerivation = Boolean(args.useSam2BoxDerivation);
+      let canUseSam2BoxDerivation = false;
+
+      if (useSam2BoxDerivation) {
+        const sam2Ready = await ensureSam2Ready();
+        if (sam2Ready.ok) {
+          canUseSam2BoxDerivation = true;
+        } else {
+          supplementalWarnings.push(
+            `SAM2 box derivation was requested but is unavailable: ${sam2Ready.error || "SAM2 is not ready."} Imported boxes were kept as provided.`
+          );
+        }
+      }
 
       // 1. Parse annotation file based on extension
       const annExt = path.extname(annotationFilePath).toLowerCase();
       let annotationMap: Map<string, AnnotationEntry>;
 
       if (annExt === ".xml") {
-        annotationMap = parseImglabXml(annotationFilePath);
+        annotationMap = parseImglabXml(annotationFilePath, importContext.landmarkTemplate, summary);
       } else if (annExt === ".json") {
         annotationMap = parseBioVisionJson(annotationFilePath);
       } else {
@@ -2459,6 +4649,7 @@ ipcMain.handle(
         boxes: any[];
       }> = [];
       const unmatched: string[] = [];
+      const detailedWarnings: string[] = [];
 
       for (const filename of imageFiles) {
         const srcPath = path.join(imageFolderPath, filename);
@@ -2466,7 +4657,7 @@ ipcMain.handle(
         const imgExt = path.extname(filename).toLowerCase();
         const mimeType = MIME_TYPES[imgExt] || "image/jpeg";
 
-        // Copy image into session (no base64 read — renderer uses localfile:// URLs)
+        // Copy image into session (no base64 read Ã¢â‚¬â€ renderer uses localfile:// URLs)
         fs.copyFileSync(srcPath, diskPath);
 
         const annotationKeys = buildMatchableKeys(filename);
@@ -2476,16 +4667,76 @@ ipcMain.handle(
 
         let boxes: any[] = [];
         if (annotation) {
-          const box = {
-            id: 0,
-            left: annotation.box.left,
-            top: annotation.box.top,
-            width: annotation.box.width,
-            height: annotation.box.height,
-            landmarks: annotation.landmarks,
+          const imageDims = getImageDimensions(diskPath) ?? getImageDimensions(srcPath);
+          let normalizedBoxes = annotation.boxes
+            .map((rawBox, index) => {
+              const context = `${filename} box ${index}`;
+              const normalizedLandmarkMetadata = {
+                missingLandmarkIdsMappedFromSchemaOrder: 0,
+              };
+              const normalizedLandmarks = normalizeLandmarks(rawBox.landmarks ?? [], context, {
+                fallbackLandmarkTemplate: importContext.landmarkTemplate,
+                metadata: normalizedLandmarkMetadata,
+              });
+              summary.missingLandmarkIdsMappedFromSchemaOrder +=
+                normalizedLandmarkMetadata.missingLandmarkIdsMappedFromSchemaOrder;
+              return normalizeImportedBoxGeometry(
+                rawBox,
+                normalizedLandmarks,
+                imageDims,
+                context,
+                importContext.policy,
+                importContext.landmarkTemplate,
+                detailedWarnings,
+                args.geometryConfig,
+                summary
+              );
+            })
+            .filter((box): box is ImportedNormalizedBox => Boolean(box));
+
+          if (canUseSam2BoxDerivation && normalizedBoxes.length > 0) {
+            const sam2Boxes: ImportedNormalizedBox[] = [];
+            for (let index = 0; index < normalizedBoxes.length; index += 1) {
+              const normalizedBox = normalizedBoxes[index];
+              try {
+                const refinedGeometry = await deriveImportedBoxGeometryWithSam2(
+                  diskPath,
+                  normalizedBox,
+                  imageDims,
+                  args.geometryConfig
+                );
+                if (refinedGeometry) {
+                  sam2Boxes.push({
+                    ...normalizedBox,
+                    ...refinedGeometry,
+                  });
+                } else {
+                  detailedWarnings.push(`${filename} box ${index}: SAM2 did not return usable geometry; kept imported box.`);
+                  sam2Boxes.push(normalizedBox);
+                }
+              } catch (sam2Error: any) {
+                detailedWarnings.push(
+                  `${filename} box ${index}: SAM2 derivation failed (${sam2Error?.message || "unknown error"}); kept imported box.`
+                );
+                sam2Boxes.push(normalizedBox);
+              }
+            }
+            normalizedBoxes = sam2Boxes;
+          }
+
+          boxes = normalizedBoxes.map((box, index) => ({
+            id: index,
+            left: box.left,
+            top: box.top,
+            width: box.width,
+            height: box.height,
+            landmarks: box.landmarks,
             source: "manual" as const,
-          };
-          boxes = [box];
+            ...(box.maskOutline ? { maskOutline: box.maskOutline } : {}),
+            ...(box.obbCorners ? { obbCorners: box.obbCorners } : {}),
+            ...(Number.isFinite(box.angle) ? { angle: box.angle } : {}),
+            ...(Number.isFinite(box.class_id) ? { class_id: box.class_id } : {}),
+          }));
 
           // Persist labels JSON to session so training can read them later
           const labelPath = path.join(
@@ -2518,12 +4769,13 @@ ipcMain.handle(
         // non-critical
       }
 
-      const warnings: string[] =
-        unmatched.length > 0
-          ? [`${unmatched.length} image(s) had no matching annotation.`]
-          : [];
+      const warnings = [...summarizeImportGeometry(summary, unmatched.length), ...supplementalWarnings];
+      if (detailedWarnings.length > 0) {
+        console.warn("[ml:load-annotated-folder] import details:", detailedWarnings.slice(0, 50));
+      }
 
-      return { ok: true, images, unmatched, warnings };
+
+      return { ok: true, images, unmatched, warnings, importSummary: summary };
     } catch (e: any) {
       console.error("ml:load-annotated-folder failed:", e);
       return { ok: false, error: e.message };
@@ -2532,48 +4784,325 @@ ipcMain.handle(
 );
 
 // List trained models in the session (or global) models directory
-ipcMain.handle("ml:list-models", async (_event, speciesId?: string) => {
-  try {
-    const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
+type LandmarkModelStatus = "active" | "deprecated";
 
-    if (!fs.existsSync(modelsDir)) {
-      fs.mkdirSync(modelsDir, { recursive: true });
-      return { ok: true, models: [] };
+type LandmarkModelRegistryEntry = {
+  key: string;
+  name: string;
+  predictorType: "dlib" | "cnn";
+  path: string;
+  createdAt: string;
+  status: LandmarkModelStatus;
+};
+
+type LandmarkModelRegistryPayload = {
+  version: 1;
+  updatedAt: string;
+  models: LandmarkModelRegistryEntry[];
+};
+
+function getCnnConfigPath(modelsDir: string, name: string): string {
+  return path.join(modelsDir, `cnn_${name}_config.json`);
+}
+
+function getCnnModelCompatibility(
+  effectiveRoot: string,
+  name: string
+): { compatible: boolean; reason?: string } {
+  const modelsDir = path.join(effectiveRoot, "models");
+  const configPath = getCnnConfigPath(modelsDir, name);
+  if (!fs.existsSync(configPath)) {
+    return {
+      compatible: false,
+      reason: "This CNN model predates the heatmap-head format and must be retrained.",
+    };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    const headType = String(parsed?.cnn_head_type || "").trim().toLowerCase();
+    const hasRequiredKeys =
+      parsed &&
+      Number.isFinite(Number(parsed.cnn_deconv_layers)) &&
+      Number.isFinite(Number(parsed.cnn_deconv_filters)) &&
+      Number.isFinite(Number(parsed.cnn_softargmax_beta));
+    if (headType !== "heatmap_deconv" || !hasRequiredKeys) {
+      return {
+        compatible: false,
+        reason: "This CNN model predates the heatmap-head format and must be retrained.",
+      };
+    }
+    return { compatible: true };
+  } catch {
+    return {
+      compatible: false,
+      reason: "This CNN model predates the heatmap-head format and must be retrained.",
+    };
+  }
+}
+
+function getModelRegistryPath(effectiveRoot: string): string {
+  return path.join(effectiveRoot, "models", "model_registry.json");
+}
+
+function buildLandmarkModelKey(name: string, predictorType: "dlib" | "cnn"): string {
+  return `${name}::${predictorType}`;
+}
+
+function scanLandmarkModels(effectiveRoot: string): Array<{
+  key: string;
+  name: string;
+  path: string;
+  predictorType: "dlib" | "cnn";
+  createdAt: string;
+  size: number;
+}> {
+  const modelsDir = path.join(effectiveRoot, "models");
+  if (!fs.existsSync(modelsDir)) {
+    fs.mkdirSync(modelsDir, { recursive: true });
+    return [];
+  }
+
+  const files = fs.readdirSync(modelsDir);
+  const dlibModels = files
+    .filter((f) => f.endsWith(".dat") && f.startsWith("predictor_"))
+    .map((file) => {
+      const filePath = path.join(modelsDir, file);
+      const stats = fs.statSync(filePath);
+      const name = file.replace(/^predictor_/, "").replace(/\.dat$/, "");
+      return {
+        key: buildLandmarkModelKey(name, "dlib"),
+        name,
+        path: filePath,
+        predictorType: "dlib" as const,
+        createdAt: stats.birthtime.toISOString(),
+        size: stats.size,
+      };
+    });
+
+  const cnnModels = files
+    .filter((f) => f.endsWith(".pth") && f.startsWith("cnn_"))
+    .map((file) => {
+      const filePath = path.join(modelsDir, file);
+      const stats = fs.statSync(filePath);
+      const name = file.replace(/^cnn_/, "").replace(/\.pth$/, "");
+      return {
+        key: buildLandmarkModelKey(name, "cnn"),
+        name,
+        path: filePath,
+        predictorType: "cnn" as const,
+        createdAt: stats.birthtime.toISOString(),
+        size: stats.size,
+      };
+    });
+
+  return [...dlibModels, ...cnnModels];
+}
+
+function readSchemaDisplayName(effectiveRoot: string, fallbackSpeciesId?: string): string {
+  const sessionJsonPath = path.join(effectiveRoot, "session.json");
+  try {
+    if (fs.existsSync(sessionJsonPath)) {
+      const parsed = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+      const name = String(parsed?.name || "").trim();
+      if (name) return name;
+    }
+  } catch {
+    // ignore and fall back
+  }
+  return fallbackSpeciesId || path.basename(effectiveRoot);
+}
+
+function listSupportedModelsForRoot(
+  effectiveRoot: string,
+  speciesId?: string
+): Array<{
+  name: string;
+  path: string;
+  size: number;
+  createdAt: Date;
+  predictorType?: "dlib" | "cnn";
+  modelKind: "landmark" | "obb_detector";
+  speciesId?: string;
+  schemaName?: string;
+  status?: "active" | "deprecated";
+  compatible?: boolean;
+  reason?: string;
+}> {
+  const schemaName = readSchemaDisplayName(effectiveRoot, speciesId);
+  const registry = syncLandmarkModelRegistry(effectiveRoot);
+  const landmarkModels = scanLandmarkModels(effectiveRoot).map((model) => ({
+    ...model,
+    createdAt: new Date(model.createdAt),
+    modelKind: "landmark" as const,
+    speciesId,
+    schemaName,
+    status: resolveModelStatus(registry, model.name, model.predictorType),
+    ...(model.predictorType === "cnn"
+      ? getCnnModelCompatibility(effectiveRoot, model.name)
+      : { compatible: true as const }),
+  }));
+
+  const obbDetectorPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
+  const obbModels = fs.existsSync(obbDetectorPath)
+    ? [
+        {
+          name: "Session OBB Detector",
+          path: obbDetectorPath,
+          size: fs.statSync(obbDetectorPath).size,
+          createdAt: fs.statSync(obbDetectorPath).birthtime,
+          modelKind: "obb_detector" as const,
+          speciesId,
+          schemaName,
+          compatible: true as const,
+        },
+      ]
+    : [];
+
+  return [...landmarkModels, ...obbModels];
+}
+
+function listGlobalSupportedModels(): Array<{
+  name: string;
+  path: string;
+  size: number;
+  createdAt: Date;
+  predictorType?: "dlib" | "cnn";
+  modelKind: "landmark" | "obb_detector";
+  speciesId?: string;
+  schemaName?: string;
+  status?: "active" | "deprecated";
+  compatible?: boolean;
+  reason?: string;
+}> {
+  const models: Array<{
+    name: string;
+    path: string;
+    size: number;
+    createdAt: Date;
+    predictorType?: "dlib" | "cnn";
+    modelKind: "landmark" | "obb_detector";
+    speciesId?: string;
+    schemaName?: string;
+    status?: "active" | "deprecated";
+    compatible?: boolean;
+    reason?: string;
+  }> = [];
+  const sessionsRoot = getSessionsRoot();
+  if (!fs.existsSync(sessionsRoot)) return models;
+
+  for (const entry of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const speciesId = entry.name;
+    const effectiveRoot = path.join(sessionsRoot, speciesId);
+    models.push(...listSupportedModelsForRoot(effectiveRoot, speciesId));
+  }
+  return models;
+}
+
+function readLandmarkModelRegistry(effectiveRoot: string): LandmarkModelRegistryPayload {
+  const registryPath = getModelRegistryPath(effectiveRoot);
+  if (!fs.existsSync(registryPath)) {
+    return { version: 1, updatedAt: new Date().toISOString(), models: [] };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
+    return {
+      version: 1,
+      updatedAt: String(parsed?.updatedAt || new Date().toISOString()),
+      models: Array.isArray(parsed?.models) ? parsed.models : [],
+    };
+  } catch {
+    return { version: 1, updatedAt: new Date().toISOString(), models: [] };
+  }
+}
+
+function writeLandmarkModelRegistry(effectiveRoot: string, payload: LandmarkModelRegistryPayload): void {
+  const registryPath = getModelRegistryPath(effectiveRoot);
+  fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+  fs.writeFileSync(registryPath, JSON.stringify(payload, null, 2), "utf-8");
+}
+
+function syncLandmarkModelRegistry(
+  effectiveRoot: string,
+  options?: { setActive?: { name: string; predictorType: "dlib" | "cnn" } | null }
+): LandmarkModelRegistryPayload {
+  const scanned = scanLandmarkModels(effectiveRoot);
+  const existing = readLandmarkModelRegistry(effectiveRoot);
+  const existingByKey = new Map(existing.models.map((entry) => [entry.key, entry]));
+  const preferredActiveKey = options?.setActive
+    ? buildLandmarkModelKey(options.setActive.name, options.setActive.predictorType)
+    : null;
+
+  const nextModels: LandmarkModelRegistryEntry[] = scanned.map((model) => {
+    const existingEntry = existingByKey.get(model.key);
+    return {
+      key: model.key,
+      name: model.name,
+      predictorType: model.predictorType,
+      path: model.path,
+      createdAt: model.createdAt,
+      status: existingEntry?.status ?? "deprecated",
+    };
+  });
+
+  (["dlib", "cnn"] as const).forEach((predictorType) => {
+    const sameType = nextModels
+      .filter((entry) => entry.predictorType === predictorType)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    if (sameType.length === 0) return;
+
+    let activeKey = preferredActiveKey;
+    if (!activeKey || !sameType.some((entry) => entry.key === activeKey)) {
+      const existingActive = sameType.find((entry) => entry.status === "active");
+      activeKey = existingActive?.key ?? sameType[0].key;
     }
 
-    const files = fs.readdirSync(modelsDir);
+    sameType.forEach((entry) => {
+      entry.status = entry.key === activeKey ? "active" : "deprecated";
+    });
+  });
 
-    const dlibModels = files
-      .filter((f) => f.endsWith(".dat") && f.startsWith("predictor_"))
-      .map((file) => {
-        const filePath = path.join(modelsDir, file);
-        const stats = fs.statSync(filePath);
-        const tag = file.replace(/^predictor_/, "").replace(/\.dat$/, "");
-        return {
-          name: tag,
-          path: filePath,
-          size: stats.size,
-          createdAt: stats.birthtime,
-          predictorType: "dlib" as const,
-        };
-      });
+  const payload: LandmarkModelRegistryPayload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    models: nextModels,
+  };
+  writeLandmarkModelRegistry(effectiveRoot, payload);
+  return payload;
+}
 
-    const cnnModels = files
-      .filter((f) => f.endsWith(".pth") && f.startsWith("cnn_"))
-      .map((file) => {
-        const filePath = path.join(modelsDir, file);
-        const stats = fs.statSync(filePath);
-        const tag = file.replace(/^cnn_/, "").replace(/\.pth$/, "");
-        return {
-          name: tag,
-          path: filePath,
-          size: stats.size,
-          createdAt: stats.birthtime,
-          predictorType: "cnn" as const,
-        };
-      });
+function resolveModelStatus(
+  registry: LandmarkModelRegistryPayload,
+  name: string,
+  predictorType: "dlib" | "cnn"
+): LandmarkModelStatus {
+  return (
+    registry.models.find((entry) => entry.key === buildLandmarkModelKey(name, predictorType))?.status ??
+    "active"
+  );
+}
 
-    const models = [...dlibModels, ...cnnModels]
+ipcMain.handle("ml:list-models", async (_event, input?: string | {
+  speciesId?: string;
+  activeOnly?: boolean;
+  includeDeprecated?: boolean;
+}) => {
+  try {
+    const speciesId = typeof input === "string" ? input : input?.speciesId;
+    const activeOnly = typeof input === "object" && input?.activeOnly === true;
+    const includeDeprecated =
+      typeof input === "object" ? input.includeDeprecated !== false : true;
+    const scannedModels = speciesId
+      ? listSupportedModelsForRoot(getEffectiveRoot(speciesId), speciesId)
+      : listGlobalSupportedModels();
+
+    const models = scannedModels.filter((model) => {
+      if (model.modelKind === "obb_detector") return true;
+      if (activeOnly && model.predictorType === "cnn" && model.compatible === false) return false;
+      if (!includeDeprecated && model.status === "deprecated") return false;
+      if (activeOnly && model.status !== "active") return false;
+      return true;
+    })
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
     return { ok: true, models };
@@ -2590,74 +5119,49 @@ ipcMain.handle(
     _event,
     modelName: string,
     speciesId?: string,
-    predictorType?: "dlib" | "cnn" | "yolo_pose"
+    predictorType?: "dlib" | "cnn",
+    modelKind?: "landmark" | "obb_detector"
   ) => {
   try {
     const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
     const dlibPath = path.join(modelsDir, `predictor_${modelName}.dat`);
     const cnnPath = path.join(modelsDir, `cnn_${modelName}.pth`);
     const cnnConfigPath = path.join(modelsDir, `cnn_${modelName}_config.json`);
-    const posePath = path.join(modelsDir, `pose_${modelName}.pt`);
-    const yoloPosePath = path.join(modelsDir, `yolo_pose_${modelName}.pt`);
-    const yoloAliasPath = path.join(modelsDir, `yolo_${modelName}.pt`);
+    const sessionObbPath = path.join(modelsDir, "session_obb_detector.pt");
 
     const dlibExists = fs.existsSync(dlibPath);
     const cnnExists = fs.existsSync(cnnPath);
-    const poseExists = fs.existsSync(posePath);
-    const yoloPoseExists = fs.existsSync(yoloPosePath);
-    const yoloAliasExists = fs.existsSync(yoloAliasPath);
+    const obbExists = fs.existsSync(sessionObbPath);
 
     if (predictorType === "dlib") {
       if (!dlibExists) return { ok: false, error: "dlib model not found" };
       fs.unlinkSync(dlibPath);
+      syncLandmarkModelRegistry(getEffectiveRoot(speciesId));
       return { ok: true };
     }
     if (predictorType === "cnn") {
       if (!cnnExists) return { ok: false, error: "CNN model not found" };
       fs.unlinkSync(cnnPath);
       if (fs.existsSync(cnnConfigPath)) fs.unlinkSync(cnnConfigPath);
+      syncLandmarkModelRegistry(getEffectiveRoot(speciesId));
       return { ok: true };
     }
-    if (predictorType === "yolo_pose") {
-      let removed = false;
-      if (poseExists) {
-        fs.unlinkSync(posePath);
-        removed = true;
-      }
-      if (yoloPoseExists) {
-        fs.unlinkSync(yoloPosePath);
-        removed = true;
-      }
-      if (yoloAliasExists) {
-        fs.unlinkSync(yoloAliasPath);
-        removed = true;
-      }
-      // Remove versioned checkpoints for this class/tag.
-      fs.readdirSync(modelsDir)
-        .filter((f) => {
-          const lower = f.toLowerCase();
-          const prefix = `yolo_${modelName.toLowerCase()}_v`;
-          return lower.startsWith(prefix) && lower.endsWith(".pt");
-        })
-        .forEach((f) => {
-          fs.unlinkSync(path.join(modelsDir, f));
-          removed = true;
-        });
-      if (!removed) return { ok: false, error: "YOLO-pose model not found" };
+    if (modelKind === "obb_detector") {
+      if (!obbExists) return { ok: false, error: "OBB detector not found" };
+      fs.unlinkSync(sessionObbPath);
       return { ok: true };
     }
 
-    // Backward-compatible behavior: if predictor type is not specified,
-    // delete both variants for this model tag.
-    if (!dlibExists && !cnnExists && !poseExists && !yoloPoseExists && !yoloAliasExists) return { ok: false, error: "Model not found" };
+    // Backward-compatible behavior: if model kind is not specified,
+    // delete any supported model matching this session root.
+    if (!dlibExists && !cnnExists && !obbExists) return { ok: false, error: "Model not found" };
     if (dlibExists) fs.unlinkSync(dlibPath);
     if (cnnExists) {
       fs.unlinkSync(cnnPath);
       if (fs.existsSync(cnnConfigPath)) fs.unlinkSync(cnnConfigPath);
     }
-    if (poseExists) fs.unlinkSync(posePath);
-    if (yoloPoseExists) fs.unlinkSync(yoloPosePath);
-    if (yoloAliasExists) fs.unlinkSync(yoloAliasPath);
+    if (obbExists) fs.unlinkSync(sessionObbPath);
+    syncLandmarkModelRegistry(getEffectiveRoot(speciesId));
     return { ok: true };
   } catch (e: any) {
     console.error("Failed to delete model:", e);
@@ -2673,29 +5177,32 @@ ipcMain.handle(
     oldName: string,
     newName: string,
     speciesId?: string,
-    predictorType?: "dlib" | "cnn" | "yolo_pose"
+    predictorType?: "dlib" | "cnn",
+    modelKind?: "landmark" | "obb_detector"
   ) => {
   try {
     const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
+    const effectiveRoot = getEffectiveRoot(speciesId);
+    const priorRegistry = syncLandmarkModelRegistry(effectiveRoot);
+    const priorStatus = predictorType === "dlib" || predictorType === "cnn"
+      ? priorRegistry.models.find((entry) => entry.key === buildLandmarkModelKey(oldName, predictorType))?.status
+      : undefined;
     const oldDlib = path.join(modelsDir, `predictor_${oldName}.dat`);
     const newDlib = path.join(modelsDir, `predictor_${newName}.dat`);
     const oldCnn = path.join(modelsDir, `cnn_${oldName}.pth`);
     const newCnn = path.join(modelsDir, `cnn_${newName}.pth`);
     const oldCnnCfg = path.join(modelsDir, `cnn_${oldName}_config.json`);
     const newCnnCfg = path.join(modelsDir, `cnn_${newName}_config.json`);
-    const oldPose = path.join(modelsDir, `pose_${oldName}.pt`);
-    const newPose = path.join(modelsDir, `pose_${newName}.pt`);
-    const oldYoloPose = path.join(modelsDir, `yolo_pose_${oldName}.pt`);
-    const newYoloPose = path.join(modelsDir, `yolo_pose_${newName}.pt`);
-
     const isDlib = fs.existsSync(oldDlib);
     const isCnn = fs.existsSync(oldCnn);
-    const isPose = fs.existsSync(oldPose) || fs.existsSync(oldYoloPose);
 
     if (predictorType === "dlib") {
       if (!isDlib) return { ok: false, error: "dlib model not found" };
       if (fs.existsSync(newDlib)) return { ok: false, error: "A dlib model with that name already exists" };
       fs.renameSync(oldDlib, newDlib);
+      syncLandmarkModelRegistry(effectiveRoot, {
+        setActive: priorStatus === "active" ? { name: newName, predictorType: "dlib" } : null,
+      });
       return { ok: true };
     }
     if (predictorType === "cnn") {
@@ -2703,19 +5210,16 @@ ipcMain.handle(
       if (fs.existsSync(newCnn)) return { ok: false, error: "A CNN model with that name already exists" };
       fs.renameSync(oldCnn, newCnn);
       if (fs.existsSync(oldCnnCfg)) fs.renameSync(oldCnnCfg, newCnnCfg);
+      syncLandmarkModelRegistry(effectiveRoot, {
+        setActive: priorStatus === "active" ? { name: newName, predictorType: "cnn" } : null,
+      });
       return { ok: true };
     }
-    if (predictorType === "yolo_pose") {
-      if (!isPose) return { ok: false, error: "YOLO-pose model not found" };
-      if (fs.existsSync(newPose) || fs.existsSync(newYoloPose)) {
-        return { ok: false, error: "A YOLO-pose model with that name already exists" };
-      }
-      if (fs.existsSync(oldPose)) fs.renameSync(oldPose, newPose);
-      if (fs.existsSync(oldYoloPose)) fs.renameSync(oldYoloPose, newYoloPose);
-      return { ok: true };
+    if (modelKind === "obb_detector") {
+      return { ok: false, error: "OBB detector uses a fixed session model name and cannot be renamed." };
     }
 
-    if (!isDlib && !isCnn && !isPose) return { ok: false, error: "Model not found" };
+    if (!isDlib && !isCnn) return { ok: false, error: "Model not found" };
     if (isDlib && fs.existsSync(newDlib)) return { ok: false, error: "A model with that name already exists" };
     if (isCnn && fs.existsSync(newCnn)) return { ok: false, error: "A model with that name already exists" };
 
@@ -2724,8 +5228,12 @@ ipcMain.handle(
       fs.renameSync(oldCnn, newCnn);
       if (fs.existsSync(oldCnnCfg)) fs.renameSync(oldCnnCfg, newCnnCfg);
     }
-    if (fs.existsSync(oldPose)) fs.renameSync(oldPose, newPose);
-    if (fs.existsSync(oldYoloPose)) fs.renameSync(oldYoloPose, newYoloPose);
+    syncLandmarkModelRegistry(effectiveRoot, {
+      setActive:
+        priorStatus === "active" && (predictorType === "dlib" || predictorType === "cnn")
+          ? { name: newName, predictorType }
+          : null,
+    });
     return { ok: true };
   } catch (e: any) {
     console.error("Failed to rename model:", e);
@@ -2736,38 +5244,32 @@ ipcMain.handle(
 // Get info about a specific model
 ipcMain.handle("ml:get-model-info", async (_event, modelName: string, speciesId?: string) => {
   try {
-    const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
+    const effectiveRoot = getEffectiveRoot(speciesId);
+    const modelsDir = path.join(effectiveRoot, "models");
     const dlibPath = path.join(modelsDir, `predictor_${modelName}.dat`);
     const cnnPath = path.join(modelsDir, `cnn_${modelName}.pth`);
-    const posePath = path.join(modelsDir, `pose_${modelName}.pt`);
-    const yoloPosePath = path.join(modelsDir, `yolo_pose_${modelName}.pt`);
+    const sessionObbPath = path.join(modelsDir, "session_obb_detector.pt");
+    const schemaName = readSchemaDisplayName(effectiveRoot, speciesId);
 
     if (fs.existsSync(dlibPath)) {
       const stats = fs.statSync(dlibPath);
       return {
         ok: true,
-        model: { name: modelName, path: dlibPath, size: stats.size, createdAt: stats.birthtime, predictorType: "dlib" },
+        model: { name: modelName, path: dlibPath, size: stats.size, createdAt: stats.birthtime, predictorType: "dlib", modelKind: "landmark", speciesId, schemaName },
       };
     }
     if (fs.existsSync(cnnPath)) {
       const stats = fs.statSync(cnnPath);
       return {
         ok: true,
-        model: { name: modelName, path: cnnPath, size: stats.size, createdAt: stats.birthtime, predictorType: "cnn" },
+        model: { name: modelName, path: cnnPath, size: stats.size, createdAt: stats.birthtime, predictorType: "cnn", modelKind: "landmark", speciesId, schemaName },
       };
     }
-    if (fs.existsSync(posePath)) {
-      const stats = fs.statSync(posePath);
+    if (modelName === "Session OBB Detector" && fs.existsSync(sessionObbPath)) {
+      const stats = fs.statSync(sessionObbPath);
       return {
         ok: true,
-        model: { name: modelName, path: posePath, size: stats.size, createdAt: stats.birthtime, predictorType: "yolo_pose" },
-      };
-    }
-    if (fs.existsSync(yoloPosePath)) {
-      const stats = fs.statSync(yoloPosePath);
-      return {
-        ok: true,
-        model: { name: modelName, path: yoloPosePath, size: stats.size, createdAt: stats.birthtime, predictorType: "yolo_pose" },
+        model: { name: modelName, path: sessionObbPath, size: stats.size, createdAt: stats.birthtime, modelKind: "obb_detector", speciesId, schemaName },
       };
     }
     return { ok: false, error: "Model not found" };
@@ -2833,118 +5335,105 @@ ipcMain.handle(
 
 interface DetectionOptions {
   speciesId?: string;
+  conf?: number;
+  nmsIou?: number;
+  maxObjects?: number;
+  imgsz?: ObbImageSize;
+  detectionPreset?: ObbDetectionPreset;
 }
 
 ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?: DetectionOptions) => {
   try {
     const speciesId = options?.speciesId;
     const effectiveRoot = getEffectiveRoot(speciesId);
+    const sessionJsonPath = path.join(effectiveRoot, "session.json");
+    const sessionMeta = safeReadJson(sessionJsonPath) || {};
+    const persistedDetectionSettings = readNormalizedSessionObbDetectionSettings(sessionMeta);
+    const resolvedDetectionSettings = normalizeObbDetectionSettings({
+      ...persistedDetectionSettings,
+      ...options,
+    });
 
-    // Priority 1: session OBB detector via superAnnotator (respects obb_config.json NMS IoU=0.3).
-    // session_obb_detector.pt is never matched by getSessionYoloModel (yolo_*.pt pattern), so we
-    // check for it explicitly here.
     const sessionObbPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
-    if (fs.existsSync(sessionObbPath) && superAnnotator) {
-      try {
-        const obbResult = await superAnnotator.send({
-          cmd: "detect_obb",
-          image_path: imagePath,
-          model_path: sessionObbPath,
-          conf: 0.35,
-          // nms_iou omitted → detect_obb() auto-loads from obb_config.json sidecar (0.3)
-        });
-        const rawDetections: any[] = Array.isArray(obbResult?.detections) ? obbResult.detections : [];
-        if (rawDetections.length > 0) {
-          const MAX_SPECIMENS = 8;
-          const topDetections = [...rawDetections]
-            .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))
-            .slice(0, MAX_SPECIMENS);
-          const boxes = topDetections.map((det: any) => {
-            const corners: [number, number][] = det.corners ?? [];
-            const classId = Number.isFinite(Number(det.class_id)) ? Number(det.class_id) : 0;
-            const conf = Number.isFinite(Number(det.confidence)) ? Number(det.confidence) : 1.0;
-            const xs = corners.map((p: [number, number]) => p[0]);
-            const ys = corners.map((p: [number, number]) => p[1]);
-            const left   = Math.round(Math.min(...xs));
-            const top    = Math.round(Math.min(...ys));
-            const right  = Math.round(Math.max(...xs));
-            const bottom = Math.round(Math.max(...ys));
-            return {
-              left, top, right, bottom,
-              width: right - left, height: bottom - top,
-              obbCorners: corners,
-              angle: det.angle ?? 0,
-              class_id: classId,
-              confidence: conf,
-              class_name: "specimen",
-              detection_method: "yolo_obb",
-              orientation_hint: {
-                orientation: classId === 0 ? "left" : "right",
-                confidence: conf,
-                source: "obb_class_id",
-              },
-            };
-          });
-          return { ok: true, boxes, detection_method: "yolo_obb" };
-        }
-      } catch (err) {
-        console.error("[detect-specimens] detect_obb failed, falling back to detect_specimen.py:", err);
+    if (fs.existsSync(sessionObbPath)) {
+      // Route all trained-session detection through the shared OBB detector script.
+      const pythonArgs = [
+        path.join(__dirname, "../backend/detection/detect_specimen.py"),
+        imagePath,
+        "--multi",
+        "--yolo-model",
+        sessionObbPath,
+        "--conf",
+        String(resolvedDetectionSettings.conf),
+        "--max-specimens",
+        String(resolvedDetectionSettings.maxObjects),
+        "--detection-preset",
+        resolvedDetectionSettings.detectionPreset,
+        "--imgsz",
+        String(resolvedDetectionSettings.imgsz),
+        "--nms-iou",
+        String(resolvedDetectionSettings.nmsIou),
+      ];
+
+      const out = await runPython(pythonArgs);
+      const data = JSON.parse(out.trim());
+      if (!data) {
+        return { ok: false, error: "No detection result", boxes: [] };
       }
+      if (data.ok === true && Array.isArray(data.boxes)) {
+        return data;
+      }
+      return { ok: false, error: "Unexpected detection format", boxes: [] };
     }
 
-    // Priority 2: detect_specimen.py with best available model (yolo_*.pt or session_obb_detector.pt fallback)
-    const yoloModel = getSessionYoloModel(speciesId)
-      ?? (fs.existsSync(sessionObbPath) ? sessionObbPath : undefined);
-
-    const pythonArgs = [
-      path.join(__dirname, "../backend/detection/detect_specimen.py"),
-      imagePath,
-      "--multi",
-    ];
-    if (yoloModel) {
-      pythonArgs.push("--yolo-model", yoloModel);
+    if (!superAnnotator.isRunning) {
+      await superAnnotator.send({ cmd: "init" });
     }
 
-    const out = await runPython(pythonArgs);
+    const classPrompt =
+      String(sessionMeta?.name || "").trim() ||
+      String(speciesId || "").trim().replace(/[-_]+/g, " ") ||
+      "specimen";
 
-    const data = JSON.parse(out.trim());
-    if (!data) {
-      return { ok: false, error: "No detection result", boxes: [] };
-    }
+    const result = await superAnnotator.send({
+      cmd: "annotate",
+      image_path: imagePath,
+      class_name: classPrompt,
+      options: {
+        conf_threshold: resolvedDetectionSettings.conf,
+        nms_iou: resolvedDetectionSettings.nmsIou,
+        sam_enabled: false,
+        max_objects: resolvedDetectionSettings.maxObjects,
+        imgsz: resolvedDetectionSettings.imgsz,
+        detection_mode: "auto",
+        detection_preset: resolvedDetectionSettings.detectionPreset,
+        orientation_policy: sessionMeta?.orientationPolicy ?? undefined,
+      },
+    });
 
-    if (data.ok === true && Array.isArray(data.boxes)) {
-      return data;
-    }
-
-    if (typeof data.left === "number") {
+    if (result?.status === "result" && Array.isArray(result.objects)) {
+      const boxes = result.objects.map((obj: any) => ({
+        ...obj.box,
+        ...(obj.obb?.corners ? { obbCorners: obj.obb.corners } : {}),
+        ...(typeof obj.obb?.angle === "number" ? { angle: obj.obb.angle } : {}),
+      }));
       return {
         ok: true,
-        boxes: [{
-          left: data.left,
-          top: data.top,
-          right: data.right,
-          bottom: data.bottom,
-          width: data.width,
-          height: data.height,
-          confidence: 1.0,
-          class_id: 0,
-          class_name: "specimen",
-        }],
-        image_width: undefined,
-        image_height: undefined,
-        num_detections: 1,
-        detection_method: "opencv_single",
+        boxes,
+        num_detections: boxes.length,
+        detection_method: result.detection_method ?? "yolo_world",
+        fallback: result.detection_method !== "yolo_obb",
       };
     }
 
-    return { ok: false, error: "Unexpected detection format", boxes: [] };
+    return { ok: false, error: result?.error || "Zero-shot detection failed", boxes: [] };
   } catch (e: any) {
     console.error("Specimen detection failed:", e);
     return { ok: false, error: e.message, boxes: [] };
   }
 });
 
-// Check detection availability (OpenCV always available)
+// Check OBB detector runtime availability
 ipcMain.handle("ml:check-yolo", async () => {
   try {
     const out = await runPython([
@@ -2954,17 +5443,587 @@ ipcMain.handle("ml:check-yolo", async () => {
 
     return JSON.parse(out.trim());
   } catch (e: any) {
-    return { available: true, primary_method: "opencv" };
+    return { available: false, primary_method: "yolo_obb", error: e.message };
   }
 });
 
-// ── Session management IPC handlers ──
+// Ã¢â€â‚¬Ã¢â€â‚¬ Session management IPC handlers Ã¢â€â‚¬Ã¢â€â‚¬
 
 function getSessionDir(speciesId: string): string {
-  const safeSpeciesId = String(speciesId || "")
-    .trim()
-    .replace(/[^a-zA-Z0-9_-]/g, "_");
-  return path.join(projectRoot, "sessions", safeSpeciesId || "default");
+  return path.join(getSessionsRoot(), sanitizeSpeciesId(speciesId));
+}
+
+function getFinalizedImagesPath(sessionDir: string): string {
+  return path.join(sessionDir, "finalized_images.json");
+}
+
+function readFinalizedList(sessionDir: string): string[] {
+  const finalizedListPath = getFinalizedImagesPath(sessionDir);
+  if (!fs.existsSync(finalizedListPath)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(finalizedListPath, "utf-8"));
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((v) => (typeof v === "string" ? v.trim() : ""))
+      .filter((v) => v.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function writeFinalizedList(sessionDir: string, names: string[]): void {
+  const finalizedListPath = getFinalizedImagesPath(sessionDir);
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  (names || []).forEach((name) => {
+    const safe = String(name || "").trim();
+    if (!safe) return;
+    const key = path.basename(safe).toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    deduped.push(safe);
+  });
+  fs.writeFileSync(finalizedListPath, JSON.stringify(deduped));
+}
+
+function finalizedNameListsMatch(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((name, index) => name === right[index]);
+}
+
+function resolveFinalizedState(
+  sessionDir: string,
+  options?: { reconcile?: boolean }
+): { names: string[]; nameSet: Set<string>; changed: boolean } {
+  const imagesDir = path.join(sessionDir, "images");
+  const labelsDir = path.join(sessionDir, "labels");
+  const imageFiles = fs.existsSync(imagesDir)
+    ? fs.readdirSync(imagesDir).filter((filename) => IMAGE_EXTS.test(filename))
+    : [];
+  const imageNameByLower = new Map<string, string>();
+  imageFiles.forEach((filename) => {
+    imageNameByLower.set(filename.toLowerCase(), filename);
+  });
+
+  const resolvedLower = new Set<string>();
+  const listNames = readFinalizedList(sessionDir);
+  listNames.forEach((name) => {
+    const lower = path.basename(String(name || "")).toLowerCase();
+    if (imageNameByLower.has(lower)) {
+      resolvedLower.add(lower);
+    }
+  });
+
+  imageFiles.forEach((filename) => {
+    const labelPath = path.join(labelsDir, filename.replace(/\.\w+$/, ".json"));
+    if (!fs.existsSync(labelPath)) return;
+    try {
+      const payload = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+      if (payload?.finalizedDetection?.isFinalized) {
+        resolvedLower.add(filename.toLowerCase());
+      }
+    } catch {
+      // Ignore malformed labels during reconciliation.
+    }
+  });
+
+  const resolvedNames = imageFiles.filter((filename) => resolvedLower.has(filename.toLowerCase()));
+  const existingCanonical = listNames
+    .map((name) => imageNameByLower.get(path.basename(String(name || "")).toLowerCase()) || "")
+    .filter(Boolean);
+  const changed = !finalizedNameListsMatch(existingCanonical, resolvedNames);
+
+  if (options?.reconcile && changed) {
+    writeFinalizedList(sessionDir, resolvedNames);
+  }
+
+  return {
+    names: resolvedNames,
+    nameSet: new Set(resolvedNames.map((name) => name.toLowerCase())),
+    changed,
+  };
+}
+
+function removeFinalizedFromLabel(labelPath: string): { hadFinalizedDetection: boolean } {
+  if (!fs.existsSync(labelPath)) {
+    return { hadFinalizedDetection: false };
+  }
+  try {
+    const payload = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+    if (!payload || typeof payload !== "object") {
+      return { hadFinalizedDetection: false };
+    }
+    const hadFinalizedDetection = Boolean(
+      payload.finalizedDetection && typeof payload.finalizedDetection === "object"
+    );
+    if (hadFinalizedDetection) {
+      delete payload.finalizedDetection;
+      fs.writeFileSync(labelPath, JSON.stringify(payload, null, 2));
+    }
+    return { hadFinalizedDetection };
+  } catch {
+    return { hadFinalizedDetection: false };
+  }
+}
+
+function readFinalizedDetectionSnapshot(
+  sessionDir: string,
+  filename: string
+): { isFinalized: boolean; boxSignature?: string } {
+  const safeFilename = path.basename(String(filename || "").trim());
+  if (!safeFilename) return { isFinalized: false };
+  const labelPath = path.join(
+    sessionDir,
+    "labels",
+    safeFilename.replace(/\.\w+$/, ".json")
+  );
+  if (!fs.existsSync(labelPath)) {
+    return { isFinalized: false };
+  }
+  try {
+    const payload = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+    return {
+      isFinalized: Boolean(payload?.finalizedDetection?.isFinalized),
+      ...(typeof payload?.finalizedDetection?.boxSignature === "string"
+        ? { boxSignature: String(payload.finalizedDetection.boxSignature) }
+        : {}),
+    };
+  } catch {
+    return { isFinalized: false };
+  }
+}
+
+function normalizeComparablePath(value?: string): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    return path.resolve(raw).replace(/\\/g, "/").toLowerCase();
+  } catch {
+    return raw.replace(/\\/g, "/").toLowerCase();
+  }
+}
+
+function deleteSegmentsForImage(
+  sessionDir: string,
+  filename: string,
+  imagePath?: string
+): { removed: number } {
+  const segmentsDir = path.join(sessionDir, "segments");
+  if (!fs.existsSync(segmentsDir)) return { removed: 0 };
+
+  const targetFilename = path.basename(String(filename || "")).toLowerCase();
+  const targetPath = normalizeComparablePath(imagePath);
+  const segmentFiles = fs.readdirSync(segmentsDir);
+  let removed = 0;
+
+  for (const file of segmentFiles) {
+    if (!file.endsWith("_meta.json")) continue;
+    const metaPath = path.join(segmentsDir, file);
+    let sourceImage = "";
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+      sourceImage =
+        typeof meta?.source_image === "string" ? String(meta.source_image) : "";
+    } catch {
+      continue;
+    }
+
+    const sourceFilename = path.basename(sourceImage).toLowerCase();
+    const sourcePath = normalizeComparablePath(sourceImage);
+    const matchesFilename = sourceFilename && sourceFilename === targetFilename;
+    const matchesPath = Boolean(targetPath && sourcePath && sourcePath === targetPath);
+    if (!matchesFilename && !matchesPath) continue;
+
+    const stem = file.replace(/_meta\.json$/i, "");
+    for (const segFile of segmentFiles) {
+      if (segFile === file || segFile.startsWith(`${stem}_`)) {
+        try {
+          fs.unlinkSync(path.join(segmentsDir, segFile));
+        } catch {
+          // best effort cleanup
+        }
+      }
+    }
+    removed += 1;
+  }
+
+  return { removed };
+}
+
+function clearFinalizedStateForImage(
+  speciesId: string,
+  filename: string,
+  imagePath?: string
+): {
+  ok: boolean;
+  filename: string;
+  removedFromList?: boolean;
+  removedSegments?: number;
+  hadFinalizedDetection?: boolean;
+  error?: string;
+} {
+  const sessionDir = getSessionDir(speciesId);
+  const safeFilename = path.basename(String(filename || "").trim());
+  if (!safeFilename) {
+    return { ok: false, filename: "", error: "Invalid filename" };
+  }
+
+  const safeLower = safeFilename.toLowerCase();
+  const resolvedState = resolveFinalizedState(sessionDir, { reconcile: true });
+  const retainedNames = resolvedState.names.filter((entry) => entry.toLowerCase() !== safeLower);
+  const removedFromList = retainedNames.length !== resolvedState.names.length;
+  if (removedFromList) {
+    writeFinalizedList(sessionDir, retainedNames);
+  }
+
+  const labelPath = path.join(
+    sessionDir,
+    "labels",
+    safeFilename.replace(/\.\w+$/, ".json")
+  );
+  const { hadFinalizedDetection } = removeFinalizedFromLabel(labelPath);
+  const { removed } = deleteSegmentsForImage(sessionDir, safeFilename, imagePath);
+
+  clearFinalizedSegmentCache(speciesId, safeFilename);
+  cancelQueuedSegmentSave(speciesId, safeFilename);
+
+  return {
+    ok: true,
+    filename: safeFilename,
+    removedFromList,
+    removedSegments: removed,
+    hadFinalizedDetection,
+  };
+}
+
+function clearFinalizedStateForSession(
+  speciesId: string
+): { removedSegmentsTotal: number; clearedLabels: number } {
+  const sessionDir = getSessionDir(speciesId);
+  const labelsDir = path.join(sessionDir, "labels");
+  const segmentsDir = path.join(sessionDir, "segments");
+  let clearedLabels = 0;
+  let removedSegmentsTotal = 0;
+
+  if (fs.existsSync(labelsDir)) {
+    for (const filename of fs.readdirSync(labelsDir)) {
+      if (!filename.endsWith(".json")) continue;
+      const result = removeFinalizedFromLabel(path.join(labelsDir, filename));
+      if (result.hadFinalizedDetection) {
+        clearedLabels += 1;
+      }
+    }
+  }
+
+  if (fs.existsSync(segmentsDir)) {
+    removedSegmentsTotal = fs.readdirSync(segmentsDir).length;
+    try {
+      fs.rmSync(segmentsDir, { recursive: true, force: true });
+    } catch {
+      // best effort cleanup
+    }
+  }
+  fs.mkdirSync(segmentsDir, { recursive: true });
+  writeFinalizedList(sessionDir, []);
+  cancelAllQueuedSegmentSavesForSpecies(speciesId);
+
+  return { removedSegmentsTotal, clearedLabels };
+}
+
+function clearFinalizedSegmentCache(speciesId: string, filename: string): void {
+  const safeFilename = path.basename(String(filename || "")).toLowerCase();
+  const prefix = `${speciesId}::`;
+  for (const key of Array.from(finalizedSegmentSignatureCache.keys())) {
+    if (!key.startsWith(prefix)) continue;
+    const keyFilename = path.basename(key.slice(prefix.length)).toLowerCase();
+    if (keyFilename === safeFilename) {
+      finalizedSegmentSignatureCache.delete(key);
+    }
+  }
+}
+
+function cancelQueuedSegmentSave(speciesId: string, filename: string): void {
+  const safeFilename = path.basename(String(filename || "")).toLowerCase();
+  for (const [sessionKey, queue] of segmentSaveQueues.entries()) {
+    const nextQueue = queue.filter(
+      (job) => !(
+        job.speciesId === speciesId &&
+        path.basename(job.filename).toLowerCase() === safeFilename
+      )
+    );
+    if (nextQueue.length === 0) {
+      segmentSaveQueues.delete(sessionKey);
+    } else if (nextQueue.length !== queue.length) {
+      segmentSaveQueues.set(sessionKey, nextQueue);
+    }
+  }
+  setSegmentQueueStatus(speciesId, filename, "idle");
+}
+
+function cancelAllQueuedSegmentSavesForSpecies(speciesId: string): void {
+  for (const [sessionKey, queue] of segmentSaveQueues.entries()) {
+    const nextQueue = queue.filter((job) => job.speciesId !== speciesId);
+    if (nextQueue.length === 0) {
+      segmentSaveQueues.delete(sessionKey);
+    } else if (nextQueue.length !== queue.length) {
+      segmentSaveQueues.set(sessionKey, nextQueue);
+    }
+  }
+  for (const key of Array.from(segmentQueueStatusByImage.keys())) {
+    if (key.startsWith(`${speciesId}::`)) {
+      segmentQueueStatusByImage.delete(key);
+    }
+  }
+  for (const key of Array.from(finalizedSegmentSignatureCache.keys())) {
+    if (key.startsWith(`${speciesId}::`)) {
+      finalizedSegmentSignatureCache.delete(key);
+    }
+  }
+}
+
+async function processSegmentSaveQueue(sessionKey: string): Promise<void> {
+  if (segmentQueueRunningSessions.has(sessionKey)) return;
+  segmentQueueRunningSessions.add(sessionKey);
+  try {
+    while (true) {
+      const queue = segmentSaveQueues.get(sessionKey) || [];
+      const job = queue[0];
+      if (!job) {
+        segmentSaveQueues.delete(sessionKey);
+        break;
+      }
+
+      const latestSignature = finalizedSegmentSignatureCache.get(job.queueKey);
+      if (latestSignature !== job.signature) {
+        queue.shift();
+        if (queue.length === 0) segmentSaveQueues.delete(sessionKey);
+        else segmentSaveQueues.set(sessionKey, queue);
+        continue;
+      }
+
+      if (!job.imagePath || job.acceptedBoxes.length === 0) {
+        finalizedSegmentSignatureCache.delete(job.queueKey);
+        setSegmentQueueStatus(
+          job.speciesId,
+          job.filename,
+          "skipped",
+          job.signature,
+          "no_boxes_or_image",
+          { expectedCount: job.acceptedBoxes.length, savedCount: 0 }
+        );
+        queue.shift();
+        if (queue.length === 0) segmentSaveQueues.delete(sessionKey);
+        else segmentSaveQueues.set(sessionKey, queue);
+        continue;
+      }
+
+      // Auto-reinit if the idle timer killed the process between annotation and finalize.
+      // save_segments_for_boxes has its own fallback chain (cache → SAM2 → rectangle),
+      // so we don't gate on sam2_ready here — let Python decide.
+      let iterativeSam2Eligible = false;
+      try {
+        iterativeSam2Eligible = (await checkSam2MinimumRequirements()).ok;
+      } catch {
+        iterativeSam2Eligible = false;
+      }
+      if (iterativeSam2Eligible && !superAnnotator.initCompleted) {
+        try {
+          const initRes = await superAnnotator.send({ cmd: "init" });
+          if (initRes?.status !== "error") {
+            superAnnotator.initCompleted = true;
+          } else {
+            iterativeSam2Eligible = false;
+          }
+        } catch {
+          iterativeSam2Eligible = false;
+        }
+      }
+
+      try {
+        // Verify process is alive; log SAM2 state but do not gate on sam2_ready.
+        // The Python save_segments_for_boxes function handles: cached masks (no SAM2
+        // needed), fresh SAM2 inference, and rectangle fallback — in that order.
+        await superAnnotator.send({ cmd: "check" });
+      } catch (error: any) {
+        finalizedSegmentSignatureCache.delete(job.queueKey);
+        setSegmentQueueStatus(
+          job.speciesId,
+          job.filename,
+          "failed",
+          job.signature,
+          error?.message || "sam2_check_failed",
+          { expectedCount: job.acceptedBoxes.length, savedCount: 0 }
+        );
+        queue.shift();
+        if (queue.length === 0) segmentSaveQueues.delete(sessionKey);
+        else segmentSaveQueues.set(sessionKey, queue);
+        continue;
+      }
+
+      setSegmentQueueStatus(
+        job.speciesId,
+        job.filename,
+        "running",
+        job.signature,
+        undefined,
+        { expectedCount: job.acceptedBoxes.length, savedCount: 0 }
+      );
+      try {
+        const xyxyBoxes = job.acceptedBoxes.map((b) => [
+          b.left,
+          b.top,
+          b.left + b.width,
+          b.top + b.height,
+        ]);
+        const saveResult = await superAnnotator.send({
+          cmd: "save_segments_for_boxes",
+          image_path: job.imagePath,
+          boxes: xyxyBoxes,
+          session_dir: job.sessionDir,
+          iterative: iterativeSam2Eligible,
+          expand_ratio: 0.10,
+          allow_rectangle_fallback: false,
+        });
+
+        const currentSignature = finalizedSegmentSignatureCache.get(job.queueKey);
+        const expectedCount = job.acceptedBoxes.length;
+        const savedCount = Number(saveResult?.saved ?? 0);
+        const details = Array.isArray(saveResult?.details)
+          ? (saveResult.details as SegmentSaveDetail[])
+          : undefined;
+        if (currentSignature !== job.signature) {
+          setSegmentQueueStatus(job.speciesId, job.filename, "idle");
+        } else if (saveResult?.status === "error") {
+          deleteSegmentsForImage(job.sessionDir, job.filename, job.imagePath);
+          persistFinalizedDetection(
+            job.sessionDir,
+            job.speciesId,
+            job.filename,
+            job.acceptedBoxes,
+            job.signature
+          );
+          setSegmentQueueStatus(
+            job.speciesId,
+            job.filename,
+            "finalized_without_segments",
+            job.signature,
+            saveResult.error || "segment_save_failed",
+            { expectedCount, savedCount: 0 },
+            details
+          );
+        } else if (savedCount < expectedCount) {
+          deleteSegmentsForImage(job.sessionDir, job.filename, job.imagePath);
+          persistFinalizedDetection(
+            job.sessionDir,
+            job.speciesId,
+            job.filename,
+            job.acceptedBoxes,
+            job.signature
+          );
+          setSegmentQueueStatus(
+            job.speciesId,
+            job.filename,
+            "finalized_without_segments",
+            job.signature,
+            summarizeSegmentSaveDetails(details) || `partial_segment_save:${savedCount}/${expectedCount}`,
+            { expectedCount, savedCount },
+            details
+          );
+        } else {
+          persistFinalizedDetection(
+            job.sessionDir,
+            job.speciesId,
+            job.filename,
+            job.acceptedBoxes,
+            job.signature
+          );
+          setSegmentQueueStatus(
+            job.speciesId,
+            job.filename,
+            "saved",
+            job.signature,
+            undefined,
+            { expectedCount, savedCount },
+            details
+          );
+        }
+      } catch (error: any) {
+        const currentSignature = finalizedSegmentSignatureCache.get(job.queueKey);
+        if (currentSignature === job.signature) {
+          finalizedSegmentSignatureCache.delete(job.queueKey);
+          setSegmentQueueStatus(
+            job.speciesId,
+            job.filename,
+            "failed",
+            job.signature,
+            error?.message || "segment_save_failed",
+            { expectedCount: job.acceptedBoxes.length, savedCount: 0 }
+          );
+        } else {
+          setSegmentQueueStatus(job.speciesId, job.filename, "idle");
+        }
+      } finally {
+        queue.shift();
+        if (queue.length === 0) segmentSaveQueues.delete(sessionKey);
+        else segmentSaveQueues.set(sessionKey, queue);
+      }
+    }
+  } finally {
+    segmentQueueRunningSessions.delete(sessionKey);
+  }
+}
+
+function enqueueSegmentSave(job: SegmentQueueJob): { queued: boolean; state: "queued" | "skipped" } {
+  if (!job.imagePath || job.acceptedBoxes.length === 0) {
+    setSegmentQueueStatus(
+      job.speciesId,
+      job.filename,
+      "skipped",
+      job.signature,
+      "no_boxes_or_image",
+      { expectedCount: job.acceptedBoxes.length, savedCount: 0 }
+    );
+    return { queued: false, state: "skipped" };
+  }
+
+  const queue = segmentSaveQueues.get(job.sessionKey) || [];
+  const duplicate = queue.some((queued) => queued.queueKey === job.queueKey && queued.signature === job.signature);
+  if (!duplicate) {
+    const nextQueue = queue.filter((queued) => queued.queueKey !== job.queueKey);
+    nextQueue.push(job);
+    segmentSaveQueues.set(job.sessionKey, nextQueue);
+  }
+  setSegmentQueueStatus(
+    job.speciesId,
+    job.filename,
+    "queued",
+    job.signature,
+    undefined,
+    { expectedCount: job.acceptedBoxes.length, savedCount: 0 }
+  );
+  void processSegmentSaveQueue(job.sessionKey);
+  return { queued: true, state: "queued" };
+}
+
+function kickAllSegmentSaveQueues(): void {
+  for (const sessionKey of segmentSaveQueues.keys()) {
+    void processSegmentSaveQueue(sessionKey);
+  }
+}
+
+function unfinalizeImageInSession(
+  speciesId: string,
+  filename: string,
+  imagePath?: string
+): {
+  ok: boolean;
+  filename: string;
+  removedFromList?: boolean;
+  removedSegments?: number;
+  hadFinalizedDetection?: boolean;
+  error?: string;
+} {
+  return clearFinalizedStateForImage(speciesId, filename, imagePath);
 }
 
 const INFERENCE_REVIEW_DRAFTS_FILE = "inference_review_drafts.json";
@@ -2985,9 +6044,9 @@ type InferenceDraftSpecimen = {
     class_name?: string;
     obbCorners?: [number, number][];
     angle?: number;
-    orientation_override?: "left" | "right" | "uncertain";
+    orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
     orientation_hint?: {
-      orientation?: "left" | "right";
+      orientation?: "left" | "right" | "up" | "down";
       confidence?: number;
       source?: string;
       head_point?: [number, number];
@@ -3006,6 +6065,10 @@ type InferenceReviewDraftItem = {
   saved: boolean;
   reviewComplete?: boolean;
   committedAt?: string | null;
+  landmarkModelKey?: string;
+  landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
+  boxSignature?: string;
+  inferenceSignature?: string;
   updatedAt: string;
 };
 
@@ -3262,11 +6325,14 @@ function resolveCanonicalInferenceSession(
   const canonicalSessionId = CANONICAL_INFERENCE_SESSION_ID;
   const canonicalManifest = readInferenceSessionManifest(speciesId, canonicalSessionId);
   if (canonicalManifest) {
-    writeInferenceSessionIndex(speciesId, {
-      version: 1,
-      canonicalSessionId,
-      updatedAt: new Date().toISOString(),
-    });
+    const existingIndex = readInferenceSessionIndex(speciesId);
+    if (!existingIndex || existingIndex.canonicalSessionId !== canonicalSessionId) {
+      writeInferenceSessionIndex(speciesId, {
+        version: 1,
+        canonicalSessionId,
+        updatedAt: new Date().toISOString(),
+      });
+    }
     return { inferenceSessionId: canonicalSessionId, manifest: canonicalManifest };
   }
 
@@ -3510,6 +6576,8 @@ function sanitizeDraftSpecimens(specimens: unknown): InferenceDraftSpecimen[] {
         orientation_override:
           s.box.orientation_override === "left" ||
           s.box.orientation_override === "right" ||
+          s.box.orientation_override === "up" ||
+          s.box.orientation_override === "down" ||
           s.box.orientation_override === "uncertain"
             ? s.box.orientation_override
             : undefined,
@@ -3526,7 +6594,10 @@ function sanitizeDraftSpecimens(specimens: unknown): InferenceDraftSpecimen[] {
         orientation_hint: s.box.orientation_hint
           ? {
               orientation:
-                s.box.orientation_hint.orientation === "left" || s.box.orientation_hint.orientation === "right"
+                s.box.orientation_hint.orientation === "left" ||
+                s.box.orientation_hint.orientation === "right" ||
+                s.box.orientation_hint.orientation === "up" ||
+                s.box.orientation_hint.orientation === "down"
                   ? s.box.orientation_hint.orientation
                   : undefined,
               confidence: Number.isFinite(Number(s.box.orientation_hint.confidence))
@@ -3555,121 +6626,6 @@ function sanitizeDraftSpecimens(specimens: unknown): InferenceDraftSpecimen[] {
           }))
         : [],
     }));
-}
-
-function safeClassName(className: string): string {
-  return (className || "object").toLowerCase().trim().replace(/\s+/g, "_");
-}
-
-function getSessionYoloAliasPath(speciesId: string, className: string): string {
-  return path.join(getSessionDir(speciesId), "models", `yolo_${safeClassName(className)}.pt`);
-}
-
-/**
- * Find the best YOLO detection model for a session.
- * Selection order:
- * 1) class-specific promoted alias (if className provided)
- * 2) active_model.path from any YOLO registry in models/
- * 3) single promoted alias yolo_<class>.pt (non-versioned) if exactly one exists
- * 4) fallback: most recently modified yolo_*.pt
- */
-function getSessionYoloModel(speciesId?: string, className?: string): string | undefined {
-  const modelsDir = path.join(getEffectiveRoot(speciesId), "models");
-  if (!fs.existsSync(modelsDir)) return undefined;
-
-  if (speciesId && className) {
-    const aliasPath = getSessionYoloAliasPath(speciesId, className);
-    if (fs.existsSync(aliasPath)) return aliasPath;
-  }
-
-  const registryCandidates: { full: string; updatedMs: number }[] = [];
-  const registryFiles = fs
-    .readdirSync(modelsDir)
-    .filter((f) => /^yolo_.+_registry\.json$/i.test(f));
-  for (const registryFile of registryFiles) {
-    try {
-      const registryPath = path.join(modelsDir, registryFile);
-      const raw = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
-      const active = raw?.active_model;
-      if (!active || typeof active.path !== "string") continue;
-      if (Boolean(active?.use_pose)) continue;
-      const activePath = path.isAbsolute(active.path)
-        ? active.path
-        : path.join(modelsDir, active.path);
-      if (!fs.existsSync(activePath)) continue;
-      let updatedMs = 0;
-      if (typeof active.updated_at === "string") {
-        const parsed = Date.parse(active.updated_at);
-        if (Number.isFinite(parsed)) updatedMs = parsed;
-      }
-      if (!updatedMs) {
-        updatedMs = fs.statSync(activePath).mtimeMs;
-      }
-      registryCandidates.push({ full: activePath, updatedMs });
-    } catch (_) {
-      // Ignore malformed registry and continue fallback resolution.
-    }
-  }
-  if (registryCandidates.length > 0) {
-    registryCandidates.sort((a, b) => b.updatedMs - a.updatedMs);
-    return registryCandidates[0].full;
-  }
-
-  const promotedAliases = fs
-    .readdirSync(modelsDir)
-    .filter((f) => /^yolo_.+\.pt$/i.test(f))
-    .filter((f) => !/_v\d+\.pt$/i.test(f))
-    .filter((f) => {
-      const clsTag = f.replace(/^yolo_/, "").replace(/\.pt$/i, "");
-      const registryPath = path.join(modelsDir, `yolo_${clsTag}_registry.json`);
-      if (!fs.existsSync(registryPath)) return true;
-      try {
-        const raw = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
-        const active = raw?.active_model;
-        if (!active) return true;
-        return !Boolean(active.use_pose);
-      } catch {
-        return true;
-      }
-    });
-  if (promotedAliases.length === 1) {
-    return path.join(modelsDir, promotedAliases[0]);
-  }
-
-  const candidates = fs
-    .readdirSync(modelsDir)
-    .filter((f) => f.startsWith("yolo_") && f.endsWith(".pt"))
-    .filter((f) => {
-      const clsTag = f
-        .replace(/^yolo_/, "")
-        .replace(/_v\d+\.pt$/i, "")
-        .replace(/\.pt$/i, "");
-      const registryPath = path.join(modelsDir, `yolo_${clsTag}_registry.json`);
-      if (!fs.existsSync(registryPath)) return true;
-      try {
-        const raw = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
-        const runs = Array.isArray(raw?.training_runs) ? raw.training_runs : [];
-        const fullPath = path.join(modelsDir, f);
-        const matched = runs.find((r: any) => {
-          const p = typeof r?.path === "string" ? r.path : "";
-          if (!p) return false;
-          const resolved = path.isAbsolute(p) ? p : path.join(modelsDir, p);
-          return path.resolve(resolved) === path.resolve(fullPath);
-        });
-        if (!matched) return true;
-        return !Boolean(matched.use_pose);
-      } catch {
-        return true;
-      }
-    })
-    .map((f) => {
-      const full = path.join(modelsDir, f);
-      return { full, mtime: fs.statSync(full).mtimeMs };
-    });
-
-  if (candidates.length === 0) return undefined;
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  return candidates[0].full;
 }
 
 const IMAGE_EXTS = /\.(jpg|jpeg|png|gif|bmp|webp)$/i;
@@ -3701,18 +6657,28 @@ ipcMain.handle(
       speciesId: string;
       name: string;
       landmarkTemplate: any[];
+      schemaKind?: SessionSchemaKind;
+      schemaSourceId?: string;
+      schemaFingerprint?: string;
       orientationPolicy?: {
         mode?: "directional" | "bilateral" | "axial" | "invariant";
         targetOrientation?: "left" | "right";
         headCategories?: string[];
         tailCategories?: string[];
+        anteriorAnchorIds?: number[];
+        posteriorAnchorIds?: number[];
         bilateralPairs?: [number, number][];
-        pcaLevelingMode?: "off" | "on" | "auto";
+        bilateralClassAxis?: "vertical_obb";
+        obbLevelingMode?: "on" | "off";
       };
     }
   ) => {
     try {
       const sessionDir = getSessionDir(args.speciesId);
+      const normalizedLandmarkTemplate = normalizeLandmarkTemplate(args.landmarkTemplate);
+      const schemaFingerprint =
+        String(args.schemaFingerprint || "").trim() ||
+        computeSchemaFingerprint(normalizedLandmarkTemplate);
       for (const sub of ["images", "labels", "models", "xml", "corrected_images", "debug"]) {
         fs.mkdirSync(path.join(sessionDir, sub), { recursive: true });
       }
@@ -3722,13 +6688,18 @@ ipcMain.handle(
           {
             speciesId: args.speciesId,
             name: args.name,
-            landmarkTemplate: args.landmarkTemplate,
+            landmarkTemplate: normalizedLandmarkTemplate,
+            schemaFingerprint,
+            schemaKind: normalizeSessionSchemaKind(args.schemaKind),
+            schemaSourceId: normalizeSessionSchemaSourceId(args.schemaSourceId),
             orientationPolicy: args.orientationPolicy || undefined,
             orientationPolicyConfigured: Boolean(args.orientationPolicy),
             orientationPolicyConfiguredAt: args.orientationPolicy
               ? new Date().toISOString()
               : undefined,
             augmentationPolicy: { gravity_aligned: true },
+            obbTrainingSettingsCustomized: false,
+            obbDetectionSettingsCustomized: false,
             createdAt: new Date().toISOString(),
             lastModified: new Date().toISOString(),
             imageCount: 0,
@@ -3912,102 +6883,253 @@ ipcMain.handle(
         top: number;
         width: number;
         height: number;
+        orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
+        obbCorners?: [number, number][];
+        angle?: number;
+        class_id?: number;
+        orientation_hint?: {
+          orientation?: "left" | "right" | "up" | "down";
+          confidence?: number;
+          source?: string;
+        };
         landmarks?: { id: number; x: number; y: number; isSkipped?: boolean }[];
       }[];
       imagePath?: string;
+      generateSegments?: boolean;
     }
   ) => {
     try {
       const sessionDir = getSessionDir(args.speciesId);
       const sessionImagePath = path.join(sessionDir, "images", args.filename);
       const resolvedImagePath = fs.existsSync(sessionImagePath) ? sessionImagePath : args.imagePath;
-
+      const generateSegments = Boolean(args.generateSegments);
       const acceptedBoxes = normalizeFinalizedAcceptedBoxes(args.boxes || []);
 
-      const xyxyBoxes = acceptedBoxes.map((b) => [
-        b.left,
-        b.top,
-        b.left + b.width,
-        b.top + b.height,
-      ]);
-
-      const cacheKey = `${args.speciesId}::${args.filename}`;
+      const cacheKey = buildSegmentQueueImageKey(args.speciesId, args.filename);
       const signature = buildAcceptedBoxesSignature(acceptedBoxes);
-      const cacheHit = finalizedSegmentSignatureCache.get(cacheKey) === signature;
-      let segmentSaveAttempted = false;
-      let segmentSaveSkipped = false;
+      const currentStatus = getSegmentQueueStatus(args.speciesId, args.filename);
+      const persistedFinalized = readFinalizedDetectionSnapshot(sessionDir, args.filename);
+      const inFlightForSameSignature =
+        (currentStatus.state === "queued" || currentStatus.state === "running") &&
+        currentStatus.signature === signature;
+      const alreadyFinalized =
+        persistedFinalized.isFinalized &&
+        persistedFinalized.boxSignature === signature &&
+        !inFlightForSameSignature;
 
-      // Only save segments if SAM2 is already warm — avoids blocking model load on finalize
-      if (superAnnotator.isRunning && resolvedImagePath && xyxyBoxes.length > 0 && !cacheHit) {
-        segmentSaveAttempted = true;
-        try {
-          await superAnnotator.send({
-            cmd: "save_segments_for_boxes",
-            image_path: resolvedImagePath,
-            boxes: xyxyBoxes,
-            session_dir: sessionDir,
-          });
-        } catch (_) {
-          // non-fatal
-        }
-      } else {
-        segmentSaveSkipped = true;
+      if (alreadyFinalized) {
+        setSegmentQueueStatus(
+          args.speciesId,
+          args.filename,
+          "already_finalized",
+          signature,
+          undefined,
+          { expectedCount: acceptedBoxes.length, savedCount: acceptedBoxes.length }
+        );
+        finalizedSegmentSignatureCache.set(cacheKey, signature);
+        return {
+          ok: true,
+          finalized: true,
+          queued: false,
+          acceptedCount: acceptedBoxes.length,
+          signature,
+          skipped: false,
+          segmentSaveQueued: false,
+          segmentQueueState: "already_finalized" as const,
+          expectedCount: acceptedBoxes.length,
+          savedCount: acceptedBoxes.length,
+        };
       }
-      // Always mark as finalized (UI lock) regardless of whether SAM2 was available
+
+      if (inFlightForSameSignature) {
+        finalizedSegmentSignatureCache.set(cacheKey, signature);
+        return {
+          ok: true,
+          finalized: false,
+          queued: currentStatus.state === "queued",
+          acceptedCount: acceptedBoxes.length,
+          signature,
+          skipped: false,
+          segmentSaveQueued: currentStatus.state === "queued",
+          segmentQueueState: currentStatus.state,
+          reason: currentStatus.reason,
+          expectedCount: currentStatus.expectedCount,
+          savedCount: currentStatus.savedCount,
+          details: currentStatus.details,
+        };
+      }
+
+      if (!generateSegments) {
+        deleteSegmentsForImage(sessionDir, args.filename, resolvedImagePath);
+        persistFinalizedDetection(
+          sessionDir,
+          args.speciesId,
+          args.filename,
+          acceptedBoxes,
+          signature
+        );
+        setSegmentQueueStatus(
+          args.speciesId,
+          args.filename,
+          "finalized_without_segments",
+          signature,
+          "segments_disabled_sam2_toggle_off",
+          { expectedCount: acceptedBoxes.length, savedCount: 0 }
+        );
+        finalizedSegmentSignatureCache.set(cacheKey, signature);
+        return {
+          ok: true,
+          finalized: true,
+          queued: false,
+          acceptedCount: acceptedBoxes.length,
+          signature,
+          skipped: false,
+          segmentSaveQueued: false,
+          segmentQueueState: "finalized_without_segments" as const,
+          reason: "segments_disabled_sam2_toggle_off",
+          expectedCount: acceptedBoxes.length,
+          savedCount: 0,
+        };
+      }
+
       finalizedSegmentSignatureCache.set(cacheKey, signature);
 
-      // Persist finalized box snapshot into label JSON.
-      const labelsDir = path.join(sessionDir, "labels");
-      fs.mkdirSync(labelsDir, { recursive: true });
-      const labelPath = path.join(labelsDir, args.filename.replace(/\.\w+$/, ".json"));
-      let payload: any = {
-        imageFilename: args.filename,
+      let segmentQueueState: "queued" | "skipped" = "skipped";
+      let segmentSaveQueued = false;
+      const queued = enqueueSegmentSave({
+        queueKey: cacheKey,
+        sessionKey: sessionDir,
         speciesId: args.speciesId,
-        boxes: [],
-        rejectedDetections: [],
-      };
-      if (fs.existsSync(labelPath)) {
-        try {
-          payload = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
-        } catch (_) {
-          // keep default payload
-        }
-      }
-      payload.imageFilename = payload.imageFilename || args.filename;
-      payload.speciesId = payload.speciesId || args.speciesId;
-      payload.boxes = Array.isArray(payload.boxes) ? payload.boxes : [];
-      payload.rejectedDetections = Array.isArray(payload.rejectedDetections) ? payload.rejectedDetections : [];
-      payload.finalizedDetection = {
-        isFinalized: true,
-        finalizedAt: new Date().toISOString(),
+        filename: args.filename,
+        sessionDir,
+        imagePath: resolvedImagePath,
         acceptedBoxes,
-        boxSignature: signature,
-      };
-      fs.writeFileSync(labelPath, JSON.stringify(payload, null, 2));
-
-      // Persist finalized filename to disk so it survives app restart
-      const finalizedListPath = path.join(sessionDir, "finalized_images.json");
-      try {
-        const existing: string[] = fs.existsSync(finalizedListPath)
-          ? JSON.parse(fs.readFileSync(finalizedListPath, "utf-8"))
-          : [];
-        if (!existing.includes(args.filename)) {
-          existing.push(args.filename);
-          fs.writeFileSync(finalizedListPath, JSON.stringify(existing));
-        }
-      } catch (_) { /* non-fatal */ }
+        signature,
+      });
+      segmentQueueState = queued.state;
+      segmentSaveQueued = queued.queued;
 
       return {
         ok: true,
-        finalized: true,
+        finalized: false,
+        queued: segmentSaveQueued,
         acceptedCount: acceptedBoxes.length,
         signature,
-        skipped: cacheHit && segmentSaveSkipped,
-        segmentSaveAttempted,
+        skipped: segmentQueueState === "skipped",
+        segmentSaveQueued,
+        segmentQueueState,
+        ...(segmentQueueState === "skipped" ? { reason: "no_boxes_or_image" } : {}),
+        ...(acceptedBoxes.length > 0 ? { expectedCount: acceptedBoxes.length } : {}),
       };
     } catch (e: any) {
       console.error("session:finalize-accepted-boxes failed:", e);
       return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:unfinalize-image",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      filename: string;
+      imagePath?: string;
+    }
+  ) => {
+    try {
+      const speciesId = String(args?.speciesId || "").trim();
+      const filename = String(args?.filename || "").trim();
+      if (!speciesId) {
+        return { ok: false, error: "Invalid speciesId" };
+      }
+      if (!filename) {
+        return { ok: false, error: "Invalid filename" };
+      }
+
+      const result = unfinalizeImageInSession(speciesId, filename, args?.imagePath);
+      if (!result.ok) {
+        return { ok: false, error: result.error || "Failed to unfinalize image." };
+      }
+
+      return {
+        ok: true,
+        unfinalized: true,
+        filename: result.filename,
+        removedFromList: Boolean(result.removedFromList),
+        removedSegments: Number(result.removedSegments || 0),
+        hadFinalizedDetection: Boolean(result.hadFinalizedDetection),
+      };
+    } catch (e: any) {
+      console.error("session:unfinalize-image failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:unfinalize-images",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      filenames?: string[];
+    }
+  ) => {
+    try {
+      const speciesId = String(args?.speciesId || "").trim();
+      if (!speciesId) {
+        return { ok: false, error: "Invalid speciesId", requested: 0, succeeded: 0, failed: 0, removedSegmentsTotal: 0 };
+      }
+
+      const sessionDir = getSessionDir(speciesId);
+      const explicitNames = Array.isArray(args?.filenames) ? args.filenames : [];
+      const targetNames =
+        explicitNames.length > 0
+          ? explicitNames
+              .map((name) => path.basename(String(name || "").trim()))
+              .filter((name) => Boolean(name))
+          : readFinalizedList(sessionDir)
+              .map((name) => path.basename(String(name || "").trim()))
+              .filter((name) => Boolean(name));
+
+      const dedupedNames: string[] = [];
+      const seen = new Set<string>();
+      targetNames.forEach((name) => {
+        const key = name.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        dedupedNames.push(name);
+      });
+
+      let succeeded = 0;
+      let failed = 0;
+      let removedSegmentsTotal = 0;
+      const errors: Array<{ filename: string; error: string }> = [];
+
+      for (const filename of dedupedNames) {
+        const result = unfinalizeImageInSession(speciesId, filename);
+        if (result.ok) {
+          succeeded += 1;
+          removedSegmentsTotal += Number(result.removedSegments || 0);
+        } else {
+          failed += 1;
+          errors.push({ filename, error: result.error || "Failed to unfinalize image." });
+        }
+      }
+
+      return {
+        ok: failed === 0,
+        requested: dedupedNames.length,
+        succeeded,
+        failed,
+        removedSegmentsTotal,
+        ...(errors.length > 0 ? { errors } : {}),
+      };
+    } catch (e: any) {
+      console.error("session:unfinalize-images failed:", e);
+      return { ok: false, error: e.message, requested: 0, succeeded: 0, failed: 0, removedSegmentsTotal: 0 };
     }
   }
 );
@@ -4078,34 +7200,58 @@ ipcMain.handle(
       const sessionDir = getSessionDir(args.speciesId);
       const imagesDir = path.join(sessionDir, "images");
       const labelsDir = path.join(sessionDir, "labels");
+      const warnings = sessionContainsLegacyNonObbLabels(sessionDir)
+        ? ["This session contains legacy boxes without OBB geometry. Re-import the annotations to normalize OBB labels."]
+        : [];
 
       // Load session metadata from session.json
       let meta: any = null;
       const sessionJsonPath = path.join(sessionDir, "session.json");
+      const representativeImageDimensions = summarizeRepresentativeImageDimensions(
+        fs.existsSync(imagesDir)
+          ? fs.readdirSync(imagesDir)
+            .filter((f) => IMAGE_EXTS.test(f))
+            .map((filename) => path.join(imagesDir, filename))
+          : []
+      );
       if (fs.existsSync(sessionJsonPath)) {
         try {
           meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
           if (meta && typeof meta === "object") {
             meta.orientationPolicyConfigured = hasConfiguredOrientationPolicy(meta);
+            meta.orientationPolicy = normalizeOrientationPolicy(
+              meta.orientationPolicy,
+              meta.landmarkTemplate
+            );
+            meta.obbTrainingSettings = readNormalizedSessionObbTrainingSettings(meta);
+            meta.obbDetectionSettings = readNormalizedSessionObbDetectionSettings(meta);
+            meta.obbTrainingSettingsCustomized = readSessionObbTrainingSettingsCustomized(meta);
+            meta.obbDetectionSettingsCustomized = readSessionObbDetectionSettingsCustomized(meta);
+            meta.representativeImageDimensions = representativeImageDimensions;
+            const schemaMetadata = resolveSessionSchemaMetadata(meta);
+            Object.assign(meta, schemaMetadata);
           }
         } catch (_) {
           // skip bad session.json
         }
       }
+      const effectiveRoot = getEffectiveRoot(args.speciesId);
+      const obbDetectorPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
+      meta = meta && typeof meta === "object" ? meta : {};
+      meta.obbDetectorReady = fs.existsSync(obbDetectorPath);
+      meta.obbTrainingSettings = readNormalizedSessionObbTrainingSettings(meta);
+      meta.obbDetectionSettings = readNormalizedSessionObbDetectionSettings(meta);
+      meta.obbTrainingSettingsCustomized = readSessionObbTrainingSettingsCustomized(meta);
+      meta.obbDetectionSettingsCustomized = readSessionObbDetectionSettingsCustomized(meta);
+      meta.representativeImageDimensions = representativeImageDimensions;
 
       if (!fs.existsSync(imagesDir)) {
-        return { ok: true, images: [], meta };
+        resolveFinalizedState(sessionDir, { reconcile: true });
+        return { ok: true, images: [], meta, warnings };
       }
 
-      // Load finalized filenames
-      const finalizedListPath = path.join(sessionDir, "finalized_images.json");
-      let finalizedSet = new Set<string>();
-      if (fs.existsSync(finalizedListPath)) {
-        try {
-          const list = JSON.parse(fs.readFileSync(finalizedListPath, "utf-8")) as string[];
-          finalizedSet = new Set(list);
-        } catch (_) { /* ignore bad file */ }
-      }
+      const finalizedState = resolveFinalizedState(sessionDir, { reconcile: true });
+      const finalizedSet = finalizedState.nameSet;
 
       const imageFiles = fs
         .readdirSync(imagesDir)
@@ -4120,12 +7266,18 @@ ipcMain.handle(
         const labelPath = path.join(labelsDir, filename.replace(/\.\w+$/, ".json"));
         if (fs.existsSync(labelPath)) {
           try {
-            const labelData = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+          const labelData = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
             isFinalizedFromLabel = Boolean(labelData?.finalizedDetection?.isFinalized);
-            if (Array.isArray(labelData?.boxes)) {
-              boxes = labelData.boxes;
+            const finalizedAccepted = Array.isArray(labelData?.finalizedDetection?.acceptedBoxes)
+              ? labelData.finalizedDetection.acceptedBoxes
+              : [];
+            if (isFinalizedFromLabel && finalizedAcceptedBoxesHaveObb(finalizedAccepted)) {
+              boxes = normalizeFinalizedAcceptedBoxesForSession(finalizedAccepted);
+            } else if (Array.isArray(labelData?.boxes)) {
+              boxes = normalizeSessionStoredBoxes(labelData.boxes);
               hasBoxes = boxes.some((b: any) => Number(b?.width) > 0 && Number(b?.height) > 0);
             }
+            hasBoxes = boxes.some((b: any) => Number(b?.width) > 0 && Number(b?.height) > 0);
           } catch (_) {
             // skip bad label files
           }
@@ -4137,11 +7289,11 @@ ipcMain.handle(
           mimeType: MIME_TYPES[ext] || "image/jpeg",
           hasBoxes,
           boxes,
-          finalized: finalizedSet.has(filename) || isFinalizedFromLabel,
+          finalized: finalizedSet.has(filename.toLowerCase()) || isFinalizedFromLabel,
         };
       });
 
-      return { ok: true, images, meta };
+      return { ok: true, images, meta, warnings };
     } catch (e: any) {
       console.error("session:load failed:", e);
       return { ok: false, error: e.message, images: [] };
@@ -4155,25 +7307,173 @@ ipcMain.handle(
     try {
       const sessionDir = getSessionDir(args.speciesId);
       const labelsDir = path.join(sessionDir, "labels");
+      const warnings = sessionContainsLegacyNonObbLabels(sessionDir)
+        ? ["This session contains legacy boxes without OBB geometry. Re-import the annotations to normalize OBB labels."]
+        : [];
       const safeFilename = path.basename(String(args.filename || "").trim());
       if (!safeFilename) {
         return { ok: false, error: "Invalid filename", boxes: [] };
       }
       const labelPath = path.join(labelsDir, safeFilename.replace(/\.\w+$/, ".json"));
+      const finalizedState = resolveFinalizedState(sessionDir, { reconcile: true });
 
       if (!fs.existsSync(labelPath)) {
-        return { ok: true, boxes: [], finalized: false };
+        return {
+          ok: true,
+          boxes: [],
+          finalized: finalizedState.nameSet.has(safeFilename.toLowerCase()),
+          warnings,
+        };
       }
 
       const labelData = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+      const finalizedAccepted = Array.isArray(labelData?.finalizedDetection?.acceptedBoxes)
+        ? labelData.finalizedDetection.acceptedBoxes
+        : [];
       return {
         ok: true,
-        boxes: Array.isArray(labelData?.boxes) ? labelData.boxes : [],
-        finalized: Boolean(labelData?.finalizedDetection?.isFinalized),
+        boxes:
+          Boolean(labelData?.finalizedDetection?.isFinalized) &&
+          finalizedAcceptedBoxesHaveObb(finalizedAccepted)
+            ? normalizeFinalizedAcceptedBoxesForSession(finalizedAccepted)
+            : normalizeSessionStoredBoxes(labelData?.boxes),
+        finalized:
+          finalizedState.nameSet.has(safeFilename.toLowerCase()) ||
+          Boolean(labelData?.finalizedDetection?.isFinalized),
+        warnings,
       };
     } catch (e: any) {
       console.error("session:load-annotation failed:", e);
       return { ok: false, error: e.message, boxes: [] };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:get-segment-save-status",
+  async (_event, args: { speciesId: string; filename: string }) => {
+    try {
+      return { ok: true, status: getSegmentQueueStatus(args.speciesId, args.filename) };
+    } catch (e: any) {
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle("schema:list-templates", async () => {
+  try {
+    return { ok: true, templates: listReusableSchemaTemplates() };
+  } catch (e: any) {
+    console.error("schema:list-templates failed:", e);
+    return { ok: false, templates: [], error: e.message };
+  }
+});
+
+ipcMain.handle(
+  "schema:save-custom-template",
+  async (
+    _event,
+    args: {
+      name: string;
+      description?: string;
+      landmarks: any[];
+      orientationPolicy?: any;
+      sourcePresetId?: string;
+    }
+  ) => {
+    try {
+      const normalizedLandmarks = normalizeLandmarkTemplate(args.landmarks);
+      if (normalizedLandmarks.length === 0) {
+        return { ok: false, error: "Custom schema requires at least one landmark." };
+      }
+      const now = new Date().toISOString();
+      const normalizedName = String(args.name || "").trim();
+      if (!normalizedName) {
+        return { ok: false, error: "Schema name is required." };
+      }
+      const library = bootstrapReusableSchemasFromSessions(readReusableSchemaLibrary());
+      const template = normalizeReusableSchemaTemplate({
+        id: `custom-template-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: normalizedName,
+        description: String(args.description || "").trim(),
+        landmarks: normalizedLandmarks,
+        orientationPolicy: args.orientationPolicy,
+        sourcePresetId: String(args.sourcePresetId || "").trim() || undefined,
+        createdAt: now,
+        updatedAt: now,
+      });
+      if (!template) {
+        return { ok: false, error: "Failed to normalize custom schema template." };
+      }
+      const nextLibrary = {
+        version: 1 as const,
+        templates: [...library.templates, template],
+      };
+      writeReusableSchemaLibrary(nextLibrary);
+      return { ok: true, template };
+    } catch (e: any) {
+      console.error("schema:save-custom-template failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "schema:update-custom-template",
+  async (
+    _event,
+    args: {
+      templateId: string;
+      updates: {
+        name: string;
+        description?: string;
+        landmarks: any[];
+        orientationPolicy?: any;
+        sourcePresetId?: string;
+      };
+    }
+  ) => {
+    try {
+      const templateId = String(args.templateId || "").trim();
+      if (!templateId) {
+        return { ok: false, error: "Template id is required." };
+      }
+      const normalizedLandmarks = normalizeLandmarkTemplate(args.updates?.landmarks);
+      if (normalizedLandmarks.length === 0) {
+        return { ok: false, error: "Custom schema requires at least one landmark." };
+      }
+      const normalizedName = String(args.updates?.name || "").trim();
+      if (!normalizedName) {
+        return { ok: false, error: "Schema name is required." };
+      }
+      const library = bootstrapReusableSchemasFromSessions(readReusableSchemaLibrary());
+      const templateIndex = library.templates.findIndex((template) => template.id === templateId);
+      if (templateIndex < 0) {
+        return { ok: false, error: `Custom schema template not found: ${templateId}` };
+      }
+      const existing = library.templates[templateIndex];
+      const updated = normalizeReusableSchemaTemplate({
+        ...existing,
+        name: normalizedName,
+        description: String(args.updates?.description || "").trim(),
+        landmarks: normalizedLandmarks,
+        orientationPolicy:
+          args.updates?.orientationPolicy === undefined
+            ? existing.orientationPolicy
+            : args.updates.orientationPolicy,
+        sourcePresetId: String(args.updates?.sourcePresetId || "").trim() || undefined,
+        updatedAt: new Date().toISOString(),
+      });
+      if (!updated) {
+        return { ok: false, error: "Failed to normalize custom schema template." };
+      }
+      const nextTemplates = [...library.templates];
+      nextTemplates[templateIndex] = updated;
+      writeReusableSchemaLibrary({ version: 1, templates: nextTemplates });
+      return { ok: true, template: updated };
+    } catch (e: any) {
+      console.error("schema:update-custom-template failed:", e);
+      return { ok: false, error: e.message };
     }
   }
 );
@@ -4199,14 +7499,30 @@ ipcMain.handle("session:list", async () => {
       if (!fs.existsSync(sessionJsonPath)) continue;
       try {
         const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+        const sessionImagesDir = path.join(sessionsDir, entry.name, "images");
+        const schemaMetadata = resolveSessionSchemaMetadata(meta);
         sessions.push({
           speciesId: meta.speciesId || entry.name,
           name: meta.name || entry.name,
           imageCount: meta.imageCount || 0,
           lastModified: meta.lastModified || meta.createdAt || "",
           landmarkCount: (meta.landmarkTemplate || []).length,
-          orientationPolicy: meta.orientationPolicy || undefined,
+          schemaFingerprint: schemaMetadata.schemaFingerprint,
+          schemaKind: schemaMetadata.schemaKind,
+          schemaSourceId: schemaMetadata.schemaSourceId,
+          orientationPolicy: normalizeOrientationPolicy(meta.orientationPolicy, meta.landmarkTemplate),
           orientationPolicyConfigured: hasConfiguredOrientationPolicy(meta),
+          obbTrainingSettings: readNormalizedSessionObbTrainingSettings(meta),
+          obbDetectionSettings: readNormalizedSessionObbDetectionSettings(meta),
+          obbTrainingSettingsCustomized: readSessionObbTrainingSettingsCustomized(meta),
+          obbDetectionSettingsCustomized: readSessionObbDetectionSettingsCustomized(meta),
+          representativeImageDimensions: summarizeRepresentativeImageDimensions(
+            fs.existsSync(sessionImagesDir)
+              ? fs.readdirSync(sessionImagesDir)
+                .filter((f) => IMAGE_EXTS.test(f))
+                .map((filename) => path.join(sessionImagesDir, filename))
+              : []
+          ),
         });
       } catch (_) {
         // skip bad session.json
@@ -4234,6 +7550,7 @@ ipcMain.handle(
       const sessionDir = getSessionDir(args.speciesId);
       const imagesDir = path.join(sessionDir, "images");
       const labelsDir = path.join(sessionDir, "labels");
+      clearFinalizedStateForSession(args.speciesId);
 
       // Delete all image files
       if (fs.existsSync(imagesDir)) {
@@ -4247,12 +7564,21 @@ ipcMain.handle(
           try { fs.unlinkSync(path.join(labelsDir, file)); } catch {}
         }
       }
-      // Delete persisted inference-review drafts
+      // Delete persisted inference-review drafts (legacy root + canonical session)
       try {
         const draftPath = getInferenceReviewDraftsPath(args.speciesId);
         if (fs.existsSync(draftPath)) {
           fs.unlinkSync(draftPath);
         }
+      } catch (_) {
+        // non-critical
+      }
+      try {
+        const sessionDir = getInferenceSessionDir(args.speciesId, CANONICAL_INFERENCE_SESSION_ID);
+        const sessionDraftPath = path.join(sessionDir, INFERENCE_REVIEW_DRAFTS_FILE);
+        if (fs.existsSync(sessionDraftPath)) fs.unlinkSync(sessionDraftPath);
+        const pathsFile = path.join(sessionDir, "image_paths.json");
+        if (fs.existsSync(pathsFile)) fs.writeFileSync(pathsFile, JSON.stringify({ imagePaths: [] }, null, 2));
       } catch (_) {
         // non-critical
       }
@@ -4319,7 +7645,10 @@ function persistInferenceCorrectionToSession(args: {
       top: number;
       width: number;
       height: number;
-      orientation_override?: "left" | "right" | "uncertain";
+      orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
+      obbCorners?: [number, number][];
+      angle?: number;
+      class_id?: number;
     };
     landmarks: { id: number; x: number; y: number }[];
   }[];
@@ -4342,35 +7671,61 @@ function persistInferenceCorrectionToSession(args: {
     fs.mkdirSync(imagesDir, { recursive: true });
     fs.mkdirSync(labelsDir, { recursive: true });
 
-    const imgName = args.filename ?? path.basename(args.imagePath);
-    const imgDest = path.join(imagesDir, imgName);
-    const lblDest = path.join(labelsDir, imgName.replace(/\.\w+$/, ".json"));
+    let imgName = args.filename ?? path.basename(args.imagePath);
+    let imgDest = path.join(imagesDir, imgName);
 
-    if (!fs.existsSync(imgDest) && fs.existsSync(args.imagePath)) {
-      fs.copyFileSync(args.imagePath, imgDest);
+    if (fs.existsSync(args.imagePath)) {
+      if (!fs.existsSync(imgDest)) {
+        fs.copyFileSync(args.imagePath, imgDest);
+      } else {
+        // Check if the existing file is different from the source
+        const srcStat = fs.statSync(args.imagePath);
+        const dstStat = fs.statSync(imgDest);
+        if (srcStat.size !== dstStat.size || srcStat.mtimeMs !== dstStat.mtimeMs) {
+          // Different file Ã¢â‚¬â€ disambiguate with a short hash of the source path
+          const hash = require("crypto").createHash("md5").update(args.imagePath).digest("hex").slice(0, 6);
+          const ext = path.extname(imgName);
+          const base = path.basename(imgName, ext);
+          imgName = `${base}_${hash}${ext}`;
+          imgDest = path.join(imagesDir, imgName);
+          if (!fs.existsSync(imgDest)) {
+            fs.copyFileSync(args.imagePath, imgDest);
+          }
+        }
+      }
     }
+
+    const lblDest = path.join(labelsDir, imgName.replace(/\.\w+$/, ".json"));
 
     let boxesPayload: any[] = [];
     if (Array.isArray(args.specimens) && args.specimens.length > 0) {
       boxesPayload = args.specimens
         .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0)
-        .map((s) => ({
-          left: Math.round(s.box.left),
-          top: Math.round(s.box.top),
-          width: Math.round(s.box.width),
-          height: Math.round(s.box.height),
-          ...(s.box.orientation_override === "left" ||
-          s.box.orientation_override === "right" ||
-          s.box.orientation_override === "uncertain"
-            ? { orientation_override: s.box.orientation_override }
-            : {}),
-          landmarks: (s.landmarks || []).map((lm) => ({
-            id: Number(lm.id),
-            x: Number(lm.x),
-            y: Number(lm.y),
-            isSkipped: false,
-          })),
-        }));
+        .map((s) => {
+          const entry: any = {
+            left: Math.round(s.box.left),
+            top: Math.round(s.box.top),
+            width: Math.round(s.box.width),
+            height: Math.round(s.box.height),
+            ...(s.box.orientation_override === "left" ||
+            s.box.orientation_override === "right" ||
+            s.box.orientation_override === "up" ||
+            s.box.orientation_override === "down" ||
+            s.box.orientation_override === "uncertain"
+              ? { orientation_override: s.box.orientation_override }
+              : {}),
+            landmarks: (s.landmarks || []).map((lm) => ({
+              id: Number(lm.id),
+              x: Number(lm.x),
+              y: Number(lm.y),
+              isSkipped: false,
+            })),
+          };
+          if (Array.isArray(s.box.obbCorners) && s.box.obbCorners.length === 4) entry.obbCorners = s.box.obbCorners;
+          if (s.box.angle != null) entry.angle = s.box.angle;
+          if (s.box.class_id != null) entry.class_id = s.box.class_id;
+          return entry;
+        });
     } else if (args.box && Array.isArray(args.landmarks)) {
       boxesPayload = [
         {
@@ -4442,9 +7797,16 @@ function persistInferenceCorrectionToSession(args: {
         orientation_override:
           b.orientation_override === "left" ||
           b.orientation_override === "right" ||
+          b.orientation_override === "up" ||
+          b.orientation_override === "down" ||
           b.orientation_override === "uncertain"
             ? b.orientation_override
             : undefined,
+        ...(Array.isArray(b.obbCorners) && b.obbCorners.length === 4
+          ? { obbCorners: b.obbCorners }
+          : {}),
+        ...(b.angle != null ? { angle: b.angle } : {}),
+        ...(b.class_id != null ? { class_id: b.class_id } : {}),
         landmarks: b.landmarks,
       }))
     );
@@ -4464,14 +7826,15 @@ function persistInferenceCorrectionToSession(args: {
     };
     fs.writeFileSync(lblDest, JSON.stringify(label, null, 2));
 
-    const finalizedListPath = path.join(sessionDir, "finalized_images.json");
     try {
-      const existing: string[] = fs.existsSync(finalizedListPath)
-        ? JSON.parse(fs.readFileSync(finalizedListPath, "utf-8"))
-        : [];
-      if (!existing.includes(imgName)) {
+      const existing = readFinalizedList(sessionDir);
+      const lower = path.basename(imgName).toLowerCase();
+      const alreadyFinalized = existing.some(
+        (name) => path.basename(String(name || "")).toLowerCase() === lower
+      );
+      if (!alreadyFinalized) {
         existing.push(imgName);
-        fs.writeFileSync(finalizedListPath, JSON.stringify(existing));
+        writeFinalizedList(sessionDir, existing);
       }
     } catch {
       // non-fatal
@@ -4498,7 +7861,16 @@ function persistInferenceCorrectionToSession(args: {
 function persistDetectionCorrectionToSession(args: {
   speciesId: string;
   imagePath: string;
-  boxes: { left: number; top: number; width: number; height: number }[];
+  boxes: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
+    obbCorners?: [number, number][];
+    angle?: number;
+    class_id?: number;
+  }[];
   imageWidth: number;
   imageHeight: number;
   filename?: string;
@@ -4554,7 +7926,7 @@ ipcMain.handle(
           top: number;
           width: number;
           height: number;
-          orientation_override?: "left" | "right" | "uncertain";
+          orientation_override?: "left" | "right" | "up" | "down" | "uncertain";
         };
         landmarks: { id: number; x: number; y: number }[];
       }[];
@@ -4640,7 +8012,7 @@ ipcMain.handle("session:list-inference-sessions", async () => {
       .readdirSync(sessionsRoot, { withFileTypes: true })
       .filter((entry) => entry.isDirectory());
 
-    const sessions = schemas
+    const candidates = schemas
       .map((entry) => {
         const speciesId = entry.name;
         const sessionJsonPath = path.join(sessionsRoot, speciesId, "session.json");
@@ -4648,11 +8020,13 @@ ipcMain.handle("session:list-inference-sessions", async () => {
         let schemaName = speciesId;
         let schemaImageCount = 0;
         let schemaUpdatedAt = "";
+        let schemaGroupKey = `species:${speciesId}`;
         try {
           const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
           schemaName = String(meta?.name || speciesId);
           schemaImageCount = Math.max(0, Number(meta?.imageCount || 0));
           schemaUpdatedAt = String(meta?.lastModified || meta?.createdAt || "");
+          schemaGroupKey = buildInferenceSchemaGroupKey(speciesId, meta);
         } catch {
           // keep defaults
         }
@@ -4662,6 +8036,7 @@ ipcMain.handle("session:list-inference-sessions", async () => {
           schemaName,
           schemaImageCount,
           schemaUpdatedAt,
+          schemaGroupKey,
           exists: Boolean(resolved.inferenceSessionId && resolved.manifest),
           inferenceSessionId: resolved.inferenceSessionId ?? undefined,
           displayName: resolved.manifest?.displayName,
@@ -4670,12 +8045,51 @@ ipcMain.handle("session:list-inference-sessions", async () => {
           migratedFrom: resolved.migratedFrom,
         };
       })
-      .filter((item): item is NonNullable<typeof item> => item !== null)
-      .sort((a, b) => {
-        const aTime = Date.parse(a.updatedAt || a.schemaUpdatedAt || "");
-        const bTime = Date.parse(b.updatedAt || b.schemaUpdatedAt || "");
-        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
-      });
+      .filter((item): item is NonNullable<typeof item> => item !== null);
+
+    const grouped = new Map<string, Array<(typeof candidates)[number]>>();
+    candidates.forEach((candidate) => {
+      const existing = grouped.get(candidate.schemaGroupKey);
+      if (existing) {
+        existing.push(candidate);
+      } else {
+        grouped.set(candidate.schemaGroupKey, [candidate]);
+      }
+    });
+
+    const sessions = Array.from(grouped.entries())
+      .map(([schemaGroupKey, entries]): InferenceSessionListEntry => {
+        const representative = [...entries].sort((a, b) => {
+          if (a.exists !== b.exists) return a.exists ? -1 : 1;
+          const aTime = parseSortableTimestamp(a.updatedAt, a.schemaUpdatedAt, a.createdAt);
+          const bTime = parseSortableTimestamp(b.updatedAt, b.schemaUpdatedAt, b.createdAt);
+          if (aTime !== bTime) return bTime - aTime;
+          return a.schemaName.localeCompare(b.schemaName);
+        })[0];
+
+        return {
+          speciesId: representative.speciesId,
+          schemaName: representative.schemaName,
+          schemaImageCount: Math.max(...entries.map((entry) => entry.schemaImageCount)),
+          schemaUpdatedAt: entries
+            .slice()
+            .sort(
+              (a, b) =>
+                parseSortableTimestamp(b.schemaUpdatedAt, b.updatedAt, b.createdAt) -
+                parseSortableTimestamp(a.schemaUpdatedAt, a.updatedAt, a.createdAt)
+            )[0]?.schemaUpdatedAt || representative.schemaUpdatedAt,
+          schemaGroupKey,
+          canonicalSpeciesId: representative.speciesId,
+          ...(entries.length > 1 ? { hiddenSessionCount: entries.length - 1 } : {}),
+          exists: representative.exists,
+          inferenceSessionId: representative.inferenceSessionId,
+          displayName: representative.displayName,
+          createdAt: representative.createdAt,
+          updatedAt: representative.updatedAt,
+          migratedFrom: representative.migratedFrom,
+        };
+      })
+      .sort((a, b) => a.schemaName.localeCompare(b.schemaName));
 
     return { ok: true, sessions };
   } catch (e: any) {
@@ -4731,6 +8145,26 @@ ipcMain.handle(
       };
     } catch (e: any) {
       console.error("session:create-inference-session failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
+  "session:delete-schema-session",
+  async (_event, args: { speciesId: string }) => {
+    try {
+      if (!args.speciesId) {
+        return { ok: false, error: "speciesId is required." };
+      }
+      const sessionDir = getSessionDir(args.speciesId);
+      if (!fs.existsSync(sessionDir)) {
+        return { ok: true, deleted: false };
+      }
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      return { ok: true, deleted: true };
+    } catch (e: any) {
+      console.error("session:delete-schema-session failed:", e);
       return { ok: false, error: e.message };
     }
   }
@@ -4871,14 +8305,28 @@ ipcMain.handle(
         const imagePathCandidate = item.imagePath
           ? path.resolve(item.imagePath)
           : path.join(getSessionDir(args.speciesId), "images", filename);
-        const imagePath = fs.existsSync(imagePathCandidate)
-          ? imagePathCandidate
-          : path.join(getSessionDir(args.speciesId), "images", filename);
-        if (!filename || !fs.existsSync(imagePath)) {
+        const sessionImagesDir = path.join(getSessionDir(args.speciesId), "images");
+        let imagePath: string | null = null;
+        if (fs.existsSync(imagePathCandidate)) {
+          imagePath = imagePathCandidate;
+        } else if (filename) {
+          const sessionExact = path.join(sessionImagesDir, filename);
+          if (fs.existsSync(sessionExact)) {
+            imagePath = sessionExact;
+          } else {
+            // Try alternate extensions in case the session copy has a different suffix
+            const stem = path.basename(filename, path.extname(filename));
+            for (const ext of [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]) {
+              const candidate = path.join(sessionImagesDir, stem + ext);
+              if (fs.existsSync(candidate)) { imagePath = candidate; break; }
+            }
+          }
+        }
+        if (!filename || !imagePath) {
           failed += 1;
           failures.push({
             filename: filename || "(unknown)",
-            error: "Image source not found for committed draft.",
+            error: `Image not found at original path (${imagePathCandidate}) or in session images directory.`,
           });
           continue;
         }
@@ -4891,6 +8339,9 @@ ipcMain.handle(
             width: s.box.width,
             height: s.box.height,
             orientation_override: s.box.orientation_override,
+            ...(s.box.obbCorners ? { obbCorners: s.box.obbCorners } : {}),
+            ...(s.box.angle != null ? { angle: s.box.angle } : {}),
+            ...(s.box.class_id != null ? { class_id: s.box.class_id } : {}),
           },
           landmarks: s.landmarks.map((lm) => ({
             id: lm.id,
@@ -4920,6 +8371,10 @@ ipcMain.handle(
           top: s.box.top,
           width: s.box.width,
           height: s.box.height,
+          orientation_override: s.box.orientation_override,
+          ...(s.box.obbCorners ? { obbCorners: s.box.obbCorners } : {}),
+          ...(s.box.angle != null ? { angle: s.box.angle } : {}),
+          ...(s.box.class_id != null ? { class_id: s.box.class_id } : {}),
         }));
         const dims = inferImageDimensionsForDetection(imagePath, boxes);
         const detectionSave = persistDetectionCorrectionToSession({
@@ -4977,6 +8432,10 @@ ipcMain.handle(
       saved?: boolean;
       reviewComplete?: boolean;
       committedAt?: string | null;
+      landmarkModelKey?: string | null;
+      landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose" | null;
+      boxSignature?: string | null;
+      inferenceSignature?: string | null;
       clear?: boolean;
     }
   ) => {
@@ -5017,6 +8476,29 @@ ipcMain.handle(
               : typeof args.committedAt === "string"
               ? args.committedAt
               : drafts.items[key]?.committedAt ?? null,
+          landmarkModelKey:
+            args.landmarkModelKey === null
+              ? undefined
+              : typeof args.landmarkModelKey === "string"
+              ? args.landmarkModelKey
+              : drafts.items[key]?.landmarkModelKey,
+          landmarkPredictorType:
+            args.landmarkPredictorType === null
+              ? undefined
+              : args.landmarkPredictorType ??
+                drafts.items[key]?.landmarkPredictorType,
+          boxSignature:
+            args.boxSignature === null
+              ? undefined
+              : typeof args.boxSignature === "string"
+              ? args.boxSignature
+              : drafts.items[key]?.boxSignature,
+          inferenceSignature:
+            args.inferenceSignature === null
+              ? undefined
+              : typeof args.inferenceSignature === "string"
+              ? args.inferenceSignature
+              : drafts.items[key]?.inferenceSignature,
           updatedAt: new Date().toISOString(),
         };
       }
@@ -5041,8 +8523,11 @@ ipcMain.handle(
         targetOrientation?: "left" | "right";
         headCategories?: string[];
         tailCategories?: string[];
+        anteriorAnchorIds?: number[];
+        posteriorAnchorIds?: number[];
         bilateralPairs?: [number, number][];
-        pcaLevelingMode?: "off" | "on" | "auto";
+        bilateralClassAxis?: "vertical_obb";
+        obbLevelingMode?: "on" | "off";
       };
     }
   ) => {
@@ -5102,6 +8587,53 @@ ipcMain.handle(
 );
 
 ipcMain.handle(
+  "session:update-obb-detector-settings",
+  async (
+    _event,
+    args: {
+      speciesId: string;
+      obbTrainingSettings?: Record<string, unknown>;
+      obbDetectionSettings?: Record<string, unknown>;
+      obbTrainingSettingsCustomized?: boolean;
+      obbDetectionSettingsCustomized?: boolean;
+    }
+  ) => {
+    try {
+      const sessionDir = getSessionDir(args.speciesId);
+      const sessionJsonPath = path.join(sessionDir, "session.json");
+      if (!fs.existsSync(sessionJsonPath)) {
+        return { ok: false, error: `Session not found: ${args.speciesId}` };
+      }
+      const meta = JSON.parse(fs.readFileSync(sessionJsonPath, "utf-8"));
+      if (args.obbTrainingSettings !== undefined) {
+        meta.obbTrainingSettings = normalizeObbTrainingSettings(args.obbTrainingSettings);
+        meta.obbTrainingSettingsCustomized =
+          typeof args.obbTrainingSettingsCustomized === "boolean"
+            ? args.obbTrainingSettingsCustomized
+            : true;
+      } else if (typeof args.obbTrainingSettingsCustomized === "boolean") {
+        meta.obbTrainingSettingsCustomized = args.obbTrainingSettingsCustomized;
+      }
+      if (args.obbDetectionSettings !== undefined) {
+        meta.obbDetectionSettings = normalizeObbDetectionSettings(args.obbDetectionSettings);
+        meta.obbDetectionSettingsCustomized =
+          typeof args.obbDetectionSettingsCustomized === "boolean"
+            ? args.obbDetectionSettingsCustomized
+            : true;
+      } else if (typeof args.obbDetectionSettingsCustomized === "boolean") {
+        meta.obbDetectionSettingsCustomized = args.obbDetectionSettingsCustomized;
+      }
+      meta.lastModified = new Date().toISOString();
+      fs.writeFileSync(sessionJsonPath, JSON.stringify(meta, null, 2));
+      return { ok: true };
+    } catch (e: any) {
+      console.error("session:update-obb-detector-settings failed:", e);
+      return { ok: false, error: e.message };
+    }
+  }
+);
+
+ipcMain.handle(
   "session:load-inference-review-drafts",
   async (_event, args: { speciesId: string; inferenceSessionId?: string }) => {
     try {
@@ -5136,6 +8668,22 @@ ipcMain.handle(
         JSON.stringify({ version: 1, imagePaths: args.imagePaths }, null, 2),
         "utf-8"
       );
+      // Eagerly copy images into the training data directory so commits
+      // succeed even if the original source files are later moved or deleted.
+      const trainingImagesDir = path.join(getSessionDir(args.speciesId), "images");
+      fs.mkdirSync(trainingImagesDir, { recursive: true });
+      for (const p of args.imagePaths || []) {
+        if (!p.path || !p.name) continue;
+        const dest = path.join(trainingImagesDir, p.name);
+        try {
+          if (path.resolve(p.path) === path.resolve(dest)) continue;
+          if (!fs.existsSync(p.path)) continue;
+          if (fs.existsSync(dest)) continue;
+          fs.copyFileSync(p.path, dest);
+        } catch {
+          // Non-fatal: commit handler has an extension-agnostic fallback
+        }
+      }
       return { ok: true };
     } catch (e: any) {
       console.error("session:save-inference-image-paths failed:", e);
@@ -5162,7 +8710,12 @@ ipcMain.handle(
         .map((p) => {
           const data = fs.readFileSync(p.path).toString("base64");
           const ext = path.extname(p.name).toLowerCase().slice(1);
-          const mimeType = ext === "png" ? "image/png" : (ext === "jpg" || ext === "jpeg") ? "image/jpeg" : "image/png";
+          const MIME_MAP: Record<string, string> = {
+            png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+            webp: "image/webp", bmp: "image/bmp", gif: "image/gif",
+            tiff: "image/tiff", tif: "image/tiff",
+          };
+          const mimeType = MIME_MAP[ext] ?? "image/jpeg";
           return { path: p.path, name: p.name, data, mimeType };
         });
       return { ok: true, images };
@@ -5343,14 +8896,15 @@ ipcMain.handle(
         "labels",
         args.filename.replace(/\.\w+$/, ".json")
       );
+      clearFinalizedStateForImage(args.speciesId, args.filename, imagePath);
 
       if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
       if (fs.existsSync(labelPath)) fs.unlinkSync(labelPath);
 
-      // Remove persisted inference-review drafts for this image.
+      // Remove persisted inference-review drafts for this image (legacy root + canonical session).
+      const lowerName = (args.filename || "").toLowerCase();
       try {
         const drafts = readInferenceReviewDrafts(args.speciesId);
-        const lowerName = (args.filename || "").toLowerCase();
         for (const [key, item] of Object.entries(drafts.items)) {
           if ((item?.filename || "").toLowerCase() === lowerName) {
             delete drafts.items[key];
@@ -5358,6 +8912,28 @@ ipcMain.handle(
         }
         drafts.updatedAt = new Date().toISOString();
         writeInferenceReviewDrafts(args.speciesId, drafts);
+      } catch (_) {
+        // non-critical cleanup
+      }
+      try {
+        const sessionDrafts = readInferenceReviewDrafts(args.speciesId, CANONICAL_INFERENCE_SESSION_ID);
+        for (const [key, item] of Object.entries(sessionDrafts.items)) {
+          if ((item?.filename || "").toLowerCase() === lowerName) delete sessionDrafts.items[key];
+        }
+        sessionDrafts.updatedAt = new Date().toISOString();
+        writeInferenceReviewDrafts(args.speciesId, sessionDrafts, CANONICAL_INFERENCE_SESSION_ID);
+      } catch (_) {
+        // non-critical cleanup
+      }
+      try {
+        const pathsFile = path.join(getInferenceSessionDir(args.speciesId, CANONICAL_INFERENCE_SESSION_ID), "image_paths.json");
+        if (fs.existsSync(pathsFile)) {
+          const { imagePaths } = JSON.parse(fs.readFileSync(pathsFile, "utf-8"));
+          const filtered = (imagePaths as Array<{ path: string }>).filter(
+            (p) => path.basename(p.path).toLowerCase() !== lowerName
+          );
+          fs.writeFileSync(pathsFile, JSON.stringify({ imagePaths: filtered }, null, 2));
+        }
       } catch (_) {
         // non-critical cleanup
       }
@@ -5397,11 +8973,14 @@ ipcMain.handle(
   }
 );
 
-// ── SuperAnnotator persistent process manager ──
+// Ã¢â€â‚¬Ã¢â€â‚¬ SuperAnnotator persistent process manager Ã¢â€â‚¬Ã¢â€â‚¬
 
 class SuperAnnotatorProcess {
   private process: ChildProcess | null = null;
   private rl: ReadlineInterface | null = null;
+  private generation = 0;
+  private activeGeneration = 0;
+  private restartingAfterTimeout = false;
   private pending: Map<
     string,
     {
@@ -5411,23 +8990,47 @@ class SuperAnnotatorProcess {
       startedAt: number;
       timeoutMs: number;
       timeout: ReturnType<typeof setTimeout>;
+      generation: number;
     }
   > = new Map();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private requestId = 0;
-  /** True after a successful `init` command — models are loaded and ready. */
+  /** True after a successful `init` command Ã¢â‚¬â€ models are loaded and ready. */
   initCompleted = false;
   private readonly IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
   private stderrTail: string[] = [];
   private readonly MAX_STDERR_TAIL_LINES = 60;
+  private activeInitRequestIds: Set<string> = new Set();
+  private backendSignature: string | null = null;
+
+  private getBackendSignature(): string {
+    const files = [
+      path.join(__dirname, "../backend/annotation/super_annotator.py"),
+      path.join(__dirname, "../backend/data/export_yolo_dataset.py"),
+    ];
+    return files
+      .map((filePath) => {
+        try {
+          const stat = fs.statSync(filePath);
+          return `${filePath}:${stat.mtimeMs}:${stat.size}`;
+        } catch {
+          return `${filePath}:missing`;
+        }
+      })
+      .join("|");
+  }
 
   async start(): Promise<void> {
     if (this.process) return; // already running
 
-    const pyPath = getPythonPath();
+    const pythonResolution = getPythonResolution();
+    warnIfUsingSystemPython(pythonResolution);
     const scriptPath = path.join(__dirname, "../backend/annotation/super_annotator.py");
+    this.backendSignature = this.getBackendSignature();
+    const generation = ++this.generation;
+    this.activeGeneration = generation;
 
-    this.process = spawn(pyPath, [scriptPath], {
+    this.process = spawn(pythonResolution.pythonPath, [scriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: path.join(__dirname, ".."),
       // Force UTF-8 for stdin/stdout so non-ASCII paths (e.g. macOS narrow
@@ -5437,9 +9040,35 @@ class SuperAnnotatorProcess {
     });
 
     this.process.stderr?.on("data", (d: Buffer) => {
+      if (generation !== this.activeGeneration) return;
       const text = d.toString();
       this.pushStderr(text);
-      console.log("[SuperAnnotator]", text.trim());
+      const progressPrefix = "__BV_OBB_PROGRESS__";
+      const lines = text.split(/\r?\n/);
+      const passthroughLines: string[] = [];
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (line.startsWith(progressPrefix)) {
+          const payload = line.slice(progressPrefix.length);
+          try {
+            const msg = JSON.parse(payload);
+            const requestId = msg?._request_id ? String(msg._request_id) : null;
+            if (requestId) {
+              this.refreshRequestTimeout(requestId);
+            }
+            this.resetIdleTimer();
+            mainWindow?.webContents.send("ml:obb-train-progress", msg);
+          } catch (err) {
+            passthroughLines.push(line);
+          }
+        } else {
+          passthroughLines.push(line);
+        }
+      }
+      if (passthroughLines.length > 0) {
+        console.log("[SuperAnnotator]", passthroughLines.join("\n"));
+      }
     });
 
     // Absorb EPIPE and other stdin write errors so they don't surface as an
@@ -5456,16 +9085,23 @@ class SuperAnnotatorProcess {
 
     this.rl = createInterface({ input: this.process.stdout! });
     this.rl.on("line", (line: string) => {
+      if (generation !== this.activeGeneration) return;
       try {
         const msg = JSON.parse(line);
 
         // Forward progress events to renderer
         if (msg.status === "progress") {
-          if (msg._request_id) {
-            this.refreshRequestTimeout(String(msg._request_id));
+          const requestId = msg._request_id ? String(msg._request_id) : null;
+          const pendingEntry = requestId ? this.pending.get(requestId) : null;
+          if (requestId) {
+            this.refreshRequestTimeout(requestId);
           }
           this.resetIdleTimer();
-          mainWindow?.webContents.send("ml:super-annotate-progress", msg);
+          if (pendingEntry?.cmdName === "train_yolo_obb") {
+            mainWindow?.webContents.send("ml:obb-train-progress", msg);
+          } else {
+            mainWindow?.webContents.send("ml:super-annotate-progress", msg);
+          }
           return;
         }
 
@@ -5474,11 +9110,18 @@ class SuperAnnotatorProcess {
           const requestId = String(msg._request_id);
           const entry = this.pending.get(requestId);
           if (!entry) {
-            console.warn(`[SuperAnnotator] Unmatched response for request ${requestId}; ignoring stale message.`);
+            console.debug(`[SuperAnnotator] Ignored response for stale or cleared request ${requestId}.`);
+            return;
+          }
+          if (entry.generation !== generation) {
+            clearTimeout(entry.timeout);
+            this.pending.delete(requestId);
+            this.activeInitRequestIds.delete(requestId);
             return;
           }
           clearTimeout(entry.timeout);
           this.pending.delete(requestId);
+          this.activeInitRequestIds.delete(requestId);
           entry.resolve(msg);
           this.resetIdleTimer();
           return;
@@ -5489,6 +9132,7 @@ class SuperAnnotatorProcess {
           const [firstId, handler] = this.pending.entries().next().value!;
           clearTimeout(handler.timeout);
           this.pending.delete(firstId);
+          this.activeInitRequestIds.delete(firstId);
           handler.resolve(msg);
           this.resetIdleTimer();
           return;
@@ -5504,6 +9148,7 @@ class SuperAnnotatorProcess {
     });
 
     this.process.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      if (generation !== this.activeGeneration) return;
       const stderrTail = this.getLastStderrTail();
       const suffix = stderrTail ? `\nRecent stderr:\n${stderrTail}` : "";
       console.log(`[SuperAnnotator] Process exited with code ${code}, signal ${signal}`);
@@ -5517,9 +9162,11 @@ class SuperAnnotatorProcess {
         );
       }
       this.pending.clear();
+      this.activeInitRequestIds.clear();
       this.process = null;
       this.rl = null;
       this.initCompleted = false; // models must be reloaded on next start
+      this.restartingAfterTimeout = false;
     });
 
     this.process.on("error", (err: Error) => {
@@ -5530,6 +9177,11 @@ class SuperAnnotatorProcess {
   }
 
   async send(cmd: Record<string, unknown>): Promise<any> {
+    const currentSignature = this.getBackendSignature();
+    if (this.process && this.backendSignature && currentSignature !== this.backendSignature) {
+      console.log("[SuperAnnotator] Backend scripts changed on disk, restarting process");
+      await this.stop();
+    }
     if (!this.process) {
       await this.start();
     }
@@ -5546,11 +9198,14 @@ class SuperAnnotatorProcess {
         const entry = this.pending.get(id);
         if (!entry) return;
         this.pending.delete(id);
+        this.activeInitRequestIds.delete(id);
+        const elapsedSec = Math.round((Date.now() - entry.startedAt) / 1000);
         entry.reject(
           new Error(
             `SuperAnnotator request timed out after ${Math.round(timeoutMs / 1000)}s (cmd="${cmdName}").`
           )
         );
+        void this.restartAfterTimeout(id, cmdName, elapsedSec);
         this.resetIdleTimer();
       }, timeoutMs);
 
@@ -5561,7 +9216,11 @@ class SuperAnnotatorProcess {
         startedAt: Date.now(),
         timeoutMs,
         timeout,
+        generation: this.activeGeneration,
       });
+      if (cmdName === "init") {
+        this.activeInitRequestIds.add(id);
+      }
 
       try {
         if (!this.process?.stdin || this.process.stdin.destroyed) {
@@ -5571,6 +9230,7 @@ class SuperAnnotatorProcess {
       } catch (err: any) {
         clearTimeout(timeout);
         this.pending.delete(id);
+        this.activeInitRequestIds.delete(id);
         reject(new Error(`Failed to write SuperAnnotator command "${cmdName}": ${err?.message || err}`));
       }
     });
@@ -5602,6 +9262,31 @@ class SuperAnnotatorProcess {
     });
     this.process = null;
     this.rl = null;
+  }
+
+  private async restartAfterTimeout(requestId: string, cmdName: string, elapsedSec: number): Promise<void> {
+    if (this.restartingAfterTimeout) return;
+    this.restartingAfterTimeout = true;
+    const pendingEntries = [...this.pending.entries()];
+    console.warn(
+      `[SuperAnnotator] Request ${requestId} timed out after ${elapsedSec}s (cmd="${cmdName}"); restarting backend and clearing ${pendingEntries.length} pending request(s).`
+    );
+    for (const [pendingId, handler] of pendingEntries) {
+      clearTimeout(handler.timeout);
+      handler.reject(
+        new Error(
+          `SuperAnnotator backend restarted after timeout while handling "${handler.cmdName}".`
+        )
+      );
+      this.pending.delete(pendingId);
+      this.activeInitRequestIds.delete(pendingId);
+    }
+    this.activeGeneration += 1;
+    try {
+      await this.stop();
+    } finally {
+      this.restartingAfterTimeout = false;
+    }
   }
 
   private resetIdleTimer(): void {
@@ -5636,8 +9321,8 @@ class SuperAnnotatorProcess {
   }
 
   private getRequestTimeoutMs(cmdName: string): number {
-    if (cmdName === "train_yolo") return 4 * 60 * 60 * 1000;
     if (cmdName === "annotate") return 15 * 60 * 1000;
+    if (cmdName === "train_yolo_obb") return 30 * 60 * 1000;
     if (cmdName === "init" || cmdName === "check") return 2 * 60 * 1000;
     return 5 * 60 * 1000;
   }
@@ -5650,11 +9335,14 @@ class SuperAnnotatorProcess {
       const active = this.pending.get(requestId);
       if (!active) return;
       this.pending.delete(requestId);
+      this.activeInitRequestIds.delete(requestId);
+      const elapsedSec = Math.round((Date.now() - active.startedAt) / 1000);
       active.reject(
         new Error(
           `SuperAnnotator request timed out after ${Math.round(active.timeoutMs / 1000)}s (cmd="${active.cmdName}").`
         )
       );
+      void this.restartAfterTimeout(requestId, active.cmdName, elapsedSec);
       this.resetIdleTimer();
     }, entry.timeoutMs);
   }
@@ -5662,15 +9350,127 @@ class SuperAnnotatorProcess {
   get isRunning(): boolean {
     return this.process !== null;
   }
+
+  get isInitializing(): boolean {
+    return this.activeInitRequestIds.size > 0;
+  }
 }
 
 const superAnnotator = new SuperAnnotatorProcess();
 
+type SuperAnnotatorRuntimeState =
+  | "not_started"
+  | "checking"
+  | "not_initialized"
+  | "initializing"
+  | "ready"
+  | "failed";
+
+type CapabilityStatusSource = "local_estimate" | "python_probe" | "python_check";
+
+function getSuperAnnotatorRuntimeState(result?: {
+  yolo_ready?: boolean;
+  sam2_ready?: boolean;
+  yolo_failed?: boolean;
+  sam2_failed?: boolean;
+}): SuperAnnotatorRuntimeState {
+  if (result?.yolo_failed || result?.sam2_failed) {
+    return "failed";
+  }
+  if (superAnnotator.isInitializing) {
+    return "initializing";
+  }
+  if (superAnnotator.initCompleted || result?.yolo_ready || result?.sam2_ready) {
+    return "ready";
+  }
+  if (superAnnotator.isRunning) {
+    return "not_initialized";
+  }
+  return "not_started";
+}
+
+const SAM2_MINIMUM_REQUIREMENTS_CACHE_TTL_MS = 30_000;
+let sam2MinimumRequirementsCache:
+  | { ok: boolean; error?: string; checkedAtMs: number }
+  | null = null;
+
+async function checkSam2MinimumRequirements(force = false): Promise<{ ok: boolean; error?: string }> {
+  const now = Date.now();
+  if (
+    !force &&
+    sam2MinimumRequirementsCache &&
+    now - sam2MinimumRequirementsCache.checkedAtMs <= SAM2_MINIMUM_REQUIREMENTS_CACHE_TTL_MS
+  ) {
+    return { ok: sam2MinimumRequirementsCache.ok, error: sam2MinimumRequirementsCache.error };
+  }
+
+  try {
+    const hwScript = path.join(__dirname, "../backend/hardware_probe.py");
+    const hwOut = await runPython([hwScript]);
+    const hw = JSON.parse(hwOut.trim());
+    const device = String(hw?.device ?? "cpu");
+    const ramGb = Number(hw?.ram_gb ?? 0);
+    const ok = device !== "cpu" && ramGb >= 8;
+    const error = ok
+      ? undefined
+      : `SAM2 requires non-CPU acceleration and at least 8 GB RAM. Detected device=${device}, RAM=${Number.isFinite(ramGb) ? ramGb : 0} GB.`;
+    sam2MinimumRequirementsCache = { ok, error, checkedAtMs: now };
+    return { ok, error };
+  } catch (e: any) {
+    const error = e?.message || "Failed to verify SAM2 hardware requirements.";
+    sam2MinimumRequirementsCache = { ok: false, error, checkedAtMs: now };
+    return { ok: false, error };
+  }
+}
+
+function persistFinalizedDetection(
+  sessionDir: string,
+  speciesId: string,
+  filename: string,
+  acceptedBoxes: FinalizedAcceptedBox[],
+  signature: string
+): void {
+  const labelsDir = path.join(sessionDir, "labels");
+  fs.mkdirSync(labelsDir, { recursive: true });
+  const labelPath = path.join(labelsDir, filename.replace(/\.\w+$/, ".json"));
+  let payload: any = {
+    imageFilename: filename,
+    speciesId,
+    boxes: [],
+    rejectedDetections: [],
+  };
+  if (fs.existsSync(labelPath)) {
+    try {
+      payload = JSON.parse(fs.readFileSync(labelPath, "utf-8"));
+    } catch {
+      // keep default payload
+    }
+  }
+  payload.imageFilename = payload.imageFilename || filename;
+  payload.speciesId = payload.speciesId || speciesId;
+  payload.boxes = Array.isArray(payload.boxes) ? payload.boxes : [];
+  payload.rejectedDetections = Array.isArray(payload.rejectedDetections) ? payload.rejectedDetections : [];
+  payload.finalizedDetection = {
+    isFinalized: true,
+    finalizedAt: new Date().toISOString(),
+    acceptedBoxes,
+    boxSignature: signature,
+  };
+  fs.writeFileSync(labelPath, JSON.stringify(payload, null, 2));
+  resolveFinalizedState(sessionDir, { reconcile: true });
+}
+
 async function ensureSam2Ready(): Promise<{ ok: boolean; error?: string }> {
   try {
+    const minimumRequirements = await checkSam2MinimumRequirements();
+    if (!minimumRequirements.ok) {
+      return minimumRequirements;
+    }
     if (!superAnnotator.isRunning) {
       const initRes = await superAnnotator.send({ cmd: "init" });
       if (initRes?.sam2_loaded) {
+        superAnnotator.initCompleted = true;
+        kickAllSegmentSaveQueues();
         return { ok: true };
       }
       const checkRes = await superAnnotator.send({ cmd: "check" });
@@ -5684,6 +9484,8 @@ async function ensureSam2Ready(): Promise<{ ok: boolean; error?: string }> {
 
     const initRes = await superAnnotator.send({ cmd: "init" });
     if (initRes?.sam2_loaded) {
+      superAnnotator.initCompleted = true;
+      kickAllSegmentSaveQueues();
       return { ok: true };
     }
     const recheck = await superAnnotator.send({ cmd: "check" });
@@ -5693,47 +9495,318 @@ async function ensureSam2Ready(): Promise<{ ok: boolean; error?: string }> {
   }
 }
 
-// ── SuperAnnotator IPC handlers ──
+async function deriveImportedBoxGeometryWithSam2(
+  imagePath: string,
+  box: ImportedNormalizedBox,
+  imageDims: { width: number; height: number } | null,
+  geometryConfig?: ImportGeometryConfig
+): Promise<Pick<ImportedNormalizedBox, "left" | "top" | "width" | "height" | "maskOutline" | "obbCorners" | "angle"> | null> {
+  const resolvedGeometry = normalizeImportGeometryConfig(geometryConfig);
+  const initialBox = buildImportSam2PromptBox(box, imageDims, geometryConfig);
+  const expandRatio = Math.max(
+    resolvedGeometry.paddingProfile.forward,
+    resolvedGeometry.paddingProfile.backward,
+    resolvedGeometry.paddingProfile.top,
+    resolvedGeometry.paddingProfile.bottom,
+    0.10
+  );
 
-/**
- * Fast, synchronous capability estimate using Node.js OS APIs.
- * Used when the Python process isn't running yet to avoid blocking the UI
- * on a cold Python startup just to show the capability badges.
- * GPU presence is unknown without Python; mode may be upgraded to
- * auto_high_performance once the real check runs after init.
- */
-function getLocalCapabilityEstimate() {
-  const freeRamGb = os.freemem() / (1024 ** 3);
-  const mode = freeRamGb > 1.0 ? "auto_lite" : "classic_fallback";
+  const result = await superAnnotator.send({
+    cmd: "resegment_box",
+    image_path: imagePath,
+    box_xyxy: initialBox,
+    iterative: true,
+    expand_ratio: expandRatio,
+  });
+
+  if (!result?.ok) {
+    return null;
+  }
+
+  const normalizePointPairs = (points: unknown): [number, number][] | undefined => {
+    if (!Array.isArray(points)) return undefined;
+    const normalized = points
+      .map((point) => {
+        if (!Array.isArray(point) || point.length < 2) return null;
+        const x = Number(point[0]);
+        const y = Number(point[1]);
+        if (!isFiniteNumber(x) || !isFiniteNumber(y)) return null;
+        return [Math.round(x), Math.round(y)] as [number, number];
+      })
+      .filter((point): point is [number, number] => Boolean(point));
+    return normalized.length > 0 ? normalized : undefined;
+  };
+
+  const maskOutline = normalizePointPairs(result.mask_outline);
+  const obbCorners = normalizePointPairs(result.obb_corners);
+  const resultBoxXyxy =
+    Array.isArray(result.box_xyxy) &&
+    result.box_xyxy.length === 4 &&
+    result.box_xyxy.every((value: unknown) => isFiniteNumber(Number(value)))
+      ? (result.box_xyxy.map((value: unknown) => Math.round(Number(value))) as [number, number, number, number])
+      : null;
+
+  let left: number;
+  let top: number;
+  let width: number;
+  let height: number;
+
+  if (resultBoxXyxy) {
+    left = resultBoxXyxy[0];
+    top = resultBoxXyxy[1];
+    width = Math.max(1, resultBoxXyxy[2] - resultBoxXyxy[0]);
+    height = Math.max(1, resultBoxXyxy[3] - resultBoxXyxy[1]);
+  } else if (obbCorners && obbCorners.length === 4) {
+    const aabb = importedCornersToAabb(obbCorners, null);
+    left = aabb.left;
+    top = aabb.top;
+    width = aabb.width;
+    height = aabb.height;
+  } else {
+    return null;
+  }
+
   return {
-    available: true,
-    mode,
-    gpu: false,
-    yolo_ready: false,
-    sam2_ready: false,
-    yolo_failed: false,
-    sam2_failed: false,
+    left,
+    top,
+    width,
+    height,
+    ...(maskOutline ? { maskOutline } : {}),
+    ...(obbCorners && obbCorners.length === 4 ? { obbCorners } : {}),
+    ...(isFiniteNumber(result.angle) ? { angle: Number(result.angle) } : {}),
   };
 }
 
-ipcMain.handle("ml:check-super-annotator", async () => {
-  // If the process isn't running yet, return an instant local estimate so
-  // the UI renders immediately without waiting for a cold Python startup.
-  if (!superAnnotator.isRunning) {
-    return getLocalCapabilityEstimate();
+function normalizeSessionStoredBoxes(boxes: any[]): any[] {
+  if (!Array.isArray(boxes)) return [];
+  const usedIds = new Set<number>();
+  let nextFallbackId = 0;
+
+  return boxes.map((box: any, index: number) => {
+    let id = isFiniteNumber(box?.id) ? Math.round(Number(box.id)) : index;
+    while (usedIds.has(id)) {
+      id = nextFallbackId;
+      nextFallbackId += 1;
+    }
+    usedIds.add(id);
+    nextFallbackId = Math.max(nextFallbackId, id + 1);
+    return { ...box, id };
+  });
+}
+
+function finalizedAcceptedBoxesHaveObb(boxes: any[]): boolean {
+  return Array.isArray(boxes) && boxes.some((box: any) =>
+    Array.isArray(box?.obbCorners) &&
+    box.obbCorners.length === 4 &&
+    Number.isFinite(Number(box?.angle)) &&
+    Number.isFinite(Number(box?.class_id))
+  );
+}
+
+function normalizeFinalizedAcceptedBoxesForSession(boxes: any[]): any[] {
+  if (!Array.isArray(boxes)) return [];
+  const normalized = normalizeFinalizedAcceptedBoxes(boxes as any);
+  return normalizeSessionStoredBoxes(
+    normalized.map((box, index) => ({
+      id: index,
+      left: box.left,
+      top: box.top,
+      width: box.width,
+      height: box.height,
+      ...(box.orientation_override ? { orientation_override: box.orientation_override } : {}),
+      ...(box.orientation_hint ? { orientation_hint: box.orientation_hint } : {}),
+      ...(Array.isArray(box.obbCorners) && box.obbCorners.length === 4 ? { obbCorners: box.obbCorners } : {}),
+      ...(box.angle != null ? { angle: box.angle } : {}),
+      ...(box.class_id != null ? { class_id: box.class_id } : {}),
+      ...(Array.isArray(box.landmarks) ? { landmarks: box.landmarks } : {}),
+    }))
+  );
+}
+
+type LandmarkWorkerProgress = {
+  percent: number;
+  stage: string;
+  current_specimen?: number;
+  total_specimens?: number;
+};
+
+class LandmarkInferenceWorkerProcess {
+  private process: ChildProcess | null = null;
+  private rl: ReadlineInterface | null = null;
+  private requestId = 0;
+  private pending = new Map<
+    string,
+    {
+      resolve: (value: any) => void;
+      reject: (error: Error) => void;
+      onProgress?: (data: LandmarkWorkerProgress) => void;
+      timeout: ReturnType<typeof setTimeout>;
+    }
+  >();
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+
+  async start(): Promise<void> {
+    if (this.process) return;
+    const pyPath = getPythonPath();
+    const scriptPath = path.join(__dirname, "../backend/inference/predict_worker.py");
+    this.process = spawn(pyPath, [scriptPath], {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: path.join(__dirname, ".."),
+      env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
+    });
+
+    this.process.stderr?.on("data", (d: Buffer) => {
+      console.log("[LandmarkWorker]", d.toString().trim());
+    });
+
+    this.process.stdin?.on("error", () => {
+      // close handler rejects pending work
+    });
+
+    this.rl = createInterface({ input: this.process.stdout! });
+    this.rl.on("line", (line: string) => {
+      try {
+        const msg = JSON.parse(line);
+        const requestId = String(msg?._request_id || "");
+        if (msg?.status === "progress") {
+          const entry = this.pending.get(requestId);
+          entry?.onProgress?.({
+            percent: Number(msg.percent) || 0,
+            stage: String(msg.stage || "progress"),
+            current_specimen: Number.isFinite(Number(msg.current_specimen)) ? Number(msg.current_specimen) : undefined,
+            total_specimens: Number.isFinite(Number(msg.total_specimens)) ? Number(msg.total_specimens) : undefined,
+          });
+          this.resetIdleTimer();
+          return;
+        }
+        const entry = this.pending.get(requestId);
+        if (!entry) return;
+        clearTimeout(entry.timeout);
+        this.pending.delete(requestId);
+        if (msg?.status === "error" || msg?.ok === false) {
+          entry.reject(new Error(String(msg?.error || "Landmark worker request failed.")));
+        } else {
+          entry.resolve(msg?.data);
+        }
+        this.resetIdleTimer();
+      } catch (error) {
+        console.error("[LandmarkWorker] Failed to parse response:", error);
+      }
+    });
+
+    this.process.on("close", (code) => {
+      const error = new Error(`Landmark worker exited with code ${code ?? -1}`);
+      for (const [, entry] of this.pending) {
+        clearTimeout(entry.timeout);
+        entry.reject(error);
+      }
+      this.pending.clear();
+      this.cleanup();
+    });
+
+    this.resetIdleTimer();
   }
+
+  async stop(): Promise<void> {
+    if (!this.process) return;
+    try {
+      await this.sendRequest("shutdown", {}, 2000);
+    } catch {
+      // ignore best-effort shutdown
+    } finally {
+      this.process.kill();
+      this.cleanup();
+    }
+  }
+
+  async predict(
+    payload: {
+      project_root: string;
+      tag: string;
+      predictor_type: "dlib" | "cnn";
+      image_path: string;
+      boxes: NonNullable<PredictOptions["boxes"]>;
+    },
+    onProgress?: (data: LandmarkWorkerProgress) => void
+  ): Promise<any> {
+    return this.sendRequest("predict", payload, 5 * 60 * 1000, onProgress);
+  }
+
+  private async sendRequest(
+    cmd: string,
+    payload: Record<string, unknown>,
+    timeoutMs: number,
+    onProgress?: (data: LandmarkWorkerProgress) => void
+  ): Promise<any> {
+    await this.start();
+    if (!this.process?.stdin?.writable) {
+      throw new Error("Landmark worker is not writable.");
+    }
+    const requestId = `lw_${Date.now()}_${++this.requestId}`;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(requestId);
+        reject(new Error(`Landmark worker request timed out for ${cmd}.`));
+      }, timeoutMs);
+      this.pending.set(requestId, { resolve, reject, onProgress, timeout });
+      this.process!.stdin!.write(
+        JSON.stringify({ cmd, _request_id: requestId, ...payload }) + "\n",
+        "utf8"
+      );
+      this.resetIdleTimer();
+    });
+  }
+
+  private resetIdleTimer(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      void this.stop();
+    }, this.IDLE_TIMEOUT_MS);
+  }
+
+  private cleanup(): void {
+    if (this.rl) {
+      this.rl.removeAllListeners();
+      this.rl.close();
+    }
+    this.rl = null;
+    this.process = null;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+  }
+}
+
+const landmarkInferenceWorker = new LandmarkInferenceWorkerProcess();
+
+// Ã¢â€â‚¬Ã¢â€â‚¬ SuperAnnotator IPC handlers Ã¢â€â‚¬Ã¢â€â‚¬
+
+ipcMain.handle("ml:check-super-annotator", async () => {
+  const pythonResolution = getPythonResolution();
+  warnIfUsingSystemPython(pythonResolution);
   try {
     const result = await superAnnotator.send({ cmd: "check" });
-    return result;
+    return {
+      ...result,
+      mode: result?.mode ?? "unknown",
+      runtimeState: getSuperAnnotatorRuntimeState(result),
+      statusSource: "python_check" as CapabilityStatusSource,
+      pythonPath: pythonResolution.pythonPath,
+      usingRepoVenv: pythonResolution.usingRepoVenv,
+    };
   } catch (e: any) {
     return {
       available: true,
-      mode: "classic_fallback",
+      mode: "unknown",
       gpu: false,
       yolo_ready: false,
       sam2_ready: false,
       yolo_failed: false,
       sam2_failed: false,
+      runtimeState: "failed" as SuperAnnotatorRuntimeState,
+      statusSource: "local_estimate" as CapabilityStatusSource,
+      pythonPath: pythonResolution.pythonPath,
+      usingRepoVenv: pythonResolution.usingRepoVenv,
       error: e.message,
     };
   }
@@ -5742,59 +9815,80 @@ ipcMain.handle("ml:check-super-annotator", async () => {
 ipcMain.handle("ml:init-super-annotator", async () => {
   try {
     const result = await superAnnotator.send({ cmd: "init" });
+    if (result?.sam2_loaded) {
+      superAnnotator.initCompleted = true;
+      kickAllSegmentSaveQueues();
+    }
     return { ok: true, ...result };
   } catch (e: any) {
     return { ok: false, error: e.message };
   }
 });
 
-ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, options?: { epochs?: number; modelTier?: "nano" | "small"; iou?: number; cls?: number; box?: number }) => {
+ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, options?: {
+  epochs?: number;
+  batch?: number;
+  modelTier?: ObbModelTier;
+  imgsz?: ObbImageSize;
+  iou?: number;
+  cls?: number;
+  box?: number;
+  samEnabled?: boolean;
+}) => {
   try {
-    if (!superAnnotator.isRunning) {
-      await superAnnotator.send({ cmd: "init" });
-    }
-    const sessionDir = path.join(projectRoot, "sessions", speciesId);
+    const sessionDir = getSessionDir(speciesId);
     if (!fs.existsSync(sessionDir)) {
       return { ok: false, error: `Session directory not found: ${sessionDir}` };
     }
+    const sessionJsonPath = path.join(sessionDir, "session.json");
+    const sessionMeta = safeReadJson(sessionJsonPath) ?? {};
+    const persistedTrainingSettings = readNormalizedSessionObbTrainingSettings(sessionMeta);
 
     // Get hardware tier; user-provided modelTier takes precedence
     const caps = await superAnnotator.send({ cmd: "check" });
-    const modelTier = options?.modelTier ?? caps?.obb_model_tier ?? "nano";
+    const modelTier =
+      options?.modelTier ??
+      persistedTrainingSettings.modelTier ??
+      caps?.obb_model_tier ??
+      "nano";
 
-    // Probe hardware to determine device + SAM2 availability for routing
+    // Probe hardware to determine device for routing.
     let hwDevice = "cpu";
-    let hwSam2Enabled = false;
     try {
       const hwScript = path.join(__dirname, "../backend/hardware_probe.py");
       const hwOut = await runPython([hwScript]);
       const hw = JSON.parse(hwOut.trim());
       hwDevice = hw.device ?? "cpu";
-      hwSam2Enabled = hwDevice !== "cpu" && (hw.ram_gb ?? 0) >= 8;
     } catch (_hwErr) {
-      console.warn("Hardware probe failed during OBB training — defaulting to cpu");
+      console.warn("Hardware probe failed during OBB training Ã¢â‚¬â€ defaulting to cpu");
     }
 
     // Read orientation schema from session.json
     let orientationSchema = "invariant";
-    const sessionJsonPath = path.join(sessionDir, "session.json");
     if (fs.existsSync(sessionJsonPath)) {
       try {
-        const session = safeReadJson(sessionJsonPath) ?? {};
-        orientationSchema = (session as any).orientationPolicy?.mode ?? "invariant";
+        orientationSchema = (sessionMeta as any).orientationPolicy?.mode ?? "invariant";
       } catch (_) { /* non-fatal */ }
     }
 
+    const samEnabled = options?.samEnabled === true;
+    const resolvedTrainingSettings = normalizeObbTrainingSettings({
+      ...persistedTrainingSettings,
+      ...options,
+      modelTier,
+    });
     const result = await superAnnotator.send({
       cmd: "train_yolo_obb",
       session_dir: sessionDir,
-      epochs: options?.epochs,   // undefined → Python selects hardware-appropriate default
+      epochs: resolvedTrainingSettings.epochs,
+      batch: resolvedTrainingSettings.batch,
+      imgsz: resolvedTrainingSettings.imgsz,
       model_tier: modelTier,
       device: hwDevice,
-      sam2_enabled: hwSam2Enabled,
-      iou_loss: options?.iou ?? 0.3,
-      cls_loss: options?.cls ?? 1.5,
-      box_loss: options?.box ?? 5.0,
+      sam2_enabled: samEnabled,
+      iou_loss: resolvedTrainingSettings.iou,
+      cls_loss: resolvedTrainingSettings.cls,
+      box_loss: resolvedTrainingSettings.box,
       orientation_schema: orientationSchema,
     });
 
@@ -5807,52 +9901,21 @@ ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, option
       try {
         const session = safeReadJson(sessionJsonPath) ?? {};
         (session as any).obbDetectorReady = true;
+        (session as any).obbTrainingSettings = resolvedTrainingSettings;
         fs.writeFileSync(sessionJsonPath, JSON.stringify(session, null, 2), "utf-8");
       } catch (_e) {
         // non-fatal
       }
     }
 
-    return { ok: true, modelPath: result?.model_path, map50: result?.map50 ?? null };
+    return {
+      ok: true,
+      modelPath: result?.model_path,
+      map50: result?.map50 ?? null,
+      warnings: Array.isArray(result?.warnings) ? result.warnings : [],
+    };
   } catch (e: any) {
     console.error("OBB detector training failed:", e);
-    return { ok: false, error: e.message };
-  }
-});
-
-ipcMain.handle("ml:tag-class-ids", async (_event, speciesId: string, boxes: any[]) => {
-  try {
-    if (!superAnnotator.isRunning) {
-      await superAnnotator.send({ cmd: "init" });
-    }
-    const sessionDir = path.join(projectRoot, "sessions", speciesId);
-    if (!fs.existsSync(sessionDir)) {
-      return { ok: false, error: `Session not found: ${sessionDir}` };
-    }
-
-    // Load orientation policy from session.json
-    let orientationPolicy: any = null;
-    const sessionJsonPath = path.join(sessionDir, "session.json");
-    if (fs.existsSync(sessionJsonPath)) {
-      try {
-        const session = safeReadJson(sessionJsonPath) ?? {};
-        orientationPolicy = (session as any).orientationPolicy ?? null;
-      } catch (_) { /* non-fatal */ }
-    }
-
-    const result = await superAnnotator.send({
-      cmd: "tag_class_ids",
-      session_dir: sessionDir,
-      boxes: boxes || [],
-      orientation_policy: orientationPolicy,
-    });
-
-    if (result?.status === "error") {
-      return { ok: false, error: result.error ?? "tag_class_ids failed" };
-    }
-    return { ok: true, taggedBoxes: result?.tagged_boxes ?? [] };
-  } catch (e: any) {
-    console.error("ml:tag-class-ids failed:", e);
     return { ok: false, error: e.message };
   }
 });
@@ -5867,11 +9930,13 @@ ipcMain.handle(
       modelTag?: string;
       speciesId?: string;
       options?: {
-        confThreshold?: number;
         samEnabled?: boolean;
         maxObjects?: number;
         detectionMode?: string;
-        detectionPreset?: string;
+        detectionPreset?: ObbDetectionPreset;
+        conf?: number;
+        nmsIou?: number;
+        imgsz?: ObbImageSize;
       };
     }
   ) => {
@@ -5882,11 +9947,12 @@ ipcMain.handle(
       if (!superAnnotator.initCompleted) {
         await superAnnotator.send({ cmd: "init" });
         superAnnotator.initCompleted = true;
+        kickAllSegmentSaveQueues();
       }
 
       // Resolve session root
       const effectiveRoot = args.speciesId
-        ? path.join(projectRoot, "sessions", args.speciesId)
+        ? getSessionDir(args.speciesId)
         : projectRoot;
 
       // Read session orientationPolicy for schema-aware canonicalization
@@ -5898,6 +9964,16 @@ ipcMain.handle(
           sessionOrientationPolicy = (sess as any).orientationPolicy ?? null;
         } catch (_) { /* non-fatal */ }
       }
+      const sessionMeta = safeReadJson(sessionJsonPath) ?? {};
+      const persistedDetectionSettings = readNormalizedSessionObbDetectionSettings(sessionMeta);
+      const resolvedDetectionSettings = normalizeObbDetectionSettings({
+        ...persistedDetectionSettings,
+        detectionPreset: args.options?.detectionPreset,
+        conf: args.options?.conf,
+        nmsIou: args.options?.nmsIou,
+        maxObjects: args.options?.maxObjects,
+        imgsz: args.options?.imgsz,
+      });
 
       // Resolve dlib model path if tag provided
       let dlibModel: string | undefined;
@@ -5913,72 +9989,8 @@ ipcMain.handle(
         }
       }
 
-      // Check for fine-tuned YOLO detection model
-      const ftModelPath = args.speciesId
-        ? getSessionYoloAliasPath(args.speciesId, args.className)
-        : path.join(effectiveRoot, "models", `yolo_${safeClassName(args.className)}.pt`);
-      const finetunedModel = fs.existsSync(ftModelPath) ? ftModelPath : undefined;
-
-      // If a session OBB detector exists, use it for annotation auto-detect
-      // instead of YOLO-World, since it is trained specifically for this session's data.
       const sessionObbPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
-      if (fs.existsSync(sessionObbPath) && superAnnotator) {
-        try {
-          const obbResult = await superAnnotator.send({
-            cmd: "detect_obb",
-            image_path: args.imagePath,
-            model_path: sessionObbPath,
-            conf: args.options?.confThreshold ?? 0.35,
-          });
-          const rawDetections: any[] = Array.isArray(obbResult?.detections) ? obbResult.detections : [];
-          const maxObj = args.options?.maxObjects ?? 20;
-          const limited = rawDetections.slice(0, maxObj);
-
-          if (limited.length > 0) {
-            const objects: any[] = [];
-            for (const det of limited) {
-              const corners: [number, number][] = det.corners ?? [];
-              const xs = corners.map((p) => p[0]);
-              const ys = corners.map((p) => p[1]);
-              const left   = Math.round(Math.min(...xs));
-              const top    = Math.round(Math.min(...ys));
-              const right  = Math.round(Math.max(...xs));
-              const bottom = Math.round(Math.max(...ys));
-              const obj: any = {
-                box: { left, top, right, bottom, width: right - left, height: bottom - top },
-                obb: {
-                  corners: corners,
-                  angle: det.angle ?? 0,
-                  center: [(left + right) / 2, (top + bottom) / 2],
-                  size: [right - left, bottom - top],
-                },
-                confidence: det.confidence ?? 0,
-                class_name: args.className ?? "specimen",
-                detection_method: "yolo_obb",
-                mask_outline: [],
-                landmarks: [],
-              };
-              // Optionally refine with SAM2 segmentation
-              if (args.options?.samEnabled !== false) {
-                try {
-                  const seg = await superAnnotator.send({
-                    cmd: "resegment_box",
-                    image_path: args.imagePath,
-                    box_xyxy: [left, top, right, bottom],
-                  });
-                  if (seg?.ok && Array.isArray(seg.mask_outline) && seg.mask_outline.length > 0) {
-                    obj.mask_outline = seg.mask_outline;
-                  }
-                } catch (_) { /* non-fatal */ }
-              }
-              objects.push(obj);
-            }
-            return { ok: true, objects, detection_method: "yolo_obb" };
-          }
-        } catch (_) {
-          // Fall through to normal annotate pipeline on any error
-        }
-      }
+      const finetunedModel = fs.existsSync(sessionObbPath) ? sessionObbPath : undefined;
 
       const samEnabled = args.options?.samEnabled ?? true;
       const result = await superAnnotator.send({
@@ -5988,11 +10000,13 @@ ipcMain.handle(
         dlib_model: dlibModel,
         id_mapping_path: idMappingPath,
         options: {
-          conf_threshold: args.options?.confThreshold ?? 0.3,
+          conf_threshold: resolvedDetectionSettings.conf,
+          nms_iou: resolvedDetectionSettings.nmsIou,
           sam_enabled: samEnabled,
-          max_objects: args.options?.maxObjects ?? 20,
+          max_objects: resolvedDetectionSettings.maxObjects,
+          imgsz: resolvedDetectionSettings.imgsz,
           detection_mode: args.options?.detectionMode ?? "auto",
-          detection_preset: args.options?.detectionPreset ?? "balanced",
+          detection_preset: resolvedDetectionSettings.detectionPreset,
           finetuned_model: finetunedModel,
           // Pass session_dir so SAM2 segments are auto-saved for synthetic augmentation
           session_dir: samEnabled ? effectiveRoot : undefined,
@@ -6052,6 +10066,7 @@ ipcMain.handle(
     args: {
       imagePath: string;
       boxXyxy: [number, number, number, number];
+      iterative?: boolean;
     }
   ) => {
     try {
@@ -6064,9 +10079,18 @@ ipcMain.handle(
         cmd: "resegment_box",
         image_path: args.imagePath,
         box_xyxy: args.boxXyxy,
+        iterative: Boolean(args.iterative),
+        expand_ratio: 0.10,
       });
       if (result.ok) {
-        return { ok: true, maskOutline: result.mask_outline as [number, number][], score: result.score };
+        return {
+          ok: true,
+          maskOutline: result.mask_outline as [number, number][],
+          obbCorners: result.obb_corners as [number, number][] | undefined,
+          angle: Number.isFinite(result.angle) ? Number(result.angle) : undefined,
+          boxXyxy: result.box_xyxy as [number, number, number, number] | undefined,
+          score: result.score,
+        };
       }
       return { ok: false, error: result.error };
     } catch (e: any) {
@@ -6076,138 +10100,7 @@ ipcMain.handle(
   }
 );
 
-ipcMain.handle(
-  "ml:get-yolo-train-plan",
-  async (
-    _event,
-    args: {
-      speciesId: string;
-      className: string;
-      epochs?: number;
-      detectionPreset?: string;
-      datasetSize?: number;
-      autoTune?: boolean;
-    }
-  ) => {
-    try {
-      const sessionDir = path.join(projectRoot, "sessions", args.speciesId);
-      if (!fs.existsSync(sessionDir)) {
-        return { ok: false, error: `Session directory not found: ${sessionDir}` };
-      }
-
-      if (!superAnnotator.initCompleted) {
-        await superAnnotator.send({ cmd: "init" });
-        superAnnotator.initCompleted = true;
-      }
-
-      const result = await superAnnotator.send({
-        cmd: "preview_yolo_train_plan",
-        session_dir: sessionDir,
-        class_name: args.className,
-        epochs: args.epochs,
-        detection_preset: args.detectionPreset ?? "balanced",
-        dataset_size: args.datasetSize,
-        auto_tune: args.autoTune ?? true,
-      });
-
-      if (result?.status === "error") {
-        return { ok: false, error: result.error ?? "YOLO training plan preview failed" };
-      }
-
-      return {
-        ok: true,
-        dataset: result?.dataset,
-        usePose: result?.use_pose,
-        detectionPreset: result?.detection_preset,
-        autoTune: result?.auto_tune,
-        datasetSizeEffective: result?.dataset_size_effective,
-        datasetSizeSource: result?.dataset_size_source,
-        resolvedTrainParams: result?.resolved_train_params,
-        preflightWarnings: result?.preflight_warnings,
-      };
-    } catch (e: any) {
-      console.error("YOLO train plan preview failed:", e);
-      return { ok: false, error: e.message };
-    }
-  }
-);
-
-ipcMain.handle(
-  "ml:train-yolo",
-  async (
-    _event,
-    args: {
-      speciesId: string;
-      className: string;
-      epochs?: number;
-      detectionPreset?: string;
-      datasetSize?: number;
-      autoTune?: boolean;
-    }
-  ) => {
-    try {
-      const sessionDir = path.join(projectRoot, "sessions", args.speciesId);
-      if (!fs.existsSync(sessionDir)) {
-        return { ok: false, error: `Session directory not found: ${sessionDir}` };
-      }
-
-      if (!superAnnotator.initCompleted) {
-        await superAnnotator.send({ cmd: "init" });
-        superAnnotator.initCompleted = true;
-      }
-
-      const result = await superAnnotator.send({
-        cmd: "train_yolo",
-        session_dir: sessionDir,
-        class_name: args.className,
-        epochs: args.epochs,
-        detection_preset: args.detectionPreset ?? "balanced",
-        dataset_size: args.datasetSize,
-        auto_tune: args.autoTune ?? true,
-      });
-
-      if (result?.status === "error") {
-        return { ok: false, error: result.error ?? "YOLO training failed" };
-      }
-
-      return {
-        ok: true,
-        modelPath: result?.active_model_path || result?.model_path,
-        candidateModelPath: result?.candidate_model_path,
-        version: result?.version,
-        promoted: result?.promoted,
-        evaluationMetricType: result?.evaluation_metric_type,
-        candidateMap50: result?.candidate_map50,
-        candidateMap50_95: result?.candidate_map50_95,
-        incumbentMap50: result?.incumbent_map50,
-        incumbentMap50_95: result?.incumbent_map50_95,
-        candidatePoseMap50: result?.candidate_pose_map50,
-        candidatePoseMap50_95: result?.candidate_pose_map50_95,
-        candidateBoxMap50: result?.candidate_box_map50,
-        candidateBoxMap50_95: result?.candidate_box_map50_95,
-        incumbentPoseMap50: result?.incumbent_pose_map50,
-        incumbentPoseMap50_95: result?.incumbent_pose_map50_95,
-        incumbentBoxMap50: result?.incumbent_box_map50,
-        incumbentBoxMap50_95: result?.incumbent_box_map50_95,
-        candidateMetrics: result?.candidate_metrics,
-        incumbentMetrics: result?.incumbent_metrics,
-        dataset: result?.dataset,
-        registryPath: result?.registry_path,
-        detectionPreset: result?.detection_preset,
-        autoTune: result?.auto_tune,
-        datasetSizeEffective: result?.dataset_size_effective,
-        datasetSizeSource: result?.dataset_size_source,
-        resolvedTrainParams: result?.resolved_train_params,
-        preflightWarnings: result?.preflight_warnings,
-      };
-    } catch (e: any) {
-      console.error("YOLO training failed:", e);
-      return { ok: false, error: e.message };
-    }
-  }
-);
-
-// ── App lifecycle ──
+// Ã¢â€â‚¬Ã¢â€â‚¬ App lifecycle Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.on("before-quit", async () => {
   await superAnnotator.stop();
@@ -6225,3 +10118,4 @@ app.on("activate", () => {
     createWindow();
   }
 });
+

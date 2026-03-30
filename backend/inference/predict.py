@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import hashlib
+import math
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -229,25 +230,83 @@ def _scale_orientation_hint(hint, scale):
     """
     if not isinstance(hint, dict):
         return hint
-    scaled = dict(hint)
     if not scale or scale == 1.0:
+        return dict(hint)
+    return _transform_orientation_hint(hint, 1.0 / float(scale))
+
+
+def _transform_orientation_hint(hint, factor):
+    """Scale any point-valued orientation metadata by factor."""
+    if not isinstance(hint, dict):
+        return hint
+    scaled = dict(hint)
+    if factor == 1.0:
         return scaled
     for point_key in ("head_point", "tail_point"):
         point = scaled.get(point_key)
         if isinstance(point, (list, tuple)) and len(point) >= 2:
             try:
-                scaled[point_key] = [round(float(point[0]) / scale, 1), round(float(point[1]) / scale, 1)]
+                scaled[point_key] = [
+                    round(float(point[0]) * float(factor), 1),
+                    round(float(point[1]) * float(factor), 1),
+                ]
             except Exception:
                 pass
     return scaled
 
 
+def _scale_obb_corners(corners, factor, image_w=None, image_h=None):
+    """Scale OBB corner coordinates while preserving canonical corner order."""
+    if not isinstance(corners, list):
+        return corners
+    scaled = []
+    for point in corners:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            x = float(point[0]) * float(factor)
+            y = float(point[1]) * float(factor)
+        except Exception:
+            continue
+        if image_w is not None:
+            x = max(0.0, min(float(image_w - 1), x))
+        if image_h is not None:
+            y = max(0.0, min(float(image_h - 1), y))
+        scaled.append([round(x, 1), round(y, 1)])
+    return scaled if len(scaled) == 4 else corners
+
+
+def _normalize_input_box(input_box, scale=1.0, image_w=None, image_h=None):
+    """Normalize a single externally-provided box into resized inference space."""
+    normalized = _normalize_input_boxes([input_box], scale=scale, image_w=image_w, image_h=image_h)
+    return normalized[0] if normalized else None
+
+
+def _scale_box_to_original(box, scale):
+    """Scale only geometric box fields back to original-image coordinates."""
+    if not isinstance(box, dict):
+        return box
+    scaled = dict(box)
+    if not scale or scale == 1.0:
+        return scaled
+    for key in ("left", "top", "right", "bottom", "width", "height"):
+        value = scaled.get(key)
+        if isinstance(value, (int, float)):
+            scaled[key] = int(round(float(value) / float(scale)))
+    for key in ("obbCorners", "obb_corners"):
+        if isinstance(scaled.get(key), list):
+            scaled[key] = _scale_obb_corners(scaled.get(key), 1.0 / float(scale))
+    if isinstance(scaled.get("orientation_hint"), dict):
+        scaled["orientation_hint"] = _scale_orientation_hint(scaled["orientation_hint"], scale)
+    return scaled
+
+
 def _resolve_orientation_hint_from_box(box, min_confidence=0.25, min_dx_ratio=0.05):
     """
-    Resolve a robust left/right hint from detector output.
+    Resolve a robust session-aware orientation hint from detector output.
 
     Uses orientation_utils.resolve_orientation_hint with a reliability gate so
-    ambiguous pose vectors do not force incorrect mirrored landmark layouts.
+    ambiguous pose vectors do not force incorrect orientation locks.
     """
     if not isinstance(box, dict):
         return None
@@ -276,10 +335,7 @@ def _should_try_canonicalization(orientation_policy):
     if not isinstance(orientation_policy, dict):
         return False
     mode = str(orientation_policy.get("mode", "invariant")).strip().lower()
-    pca_mode = str(orientation_policy.get("pcaLevelingMode", "off")).strip().lower()
-    if pca_mode not in ("off", "on", "auto"):
-        pca_mode = "off"
-    return mode != "invariant" and pca_mode in ("on", "auto")
+    return mode != "invariant"
 
 
 def _get_sam2_model():
@@ -435,96 +491,7 @@ def _sam2_mask_for_box(image_bgr, box):
         return None
 
 
-def _rough_mask_from_crop(crop_512):
-    """
-    Estimate a coarse foreground mask when SAM2 is unavailable.
-
-    This is a fallback only: threshold + largest contour in standardized crop space.
-    """
-    try:
-        gray = cv2.cvtColor(crop_512, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, mask = cv2.threshold(
-            blur,
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-        )
-        # Prefer the larger polarity (foreground can be light or dark).
-        if int(np.count_nonzero(mask)) > (mask.size // 2):
-            mask = cv2.bitwise_not(mask)
-
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        return _sanitize_binary_mask(mask, min_area=32)
-    except Exception:
-        return None
-
-
-def _canonicalize_crop_with_standard_mask(
-    crop_512,
-    crop_meta,
-    mask_512,
-    orientation_policy,
-    orientation_hint,
-):
-    if mask_512 is None:
-        return crop_512, crop_meta, None
-    try:
-        canonical_img, _mask_512, canonical_meta = ou.canonicalize_with_mask(
-            crop_512,
-            mask_512,
-            policy=orientation_policy,
-            pca_mode="auto",
-            orientation_hint=orientation_hint,
-        )
-        updated_meta = {
-            **crop_meta,
-            "rotation": float(canonical_meta.get("pca_rotation", 0.0)),
-            "canonical_flip_applied": bool(canonical_meta.get("canonical_flip_applied", False)),
-            "canonicalization": canonical_meta,
-        }
-        return canonical_img, updated_meta, canonical_meta
-    except Exception:
-        return crop_512, crop_meta, None
-
-
-def _canonicalize_crop_with_mask(
-    crop_512,
-    crop_meta,
-    mask_full,
-    orientation_policy,
-    orientation_hint,
-):
-    if mask_full is None:
-        return crop_512, crop_meta, None
-    try:
-        cx1, cy1 = [int(v) for v in crop_meta["crop_origin"]]
-        cw, ch = [int(v) for v in crop_meta["crop_size"]]
-        if cw <= 0 or ch <= 0:
-            return crop_512, crop_meta, None
-        mask_crop = mask_full[cy1:cy1 + ch, cx1:cx1 + cw]
-        if mask_crop.size == 0:
-            return crop_512, crop_meta, None
-        mask_512 = cv2.resize(
-            mask_crop.astype(np.uint8),
-            (STANDARD_SIZE, STANDARD_SIZE),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        return _canonicalize_crop_with_standard_mask(
-            crop_512,
-            crop_meta,
-            mask_512,
-            orientation_policy,
-            orientation_hint,
-        )
-    except Exception:
-        return crop_512, crop_meta, None
-
-
-def _build_inference_metadata(orientation_debug):
+def _build_inference_metadata(orientation_debug, *, clamped_landmark_count=0, box_source=None):
     """
     Build a stable metadata payload describing canonicalization + orientation choice.
     """
@@ -532,7 +499,6 @@ def _build_inference_metadata(orientation_debug):
     canonical = debug.get("canonicalization")
     if not isinstance(canonical, dict):
         canonical = {}
-    pca_rotation = canonical.get("pca_rotation")
     direction_conf = canonical.get("inferred_direction_confidence")
     raw_hint = debug.get("orientation_hint_raw")
     hint_orientation = None
@@ -552,10 +518,10 @@ def _build_inference_metadata(orientation_debug):
     was_flipped = bool(
         debug.get("was_flipped", debug.get("used_flipped_crop", False))
     )
+    clamp_count = int(max(0, clamped_landmark_count))
+    requires_review = clamp_count >= 3
     return {
         "mask_source": canonical.get("mask_source"),
-        "pca_rotation": pca_rotation,
-        "pca_angle": pca_rotation,
         "canonical_flip_applied": bool(canonical.get("canonical_flip_applied", False)),
         "direction_source": canonical.get("direction_source"),
         "inferred_direction": canonical.get("inferred_direction"),
@@ -570,6 +536,18 @@ def _build_inference_metadata(orientation_debug):
         "detector_hint_orientation": hint_orientation,
         "detector_hint_source": hint_source,
         "orientation_warning": debug.get("orientation_warning"),
+        "clamped_landmark_count": clamp_count,
+        "box_source": box_source,
+        "landmark_health_warning": (
+            {
+                "code": "high_clamp_count",
+                "message": "Many landmarks required boundary clamping; review recommended.",
+                "severity": "warning",
+            }
+            if requires_review
+            else None
+        ),
+        "review_recommended": requires_review,
     }
 
 
@@ -629,13 +607,33 @@ def _predict_with_orientation_lock(
             orientation_debug = {}
         orientation_debug["locked_from_canonicalization"] = False
         orientation_debug["orientation_warning"] = {
-            "code": "legacy_detector_no_orientation_hint",
+            "code": "missing_orientation_hint",
             "message": (
                 "Directional schema without detector orientation hint: "
-                "using dual-candidate fallback. Retrain YOLO with orientation-aware classes."
+                "using dual-candidate orientation selection."
             ),
         }
         return landmarks_512, was_flipped, orientation_debug
+
+    if orientation_mode == "bilateral" and orientation_hint in ("up", "down"):
+        primary = predict_fn(crop_512) or []
+        direction_source = None
+        direction_conf = None
+        if isinstance(canonicalization_debug, dict):
+            direction_source = canonicalization_debug.get("direction_source")
+            direction_conf = canonicalization_debug.get("direction_confidence")
+        return primary, False, {
+            "used_flipped_crop": False,
+            "selection_reason": "bilateral_detector_hint_only",
+            "candidate_b_evaluated": False,
+            "head_landmark_id": head_landmark_id,
+            "tail_landmark_id": tail_landmark_id,
+            "target_orientation": target_orientation,
+            "locked_from_canonicalization": True,
+            "lock_direction_source": direction_source,
+            "lock_direction_confidence": direction_conf,
+            "orientation_hint": orientation_hint,
+        }
 
     lock_orientation = ou.should_lock_orientation_from_canonicalization(
         canonicalization_debug,
@@ -753,30 +751,6 @@ if _torch_available:
         return coords.reshape(b, k * 2)
 
 
-    class CNNLandmarkPredictorLegacy(nn.Module):
-        """Legacy coordinate-regression head kept for backwards compatibility."""
-        def __init__(self, n_landmarks, model_variant="efficientnet_b0"):
-            super().__init__()
-            features, feat_dim, resolved_variant, fallback_reason = _build_cnn_backbone(model_variant)
-            self.features = features
-            self.pool = nn.AdaptiveAvgPool2d(1)
-            self.head = nn.Sequential(
-                nn.Flatten(),
-                nn.Linear(feat_dim, 256),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(256, n_landmarks * 2),
-                nn.Sigmoid(),
-            )
-            self.model_variant = resolved_variant
-            self.variant_fallback_reason = fallback_reason
-
-        def forward(self, x):
-            x = self.features(x)
-            x = self.pool(x)
-            return self.head(x)
-
-
     class CNNLandmarkPredictor(nn.Module):
         """Backbone + deconvolution heatmap head + soft-argmax decoder."""
         def __init__(
@@ -792,56 +766,36 @@ if _torch_available:
             features, feat_dim, resolved_variant, fallback_reason = _build_cnn_backbone(model_variant)
             self.features = features
             self.n_landmarks = int(n_landmarks)
-            self.head_type = str(head_type or "heatmap_deconv").strip().lower()
-            if self.head_type not in ("heatmap_deconv", "regression"):
-                self.head_type = "heatmap_deconv"
+            self.head_type = "heatmap_deconv"
             self.softargmax_beta = float(softargmax_beta)
             self.deconv_layers = int(max(1, deconv_layers))
             self.deconv_filters = int(max(32, deconv_filters))
             self.model_variant = resolved_variant
             self.variant_fallback_reason = fallback_reason
 
-            if self.head_type == "regression":
-                self.pool = nn.AdaptiveAvgPool2d(1)
-                self.head = nn.Sequential(
-                    nn.Flatten(),
-                    nn.Linear(feat_dim, 256),
-                    nn.ReLU(),
-                    nn.Dropout(0.3),
-                    nn.Linear(256, self.n_landmarks * 2),
-                    nn.Sigmoid(),
+            layers = []
+            in_ch = feat_dim
+            for _ in range(self.deconv_layers):
+                layers.extend(
+                    [
+                        nn.ConvTranspose2d(
+                            in_ch,
+                            self.deconv_filters,
+                            kernel_size=4,
+                            stride=2,
+                            padding=1,
+                            bias=False,
+                        ),
+                        nn.BatchNorm2d(self.deconv_filters),
+                        nn.ReLU(inplace=True),
+                    ]
                 )
-                self.deconv = None
-                self.heatmap_head = None
-            else:
-                layers = []
-                in_ch = feat_dim
-                for _ in range(self.deconv_layers):
-                    layers.extend(
-                        [
-                            nn.ConvTranspose2d(
-                                in_ch,
-                                self.deconv_filters,
-                                kernel_size=4,
-                                stride=2,
-                                padding=1,
-                                bias=False,
-                            ),
-                            nn.BatchNorm2d(self.deconv_filters),
-                            nn.ReLU(inplace=True),
-                        ]
-                    )
-                    in_ch = self.deconv_filters
-                self.deconv = nn.Sequential(*layers)
-                self.heatmap_head = nn.Conv2d(in_ch, self.n_landmarks, kernel_size=1, stride=1, padding=0)
-                self.pool = None
-                self.head = None
+                in_ch = self.deconv_filters
+            self.deconv = nn.Sequential(*layers)
+            self.heatmap_head = nn.Conv2d(in_ch, self.n_landmarks, kernel_size=1, stride=1, padding=0)
 
         def forward(self, x):
             x = self.features(x)
-            if self.head_type == "regression":
-                x = self.pool(x)
-                return self.head(x)
             up = self.deconv(x)
             heatmaps = self.heatmap_head(up)
             return _spatial_soft_argmax_2d(heatmaps, beta=self.softargmax_beta)
@@ -853,22 +807,6 @@ if _torch_available:
         tv_transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                 std=[0.229, 0.224, 0.225]),
     ])
-
-
-def standardize_crop(image, box, pad_ratio=0.20):
-    """
-    Crop image to bounding box + padding and resize to STANDARD_SIZE x STANDARD_SIZE.
-    Returns (cropped_image, crop_metadata) for inverse mapping.
-    """
-    bx = int(box.get("left", 0))
-    by = int(box.get("top", 0))
-    if "right" in box and "bottom" in box:
-        x2 = int(box.get("right", bx))
-        y2 = int(box.get("bottom", by))
-    else:
-        x2 = bx + int(box.get("width", 1))
-        y2 = by + int(box.get("height", 1))
-    return ou.base_standardize(image, [bx, by, x2, y2], pad_ratio=pad_ratio)
 
 
 def map_landmarks_to_original(
@@ -892,19 +830,70 @@ def map_landmarks_to_original(
         image_scale=image_scale,
         image_shape=image_shape,
     )
-    # Keep predict.py output shape stable (integer pixel coordinates).
     return [
-        {"id": lm["id"], "x": int(round(lm["x"])), "y": int(round(lm["y"]))}
+        {"id": lm["id"], "x": float(lm["x"]), "y": float(lm["y"])}
         for lm in mapped
     ]
+
+
+def _clamp_landmarks_to_box(landmarks, box, *, image_shape=None):
+    if not isinstance(box, dict):
+        return landmarks, 0, []
+
+    obb_corners = box.get("obbCorners") or box.get("obb_corners")
+    use_obb = isinstance(obb_corners, list) and len(obb_corners) == 4
+    img_h = img_w = None
+    if isinstance(image_shape, (list, tuple)) and len(image_shape) >= 2:
+        img_h = int(image_shape[0])
+        img_w = int(image_shape[1])
+
+    left = float(box.get("left", 0.0))
+    top = float(box.get("top", 0.0))
+    right = float(box.get("right", left + float(box.get("width", 0.0))))
+    bottom = float(box.get("bottom", top + float(box.get("height", 0.0))))
+
+    clamped = []
+    clamped_ids = []
+    clamped_count = 0
+    for lm in landmarks or []:
+        x = float(lm.get("x", 0.0))
+        y = float(lm.get("y", 0.0))
+        new_x, new_y = x, y
+        was_clamped = False
+        if use_obb:
+            if not ou.point_in_convex_quad((x, y), obb_corners):
+                new_x, new_y = ou.project_point_to_obb_perimeter((x, y), obb_corners)
+                was_clamped = True
+        else:
+            clamped_x = max(left, min(right, x))
+            clamped_y = max(top, min(bottom, y))
+            was_clamped = (clamped_x != x) or (clamped_y != y)
+            new_x, new_y = clamped_x, clamped_y
+
+        if img_w is not None and img_w > 0:
+            new_x = max(0.0, min(float(img_w - 1), new_x))
+        if img_h is not None and img_h > 0:
+            new_y = max(0.0, min(float(img_h - 1), new_y))
+
+        if was_clamped:
+            clamped_count += 1
+            clamped_ids.append(int(lm.get("id", -1)))
+        clamped.append({
+            "id": int(lm["id"]),
+            "x": int(round(new_x)),
+            "y": int(round(new_y)),
+        })
+
+    return clamped, clamped_count, clamped_ids
 
 
 def _normalize_input_boxes(input_boxes, scale=1.0, image_w=None, image_h=None):
     """
     Normalize externally-provided boxes to predictor input space.
 
-    input_boxes are expected in original-image coordinates. They are scaled to
-    the resized inference image when scale != 1.0.
+    input_boxes are expected in original-image coordinates and must include
+    valid obbCorners. They are scaled to the resized inference image when
+    scale != 1.0.
     """
     if not isinstance(input_boxes, list):
         return []
@@ -913,6 +902,10 @@ def _normalize_input_boxes(input_boxes, scale=1.0, image_w=None, image_h=None):
     for raw in input_boxes:
         if not isinstance(raw, dict):
             continue
+        obb_corners_raw = raw.get("obbCorners") or raw.get("obb_corners")
+        if not isinstance(obb_corners_raw, list) or len(obb_corners_raw) != 4:
+            raise ValueError("provided inference boxes must include obbCorners")
+
         try:
             left = float(raw.get("left", 0.0)) * scale
             top = float(raw.get("top", 0.0)) * scale
@@ -924,8 +917,8 @@ def _normalize_input_boxes(input_boxes, scale=1.0, image_w=None, image_h=None):
                 height = float(raw.get("height", 0.0)) * scale
                 right = left + width
                 bottom = top + height
-        except Exception:
-            continue
+        except Exception as exc:
+            raise ValueError(f"invalid provided inference box: {exc}") from exc
 
         if image_w is not None and image_h is not None:
             left = max(0.0, min(float(image_w - 1), left))
@@ -947,7 +940,17 @@ def _normalize_input_boxes(input_boxes, scale=1.0, image_w=None, image_h=None):
             "height": int(round(bottom - top)),
         }
         if isinstance(raw.get("orientation_hint"), dict):
-            box["orientation_hint"] = raw.get("orientation_hint")
+            box["orientation_hint"] = _transform_orientation_hint(raw.get("orientation_hint"), float(scale))
+        box["obbCorners"] = _scale_obb_corners(
+            obb_corners_raw,
+            float(scale),
+            image_w=image_w,
+            image_h=image_h,
+        )
+        if raw.get("angle") is not None:
+            box["angle"] = raw["angle"]
+        if raw.get("class_id") is not None:
+            box["class_id"] = raw["class_id"]
         normalized.append(box)
     return normalized
 
@@ -983,6 +986,296 @@ def _make_cnn_predict_fn(model, landmark_ids):
     return _predict
 
 
+def _ensure_obb_box_geometry(box, *, context="box", image_shape=None):
+    if not isinstance(box, dict):
+        raise ValueError(f"{context} must be a dict")
+    obb_corners = box.get("obbCorners") or box.get("obb_corners")
+    if not isinstance(obb_corners, list) or len(obb_corners) != 4:
+        raise ValueError(f"{context} requires obbCorners")
+
+    corners = []
+    for point in obb_corners:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            raise ValueError(f"{context} has invalid obbCorners")
+        corners.append([float(point[0]), float(point[1])])
+
+    aabb = ou.obb_corners_to_aabb(corners, image_shape=image_shape)
+    angle = box.get("angle")
+    if angle is None:
+        angle = math.degrees(
+            math.atan2(
+                float(corners[1][1]) - float(corners[0][1]),
+                float(corners[1][0]) - float(corners[0][0]),
+            )
+        )
+
+    normalized = {
+        **box,
+        **aabb,
+        "obbCorners": corners,
+        "angle": float(angle),
+        "class_id": int(box.get("class_id", 0)),
+    }
+    if isinstance(box.get("orientation_hint"), dict):
+        normalized["orientation_hint"] = dict(box.get("orientation_hint"))
+    return normalized
+
+
+def _load_and_resize_for_inference(image_path, max_dim=1500):
+    img_original, orig_w, orig_h = load_image(image_path)
+    if img_original is None:
+        raise RuntimeError(f"Could not read: {image_path}")
+
+    scale = 1.0
+    detector_w, detector_h = orig_w, orig_h
+    img_detector = img_original
+    if max(orig_w, orig_h) > max_dim:
+        scale = max_dim / max(orig_w, orig_h)
+        detector_w = int(orig_w * scale)
+        detector_h = int(orig_h * scale)
+        img_detector = cv2.resize(img_original, (detector_w, detector_h), interpolation=cv2.INTER_AREA)
+
+    return img_original, img_detector, orig_w, orig_h, scale, detector_w, detector_h
+
+
+def _detect_single_obb_box(
+    image_path,
+    detector_img,
+    scale,
+    detector_w,
+    detector_h,
+    *,
+    yolo_model_path=None,
+    orientation_policy=None,
+    input_box=None,
+    original_w=None,
+    original_h=None,
+):
+    temp_path = None
+    try:
+        if input_box is not None:
+            normalized = _normalize_input_box(
+                input_box,
+                scale=1.0,
+                image_w=original_w,
+                image_h=original_h,
+            )
+            return _ensure_obb_box_geometry(
+                normalized,
+                context="input_box",
+                image_shape=(original_h, original_w),
+            )
+
+        if not yolo_model_path:
+            raise RuntimeError("OBB detector required: no detector model path was provided.")
+
+        detection_path = image_path
+        if scale != 1.0:
+            temp_fd, temp_path = tempfile.mkstemp(suffix=".png")
+            os.close(temp_fd)
+            cv2.imwrite(temp_path, detector_img)
+            detection_path = temp_path
+
+        detected = detect_specimen(
+            detection_path,
+            margin=20,
+            yolo_model_path=yolo_model_path,
+            orientation_policy=orientation_policy,
+        )
+        if detected is None:
+            raise RuntimeError("OBB detector produced no detections.")
+        detected = _ensure_obb_box_geometry(
+            detected,
+            context="detected box",
+            image_shape=(detector_h, detector_w),
+        )
+        if scale != 1.0:
+            detected = _scale_box_to_original(detected, scale)
+        detected = _ensure_obb_box_geometry(
+            detected,
+            context="detected box (original space)",
+            image_shape=(original_h, original_w),
+        )
+        return detected
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _detect_multi_obb_boxes(
+    image_path,
+    detector_img,
+    scale,
+    detector_w,
+    detector_h,
+    *,
+    yolo_model_path=None,
+    orientation_policy=None,
+    input_boxes=None,
+    min_area_ratio=0.02,
+    original_w=None,
+    original_h=None,
+):
+    if isinstance(input_boxes, list) and input_boxes:
+        normalized_boxes = _normalize_input_boxes(
+            input_boxes,
+            scale=1.0,
+            image_w=original_w,
+            image_h=original_h,
+        )
+        return {
+            "boxes": [
+                _ensure_obb_box_geometry(box, context=f"input_boxes[{idx}]", image_shape=(original_h, original_w))
+                for idx, box in enumerate(normalized_boxes)
+            ],
+            "detection_method": "provided_obb_boxes",
+            "fallback_reason": None,
+        }
+
+    if not yolo_model_path:
+        raise RuntimeError("OBB detector required: no detector model path was provided.")
+
+    temp_path = None
+    try:
+        detection_path = image_path
+        if scale != 1.0:
+            temp_fd, temp_path = tempfile.mkstemp(suffix=".png")
+            os.close(temp_fd)
+            cv2.imwrite(temp_path, detector_img)
+            detection_path = temp_path
+
+        detection_result = detect_multiple_specimens(
+            detection_path,
+            min_area_ratio=min_area_ratio,
+            yolo_model_path=yolo_model_path,
+            orientation_policy=orientation_policy,
+        )
+        detected_boxes = detection_result.get("boxes", []) if isinstance(detection_result, dict) else []
+        if not detected_boxes:
+            raise RuntimeError("OBB detector produced no detections.")
+
+        boxes_original = []
+        for idx, box in enumerate(detected_boxes):
+            normalized = _ensure_obb_box_geometry(
+                box,
+                context=f"detected_boxes[{idx}]",
+                image_shape=(detector_h, detector_w),
+            )
+            if scale != 1.0:
+                normalized = _scale_box_to_original(normalized, scale)
+            normalized = _ensure_obb_box_geometry(
+                normalized,
+                context=f"detected_boxes[{idx}] (original space)",
+                image_shape=(original_h, original_w),
+            )
+            boxes_original.append(normalized)
+
+        return {
+            "boxes": boxes_original,
+            "detection_method": detection_result.get("detection_method", "yolo_obb"),
+            "fallback_reason": detection_result.get("error"),
+        }
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _run_obb_inference_on_box(
+    *,
+    img_original,
+    box,
+    orig_h,
+    orig_w,
+    detector_scale,
+    detector_w,
+    detector_h,
+    orientation_policy,
+    predict_fn,
+    target_orientation,
+    landmark_template,
+    head_landmark_id,
+    tail_landmark_id,
+):
+    orientation_hint = _resolve_orientation_hint_from_box(
+        box,
+        min_confidence=0.25,
+        min_dx_ratio=0.06,
+    )
+    apply_leveling = (orientation_policy.get("obbLevelingMode", "on") == "on")
+    cropped, crop_meta = ou.extract_standardized_obb_crop(
+        img_original,
+        box["obbCorners"],
+        apply_leveling=apply_leveling,
+    )
+    cropped, crop_meta, canonicalization_debug = ou.apply_obb_geometry(
+        cropped,
+        crop_meta,
+        int(box.get("class_id", 0)),
+        orientation_policy,
+    )
+    if isinstance(canonicalization_debug, dict):
+        canonicalization_debug["source"] = "obb_geometry"
+
+    landmarks_512, was_flipped, orientation_debug = _predict_with_orientation_lock(
+        crop_512=cropped,
+        predict_fn=predict_fn,
+        orientation_policy=orientation_policy,
+        canonicalization_debug=canonicalization_debug,
+        target_orientation=target_orientation,
+        landmark_template=landmark_template,
+        head_landmark_id=head_landmark_id,
+        tail_landmark_id=tail_landmark_id,
+        orientation_hint=orientation_hint,
+    )
+    if isinstance(orientation_debug, dict):
+        orientation_debug["canonicalization"] = canonicalization_debug
+        orientation_debug["was_flipped"] = bool(was_flipped)
+        orientation_debug["orientation_hint"] = orientation_hint
+        orientation_debug["orientation_hint_raw"] = box.get("orientation_hint")
+
+    mapped_landmarks = map_landmarks_to_original(
+        landmarks_512,
+        crop_meta,
+        1.0,
+        was_flipped,
+        image_shape=(orig_h, orig_w),
+    )
+    pre_clamp_landmarks = [
+        {"id": int(lm["id"]), "x": float(lm["x"]), "y": float(lm["y"])}
+        for lm in mapped_landmarks
+    ]
+    landmarks, clamped_landmark_count, clamped_landmark_ids = _clamp_landmarks_to_box(
+        mapped_landmarks,
+        box,
+        image_shape=(orig_h, orig_w),
+    )
+    landmarks = sorted(landmarks, key=lambda lm: lm["id"])
+    return {
+        "landmarks": landmarks,
+        "detected_box": dict(box),
+        "orientation_hint": box.get("orientation_hint"),
+        "orientation_debug": orientation_debug,
+        "inference_metadata": _build_inference_metadata(
+            orientation_debug,
+            clamped_landmark_count=clamped_landmark_count,
+            box_source=box.get("detection_method", "provided_obb"),
+        ),
+        "clamped_landmark_count": clamped_landmark_count,
+        "clamped_landmark_ids": clamped_landmark_ids,
+        "pre_clamp_landmarks": pre_clamp_landmarks if clamped_landmark_count > 0 else None,
+        "resolution_debug": {
+            "detector_image_size": {"width": int(detector_w), "height": int(detector_h)},
+            "original_image_size": {"width": int(orig_w), "height": int(orig_h)},
+            "detector_scale": float(detector_scale),
+            "crop_extracted_from_original": True,
+            "crop_box_obb_corners": [
+                [float(point[0]), float(point[1])]
+                for point in (box.get("obbCorners") or [])
+            ] if isinstance(box.get("obbCorners"), list) else None,
+        },
+    }
+
+
 def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box=None):
     """
     Predict landmarks using trained dlib shape predictor.
@@ -993,11 +1286,9 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box
         project_root: Session root directory (sessions/{speciesId}/ for session models)
         tag: Model tag matching predictor_{tag}.dat
         image_path: Path to the image to run inference on
-        yolo_model_path: Optional path to session-specific YOLO detection model.
-                         When provided, YOLO is used for specimen detection;
-                         falls back to OpenCV contours if YOLO finds nothing.
-        input_box: Optional pre-detected box dict. When provided with obbCorners, the
-                   OBB geometry engine is used instead of detection + PCA canonicalization.
+        yolo_model_path: Optional path to the session-specific OBB detector model.
+        input_box: Optional pre-detected OBB box dict. When provided with obbCorners, the
+                   detector stage is skipped and inference uses the supplied OBB geometry.
     """
     modeldir = os.path.join(project_root, "models")
     debug_dir = os.path.join(project_root, "debug")
@@ -1034,142 +1325,46 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box
 
     print("PROGRESS 10 loading_model", file=sys.stderr)
 
-    # Load and resize image
-    img, orig_w, orig_h = load_image(image_path)
-    if img is None:
-        raise RuntimeError(f"Could not read: {image_path}")
-
+    img_original, img_detector, orig_w, orig_h, scale, detector_w, detector_h = _load_and_resize_for_inference(image_path)
     img_hash = hashlib.md5(open(image_path, 'rb').read(1000)).hexdigest()[:8]
 
-    max_dim = 1500
-    scale = 1.0
-    w, h = orig_w, orig_h
-    if max(orig_w, orig_h) > max_dim:
-        scale = max_dim / max(orig_w, orig_h)
-        w, h = int(orig_w * scale), int(orig_h * scale)
-        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-
-    # Detect specimen bounding box (skip when caller provides input_box)
-    temp_path = None
-    if input_box is not None:
-        detected = dict(input_box)
-    else:
-        if scale != 1.0:
-            temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
-            os.close(temp_fd)
-            cv2.imwrite(temp_path, img)
-            detection_path = temp_path
-        else:
-            detection_path = image_path
-
-        detected = detect_specimen(detection_path, margin=20, yolo_model_path=yolo_model_path)
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-        if detected is None:
-            detected = {'left': 0, 'top': 0, 'right': w, 'bottom': h, 'width': w, 'height': h}
-
     print("PROGRESS 30 detecting", file=sys.stderr)
-
-    orientation_hint = _resolve_orientation_hint_from_box(
-        detected,
-        min_confidence=0.25,
-        min_dx_ratio=0.06,
+    detected = _detect_single_obb_box(
+        image_path,
+        img_detector,
+        scale,
+        detector_w,
+        detector_h,
+        yolo_model_path=yolo_model_path,
+        orientation_policy=orientation_policy,
+        input_box=input_box,
+        original_w=orig_w,
+        original_h=orig_h,
     )
-
-    # Standardize: crop using OBB geometry engine when obb_corners available,
-    # otherwise fall back to axis-aligned crop + PCA canonicalization.
-    cropped = None
-    crop_meta = None
-    canonicalization_debug = None
-    mask_outline = None
-
-    obb_corners = detected.get("obbCorners") or detected.get("obb_corners") if isinstance(detected, dict) else None
-    obb_class_id = int(detected.get("class_id", 0)) if isinstance(detected, dict) else 0
-    if obb_corners and len(obb_corners) == 4:
-        apply_leveling = (orientation_policy.get("obbLevelingMode", "on") == "on")
-        cropped, crop_meta = ou.extract_obb_crop(img, obb_corners, pad_ratio=0.15, apply_leveling=apply_leveling)
-        cropped, crop_meta, canonicalization_debug = ou.apply_obb_geometry(
-            cropped, crop_meta, obb_class_id, orientation_policy
-        )
-        if isinstance(canonicalization_debug, dict):
-            canonicalization_debug["source"] = "obb_geometry"
-    else:
-        cropped, crop_meta = standardize_crop(img, detected)
-        if _should_try_canonicalization(orientation_policy):
-            sam_mask = _sam2_mask_for_box(img, detected)
-            if sam_mask is not None:
-                mask_outline = _mask_outline_from_full_mask(
-                    sam_mask,
-                    scale=scale,
-                    image_shape=(orig_h, orig_w),
-                )
-                cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_mask(
-                    cropped,
-                    crop_meta,
-                    sam_mask,
-                    orientation_policy,
-                    orientation_hint,
-                )
-                if isinstance(canonicalization_debug, dict):
-                    canonicalization_debug["mask_source"] = "sam2"
-            else:
-                rough_mask = _rough_mask_from_crop(cropped)
-                if rough_mask is not None:
-                    cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_standard_mask(
-                        cropped,
-                        crop_meta,
-                        rough_mask,
-                        orientation_policy,
-                        orientation_hint,
-                    )
-                    if isinstance(canonicalization_debug, dict):
-                        canonicalization_debug["mask_source"] = "rough_otsu"
 
     # Run dlib on the standardized 512x512 image (full-image rect)
     rect = dlib.rectangle(0, 0, STANDARD_SIZE, STANDARD_SIZE)
     predictor = dlib.shape_predictor(predictor_path)
     predict_fn = _make_dlib_predict_fn(predictor, rect, index_to_original)
-    landmarks_512, was_flipped, orientation_debug = _predict_with_orientation_lock(
-        crop_512=cropped,
-        predict_fn=predict_fn,
+    print("PROGRESS 65 predicting", file=sys.stderr)
+    obb_prediction = _run_obb_inference_on_box(
+        img_original=img_original,
+        box=detected,
+        orig_h=orig_h,
+        orig_w=orig_w,
+        detector_scale=scale,
+        detector_w=detector_w,
+        detector_h=detector_h,
         orientation_policy=orientation_policy,
-        canonicalization_debug=canonicalization_debug,
+        predict_fn=predict_fn,
         target_orientation=target_orientation,
         landmark_template=landmark_template,
         head_landmark_id=head_landmark_id,
         tail_landmark_id=tail_landmark_id,
-        orientation_hint=orientation_hint,
     )
-    if isinstance(orientation_debug, dict):
-        if canonicalization_debug is not None:
-            orientation_debug["canonicalization"] = canonicalization_debug
-        orientation_debug["was_flipped"] = bool(was_flipped)
-        orientation_debug["orientation_hint"] = orientation_hint
-        orientation_debug["orientation_hint_raw"] = (
-            detected.get("orientation_hint") if isinstance(detected, dict) else None
-        )
-
-    print("PROGRESS 65 predicting", file=sys.stderr)
-
-    # Map back to original image coordinates (un-flip if the crop was flipped)
-    landmarks = sorted(
-        map_landmarks_to_original(
-            landmarks_512,
-            crop_meta,
-            scale,
-            was_flipped,
-            image_shape=(orig_h, orig_w),
-        ),
-        key=lambda lm: lm["id"]
-    )
-
-    print("PROGRESS 90 mapping", file=sys.stderr)
-
-    # Scale bounding box to original size (skip non-numeric fields like detection_method)
-    if scale != 1.0:
-        detected = {k: int(v / scale) if isinstance(v, (int, float)) else v for k, v in detected.items()}
-        if isinstance(detected.get("orientation_hint"), dict):
-            detected["orientation_hint"] = _scale_orientation_hint(detected["orientation_hint"], scale)
+    landmarks = obb_prediction["landmarks"]
+    orientation_debug = obb_prediction["orientation_debug"]
+    detected = obb_prediction["detected_box"]
 
     result = {
         "image": image_path,
@@ -1179,10 +1374,11 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box
         "inference_scale": scale,
         "num_landmarks": len(landmarks),
         "id_mapping": index_to_original if index_to_original else None,
-        "detection_method": detected.get("detection_method", "opencv") if isinstance(detected, dict) else "opencv",
-        "orientation_hint": detected.get("orientation_hint") if isinstance(detected, dict) else None,
-        "inference_metadata": _build_inference_metadata(orientation_debug),
-        "mask_outline": mask_outline,
+        "detection_method": detected.get("detection_method", "yolo_obb") if isinstance(detected, dict) else "yolo_obb",
+        "orientation_hint": obb_prediction["orientation_hint"],
+        "inference_metadata": obb_prediction["inference_metadata"],
+        "resolution_debug": obb_prediction["resolution_debug"],
+        "mask_outline": None,
     }
 
     # Save prediction log for debugging
@@ -1196,7 +1392,14 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box
         "scale": scale,
         "debug_hash": img_hash,
         "orientation_debug": orientation_debug,
-        "inference_metadata": _build_inference_metadata(orientation_debug),
+        "inference_metadata": obb_prediction["inference_metadata"],
+        "resolution_debug": obb_prediction["resolution_debug"],
+        "clamped_landmark_ids": obb_prediction.get("clamped_landmark_ids", []),
+        **(
+            {"pre_clamp_landmarks": obb_prediction["pre_clamp_landmarks"]}
+            if obb_prediction.get("pre_clamp_landmarks")
+            else {}
+        ),
     }
     save_prediction_log(debug_dir, tag, log_entry)
 
@@ -1211,16 +1414,7 @@ def predict_multi_specimen(
     yolo_model_path=None,
     input_boxes=None,
 ):
-    """
-    Predict landmarks for multiple specimens using detection + dlib.
-    Uses tight-crop standardization per specimen to match training.
-    Returns list of {box, landmarks} for each detected specimen.
-
-    Args:
-        yolo_model_path: Optional path to session YOLO detection model; preferred over OpenCV.
-    """
-    from detection.detect_specimen import detect_multiple_specimens
-
+    """Predict landmarks for multiple specimens using OBB detection + dlib."""
     modeldir = os.path.join(project_root, "models")
     debug_dir = os.path.join(project_root, "debug")
     predictor_path = os.path.join(modeldir, f"predictor_{tag}.dat")
@@ -1255,42 +1449,21 @@ def predict_multi_specimen(
         head_landmark_id = _resolve_head_landmark_id(project_root, None)
 
     print("PROGRESS 10 loading_model", file=sys.stderr)
-
-    # Load and resize image
-    img, orig_w, orig_h = load_image(image_path)
-    if img is None:
-        raise RuntimeError(f"Could not read: {image_path}")
-
-    max_dim = 1500
-    scale = 1.0
-    w, h = orig_w, orig_h
-    if max(orig_w, orig_h) > max_dim:
-        scale = max_dim / max(orig_w, orig_h)
-        w, h = int(orig_w * scale), int(orig_h * scale)
-        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-
-    detection_method = "provided_boxes"
-    if isinstance(input_boxes, list) and input_boxes:
-        detected_boxes = _normalize_input_boxes(input_boxes, scale=scale, image_w=w, image_h=h)
-        detection_result = {"boxes": detected_boxes, "detection_method": detection_method}
-    else:
-        # Save temp image for detection if scaled
-        temp_path = None
-        if scale != 1.0:
-            temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
-            os.close(temp_fd)
-            cv2.imwrite(temp_path, img)
-            detection_path = temp_path
-        else:
-            detection_path = image_path
-
-        # Detect multiple specimens (YOLO-first if model provided, else OpenCV)
-        detection_result = detect_multiple_specimens(detection_path, min_area_ratio=min_area_ratio,
-                                                     yolo_model_path=yolo_model_path)
-        detected_boxes = detection_result.get("boxes", [])
-
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+    img_original, img_detector, orig_w, orig_h, scale, detector_w, detector_h = _load_and_resize_for_inference(image_path)
+    detection_result = _detect_multi_obb_boxes(
+        image_path,
+        img_detector,
+        scale,
+        detector_w,
+        detector_h,
+        yolo_model_path=yolo_model_path,
+        orientation_policy=orientation_policy,
+        input_boxes=input_boxes,
+        min_area_ratio=min_area_ratio,
+        original_w=orig_w,
+        original_h=orig_h,
+    )
+    detected_boxes = detection_result["boxes"]
 
     print("PROGRESS 30 detecting", file=sys.stderr)
 
@@ -1299,7 +1472,8 @@ def predict_multi_specimen(
             "image": image_path,
             "specimens": [],
             "num_specimens": 0,
-            "image_dimensions": {"width": orig_w, "height": orig_h}
+            "image_dimensions": {"width": orig_w, "height": orig_h},
+            "detection_method": detection_result.get("detection_method", "yolo_obb"),
         }
 
     # Load dlib predictor
@@ -1308,104 +1482,44 @@ def predict_multi_specimen(
     predict_fn = _make_dlib_predict_fn(predictor, rect, index_to_original)
 
     specimens = []
+    clamp_debug = []
     for box_idx, box in enumerate(detected_boxes):
-        # Report incremental progress per specimen (40–85 range)
         pct = 40 + int(45 * (box_idx / max(len(detected_boxes), 1)))
         print(f"PROGRESS {pct} predicting", file=sys.stderr)
-        orientation_hint = _resolve_orientation_hint_from_box(
-            box,
-            min_confidence=0.25,
-            min_dx_ratio=0.06,
-        )
-
-        # Standardize: crop to bounding box + padding, resize to 512x512
-        cropped, crop_meta = standardize_crop(img, box)
-        canonicalization_debug = None
-        mask_outline = None
-        if _should_try_canonicalization(orientation_policy):
-            sam_mask = _sam2_mask_for_box(img, box)
-            if sam_mask is not None:
-                mask_outline = _mask_outline_from_full_mask(
-                    sam_mask,
-                    scale=scale,
-                    image_shape=(orig_h, orig_w),
-                )
-                cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_mask(
-                    cropped,
-                    crop_meta,
-                    sam_mask,
-                    orientation_policy,
-                    orientation_hint,
-                )
-                if isinstance(canonicalization_debug, dict):
-                    canonicalization_debug["mask_source"] = "sam2"
-            else:
-                rough_mask = _rough_mask_from_crop(cropped)
-                if rough_mask is not None:
-                    cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_standard_mask(
-                        cropped,
-                        crop_meta,
-                        rough_mask,
-                        orientation_policy,
-                        orientation_hint,
-                    )
-                    if isinstance(canonicalization_debug, dict):
-                        canonicalization_debug["mask_source"] = "rough_otsu"
-
-        landmarks_512, was_flipped, orientation_debug = _predict_with_orientation_lock(
-            crop_512=cropped,
-            predict_fn=predict_fn,
+        obb_prediction = _run_obb_inference_on_box(
+            img_original=img_original,
+            box=box,
+            orig_h=orig_h,
+            orig_w=orig_w,
+            detector_scale=scale,
+            detector_w=detector_w,
+            detector_h=detector_h,
             orientation_policy=orientation_policy,
-            canonicalization_debug=canonicalization_debug,
+            predict_fn=predict_fn,
             target_orientation=target_orientation,
             landmark_template=landmark_template,
             head_landmark_id=head_landmark_id,
             tail_landmark_id=tail_landmark_id,
-            orientation_hint=orientation_hint,
         )
-        if isinstance(orientation_debug, dict):
-            if canonicalization_debug is not None:
-                orientation_debug["canonicalization"] = canonicalization_debug
-            orientation_debug["was_flipped"] = bool(was_flipped)
-            orientation_debug["orientation_hint"] = orientation_hint
-            orientation_debug["orientation_hint_raw"] = box.get("orientation_hint") if isinstance(box, dict) else None
-
-        # Map back to original image coordinates (un-flip if the crop was flipped)
-        landmarks = sorted(
-            map_landmarks_to_original(
-                landmarks_512,
-                crop_meta,
-                scale,
-                was_flipped,
-                image_shape=(orig_h, orig_w),
-            ),
-            key=lambda lm: lm["id"]
-        )
-
-        # Scale bounding box back to original size
-        scaled_box = {}
-        if scale != 1.0:
-            for k, v in box.items():
-                if isinstance(v, (int, float)):
-                    scaled_box[k] = int(v / scale)
-                elif k in ("obbCorners", "obb_corners") and isinstance(v, list):
-                    scaled_box[k] = [[pt[0] / scale, pt[1] / scale] for pt in v]
-                else:
-                    scaled_box[k] = v
-        else:
-            scaled_box = dict(box)
-        scaled_box["confidence"] = box.get("confidence")
-        scaled_box["class_name"] = box.get("class_name")
-        if isinstance(box.get("orientation_hint"), dict):
-            scaled_box["orientation_hint"] = _scale_orientation_hint(box.get("orientation_hint"), scale)
-
         specimens.append({
-            "box": scaled_box,
-            "landmarks": landmarks,
-            "num_landmarks": len(landmarks),
-            "orientation_debug": orientation_debug,
-            "inference_metadata": _build_inference_metadata(orientation_debug),
-            "mask_outline": mask_outline,
+            "box": obb_prediction["detected_box"],
+            "landmarks": obb_prediction["landmarks"],
+            "num_landmarks": len(obb_prediction["landmarks"]),
+            "orientation_debug": obb_prediction["orientation_debug"],
+            "inference_metadata": obb_prediction["inference_metadata"],
+            "resolution_debug": obb_prediction["resolution_debug"],
+            "mask_outline": None,
+        })
+        clamp_debug.append({
+            "box_index": box_idx,
+            "clamped_landmark_ids": obb_prediction.get("clamped_landmark_ids", []),
+            "clamped_landmark_count": obb_prediction.get("clamped_landmark_count", 0),
+            "resolution_debug": obb_prediction["resolution_debug"],
+            **(
+                {"pre_clamp_landmarks": obb_prediction["pre_clamp_landmarks"]}
+                if obb_prediction.get("pre_clamp_landmarks")
+                else {}
+            ),
         })
 
     print("PROGRESS 90 mapping", file=sys.stderr)
@@ -1416,7 +1530,7 @@ def predict_multi_specimen(
         "num_specimens": len(specimens),
         "image_dimensions": {"width": orig_w, "height": orig_h},
         "inference_scale": scale,
-        "detection_method": detection_result.get("detection_method", "opencv"),
+        "detection_method": detection_result.get("detection_method", "yolo_obb"),
     }
 
     # Save prediction log
@@ -1425,7 +1539,8 @@ def predict_multi_specimen(
         "image": os.path.basename(image_path),
         "mode": "multi-specimen",
         "num_specimens": len(specimens),
-        "specimens": specimens
+        "specimens": specimens,
+        "clamp_debug": clamp_debug,
     }
     save_prediction_log(debug_dir, tag, log_entry)
 
@@ -1458,32 +1573,37 @@ def _load_cnn_model(project_root, tag):
     n_landmarks = config["n_landmarks"]
     landmark_ids = config.get("landmark_ids", list(range(n_landmarks)))
     model_variant = config.get("model_variant_resolved") or config.get("model_variant_requested") or "efficientnet_b0"
-    head_type = str(config.get("cnn_head_type", "regression")).strip().lower()
-    deconv_layers = int(config.get("cnn_deconv_layers", 3))
-    deconv_filters = int(config.get("cnn_deconv_filters", 256))
-    softargmax_beta = float(config.get("cnn_softargmax_beta", 25.0))
+    head_type = str(config.get("cnn_head_type", "")).strip().lower()
+    format_version = int(config.get("cnn_format_version", 1) or 1)
+    if head_type != "heatmap_deconv":
+        raise RuntimeError(
+            "This CNN model predates the heatmap-head format and must be retrained."
+        )
+    required_keys = ("cnn_deconv_layers", "cnn_deconv_filters", "cnn_softargmax_beta")
+    missing_keys = [key for key in required_keys if key not in config]
+    if missing_keys:
+        raise RuntimeError(
+            "This CNN model predates the heatmap-head format and must be retrained."
+        )
+    deconv_layers = int(config["cnn_deconv_layers"])
+    deconv_filters = int(config["cnn_deconv_filters"])
+    softargmax_beta = float(config["cnn_softargmax_beta"])
 
     state = torch.load(model_path, map_location="cpu")
-    model = None
-    # Preferred path: new heatmap-deconv architecture.
-    if head_type == "heatmap_deconv":
-        try:
-            model = CNNLandmarkPredictor(
-                n_landmarks,
-                model_variant=model_variant,
-                head_type="heatmap_deconv",
-                deconv_layers=deconv_layers,
-                deconv_filters=deconv_filters,
-                softargmax_beta=softargmax_beta,
-            )
-            model.load_state_dict(state, strict=True)
-        except Exception:
-            model = None
-
-    # Fallback for older checkpoints.
-    if model is None:
-        model = CNNLandmarkPredictorLegacy(n_landmarks, model_variant=model_variant)
-        model.load_state_dict(state, strict=False)
+    try:
+        model = CNNLandmarkPredictor(
+            n_landmarks,
+            model_variant=model_variant,
+            head_type="heatmap_deconv",
+            deconv_layers=deconv_layers,
+            deconv_filters=deconv_filters,
+            softargmax_beta=softargmax_beta,
+        )
+        model.load_state_dict(state, strict=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"This CNN model predates the heatmap-head format and must be retrained. ({exc})"
+        ) from exc
     model.eval()
 
     # Load orientation / template data from id_mapping (same as dlib path)
@@ -1523,10 +1643,10 @@ def _cnn_landmarks_from_coords(coords_np, landmark_ids, flip=False):
     return lms
 
 
-def predict_cnn_image(project_root, tag, image_path, yolo_model_path=None):
+def predict_cnn_image(project_root, tag, image_path, yolo_model_path=None, input_box=None):
     """
     Predict landmarks using trained CNN shape predictor.
-    Same detection + standardization pipeline as the dlib path.
+    Uses the same OBB-only crop/remap pipeline as the dlib path.
     """
     debug_dir = os.path.join(project_root, "debug")
 
@@ -1540,118 +1660,43 @@ def predict_cnn_image(project_root, tag, image_path, yolo_model_path=None):
     model, landmark_ids, target_orientation, landmark_template, head_landmark_id, tail_landmark_id = \
         _load_cnn_model(project_root, tag)
 
-    # Load and resize image
-    img, orig_w, orig_h = load_image(image_path)
-    if img is None:
-        raise RuntimeError(f"Could not read: {image_path}")
-
-    max_dim = 1500
-    scale = 1.0
-    w, h = orig_w, orig_h
-    if max(orig_w, orig_h) > max_dim:
-        scale = max_dim / max(orig_w, orig_h)
-        w, h = int(orig_w * scale), int(orig_h * scale)
-        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-
-    # Detection
-    temp_path = None
-    if scale != 1.0:
-        temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
-        os.close(temp_fd)
-        cv2.imwrite(temp_path, img)
-        detection_path = temp_path
-    else:
-        detection_path = image_path
-
-    detected = detect_specimen(detection_path, margin=20, yolo_model_path=yolo_model_path)
-    if temp_path and os.path.exists(temp_path):
-        os.remove(temp_path)
+    img_original, img_detector, orig_w, orig_h, scale, detector_w, detector_h = _load_and_resize_for_inference(image_path)
 
     print("PROGRESS 30 detecting", file=sys.stderr)
-
-    if detected is None:
-        detected = {'left': 0, 'top': 0, 'right': w, 'bottom': h, 'width': w, 'height': h}
-    orientation_hint = _resolve_orientation_hint_from_box(
-        detected,
-        min_confidence=0.25,
-        min_dx_ratio=0.06,
+    detected = _detect_single_obb_box(
+        image_path,
+        img_detector,
+        scale,
+        detector_w,
+        detector_h,
+        yolo_model_path=yolo_model_path,
+        orientation_policy=orientation_policy,
+        input_box=input_box,
+        original_w=orig_w,
+        original_h=orig_h,
     )
 
-    cropped, crop_meta = standardize_crop(img, detected)
-    canonicalization_debug = None
-    mask_outline = None
-    if _should_try_canonicalization(orientation_policy):
-        sam_mask = _sam2_mask_for_box(img, detected)
-        if sam_mask is not None:
-            mask_outline = _mask_outline_from_full_mask(
-                sam_mask,
-                scale=scale,
-                image_shape=(orig_h, orig_w),
-            )
-            cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_mask(
-                cropped,
-                crop_meta,
-                sam_mask,
-                orientation_policy,
-                orientation_hint,
-            )
-            if isinstance(canonicalization_debug, dict):
-                canonicalization_debug["mask_source"] = "sam2"
-        else:
-            rough_mask = _rough_mask_from_crop(cropped)
-            if rough_mask is not None:
-                cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_standard_mask(
-                    cropped,
-                    crop_meta,
-                    rough_mask,
-                    orientation_policy,
-                    orientation_hint,
-                )
-                if isinstance(canonicalization_debug, dict):
-                    canonicalization_debug["mask_source"] = "rough_otsu"
-
     print("PROGRESS 65 predicting", file=sys.stderr)
-
     predict_fn = _make_cnn_predict_fn(model, landmark_ids)
-    landmarks_512, was_flipped, orientation_debug = _predict_with_orientation_lock(
-        crop_512=cropped,
-        predict_fn=predict_fn,
+    obb_prediction = _run_obb_inference_on_box(
+        img_original=img_original,
+        box=detected,
+        orig_h=orig_h,
+        orig_w=orig_w,
+        detector_scale=scale,
+        detector_w=detector_w,
+        detector_h=detector_h,
         orientation_policy=orientation_policy,
-        canonicalization_debug=canonicalization_debug,
+        predict_fn=predict_fn,
         target_orientation=target_orientation,
         landmark_template=landmark_template,
         head_landmark_id=head_landmark_id,
         tail_landmark_id=tail_landmark_id,
-        orientation_hint=orientation_hint,
     )
-    if isinstance(orientation_debug, dict):
-        if canonicalization_debug is not None:
-            orientation_debug["canonicalization"] = canonicalization_debug
-        orientation_debug["was_flipped"] = bool(was_flipped)
-        orientation_debug["orientation_hint"] = orientation_hint
-        orientation_debug["orientation_hint_raw"] = (
-            detected.get("orientation_hint") if isinstance(detected, dict) else None
-        )
-
-    print("PROGRESS 90 mapping", file=sys.stderr)
-
-    landmarks = sorted(
-        map_landmarks_to_original(
-            landmarks_512,
-            crop_meta,
-            scale,
-            was_flipped=was_flipped,
-            image_shape=(orig_h, orig_w),
-        ),
-        key=lambda lm: lm["id"]
-    )
-
-    if scale != 1.0:
-        detected = {k: int(v / scale) if isinstance(v, (int, float)) else v for k, v in detected.items()}
-        if isinstance(detected.get("orientation_hint"), dict):
-            detected["orientation_hint"] = _scale_orientation_hint(detected["orientation_hint"], scale)
-
-    detection_method = detected.get("detection_method", "opencv") if isinstance(detected, dict) else "opencv"
+    landmarks = obb_prediction["landmarks"]
+    orientation_debug = obb_prediction["orientation_debug"]
+    detected = obb_prediction["detected_box"]
+    detection_method = detected.get("detection_method", "yolo_obb") if isinstance(detected, dict) else "yolo_obb"
     fallback_reason = detected.get("fallback_reason") if isinstance(detected, dict) else None
 
     result = {
@@ -1665,18 +1710,11 @@ def predict_cnn_image(project_root, tag, image_path, yolo_model_path=None):
         "fallback_reason": fallback_reason,
         "predictor_type": "cnn",
         "predictor_variant": getattr(model, "model_variant", None),
-        "orientation_hint": detected.get("orientation_hint") if isinstance(detected, dict) else None,
-        "orientation_debug": orientation_debug or {
-            "was_flipped": bool(was_flipped),
-            "orientation_hint": orientation_hint,
-        },
-        "inference_metadata": _build_inference_metadata(
-            orientation_debug or {
-                "was_flipped": bool(was_flipped),
-                "orientation_hint": orientation_hint,
-            }
-        ),
-        "mask_outline": mask_outline,
+        "orientation_hint": obb_prediction["orientation_hint"],
+        "orientation_debug": orientation_debug,
+        "inference_metadata": obb_prediction["inference_metadata"],
+        "resolution_debug": obb_prediction["resolution_debug"],
+        "mask_outline": None,
     }
 
     log_entry = {
@@ -1690,14 +1728,14 @@ def predict_cnn_image(project_root, tag, image_path, yolo_model_path=None):
         "detection_method": detection_method,
         "fallback_reason": fallback_reason,
         "scale": scale,
-        "was_flipped": was_flipped,
-        "orientation_debug": orientation_debug
-        or {"was_flipped": bool(was_flipped), "orientation_hint": orientation_hint},
-        "inference_metadata": _build_inference_metadata(
-            orientation_debug or {
-                "was_flipped": bool(was_flipped),
-                "orientation_hint": orientation_hint,
-            }
+        "orientation_debug": orientation_debug,
+        "inference_metadata": obb_prediction["inference_metadata"],
+        "resolution_debug": obb_prediction["resolution_debug"],
+        "clamped_landmark_ids": obb_prediction.get("clamped_landmark_ids", []),
+        **(
+            {"pre_clamp_landmarks": obb_prediction["pre_clamp_landmarks"]}
+            if obb_prediction.get("pre_clamp_landmarks")
+            else {}
         ),
     }
     save_prediction_log(debug_dir, tag, log_entry, predictor_type="cnn")
@@ -1712,11 +1750,7 @@ def predict_cnn_multi_specimen(
     yolo_model_path=None,
     input_boxes=None,
 ):
-    """
-    Predict landmarks for multiple specimens using detection + CNN.
-    """
-    from detection.detect_specimen import detect_multiple_specimens
-
+    """Predict landmarks for multiple specimens using OBB detection + CNN."""
     debug_dir = os.path.join(project_root, "debug")
 
     orientation_policy = {}
@@ -1729,40 +1763,25 @@ def predict_cnn_multi_specimen(
     model, landmark_ids, target_orientation, landmark_template, head_landmark_id, tail_landmark_id = \
         _load_cnn_model(project_root, tag)
 
-    img, orig_w, orig_h = load_image(image_path)
-    if img is None:
-        raise RuntimeError(f"Could not read: {image_path}")
-
-    max_dim = 1500
-    scale = 1.0
-    w, h = orig_w, orig_h
-    if max(orig_w, orig_h) > max_dim:
-        scale = max_dim / max(orig_w, orig_h)
-        w, h = int(orig_w * scale), int(orig_h * scale)
-        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-
-    if isinstance(input_boxes, list) and input_boxes:
-        detected_boxes = _normalize_input_boxes(input_boxes, scale=scale, image_w=w, image_h=h)
-        detection_result = {"boxes": detected_boxes, "detection_method": "provided_boxes"}
-    else:
-        temp_path = None
-        if scale != 1.0:
-            temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
-            os.close(temp_fd)
-            cv2.imwrite(temp_path, img)
-            detection_path = temp_path
-        else:
-            detection_path = image_path
-
-        detection_result = detect_multiple_specimens(detection_path, min_area_ratio=min_area_ratio,
-                                                     yolo_model_path=yolo_model_path)
-        detected_boxes = detection_result.get("boxes", [])
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+    img_original, img_detector, orig_w, orig_h, scale, detector_w, detector_h = _load_and_resize_for_inference(image_path)
+    detection_result = _detect_multi_obb_boxes(
+        image_path,
+        img_detector,
+        scale,
+        detector_w,
+        detector_h,
+        yolo_model_path=yolo_model_path,
+        orientation_policy=orientation_policy,
+        input_boxes=input_boxes,
+        min_area_ratio=min_area_ratio,
+        original_w=orig_w,
+        original_h=orig_h,
+    )
+    detected_boxes = detection_result["boxes"]
 
     print("PROGRESS 30 detecting", file=sys.stderr)
 
-    detection_method = detection_result.get("detection_method", "opencv")
+    detection_method = detection_result.get("detection_method", "yolo_obb")
     fallback_reason = detection_result.get("fallback_reason")
 
     if not detected_boxes:
@@ -1776,106 +1795,45 @@ def predict_cnn_multi_specimen(
         }
 
     specimens = []
+    clamp_debug = []
     predict_fn = _make_cnn_predict_fn(model, landmark_ids)
     for box_idx, box in enumerate(detected_boxes):
         pct = 40 + int(45 * (box_idx / max(len(detected_boxes), 1)))
         print(f"PROGRESS {pct} predicting", file=sys.stderr)
-        orientation_hint = _resolve_orientation_hint_from_box(
-            box,
-            min_confidence=0.25,
-            min_dx_ratio=0.06,
-        )
-
-        cropped, crop_meta = standardize_crop(img, box)
-        canonicalization_debug = None
-        mask_outline = None
-        if _should_try_canonicalization(orientation_policy):
-            sam_mask = _sam2_mask_for_box(img, box)
-            if sam_mask is not None:
-                mask_outline = _mask_outline_from_full_mask(
-                    sam_mask,
-                    scale=scale,
-                    image_shape=(orig_h, orig_w),
-                )
-                cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_mask(
-                    cropped,
-                    crop_meta,
-                    sam_mask,
-                    orientation_policy,
-                    orientation_hint,
-                )
-                if isinstance(canonicalization_debug, dict):
-                    canonicalization_debug["mask_source"] = "sam2"
-            else:
-                rough_mask = _rough_mask_from_crop(cropped)
-                if rough_mask is not None:
-                    cropped, crop_meta, canonicalization_debug = _canonicalize_crop_with_standard_mask(
-                        cropped,
-                        crop_meta,
-                        rough_mask,
-                        orientation_policy,
-                        orientation_hint,
-                    )
-                    if isinstance(canonicalization_debug, dict):
-                        canonicalization_debug["mask_source"] = "rough_otsu"
-
-        landmarks_512, was_flipped, orientation_debug = _predict_with_orientation_lock(
-            crop_512=cropped,
-            predict_fn=predict_fn,
+        obb_prediction = _run_obb_inference_on_box(
+            img_original=img_original,
+            box=box,
+            orig_h=orig_h,
+            orig_w=orig_w,
+            detector_scale=scale,
+            detector_w=detector_w,
+            detector_h=detector_h,
             orientation_policy=orientation_policy,
-            canonicalization_debug=canonicalization_debug,
+            predict_fn=predict_fn,
             target_orientation=target_orientation,
             landmark_template=landmark_template,
             head_landmark_id=head_landmark_id,
             tail_landmark_id=tail_landmark_id,
-            orientation_hint=orientation_hint,
         )
-        if isinstance(orientation_debug, dict):
-            if canonicalization_debug is not None:
-                orientation_debug["canonicalization"] = canonicalization_debug
-            orientation_debug["was_flipped"] = bool(was_flipped)
-            orientation_debug["orientation_hint"] = orientation_hint
-            orientation_debug["orientation_hint_raw"] = box.get("orientation_hint") if isinstance(box, dict) else None
-
-        landmarks = sorted(
-            map_landmarks_to_original(
-                landmarks_512,
-                crop_meta,
-                scale,
-                was_flipped=was_flipped,
-                image_shape=(orig_h, orig_w),
-            ),
-            key=lambda lm: lm["id"]
-        )
-
-        # Scale bounding box back to original size
-        scaled_box = {}
-        if scale != 1.0:
-            for k, v in box.items():
-                if isinstance(v, (int, float)):
-                    scaled_box[k] = int(v / scale)
-                elif k in ("obbCorners", "obb_corners") and isinstance(v, list):
-                    scaled_box[k] = [[pt[0] / scale, pt[1] / scale] for pt in v]
-                else:
-                    scaled_box[k] = v
-        else:
-            scaled_box = dict(box)
-        scaled_box["confidence"] = box.get("confidence")
-        scaled_box["class_name"] = box.get("class_name")
-        if isinstance(box.get("orientation_hint"), dict):
-            scaled_box["orientation_hint"] = _scale_orientation_hint(box.get("orientation_hint"), scale)
-
-        specimen_orientation_debug = orientation_debug or {
-            "was_flipped": bool(was_flipped),
-            "orientation_hint": orientation_hint,
-        }
         specimens.append({
-            "box": scaled_box,
-            "landmarks": landmarks,
-            "num_landmarks": len(landmarks),
-            "orientation_debug": specimen_orientation_debug,
-            "inference_metadata": _build_inference_metadata(specimen_orientation_debug),
-            "mask_outline": mask_outline,
+            "box": obb_prediction["detected_box"],
+            "landmarks": obb_prediction["landmarks"],
+            "num_landmarks": len(obb_prediction["landmarks"]),
+            "orientation_debug": obb_prediction["orientation_debug"],
+            "inference_metadata": obb_prediction["inference_metadata"],
+            "resolution_debug": obb_prediction["resolution_debug"],
+            "mask_outline": None,
+        })
+        clamp_debug.append({
+            "box_index": box_idx,
+            "clamped_landmark_ids": obb_prediction.get("clamped_landmark_ids", []),
+            "clamped_landmark_count": obb_prediction.get("clamped_landmark_count", 0),
+            "resolution_debug": obb_prediction["resolution_debug"],
+            **(
+                {"pre_clamp_landmarks": obb_prediction["pre_clamp_landmarks"]}
+                if obb_prediction.get("pre_clamp_landmarks")
+                else {}
+            ),
         })
 
     print("PROGRESS 90 mapping", file=sys.stderr)
@@ -1901,6 +1859,7 @@ def predict_cnn_multi_specimen(
         "detection_method": detection_method,
         "fallback_reason": fallback_reason,
         "specimens": specimens,
+        "clamp_debug": clamp_debug,
     }
     save_prediction_log(debug_dir, tag, log_entry, predictor_type="cnn")
     return result
@@ -1974,7 +1933,8 @@ if __name__ == "__main__":
     else:
         if predictor_type == "cnn":
             result = predict_cnn_image(project_root, tag, image_path,
-                                       yolo_model_path=yolo_model_path)
+                                       yolo_model_path=yolo_model_path,
+                                       input_box=obb_input_box)
         else:
             result = predict_image(project_root, tag, image_path,
                                    yolo_model_path=yolo_model_path,

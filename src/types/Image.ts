@@ -37,11 +37,43 @@ export interface BoundingBox {
     rotation: number;
     scale: number;
   };
-  detectionMethod?: string; // "yolo_world+sam2", "opencv", etc.
-  // OBB fields (set when annotated via YOLO-World+SAM2 or manual OBB tool)
+  detectionMethod?: string; // "yolo_obb", "yolo_obb+sam2", etc.
+  // OBB fields (set when annotated via the session OBB detector or manual OBB tool)
   angle?: number;                  // OBB rotation angle in degrees
   obbCorners?: [number, number][]; // 4 corners [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
   class_id?: number;               // 0=canonical (left/up), 1=mirror (right/down), from OBB orientation
+  orientation_override?: OrientationLabel;
+  orientation_hint?: {
+    orientation?: StoredOrientationLabel;
+    confidence?: number;
+    source?: string;
+  };
+}
+
+export type FinalizePhase =
+  | "idle"
+  | "queued"
+  | "running"
+  | "saved"
+  | "already_finalized"
+  | "finalized_without_segments"
+  | "failed";
+
+export interface FinalizeFailureDetail {
+  index: number;
+  status: "saved" | "failed";
+  maskSource?: string;
+  reason?: string;
+}
+
+export interface FinalizePhaseMetadata {
+  state: Exclude<FinalizePhase, "idle">;
+  signature?: string;
+  updatedAt: string;
+  reason?: string;
+  expectedCount?: number;
+  savedCount?: number;
+  details?: FinalizeFailureDetail[];
 }
 
 export interface AnnotatedImage {
@@ -59,6 +91,7 @@ export interface AnnotatedImage {
   diskPath?: string;    // Persisted path in session directory (survives restarts)
   isFinalized?: boolean; // True once the user has clicked "Finalize This Image"
   hasBoxes?: boolean; // Lightweight metadata from session restore for lazy box hydration
+  finalizePhase?: FinalizePhaseMetadata;
 
   // Agentic metadata (optional)
   processingStatus?: "pending" | "predicted" | "review" | "approved";
@@ -67,22 +100,97 @@ export interface AnnotatedImage {
 
 // Landmark schema definition
 export interface LandmarkDefinition {
-  index: number; // 0, 1, 2...
+  index: number; // 1, 2, 3...
   name: string; // "Left Forewing Apex"
   description?: string;
   category?: string; // "forewing", "head", "body", etc.
 }
 
 export type OrientationMode = "directional" | "bilateral" | "axial" | "invariant";
+export type BilateralClassAxis = "vertical_obb";
+export type StoredOrientationLabel = "left" | "right" | "up" | "down";
+export type OrientationLabel = StoredOrientationLabel | "uncertain";
+export type ObbModelTier = "nano" | "small" | "medium" | "large";
+export type ObbImageSize = 640 | 960 | 1280;
+export type ObbDetectionPreset =
+  | "balanced"
+  | "precision"
+  | "recall"
+  | "single_object"
+  | "custom";
+
+export interface RepresentativeImageDimensions {
+  width: number;
+  height: number;
+  sampleCount?: number;
+  megapixels?: number;
+}
 
 export interface OrientationPolicy {
   mode: OrientationMode;
   targetOrientation?: "left" | "right";
   headCategories?: string[];
   tailCategories?: string[];
+  anteriorAnchorIds?: number[];
+  posteriorAnchorIds?: number[];
   bilateralPairs?: [number, number][];
-  pcaLevelingMode?: "off" | "on" | "auto";
+  bilateralClassAxis?: BilateralClassAxis;
   obbLevelingMode?: "on" | "off";  // Controls whether OBB rotation is applied during crop extraction
+}
+
+export interface ObbTrainingSettings {
+  modelTier?: ObbModelTier;
+  imgsz?: ObbImageSize;
+  epochs?: number;
+  batch?: number;
+  iou?: number;
+  cls?: number;
+  box?: number;
+}
+
+export interface ObbDetectionSettings {
+  detectionPreset?: ObbDetectionPreset;
+  conf?: number;
+  nmsIou?: number;
+  maxObjects?: number;
+  imgsz?: ObbImageSize;
+}
+
+export interface ObbTrainProgressDetails {
+  epoch?: number;
+  epochs?: number;
+  batch?: number;
+  batches?: number;
+  loss?: number;
+  lr?: number;
+  elapsed_sec?: number;
+  eta_sec?: number;
+  workers?: number;
+  device?: string;
+  platform?: string;
+  amp_enabled?: boolean;
+}
+
+export interface ObbTrainProgressEvent {
+  percent: number;
+  stage: string;
+  message: string;
+  details?: ObbTrainProgressDetails;
+}
+
+export interface GeometryMappingConfig {
+  axisMode: "auto" | "manual_anchors";
+  anchorLandmarkIds?: {
+    anteriorIds: number[];
+    posteriorIds: number[];
+  };
+  paddingMode: "tight" | "asymmetric";
+  paddingProfile?: {
+    forwardPct: number;
+    backwardPct: number;
+    topPct: number;
+    bottomPct: number;
+  };
 }
 
 export interface LandmarkSchema {
@@ -90,6 +198,14 @@ export interface LandmarkSchema {
   name: string;
   description: string;
   landmarks: LandmarkDefinition[];
+}
+
+export interface ReusableSchemaTemplate extends LandmarkSchema {
+  kind: "custom";
+  orientationPolicy?: OrientationPolicy;
+  sourcePresetId?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 // Species registry
@@ -105,11 +221,14 @@ export interface Species {
   };
   landmarkTemplate: LandmarkDefinition[];
   orientationPolicy?: OrientationPolicy;
+  obbTrainingSettings?: ObbTrainingSettings;
+  obbDetectionSettings?: ObbDetectionSettings;
+  representativeImageDimensions?: RepresentativeImageDimensions;
   models: SpeciesModel[];
   imageCount: number;
   annotationCount?: number;
-  createdAt: Date;
-  lastModified?: Date;
+  createdAt: string;
+  lastModified?: string;
 }
 
 interface SpeciesModel {
@@ -130,5 +249,11 @@ export interface TrainedModel {
   path: string;
   size: number;
   createdAt: Date;
-  predictorType?: "dlib" | "cnn" | "yolo_pose";
+  predictorType?: "dlib" | "cnn";
+  modelKind?: "landmark" | "obb_detector";
+  speciesId?: string;
+  schemaName?: string;
+  status?: "active" | "deprecated";
+  compatible?: boolean;
+  reason?: string;
 }

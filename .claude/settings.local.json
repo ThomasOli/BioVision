@@ -16,7 +16,19 @@
       "Bash(/Users/juntianzhong/BioVision/venv/bin/python3 -c \"import torch; print\\(''torch:'', torch.__version__\\); print\\(''mps built:'', torch.backends.mps.is_built\\(\\)\\); print\\(''mps available:'', torch.backends.mps.is_available\\(\\)\\); print\\(''cuda available:'', torch.cuda.is_available\\(\\)\\)\")",
       "Bash(/Users/juntianzhong/BioVision/venv/bin/python3 -c \"from ultralytics import YOLOWorld; m = YOLOWorld\\(''yolov8s-worldv2.pt''\\); print\\(''loaded OK''\\)\")",
       "Bash(/Users/juntianzhong/BioVision/venv/bin/python3 /Users/juntianzhong/BioVision/backend/hardware_probe.py)",
-      "Read(//c/Users/yupin/.claude/projects/c--Users-yupin-Downloads-BioVision/ff7dc567-3a86-4f0a-aac5-e944e2d542ad/tool-results/**)"
+      "Read(//c/Users/yupin/.claude/projects/c--Users-yupin-Downloads-BioVision/ff7dc567-3a86-4f0a-aac5-e944e2d542ad/tool-results/**)",
+      "Read(//c/Users/**)",
+      "Bash(python scripts/reset_finalized.py \"models/sessions/schema-fish-morphometrics\")",
+      "Bash(python -c \":*)",
+      "Read(//^def export_dataset/,/^def [a-zA-Z]/**)",
+      "Bash(awk 'NR>=1274 && NR<=1898' backend/data/export_yolo_dataset.py)",
+      "Bash(cat \"c:\\\\Users\\\\yupin\\\\Downloads\\\\BioVision\\\\models\\\\sessions\\\\schema-fish-morphometrics\\\\obb_dataset\\\\labels\\\\val\"/*.txt)",
+      "Bash(cat \"c:\\\\Users\\\\yupin\\\\Downloads\\\\BioVision\\\\models\\\\sessions\\\\schema-fish-morphometrics\\\\obb_dataset\\\\labels\\\\train\"/*.txt)",
+      "Bash(cat /c/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics/obb_dataset/labels/val/*.txt)",
+      "Bash(head -3 /c/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics/obb_dataset/labels/train/*.txt)",
+      "Bash(sort -t. -k1 -n)",
+      "Read(//c/Users/yupin/Downloads/BioVision/**)",
+      "Bash(ls c:/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics/ find c:/Users/yupin/Downloads/BioVision/models/sessions/schema-fish-morphometrics -name *.json)"
     ]
   }
 }

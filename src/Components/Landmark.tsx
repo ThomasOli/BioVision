@@ -18,7 +18,6 @@ import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-  TooltipProvider,
 } from "@/Components/ui/tooltip";
 import { Separator } from "@/Components/ui/separator";
 import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
@@ -132,8 +131,7 @@ const Landmark: React.FC<LandmarkProps> = ({
   const opacity01 = opacity / 100;
 
   return (
-    <TooltipProvider>
-      <motion.div variants={cardHover} initial="initial" whileHover="hover">
+    <motion.div variants={cardHover} initial="initial" whileHover="hover">
         <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
@@ -369,7 +367,6 @@ const Landmark: React.FC<LandmarkProps> = ({
           </CardContent>
         </Card>
       </motion.div>
-    </TooltipProvider>
   );
 };
 

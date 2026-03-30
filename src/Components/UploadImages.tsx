@@ -1,14 +1,17 @@
-import React, { ChangeEvent, useState, DragEvent } from "react";
+import React, { ChangeEvent, useEffect, useState, DragEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Upload, Folder, Trash2, X, ImageIcon, Loader2, FileText, FolderOpen, Tag } from "lucide-react";
 import { useDispatch, useSelector } from "react-redux";
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
+import { Input } from "@/Components/ui/input";
 import { Progress } from "@/Components/ui/progress";
 import { ScrollArea } from "@/Components/ui/scroll-area";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/Components/ui/dialog";
 import { addFilesWithSpecies } from "../state/filesState/fileSlice";
+import { updateSpecies } from "../state/speciesState/speciesSlice";
 import type { RootState } from "../state/store";
-import type { AnnotatedImage, BoundingBox } from "../types/Image";
+import type { AnnotatedImage, BoundingBox, GeometryMappingConfig, LandmarkDefinition, Species } from "../types/Image";
 import { staggerContainer, staggerItem, dropzoneActive, buttonHover, buttonTap } from "@/lib/animations";
 import { toast } from "sonner";
 
@@ -29,9 +32,24 @@ async function fileToBase64(file: File): Promise<string> {
   });
 }
 
+const DEFAULT_GEOMETRY_CONFIG: GeometryMappingConfig = {
+  axisMode: "auto",
+  paddingMode: "tight",
+  paddingProfile: {
+    forwardPct: 10,
+    backwardPct: 10,
+    topPct: 10,
+    bottomPct: 10,
+  },
+};
+
 const UploadImages: React.FC = () => {
   const dispatch = useDispatch();
   const activeSpeciesId = useSelector((state: RootState) => state.species.activeSpeciesId);
+  const activeSpecies = useSelector((state: RootState) =>
+    state.species.species.find((species) => species.id === state.species.activeSpeciesId)
+  );
+  const fallbackLandmarkTemplate = activeSpecies?.landmarkTemplate ?? [];
 
   const [activeTab, setActiveTab] = useState<"upload" | "preannotated">("upload");
 
@@ -46,6 +64,132 @@ const UploadImages: React.FC = () => {
   const [paFolderPath, setPaFolderPath] = useState<string | null>(null);
   const [paAnnotationPath, setPaAnnotationPath] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [geometryModalOpen, setGeometryModalOpen] = useState(false);
+  const [geometryConfig, setGeometryConfig] = useState<GeometryMappingConfig>(DEFAULT_GEOMETRY_CONFIG);
+  const [useSam2BoxDerivation, setUseSam2BoxDerivation] = useState(false);
+  const [guidedAnteriorIds, setGuidedAnteriorIds] = useState<number[]>([]);
+  const [guidedPosteriorIds, setGuidedPosteriorIds] = useState<number[]>([]);
+  const [sessionLandmarkTemplate, setSessionLandmarkTemplate] = useState<LandmarkDefinition[] | null>(null);
+  const [sessionTemplateSpeciesId, setSessionTemplateSpeciesId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!activeSpeciesId) {
+      setSessionLandmarkTemplate(null);
+      setSessionTemplateSpeciesId(null);
+      return;
+    }
+
+    if (activeTab !== "preannotated") {
+      return;
+    }
+
+    window.api.sessionLoad(activeSpeciesId).then((result) => {
+      if (cancelled) return;
+      if (!result?.ok) {
+        setSessionLandmarkTemplate(null);
+        setSessionTemplateSpeciesId(activeSpeciesId);
+        return;
+      }
+      const loadedTemplate = Array.isArray(result.meta?.landmarkTemplate)
+        ? (result.meta?.landmarkTemplate as LandmarkDefinition[])
+        : [];
+      setSessionLandmarkTemplate(loadedTemplate);
+      setSessionTemplateSpeciesId(activeSpeciesId);
+
+      const fallbackSerialized = JSON.stringify(fallbackLandmarkTemplate ?? []);
+      const loadedSerialized = JSON.stringify(loadedTemplate ?? []);
+      const nextUpdates: Partial<Species> = {};
+      if (fallbackSerialized !== loadedSerialized) {
+        nextUpdates.landmarkTemplate = loadedTemplate;
+      }
+      if (result.meta?.orientationPolicy) {
+        nextUpdates.orientationPolicy = result.meta.orientationPolicy;
+      }
+      if (Object.keys(nextUpdates).length > 0) {
+        dispatch(
+          updateSpecies({
+            id: activeSpeciesId,
+            updates: nextUpdates,
+          })
+        );
+      }
+    }).catch(() => {
+      if (cancelled) return;
+      setSessionLandmarkTemplate(null);
+      setSessionTemplateSpeciesId(activeSpeciesId);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSpeciesId, activeTab, dispatch, fallbackLandmarkTemplate]);
+
+  const landmarkTemplate =
+    activeSpeciesId &&
+    sessionTemplateSpeciesId === activeSpeciesId &&
+    Array.isArray(sessionLandmarkTemplate)
+      ? sessionLandmarkTemplate
+      : fallbackLandmarkTemplate;
+
+  useEffect(() => {
+    const policy = activeSpecies?.orientationPolicy;
+    const availableIds = new Set(landmarkTemplate.map((landmark) => Number(landmark.index)));
+    const nextAnterior = Array.isArray(policy?.anteriorAnchorIds)
+      ? policy.anteriorAnchorIds.map((id) => Number(id)).filter((id) => availableIds.has(id))
+      : [];
+    const nextPosterior = Array.isArray(policy?.posteriorAnchorIds)
+      ? policy.posteriorAnchorIds.map((id) => Number(id)).filter((id) => availableIds.has(id))
+      : [];
+    setGuidedAnteriorIds(nextAnterior);
+    setGuidedPosteriorIds(nextPosterior);
+  }, [activeSpecies?.orientationPolicy, landmarkTemplate]);
+
+  const resolveAnchorIds = () => {
+    if (geometryConfig.axisMode !== "manual_anchors") return undefined;
+    const anteriorIds = guidedAnteriorIds.filter((id) => Number.isFinite(Number(id))).map((id) => Number(id));
+    const posteriorIds = guidedPosteriorIds.filter((id) => Number.isFinite(Number(id))).map((id) => Number(id));
+    if (anteriorIds.length === 0 || posteriorIds.length === 0) return undefined;
+    return { anteriorIds, posteriorIds };
+  };
+
+  const resolvedAnchorIds = resolveAnchorIds();
+  const manualAnchorError =
+    geometryConfig.axisMode !== "manual_anchors"
+      ? null
+      : landmarkTemplate.length === 0
+      ? "This schema does not define landmarks for manual anchors."
+      : !resolvedAnchorIds
+      ? "Select both anterior and posterior landmarks."
+      : resolvedAnchorIds.anteriorIds.some((id) => resolvedAnchorIds.posteriorIds.includes(id))
+      ? "Anterior and posterior anchor sets must not overlap."
+      : null;
+
+  const resolveImportGeometryConfig = (): GeometryMappingConfig => ({
+    axisMode: geometryConfig.axisMode,
+    ...(geometryConfig.axisMode === "manual_anchors" && resolvedAnchorIds
+      ? { anchorLandmarkIds: resolvedAnchorIds }
+      : {}),
+    paddingMode: geometryConfig.paddingMode,
+    ...(geometryConfig.paddingMode === "asymmetric"
+      ? {
+          paddingProfile: {
+            forwardPct: Math.max(0, Number(geometryConfig.paddingProfile?.forwardPct) || 0),
+            backwardPct: Math.max(0, Number(geometryConfig.paddingProfile?.backwardPct) || 0),
+            topPct: Math.max(0, Number(geometryConfig.paddingProfile?.topPct) || 0),
+            bottomPct: Math.max(0, Number(geometryConfig.paddingProfile?.bottomPct) || 0),
+          },
+        }
+      : {
+          paddingProfile: {
+            forwardPct: 10,
+            backwardPct: 10,
+            topPct: 10,
+            bottomPct: 10,
+          },
+        }),
+  });
 
   const appendToQueue = (incomingFiles: File[], incomingPreviews: string[]) => {
     const existingKeys = new Set(selectedFiles.map(fileKey));
@@ -211,12 +355,18 @@ const UploadImages: React.FC = () => {
 
   const handleImportAnnotated = async () => {
     if (!paFolderPath || !paAnnotationPath || !activeSpeciesId) return;
+    if (manualAnchorError) {
+      toast.error(manualAnchorError);
+      return;
+    }
     setIsImporting(true);
     try {
       const result = await window.api.loadAnnotatedFolder({
         imageFolderPath: paFolderPath,
         annotationFilePath: paAnnotationPath,
         speciesId: activeSpeciesId,
+        geometryConfig: resolveImportGeometryConfig(),
+        useSam2BoxDerivation,
       });
 
       if (!result.ok || !result.images?.length) {
@@ -249,9 +399,13 @@ const UploadImages: React.FC = () => {
         ? ` ${result.unmatched.length} image(s) had no matching annotation.`
         : "";
       toast.success(`Imported ${result.images.length} images with landmarks.${unmatchedMsg}`);
+      if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+        toast.warning(result.warnings[0]);
+      }
 
       setPaFolderPath(null);
       setPaAnnotationPath(null);
+      setGeometryModalOpen(false);
     } catch (err) {
       console.error("Pre-annotated import failed:", err);
       toast.error("Import failed. Please try again.");
@@ -387,8 +541,222 @@ const UploadImages: React.FC = () => {
   const paFolderParts = paFolderPath ? paFolderPath.split(/[\\/]/).filter(Boolean) : [];
   const paFolderName = paFolderParts.length > 0 ? paFolderParts[paFolderParts.length - 1] : null;
 
+  const updatePadding = (key: "forwardPct" | "backwardPct" | "topPct" | "bottomPct", value: string) => {
+    const numeric = Math.max(0, Number(value) || 0);
+    setGeometryConfig((current) => ({
+      ...current,
+      paddingProfile: {
+        forwardPct: current.paddingProfile?.forwardPct ?? 10,
+        backwardPct: current.paddingProfile?.backwardPct ?? 10,
+        topPct: current.paddingProfile?.topPct ?? 10,
+        bottomPct: current.paddingProfile?.bottomPct ?? 10,
+        [key]: numeric,
+      },
+    }));
+  };
+
   return (
     <div className="flex w-full flex-col items-center gap-3">
+      <Dialog open={geometryModalOpen} onOpenChange={(open) => !isImporting && setGeometryModalOpen(open)}>
+        <DialogContent className="sm:max-w-lg max-h-[85vh] overflow-y-auto scrollbar-app p-0">
+          <div className="flex min-h-0 flex-col">
+          <DialogHeader className="px-6 pt-6">
+            <DialogTitle>Geometry Mapping</DialogTitle>
+            <DialogDescription>
+              Configure how missing OBB geometry should be derived from landmarks during import.
+            </DialogDescription>
+          </DialogHeader>
+
+            <div className="space-y-4 px-6 py-4 text-sm">
+            <div className="space-y-2">
+              <p className="font-semibold">Axis Definition</p>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="radio"
+                  name="geometry-axis-mode"
+                  checked={geometryConfig.axisMode === "auto"}
+                  onChange={() =>
+                    setGeometryConfig((current) => ({
+                      ...current,
+                      axisMode: "auto",
+                    }))
+                  }
+                />
+                  <div>
+                    <div className="font-medium">Auto</div>
+                    <div className="text-xs text-muted-foreground">Use schema anchor arrays first, then category or bi-centroid fallback when anchors are unavailable.</div>
+                  </div>
+                </label>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="radio"
+                  name="geometry-axis-mode"
+                  checked={geometryConfig.axisMode === "manual_anchors"}
+                  onChange={() =>
+                    setGeometryConfig((current) => ({
+                      ...current,
+                      axisMode: "manual_anchors",
+                    }))
+                  }
+                />
+                <div className="w-full space-y-2">
+                  <div>
+                    <div className="font-medium">Manual anchors</div>
+                    <div className="text-xs text-muted-foreground">Select one-or-many anterior and posterior landmarks. Import derives the specimen axis from the centroid of each anchor group.</div>
+                  </div>
+                  {geometryConfig.axisMode === "manual_anchors" && (
+                    landmarkTemplate.length > 0 ? (
+                      <div className="grid gap-3 rounded-md border p-3">
+                        <div className="space-y-2">
+                          <div className="text-xs font-medium">Anterior anchor landmarks</div>
+                          <ScrollArea className="h-40 rounded-md border bg-muted/20 px-3 py-2">
+                            <div className="grid grid-cols-1 gap-2 pr-3 sm:grid-cols-2">
+                              {landmarkTemplate.map((landmark) => (
+                                <label key={`manual-anterior-${landmark.index}`} className="flex items-center gap-2 rounded-md px-1 py-1 text-xs hover:bg-muted/40">
+                                  <input
+                                    type="checkbox"
+                                    checked={guidedAnteriorIds.includes(Number(landmark.index))}
+                                    onChange={() =>
+                                      setGuidedAnteriorIds((current) =>
+                                        current.includes(Number(landmark.index))
+                                          ? current.filter((value) => value !== Number(landmark.index))
+                                          : [...current, Number(landmark.index)].sort((a, b) => a - b)
+                                      )
+                                    }
+                                  />
+                                  <span>{landmark.name} (#{landmark.index})</span>
+                                </label>
+                              ))}
+                            </div>
+                          </ScrollArea>
+                        </div>
+                        <div className="space-y-2">
+                          <div className="text-xs font-medium">Posterior anchor landmarks</div>
+                          <ScrollArea className="h-40 rounded-md border bg-muted/20 px-3 py-2">
+                            <div className="grid grid-cols-1 gap-2 pr-3 sm:grid-cols-2">
+                              {landmarkTemplate.map((landmark) => (
+                                <label key={`manual-posterior-${landmark.index}`} className="flex items-center gap-2 rounded-md px-1 py-1 text-xs hover:bg-muted/40">
+                                  <input
+                                    type="checkbox"
+                                    checked={guidedPosteriorIds.includes(Number(landmark.index))}
+                                    onChange={() =>
+                                      setGuidedPosteriorIds((current) =>
+                                        current.includes(Number(landmark.index))
+                                          ? current.filter((value) => value !== Number(landmark.index))
+                                          : [...current, Number(landmark.index)].sort((a, b) => a - b)
+                                      )
+                                    }
+                                  />
+                                  <span>{landmark.name} (#{landmark.index})</span>
+                                </label>
+                              ))}
+                            </div>
+                          </ScrollArea>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
+                        No landmarks are available for manual anchors in this schema.
+                      </div>
+                    )
+                  )}
+                </div>
+              </label>
+              {manualAnchorError && <p className="text-xs text-destructive">{manualAnchorError}</p>}
+            </div>
+
+            <div className="space-y-2">
+              <p className="font-semibold">Envelope Inflation</p>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="radio"
+                  name="geometry-padding-mode"
+                  checked={geometryConfig.paddingMode === "tight"}
+                  onChange={() =>
+                    setGeometryConfig((current) => ({
+                      ...current,
+                      paddingMode: "tight",
+                    }))
+                  }
+                />
+                <div>
+                  <div className="font-medium">Tight</div>
+                  <div className="text-xs text-muted-foreground">Use the standard 10% margin on all sides.</div>
+                </div>
+              </label>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="radio"
+                  name="geometry-padding-mode"
+                  checked={geometryConfig.paddingMode === "asymmetric"}
+                  onChange={() =>
+                    setGeometryConfig((current) => ({
+                      ...current,
+                      paddingMode: "asymmetric",
+                    }))
+                  }
+                />
+                <div className="w-full space-y-2">
+                  <div>
+                    <div className="font-medium">Asymmetric</div>
+                    <div className="text-xs text-muted-foreground">Extend the specimen envelope beyond the landmark hull in the OBB frame.</div>
+                  </div>
+                  {geometryConfig.paddingMode === "asymmetric" && (
+                    <div className="grid grid-cols-2 gap-2">
+                      {([
+                        ["forwardPct", "Forward %"],
+                        ["backwardPct", "Backward %"],
+                        ["topPct", "Top %"],
+                        ["bottomPct", "Bottom %"],
+                      ] as const).map(([key, label]) => (
+                        <label key={key} className="space-y-1 text-xs">
+                          <span>{label}</span>
+                          <Input
+                            type="number"
+                            min={0}
+                            step={1}
+                            value={geometryConfig.paddingProfile?.[key] ?? 0}
+                            onChange={(event) => updatePadding(key, event.target.value)}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </label>
+            </div>
+
+            <div className="space-y-2">
+              <p className="font-semibold">SAM2 Box Derivation</p>
+              <label className="flex items-start gap-2 rounded-lg border p-3">
+                <input
+                  type="checkbox"
+                  checked={useSam2BoxDerivation}
+                  onChange={(event) => setUseSam2BoxDerivation(event.target.checked)}
+                />
+                <div>
+                  <div className="font-medium">Use iterative SAM2 during import</div>
+                  <div className="text-xs text-muted-foreground">
+                    Regenerate each imported box from a SAM2 mask. This is slower, but it can replace coarse imported boxes with mask-aligned geometry.
+                  </div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <DialogFooter className="sticky bottom-0 gap-2 border-t bg-background px-6 py-4 sm:gap-0">
+            <Button variant="outline" disabled={isImporting} onClick={() => setGeometryModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button disabled={isImporting || Boolean(manualAnchorError)} onClick={handleImportAnnotated}>
+              {isImporting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              {isImporting ? "Importing..." : "Start Import"}
+            </Button>
+          </DialogFooter>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Tab switcher */}
       <div className="flex w-full max-w-[320px] rounded-lg border bg-muted/30 p-1">
         <button
@@ -474,7 +842,7 @@ const UploadImages: React.FC = () => {
             <Button
               className="w-full font-bold"
               disabled={!paFolderPath || !paAnnotationPath || !activeSpeciesId || isImporting}
-              onClick={handleImportAnnotated}
+              onClick={() => setGeometryModalOpen(true)}
             >
               {isImporting ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />

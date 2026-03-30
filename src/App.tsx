@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from "react"
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useDispatch, useSelector } from "react-redux"
 import { motion } from "framer-motion"
 
@@ -13,11 +13,19 @@ import { UndoRedoClearContextProvider } from "./Components/UndoRedoClearContext"
 import { LandingPage } from "./Components/LandingPage"
 import { MyModelsPage } from "./Components/MyModelsPage"
 import { InferencePage } from "./Components/InferencePage"
-import { AppView, AnnotatedImage } from "./types/Image"
-import { DetectionMode, DetectionPreset } from "./Components/DetectionModeSelector"
+import { AppView, AnnotatedImage, RepresentativeImageDimensions } from "./types/Image"
+import { DetectionMode } from "./Components/DetectionModeSelector"
 import { AppDispatch, RootState } from "./state/store"
 import { setSessionImages } from "./state/filesState/fileSlice"
 import { setHardwareCapabilities } from "./state/hardwareSlice"
+import {
+  areObbDetectionSettingsEqual,
+  DEFAULT_OBB_DETECTION_SETTINGS,
+  getRecommendedObbDetectionSettings,
+  normalizeObbDetectionSettings,
+  summarizeRepresentativeImageDimensions,
+} from "./lib/obbDetectorSettings"
+import type { ObbDetectionSettings } from "./types/Image"
 
 /** Restores session images+annotations from disk whenever the active species changes. */
 function SessionRestorer() {
@@ -93,6 +101,7 @@ const App: React.FC = () => {
   const [openTrainDialogOnMount, setOpenTrainDialogOnMount] = useState(false)
   const [openSchemaDialogOnMount, setOpenSchemaDialogOnMount] = useState(false)
   const [selectedModelForInference, setSelectedModelForInference] = useState<string>("")
+  const [selectedInferenceSpeciesId, setSelectedInferenceSpeciesId] = useState<string>("")
   const [hasActivatedSchemaThisRun, setHasActivatedSchemaThisRun] = useState(false)
 
   // Workspace state
@@ -106,10 +115,113 @@ const App: React.FC = () => {
   })
   // Detection state
   const [detectionMode, setDetectionMode] = useState<DetectionMode>("manual")
-  const [autoConfidence, setAutoConfidence] = useState(0.3)
-  const [detectionPreset, setDetectionPreset] = useState<DetectionPreset>("balanced")
+  const [obbDetectionSettings, setObbDetectionSettings] = useState<ObbDetectionSettings>(DEFAULT_OBB_DETECTION_SETTINGS)
+  const [obbDetectionSettingsCustomized, setObbDetectionSettingsCustomized] = useState(false)
+  const [sessionImageCountHint, setSessionImageCountHint] = useState(0)
+  const [sessionRepresentativeImageDimensions, setSessionRepresentativeImageDimensions] =
+    useState<RepresentativeImageDimensions | undefined>(undefined)
+  const [workspaceRepresentativeImageDimensions, setWorkspaceRepresentativeImageDimensions] =
+    useState<RepresentativeImageDimensions | undefined>(undefined)
   const [objectClassName, setObjectClassName] = useState("")
   const [samEnabled, setSamEnabled] = useState(false)
+  const workspaceImages = useSelector((state: RootState) => state.files.fileArray)
+
+  useEffect(() => {
+    if (workspaceImages.length === 0) {
+      setWorkspaceRepresentativeImageDimensions(undefined)
+      return
+    }
+    let cancelled = false
+    const sample = workspaceImages
+      .slice(0, 12)
+      .map((img) => img.url)
+      .filter((url): url is string => typeof url === "string" && url.length > 0)
+
+    Promise.all(
+      sample.map(
+        (url) =>
+          new Promise<{ width: number; height: number } | null>((resolve) => {
+            const image = new Image()
+            image.onload = () => resolve({ width: image.naturalWidth || image.width, height: image.naturalHeight || image.height })
+            image.onerror = () => resolve(null)
+            image.src = url
+          })
+      )
+    ).then((results) => {
+      if (cancelled) return
+      setWorkspaceRepresentativeImageDimensions(
+        summarizeRepresentativeImageDimensions(
+          results.filter((entry): entry is { width: number; height: number } => Boolean(entry))
+        )
+      )
+    })
+
+    return () => { cancelled = true }
+  }, [workspaceImages])
+
+  const effectiveImageCount = sessionImageCountHint > 0 ? sessionImageCountHint : workspaceImages.length
+  const effectiveRepresentativeImageDimensions =
+    workspaceRepresentativeImageDimensions ?? sessionRepresentativeImageDimensions
+  const obbDetectionRecommendation = useMemo(
+    () => getRecommendedObbDetectionSettings(
+      effectiveImageCount,
+      effectiveRepresentativeImageDimensions
+    ),
+    [effectiveImageCount, effectiveRepresentativeImageDimensions]
+  )
+
+  useEffect(() => {
+    if (!activeSpeciesId) {
+      setObbDetectionSettings(DEFAULT_OBB_DETECTION_SETTINGS)
+      setObbDetectionSettingsCustomized(false)
+      setSessionImageCountHint(0)
+      setSessionRepresentativeImageDimensions(undefined)
+      return
+    }
+    let cancelled = false
+    window.api.sessionLoad(activeSpeciesId)
+      .then((result) => {
+        if (cancelled || !result?.ok) return
+        const customized = Boolean(result.meta?.obbDetectionSettingsCustomized)
+        setObbDetectionSettingsCustomized(customized)
+        setSessionImageCountHint(typeof result.meta?.imageCount === "number" ? result.meta.imageCount : 0)
+        setSessionRepresentativeImageDimensions(
+          result.meta?.representativeImageDimensions as RepresentativeImageDimensions | undefined
+        )
+        setObbDetectionSettings(
+          customized
+            ? normalizeObbDetectionSettings(
+              result.meta?.obbDetectionSettings as ObbDetectionSettings | undefined,
+              obbDetectionRecommendation.settings
+            )
+            : obbDetectionRecommendation.settings
+        )
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setObbDetectionSettings(DEFAULT_OBB_DETECTION_SETTINGS)
+          setObbDetectionSettingsCustomized(false)
+          setSessionImageCountHint(0)
+          setSessionRepresentativeImageDimensions(undefined)
+        }
+      })
+    return () => { cancelled = true }
+  }, [activeSpeciesId])
+
+  useEffect(() => {
+    if (!activeSpeciesId || obbDetectionSettingsCustomized) return
+    if (areObbDetectionSettingsEqual(obbDetectionSettings, obbDetectionRecommendation.settings)) return
+    setObbDetectionSettings(obbDetectionRecommendation.settings)
+    window.api.sessionUpdateObbDetectorSettings(activeSpeciesId, {
+      obbDetectionSettings: obbDetectionRecommendation.settings,
+      obbDetectionSettingsCustomized: false,
+    }).catch(() => {/* ignore */})
+  }, [
+    activeSpeciesId,
+    obbDetectionRecommendation.settings,
+    obbDetectionSettings,
+    obbDetectionSettingsCustomized,
+  ])
 
   const handleColorChange = (selectedColor: string) => setColor(selectedColor)
   const handleSwitchChange = () => setIsSwitchOn((prev) => !prev)
@@ -235,6 +347,7 @@ const App: React.FC = () => {
     }
     if (view !== "inference") {
       setSelectedModelForInference("")
+      setSelectedInferenceSpeciesId("")
     }
     if (view !== "landing") {
       setOpenSchemaDialogOnMount(false)
@@ -246,8 +359,13 @@ const App: React.FC = () => {
     setCurrentView("landing")
   }
 
-  const handleSelectModelForInference = (modelName: string) => {
-    setSelectedModelForInference(modelName)
+  const handleSelectModelForInference = (selection: {
+    speciesId?: string;
+    modelKey?: string;
+    modelKind?: "landmark" | "obb_detector";
+  }) => {
+    setSelectedModelForInference(selection.modelKey || "")
+    setSelectedInferenceSpeciesId(selection.speciesId || "")
   }
 
   useEffect(() => {
@@ -271,7 +389,7 @@ const App: React.FC = () => {
       >
         <div
           ref={menuWrapRef}
-          className="h-full overflow-y-auto overflow-x-hidden bg-card"
+          className="h-full overflow-y-auto overflow-x-hidden bg-card scrollbar-app"
         >
           <Menu
             onOpacityChange={handleOpacityChange}
@@ -282,10 +400,20 @@ const App: React.FC = () => {
             onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
             detectionMode={detectionMode}
             onDetectionModeChange={setDetectionMode}
-            autoConfidence={autoConfidence}
-            onAutoConfidenceChange={setAutoConfidence}
-            detectionPreset={detectionPreset}
-            onDetectionPresetChange={setDetectionPreset}
+            obbDetectionSettings={obbDetectionSettings}
+            obbDetectionRecommendation={obbDetectionRecommendation.summary}
+            representativeImageDimensions={effectiveRepresentativeImageDimensions}
+            onObbDetectionSettingsChange={(settings) => {
+              const normalized = normalizeObbDetectionSettings(settings)
+              setObbDetectionSettings(normalized)
+              setObbDetectionSettingsCustomized(true)
+              if (activeSpeciesId) {
+                window.api.sessionUpdateObbDetectorSettings(activeSpeciesId, {
+                  obbDetectionSettings: normalized,
+                  obbDetectionSettingsCustomized: true,
+                }).catch(() => {/* ignore */})
+              }
+            }}
             className={objectClassName}
             onClassNameChange={setObjectClassName}
             samEnabled={samEnabled}
@@ -317,8 +445,7 @@ const App: React.FC = () => {
               opacity={opacity}
               isSwitchOn={isSwitchOn}
               detectionMode={detectionMode}
-              confThreshold={autoConfidence}
-              detectionPreset={detectionPreset}
+              obbDetectionSettings={obbDetectionSettings}
               className={objectClassName}
               samEnabled={samEnabled}
             />
@@ -352,6 +479,7 @@ const App: React.FC = () => {
           <InferencePage
             onNavigate={handleNavigate}
             initialModel={selectedModelForInference}
+            initialSpeciesId={selectedInferenceSpeciesId}
             hasActivatedSchemaThisRun={hasActivatedSchemaThisRun}
           />
         )

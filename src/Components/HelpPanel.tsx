@@ -173,7 +173,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Auto Detection</p>
                       <p>
-                        Auto mode runs YOLO-World first and falls back to OpenCV if YOLO is unavailable.
+                        Auto mode uses the session OBB detector, then optionally refines masks with SAM2.
                         Use Auto-Detect, then correct or delete bad boxes before finalizing.
                       </p>
                     </div>
@@ -216,14 +216,14 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Orientation Schemas</p>
                       <p>
-                        Directional is for strict head/tail objects. Bilateral is for paired left-right
-                        structures. Axial is for elongated rotating specimens. Invariant is for objects with
-                        no stable directional axis.
+                        Directional is for strict head/tail objects. Bilateral is for up/down symmetry
+                        along a primary biological axis. Axial is for elongated specimens with an axis but
+                        no true polarity. Invariant is for objects with no stable directional axis.
                       </p>
                       <p>
                         The OBB detector levels specimen crops to a canonical orientation before landmark
-                        prediction. class_id (0 = canonical, 1 = mirrored) is tagged at annotation time and
-                        applied again during training and inference.
+                        prediction. For directional schemas, class_id encodes left/right; for bilateral it
+                        encodes up/down; axial and invariant detector export stay one-class.
                       </p>
                     </div>
                   </div>
@@ -277,12 +277,12 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                         <li>dlib: faster training, strongest on standardized imaging</li>
                         <li>CNN: slower training, stronger under higher image variation</li>
                         <li>CNN variant and augmentation controls are in the training dialog</li>
-                        <li>Review preflight and parity options before long runs</li>
+                        <li>Review preflight settings before long runs</li>
                       </ul>
                     </div>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
-                        Training is staged (dataset prep, fit, parity evaluation, finalize). Models and
+                        Training is staged (dataset prep, fit, finalize). Models and
                         detector artifacts remain scoped to the current schema session.
                       </p>
                     </div>
@@ -317,7 +317,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <p className="font-medium text-foreground">Session Rules</p>
                       <ul className="ml-4 list-disc space-y-1">
                         <li>One inference session exists per schema</li>
-                        <li>Inference hub is unlocked after opening or resuming Annotate in this app run</li>
+                        <li>Inference hub is available once a session with a trained model is selected</li>
                         <li>Draft edits and landmark corrections are autosaved in-session</li>
                         <li>Retraining is manual from Annotate/Train after commits</li>
                       </ul>

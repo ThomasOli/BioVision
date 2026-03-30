@@ -2,7 +2,13 @@
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSelector } from "react-redux";
 import { RootState } from "../state/store";
-import { Point, BoundingBox, AnnotatedImage } from "../types/Image";
+import { Point, BoundingBox, AnnotatedImage, StoredOrientationLabel } from "../types/Image";
+import {
+  getClassIdForOrientationLabel,
+  getOppositeOrientationLabel,
+  getOrientationHintForClassId,
+  getOrientationLabelFromBox,
+} from "@/lib/orientationDisplay";
 
 // Deep clone helper for boxes
 const cloneBoxes = (boxes: BoundingBox[]): BoundingBox[] =>
@@ -49,6 +55,12 @@ interface SuperAnnotateObjectData {
     scale: number;
   };
   detection_method: string;
+  class_id?: number;
+  orientation_hint?: {
+    orientation?: StoredOrientationLabel;
+    confidence?: number;
+    source?: string;
+  };
   obb?: {
     angle: number;
     corners: [number, number][];
@@ -72,6 +84,7 @@ interface UndoRedoClearContextProps {
   updateBox: (boxId: number, updates: Partial<Omit<BoundingBox, "id" | "landmarks">>) => void;
   setBoxesFromDetection: (detectedBoxes: DetectedBoxData[]) => void;
   setBoxesFromSuperAnnotation: (objects: SuperAnnotateObjectData[]) => void;
+  flipAllBoxOrientations: () => void;
   // Landmark operations (now takes boxId)
   addLandmark: (boxId: number, point: Omit<Point, "id">) => void;
   deleteLandmark: (boxId: number, pointId: number) => void;
@@ -89,7 +102,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
   const speciesList = useSelector((state: RootState) => state.species.species);
 
   const [images, setImages] = useState<AnnotatedImage[]>([]);
-  const [selectedImage, setSelectedImage] = useState<number>(0);
+  const [selectedImage, setSelectedImageState] = useState<number>(0);
   const dirtyImageIds = useRef<Set<number>>(new Set());
   const autoSaveTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
 
@@ -101,6 +114,16 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     if (!template?.length) return 0;
     return Math.min(...template.map((lm) => lm.index));
   }, [activeSpeciesId, speciesList]);
+
+  const activeOrientationPolicy = useMemo(
+    () => speciesList.find((s) => s.id === activeSpeciesId)?.orientationPolicy,
+    [activeSpeciesId, speciesList]
+  );
+  const activeOrientationMode = activeOrientationPolicy?.mode;
+  const activeBilateralClassAxis = activeOrientationPolicy?.bilateralClassAxis;
+  const effectiveBilateralClassAxis =
+    activeBilateralClassAxis ??
+    (activeOrientationMode === "bilateral" ? "vertical_obb" : undefined);
 
   // Keep images in sync with Redux fileArray, filtered by activeSpeciesId
   useEffect(() => {
@@ -132,8 +155,15 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
           const next = { ...img };
           let changed = false;
 
-          if (fromRedux.isFinalized && !img.isFinalized) {
-            next.isFinalized = true;
+          const reduxFinalized = Boolean(fromRedux.isFinalized);
+          if (Boolean(img.isFinalized) !== reduxFinalized) {
+            next.isFinalized = reduxFinalized;
+            changed = true;
+          }
+          const reduxFinalizePhase = fromRedux.finalizePhase;
+          const currentFinalizePhase = img.finalizePhase;
+          if (JSON.stringify(currentFinalizePhase ?? null) !== JSON.stringify(reduxFinalizePhase ?? null)) {
+            next.finalizePhase = reduxFinalizePhase;
             changed = true;
           }
           if (fromRedux.hasBoxes && !img.hasBoxes) {
@@ -160,7 +190,7 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
 
   // Clamp selectedImage whenever images length changes
   useEffect(() => {
-    setSelectedImage((prev) => {
+    setSelectedImageState((prev) => {
       if (images.length === 0) return 0;
       return Math.min(Math.max(prev, 0), images.length - 1);
     });
@@ -172,37 +202,34 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     return Math.min(Math.max(selectedImage, 0), images.length - 1);
   }, [selectedImage, images.length]);
 
-  // Mark the current image as dirty (needs auto-save)
+  // Keep a ref to images so the auto-save callback can read current state
+  // without needing images in the auto-save effect's dependency array.
+  const imagesRef = useRef(images);
+  useEffect(() => { imagesRef.current = images; }, [images]);
+
+  const activeSpeciesIdRef = useRef(activeSpeciesId);
+  useEffect(() => { activeSpeciesIdRef.current = activeSpeciesId; }, [activeSpeciesId]);
+
+  // Mark the current image as dirty and schedule a debounced auto-save.
+  // Scheduling here (not in a useEffect) means the timer only resets when
+  // an actual edit happens — not on every render caused by state changes.
   const markDirty = useCallback((imageId: number) => {
     dirtyImageIds.current.add(imageId);
-  }, []);
-
-  // Debounced auto-save: persist dirty images' annotations to disk
-  useEffect(() => {
-    if (!activeSpeciesId || images.length === 0 || dirtyImageIds.current.size === 0) return;
-
     clearTimeout(autoSaveTimeoutRef.current);
     autoSaveTimeoutRef.current = setTimeout(async () => {
+      if (!activeSpeciesIdRef.current) return;
       const idsToSave = new Set(dirtyImageIds.current);
       dirtyImageIds.current.clear();
-
-      for (const img of images) {
-        if (!idsToSave.has(img.id)) continue;
-        if (!img.speciesId) continue;
+      for (const img of imagesRef.current) {
+        if (!idsToSave.has(img.id) || !img.speciesId) continue;
         try {
-          await window.api.sessionSaveAnnotations(
-            img.speciesId,
-            img.filename,
-            img.boxes
-          );
+          await window.api.sessionSaveAnnotations(img.speciesId, img.filename, img.boxes);
         } catch (err) {
           console.error(`Auto-save failed for ${img.filename}:`, err);
         }
       }
-    }, 1000);
-
-    return () => clearTimeout(autoSaveTimeoutRef.current);
-  }, [images, activeSpeciesId]);
+    }, 2000);
+  }, []);
 
   // Current boxes for the active image
   const boxes = useMemo<BoundingBox[]>(() => {
@@ -223,13 +250,26 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     return boxes.flatMap((box) => box.landmarks);
   }, [boxes]);
 
+  const setSelectedImage = useCallback<React.Dispatch<React.SetStateAction<number>>>((value) => {
+    setImages((prevImages) => {
+      let changed = false;
+      const nextImages = prevImages.map((img) => {
+        if (img.selectedBoxId === null) return img;
+        changed = true;
+        return { ...img, selectedBoxId: null };
+      });
+      return changed ? nextImages : prevImages;
+    });
+    setSelectedImageState(value);
+  }, []);
+
   // Helper to save snapshot before change (also marks image dirty for auto-save)
   const saveSnapshot = useCallback(
     (activeImage: AnnotatedImage): AnnotatedImage => {
       markDirty(activeImage.id);
       return {
         ...activeImage,
-        history: [...(activeImage.history ?? []), cloneBoxes(activeImage.boxes)],
+        history: [...(activeImage.history ?? []), cloneBoxes(activeImage.boxes)].slice(-30),
         future: [],
       };
     },
@@ -444,6 +484,53 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     [selectedImage, saveSnapshot]
   );
 
+  const flipAllBoxOrientations = useCallback(() => {
+    setImages((prevImages) => {
+      return prevImages.map((img) => {
+        if (!img.boxes?.length) return img;
+        const flippedBoxes = img.boxes.map((box) => {
+          const currentOrientation = getOrientationLabelFromBox(
+            activeOrientationMode,
+            box,
+            effectiveBilateralClassAxis,
+            0
+          );
+          const nextOrientation = getOppositeOrientationLabel(
+            activeOrientationMode,
+            currentOrientation,
+            effectiveBilateralClassAxis
+          );
+          const nextId =
+            getClassIdForOrientationLabel(
+              activeOrientationMode,
+              nextOrientation,
+              effectiveBilateralClassAxis
+            ) ?? (box.class_id === 1 ? 0 : 1);
+          return {
+            ...box,
+            class_id: nextId,
+            orientation_hint: {
+              ...(box.orientation_hint ?? {}),
+              orientation:
+                getOrientationHintForClassId(
+                  activeOrientationMode,
+                  nextId,
+                  effectiveBilateralClassAxis
+                ) ?? nextOrientation,
+              confidence:
+                Number.isFinite(Number(box.orientation_hint?.confidence))
+                  ? Number(box.orientation_hint?.confidence)
+                  : 1,
+              source: box.orientation_hint?.source || "user_flip_all",
+            },
+          };
+        });
+        markDirty(img.id);
+        return { ...img, boxes: flippedBoxes };
+      });
+    });
+  }, [effectiveBilateralClassAxis, activeOrientationMode, markDirty]);
+
   const addLandmark = useCallback(
     (boxId: number, pointData: Omit<Point, "id">) => {
       setImages((prevImages) => {
@@ -655,6 +742,11 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
           const id = idCursor;
           usedIds.add(id);
           idCursor += 1;
+          const classIdFromObject = Number.isFinite(Number(obj.class_id))
+            ? Number(obj.class_id)
+            : Number.isFinite(Number((obj as unknown as { box?: { class_id?: number } }).box?.class_id))
+              ? Number((obj as unknown as { box?: { class_id?: number } }).box?.class_id)
+              : undefined;
           return {
             id,
             left: obj.box.left,
@@ -673,6 +765,8 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
             className: obj.class_name,
             instanceMetadata: obj.instance_metadata,
             detectionMethod: obj.detection_method,
+            class_id: classIdFromObject,
+            orientation_hint: obj.orientation_hint,
             ...(obj.obb ? {
               angle: obj.obb.angle,
               obbCorners: obj.obb.corners as [number, number][],
@@ -698,29 +792,33 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
     [selectedImage, saveSnapshot]
   );
 
+  const contextValue = useMemo(() => ({
+    images,
+    setImages,
+    undo,
+    redo,
+    clear,
+    boxes,
+    selectedBoxId,
+    addBox,
+    deleteBox,
+    selectBox,
+    updateBox,
+    flipAllBoxOrientations,
+    setBoxesFromDetection,
+    setBoxesFromSuperAnnotation,
+    addLandmark,
+    deleteLandmark,
+    skipLandmark,
+    setSelectedImage,
+    points,
+  }), [images, setImages, undo, redo, clear, boxes, selectedBoxId,
+      addBox, deleteBox, selectBox, updateBox, flipAllBoxOrientations,
+      setBoxesFromDetection, setBoxesFromSuperAnnotation,
+      addLandmark, deleteLandmark, skipLandmark, setSelectedImage, points]);
+
   return (
-    <UndoRedoClearContext.Provider
-      value={{
-        images,
-        setImages,
-        undo,
-        redo,
-        clear,
-        boxes,
-        selectedBoxId,
-        addBox,
-        deleteBox,
-        selectBox,
-        updateBox,
-        setBoxesFromDetection,
-        setBoxesFromSuperAnnotation,
-        addLandmark,
-        deleteLandmark,
-        skipLandmark,
-        setSelectedImage,
-        points,
-      }}
-    >
+    <UndoRedoClearContext.Provider value={contextValue}>
       {children}
     </UndoRedoClearContext.Provider>
   );
