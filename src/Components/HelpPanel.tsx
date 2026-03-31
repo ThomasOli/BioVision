@@ -105,19 +105,20 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm"
+            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm"
             onClick={() => onOpenChange(false)}
           />
 
+          <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
           <motion.div
-            initial={{ x: "100%" }}
-            animate={{ x: 0 }}
-            exit={{ x: "100%" }}
-            transition={{ type: "spring", damping: 30, stiffness: 300 }}
-            className="fixed right-0 top-0 z-50 h-full w-full max-w-md border-l bg-background shadow-xl"
+            initial={{ opacity: 0, scale: 0.96, y: 12 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 12 }}
+            transition={{ type: "spring", damping: 30, stiffness: 320 }}
+            className="w-full max-w-2xl rounded-lg border bg-background shadow-xl pointer-events-auto"
           >
             <div className="flex items-center justify-between border-b p-4">
-              <h2 className="text-lg font-bold">Help & Documentation</h2>
+              <h2 className="font-display text-base font-semibold">Help & Documentation</h2>
               <motion.div {...buttonHover} {...buttonTap}>
                 <Button
                   variant="ghost"
@@ -129,7 +130,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
               </motion.div>
             </div>
 
-            <ScrollArea className="h-[calc(100vh-65px)]">
+            <ScrollArea className="h-[75vh]">
               <div className="space-y-4 p-4">
                 <AccordionItem
                   title="Getting Started"
@@ -414,6 +415,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
               </div>
             </ScrollArea>
           </motion.div>
+          </div>
         </>
       )}
     </AnimatePresence>

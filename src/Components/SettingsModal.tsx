@@ -1,11 +1,9 @@
 import React, { useEffect, useState } from "react";
-import { motion } from "framer-motion";
-import { FolderOpen, Monitor, Moon, Sun, Copy, ChevronDown } from "lucide-react";
+import { FolderOpen, Monitor, Moon, Sun, Copy } from "lucide-react";
 import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
 import { Label } from "@/Components/ui/label";
 import { Separator } from "@/Components/ui/separator";
 import { Slider } from "@/Components/ui/slider";
@@ -20,7 +18,6 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/Components/ui/tooltip";
-import { buttonHover, buttonTap } from "@/lib/animations";
 import { useTheme } from "./theme-provider";
 
 interface SettingsModalProps {
@@ -41,41 +38,11 @@ const LANDMARK_COLORS = [
   { name: "White", value: "white" },
 ];
 
-interface SettingsSectionProps {
-  title: string;
-  children: React.ReactNode;
-  defaultOpen?: boolean;
-}
-
-const SettingsSection: React.FC<SettingsSectionProps> = ({
-  title,
-  children,
-  defaultOpen = true,
-}) => {
-  const [isOpen, setIsOpen] = useState(defaultOpen);
-
-  return (
-    <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
-      <CardHeader
-        className="cursor-pointer pb-3"
-        onClick={() => setIsOpen(!isOpen)}
-      >
-        <div className="flex items-center justify-between">
-          <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
-            {title}
-          </CardTitle>
-          <ChevronDown
-            className={cn(
-              "h-4 w-4 text-muted-foreground transition-transform",
-              isOpen && "rotate-180"
-            )}
-          />
-        </div>
-      </CardHeader>
-      {isOpen && <CardContent className="space-y-4">{children}</CardContent>}
-    </Card>
-  );
-};
+const SectionLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70 mb-3">
+    {children}
+  </p>
+);
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   open,
@@ -146,136 +113,127 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto scrollbar-app sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle className="text-sm font-bold">Settings</DialogTitle>
+      <DialogContent className="sm:max-w-[500px] max-h-[90vh] overflow-x-hidden overflow-y-auto scrollbar-app">
+        <DialogHeader className="pb-1">
+          <DialogTitle className="font-display text-base font-semibold">Settings</DialogTitle>
         </DialogHeader>
 
-          <div className="space-y-4 py-4">
-            {/* Project Settings */}
-            <SettingsSection title="Project">
-              <div className="space-y-3">
-                <div>
-                  <Label className="text-sm font-medium">Project Directory</Label>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    Where images, labels, and models are stored
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <div className="min-w-0 flex-1 truncate rounded-md border bg-muted/50 px-3 py-2 font-mono text-xs">
-                        {projectPath || "Loading..."}
-                      </div>
-                    </TooltipTrigger>
-                    <TooltipContent side="bottom" align="start">
+        <div className="space-y-6 py-2">
+
+          {/* ── Project ─────────────────────────────────────── */}
+          <div>
+            <SectionLabel>Project</SectionLabel>
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">Project Directory</Label>
+              <p className="text-xs text-muted-foreground">
+                Where images, labels, and models are stored
+              </p>
+              <div className="flex items-center gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="flex-1 truncate font-mono text-xs text-muted-foreground cursor-default">
                       {projectPath || "Loading..."}
-                    </TooltipContent>
-                  </Tooltip>
-                  <motion.div {...buttonHover} {...buttonTap}>
-                    <Button
-                      variant="outline"
-                      size="icon"
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" align="start">
+                    {projectPath || "Loading..."}
+                  </TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
                       onClick={handleCopyPath}
                       disabled={!projectPath}
+                      className="shrink-0 text-muted-foreground/50 transition-colors hover:text-foreground disabled:opacity-30"
                     >
-                      <Copy className="h-4 w-4" />
-                    </Button>
-                  </motion.div>
-                </div>
-                <motion.div {...buttonHover} {...buttonTap}>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleSelectProjectPath}
-                    className="w-full"
-                  >
-                    <FolderOpen className="mr-2 h-4 w-4" />
-                    Change Directory
-                  </Button>
-                </motion.div>
+                      <Copy className="h-3.5 w-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">Copy path</TooltipContent>
+                </Tooltip>
               </div>
-            </SettingsSection>
-
-            {/* Display Settings */}
-            <SettingsSection title="Display">
-              <div className="space-y-4">
-                {/* Theme */}
-                <div className="space-y-2">
-                  <Label className="text-sm font-medium">Theme</Label>
-                  <div className="flex gap-2">
-                    {themeOptions.map((option) => (
-                      <motion.div key={option.value} {...buttonHover} {...buttonTap}>
-                        <Button
-                          variant={theme === option.value ? "default" : "outline"}
-                          size="sm"
-                          onClick={() => setTheme(option.value)}
-                          className="flex-1"
-                        >
-                          {option.icon}
-                          <span className="ml-2">{option.label}</span>
-                        </Button>
-                      </motion.div>
-                    ))}
-                  </div>
-                </div>
-
-                <Separator />
-
-                {/* Default Landmark Color */}
-                <div className="space-y-2">
-                  <Label className="text-sm font-medium">Default Landmark Color</Label>
-                  <div className="grid grid-cols-4 gap-2">
-                    {LANDMARK_COLORS.map((color) => (
-                      <motion.div key={color.value} {...buttonHover} {...buttonTap}>
-                        <button
-                          onClick={() => handleColorChange(color.value)}
-                          className={cn(
-                            "flex h-10 w-full items-center justify-center rounded-md border transition-all",
-                            defaultColor === color.value
-                              ? "border-primary ring-2 ring-primary ring-offset-2 ring-offset-background"
-                              : "border-border hover:border-primary/50"
-                          )}
-                        >
-                          <div
-                            className="h-5 w-5 rounded-full"
-                            style={{ backgroundColor: color.value }}
-                          />
-                        </button>
-                      </motion.div>
-                    ))}
-                  </div>
-                </div>
-
-                <Separator />
-
-                {/* Default Opacity */}
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <Label className="text-sm font-medium">Default Opacity</Label>
-                    <span className="text-xs text-muted-foreground">
-                      {defaultOpacity}%
-                    </span>
-                  </div>
-                  <Slider
-                    value={[defaultOpacity]}
-                    onValueChange={handleOpacityChange}
-                    min={10}
-                    max={100}
-                    step={5}
-                    className="w-full"
-                  />
-                </div>
-              </div>
-            </SettingsSection>
-
-            {/* Training Settings (future) */}
-            <SettingsSection title="Training (Advanced)" defaultOpen={false}>
-              <p className="text-xs text-muted-foreground">
-                Advanced training parameters will be available in a future update.
-              </p>
-            </SettingsSection>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleSelectProjectPath}
+                className="w-full text-xs"
+              >
+                <FolderOpen className="mr-2 h-3.5 w-3.5" />
+                Browse...
+              </Button>
+            </div>
           </div>
+
+          <Separator />
+
+          {/* ── Display ─────────────────────────────────────── */}
+          <div className="space-y-4">
+            <SectionLabel>Display</SectionLabel>
+
+            {/* Theme — segmented control */}
+            <div className="space-y-1.5">
+              <Label className="text-sm font-medium">Theme</Label>
+              <div className="grid grid-cols-3 gap-1 rounded-lg border border-border/50 bg-muted/30 p-1">
+                {themeOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    onClick={() => setTheme(option.value)}
+                    className={cn(
+                      "flex items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-medium transition-all duration-150",
+                      theme === option.value
+                        ? "bg-background text-foreground shadow-sm ring-1 ring-border/40"
+                        : "text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    {option.icon}
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Landmark color — circles */}
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">Default Landmark Color</Label>
+              <div className="flex flex-wrap gap-2.5">
+                {LANDMARK_COLORS.map((color) => (
+                  <Tooltip key={color.value}>
+                    <TooltipTrigger asChild>
+                      <button
+                        onClick={() => handleColorChange(color.value)}
+                        className={cn(
+                          "h-7 w-7 rounded-full border-2 transition-all duration-150",
+                          defaultColor === color.value
+                            ? "border-foreground shadow-md scale-110"
+                            : "border-transparent opacity-70 hover:opacity-100 hover:scale-105"
+                        )}
+                        style={{ backgroundColor: color.value }}
+                      />
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">{color.name}</TooltipContent>
+                  </Tooltip>
+                ))}
+              </div>
+            </div>
+
+            {/* Opacity */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label className="text-sm font-medium">Default Opacity</Label>
+                <span className="font-mono text-xs text-muted-foreground">{defaultOpacity}%</span>
+              </div>
+              <Slider
+                value={[defaultOpacity]}
+                onValueChange={handleOpacityChange}
+                min={10}
+                max={100}
+                step={5}
+                className="w-full"
+              />
+            </div>
+          </div>
+
+        </div>
       </DialogContent>
     </Dialog>
   );
