@@ -55,8 +55,9 @@ module.exports = {
         sm: "calc(var(--radius) - 4px)",
       },
       fontFamily: {
-        sans: ["Inter", "system-ui", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "sans-serif"],
-        mono: ["Fira Code", "SFMono-Regular", "Consolas", "monospace"],
+        sans: ["IBM Plex Sans", "system-ui", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "sans-serif"],
+        mono: ["IBM Plex Mono", "Fira Code", "SFMono-Regular", "Consolas", "monospace"],
+        display: ["Syne", "system-ui", "sans-serif"],
       },
       keyframes: {
         "accordion-down": {
