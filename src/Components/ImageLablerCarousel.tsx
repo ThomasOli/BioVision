@@ -33,7 +33,7 @@ import { updateSpecies } from "@/state/speciesState/speciesSlice";
 import { normalizeObbDetectionSettings } from "@/lib/obbDetectorSettings";
 
 import { Button } from "@/Components/ui/button";
-import { Card, CardContent } from "@/Components/ui/card";
+import { Card } from "@/Components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -1256,34 +1256,45 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
   // Only show empty state if BOTH Redux and Context have no images
   if (!hasAnyImages) {
     return (
-      <Card className="w-full max-w-[900px] border-border/50 bg-card/50 backdrop-blur-sm">
-        <CardContent className="p-6 text-center">
-          <h2 className="mb-2 text-lg font-bold text-foreground">
-            No images available.
-          </h2>
-          <p className="mx-auto max-w-[520px] text-sm text-muted-foreground">
-            Press <strong>Ctrl+N</strong> to upload images, or use the left
-            sidebar to begin labeling.
-          </p>
-        </CardContent>
-      </Card>
+      <div className="flex h-full w-full items-center justify-center">
+        <div className="flex flex-col items-center gap-4 rounded-xl border border-border/40 bg-card/50 backdrop-blur-sm p-10 text-center max-w-sm">
+          <div className="rounded-xl bg-primary/10 p-4 ring-1 ring-primary/20">
+            <ZoomIn className="h-8 w-8 text-primary" />
+          </div>
+          <div className="space-y-1.5">
+            <h2 className="font-display text-base font-semibold text-foreground">No images loaded</h2>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Press{" "}
+              <kbd className="rounded border border-border/60 bg-muted/70 px-1.5 py-0.5 font-mono text-[10px]">
+                Ctrl+N
+              </kbd>{" "}
+              to upload images, or use the sidebar to begin labeling.
+            </p>
+          </div>
+        </div>
+      </div>
     );
   }
 
   return (
       <Card className="flex h-full w-full min-h-0 min-w-0 flex-col gap-3 border-border/50 bg-card/50 p-4 backdrop-blur-sm">
         {/* Toolbar */}
-        <div className="flex w-full flex-col gap-2 md:flex-row md:items-start md:justify-between">
-          <div className="min-w-0 md:pr-3">
-            <p className="text-sm font-bold text-foreground">
-              Image {currentIndex + 1} / {totalImages}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              Use ← / → to navigate • Ctrl+N to add
-            </p>
+        <div className="flex w-full flex-wrap items-center gap-1.5">
+          {/* Image counter + filename */}
+          <div className="flex items-center gap-2 mr-auto">
+            <div className="flex items-center gap-1 rounded-md border border-border/50 bg-muted/50 px-2.5 py-1">
+              <span className="font-mono text-xs font-semibold text-foreground">{currentIndex + 1}</span>
+              <span className="font-mono text-[10px] text-muted-foreground/40">/</span>
+              <span className="font-mono text-xs text-muted-foreground">{totalImages}</span>
+            </div>
+            {current?.filename && (
+              <span className="hidden md:block truncate font-mono text-[11px] text-muted-foreground/55 max-w-[220px]">
+                {current.filename}
+              </span>
+            )}
           </div>
 
-          <div className="flex min-w-0 flex-1 flex-wrap items-center justify-start gap-2 md:justify-end">
+          <div className="flex flex-wrap items-center gap-1.5">
             {/* Finalized badge — shown in any detection mode once finalized */}
             {isCurrentFinalizing ? (
               <div className="flex items-center gap-2">
@@ -1510,14 +1521,14 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
 
         {/* Progress bar for auto-detection */}
         {autoDetectProgress && (
-          <div className="w-full">
-            <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
-              <span>{autoDetectProgress.message}</span>
-              <span>{autoDetectProgress.percent}%</span>
+          <div className="w-full space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="font-mono text-[11px] text-muted-foreground">{autoDetectProgress.message}</span>
+              <span className="font-mono text-[11px] text-primary">{autoDetectProgress.percent}%</span>
             </div>
-            <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+            <div className="w-full h-1 bg-muted rounded-full overflow-hidden">
               <div
-                className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                className="h-full bg-primary rounded-full transition-all duration-300"
                 style={{ width: `${autoDetectProgress.percent}%` }}
               />
             </div>
@@ -1531,7 +1542,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         )}
 
         {/* Image area */}
-        <div className="relative flex flex-1 min-h-0 min-w-0 items-center justify-center overflow-hidden rounded-xl border bg-background">
+        <div className="relative flex flex-1 min-h-0 min-w-0 items-center justify-center overflow-hidden rounded-lg border border-border/50 bg-muted/15">
           {/* Previous button */}
           <div className="absolute left-2 top-1/2 z-20 -translate-y-1/2">
             <motion.div {...buttonHover} {...buttonTap}>
@@ -1541,7 +1552,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 onClick={handlePrev}
                 disabled={totalImages <= 1}
                 aria-label="Previous"
-                className="bg-background/90 backdrop-blur-sm shadow-md"
+                className="h-9 w-9 bg-background/80 backdrop-blur-md border-border/50 shadow-lg disabled:opacity-30"
               >
                 <ChevronLeft className="h-4 w-4" />
               </Button>
@@ -1590,7 +1601,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
                 onClick={handleNext}
                 disabled={totalImages <= 1}
                 aria-label="Next"
-                className="bg-background/90 backdrop-blur-sm shadow-md"
+                className="h-9 w-9 bg-background/80 backdrop-blur-md border-border/50 shadow-lg disabled:opacity-30"
               >
                 <ChevronRight className="h-4 w-4" />
               </Button>
