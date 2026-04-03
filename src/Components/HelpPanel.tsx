@@ -9,6 +9,8 @@ import {
   Keyboard,
   Lightbulb,
   Rocket,
+  ListChecks,
+  Database,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -99,7 +101,6 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
     <AnimatePresence>
       {open && (
         <>
-          {/* Backdrop */}
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -108,7 +109,6 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
             onClick={() => onOpenChange(false)}
           />
 
-          {/* Panel */}
           <motion.div
             initial={{ x: "100%" }}
             animate={{ x: 0 }}
@@ -116,7 +116,6 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
             transition={{ type: "spring", damping: 30, stiffness: 300 }}
             className="fixed right-0 top-0 z-50 h-full w-full max-w-md border-l bg-background shadow-xl"
           >
-            {/* Header */}
             <div className="flex items-center justify-between border-b p-4">
               <h2 className="text-lg font-bold">Help & Documentation</h2>
               <motion.div {...buttonHover} {...buttonTap}>
@@ -130,10 +129,8 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
               </motion.div>
             </div>
 
-            {/* Content */}
             <ScrollArea className="h-[calc(100vh-65px)]">
               <div className="space-y-4 p-4">
-                {/* Getting Started */}
                 <AccordionItem
                   title="Getting Started"
                   icon={<Rocket className="h-4 w-4" />}
@@ -141,107 +138,226 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      BioVision helps you train machine learning models to automatically
-                      detect landmarks on biological images.
+                      BioVision uses a commit-now, train-later loop: annotate and train inside a schema
+                      session, review predictions in inference, then commit reviewed images back to schema
+                      training data.
                     </p>
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Install:</p>
+                      <ul className="ml-4 list-disc space-y-1">
+                        <li>Windows: run <code>setup.bat</code></li>
+                        <li>macOS/Linux: run <code>bash setup.sh</code></li>
+                      </ul>
+                    </div>
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Quick Start:</p>
                       <ol className="ml-4 list-decimal space-y-1">
-                        <li>Import your images using "Annotate Images"</li>
-                        <li>Draw bounding boxes around regions of interest</li>
-                        <li>Add landmark points within each box</li>
-                        <li>Train a model when you have enough annotations</li>
-                        <li>Use your model to predict landmarks on new images</li>
+                        <li>Create or resume a schema session</li>
+                        <li>Choose orientation policy (Directional/Bilateral/Axial/Invariant)</li>
+                        <li>Upload images and annotate using Manual OBB or Auto detection</li>
+                        <li>Finalize accepted boxes and landmarks</li>
+                        <li>Train OBB detector (when applicable), then train dlib or CNN</li>
+                        <li>Open Inference hub and create the schema-bound inference session</li>
+                        <li>Run detection and landmark inference, review, then mark images complete</li>
+                        <li>Commit review-complete images to training data, then retrain later from Annotate/Train</li>
                       </ol>
                     </div>
                   </div>
                 </AccordionItem>
 
-                {/* Annotation Workflow */}
                 <AccordionItem
                   title="Annotation Workflow"
                   icon={<Pencil className="h-4 w-4" />}
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Bounding Boxes</p>
+                      <p className="font-medium text-foreground">Auto Detection</p>
                       <p>
-                        Use the Box tool to draw rectangles around regions you want to
-                        annotate. Each box represents one instance of your subject.
+                        Auto mode uses the session OBB detector, then optionally refines masks with SAM2.
+                        Use Auto-Detect, then correct or delete bad boxes before finalizing.
                       </p>
                     </div>
                     <Separator />
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Landmarks</p>
+                      <p className="font-medium text-foreground">Manual OBB Drawing</p>
                       <p>
-                        Switch to the Landmark tool to place points within a selected box.
-                        Consistent landmark ordering across all images is important for
-                        training quality.
+                        Manual mode draws boxes directly. Select a box to move, resize, and rotate it
+                        into an oriented bounding box (OBB). In directional schemas, use the head-direction
+                        toggle so new boxes start with the intended default orientation.
                       </p>
                     </div>
                     <Separator />
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Selection & Editing</p>
+                      <p className="font-medium text-foreground">SAM2 Segmentation (Optional)</p>
                       <p>
-                        Use the Select tool to move boxes or landmarks. Click on a box to
-                        select it, then drag to reposition.
+                        SAM2 refinement requires GPU acceleration (CUDA or Apple MPS) and at least 8 GB RAM,
+                        and is only available in high-performance mode. Lite mode still supports detection
+                        without SAM2.
+                      </p>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Landmark Placement</p>
+                      <p>
+                        Place landmarks consistently inside each accepted box. Landmark order and landmark ID
+                        consistency are critical for stable training.
+                      </p>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Correction and Finalization</p>
+                      <p>
+                        In Auto mode, correction mode lets you redraw and resize selected detections.
+                        Deleting bad auto detections records hard negatives for future detector fine-tuning.
+                        Finalize only when boxes and landmarks are accepted.
+                      </p>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Orientation Schemas</p>
+                      <p>
+                        Directional is for strict head/tail objects. Bilateral is for up/down symmetry
+                        along a primary biological axis. Axial is for elongated specimens with an axis but
+                        no true polarity. Invariant is for objects with no stable directional axis.
+                      </p>
+                      <p>
+                        The OBB detector levels specimen crops to a canonical orientation before landmark
+                        prediction. For directional schemas, class_id encodes left/right; for bilateral it
+                        encodes up/down; axial and invariant detector export stay one-class.
                       </p>
                     </div>
                   </div>
                 </AccordionItem>
 
-                {/* Training */}
+                <AccordionItem
+                  title="Pre-Annotated Import"
+                  icon={<Database className="h-4 w-4" />}
+                >
+                  <div className="space-y-3 text-sm text-muted-foreground">
+                    <p>
+                      You can import pre-annotated data into a schema session before continuing manual
+                      annotation and review.
+                    </p>
+                    <ul className="ml-4 list-disc space-y-1">
+                      <li>Supported: JSON with boxes and landmarks</li>
+                      <li>Supported: landmarks-only JSON (box is auto-derived and validated)</li>
+                      <li>Supported: annotated image folder import with matched label files</li>
+                    </ul>
+                    <div className="rounded-md bg-muted/50 p-3">
+                      <p className="text-xs">
+                        Imported labels and in-app edits are merged into one session label store,
+                        so training uses one consistent schema-scoped dataset.
+                      </p>
+                    </div>
+                  </div>
+                </AccordionItem>
+
                 <AccordionItem
                   title="Training Models"
                   icon={<Target className="h-4 w-4" />}
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      BioVision uses dlib's shape predictor to train landmark detection
-                      models.
+                      Landmark training supports <span className="font-medium text-foreground">dlib</span> and{" "}
+                      <span className="font-medium text-foreground">CNN</span> (SimpleBaseline default with
+                      system-gated variants). Detection fine-tuning uses schema-scoped YOLO OBB checkpoints.
                     </p>
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Best Practices:</p>
+                      <p className="font-medium text-foreground">Training Order</p>
+                      <ol className="ml-4 list-decimal space-y-1">
+                        <li>Train OBB detector first when OBB annotations are present</li>
+                        <li>Train landmark predictor second (dlib or CNN)</li>
+                        <li>Use inference commits to expand data, then retrain later</li>
+                      </ol>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Predictor Guidance</p>
                       <ul className="ml-4 list-disc space-y-1">
-                        <li>Annotate at least 20-30 images for basic training</li>
-                        <li>Include diverse examples (angles, lighting, sizes)</li>
-                        <li>Be consistent with landmark placement order</li>
-                        <li>Use clear, versioned model names (e.g., "model_v1")</li>
+                        <li>dlib: faster training, strongest on standardized imaging</li>
+                        <li>CNN: slower training, stronger under higher image variation</li>
+                        <li>CNN variant and augmentation controls are in the training dialog</li>
+                        <li>Review preflight settings before long runs</li>
                       </ul>
                     </div>
                     <div className="rounded-md bg-muted/50 p-3">
                       <p className="text-xs">
-                        Training time varies based on the number of images and landmarks.
-                        Larger datasets produce more accurate models.
+                        Training is staged (dataset prep, fit, finalize). Models and
+                        detector artifacts remain scoped to the current schema session.
                       </p>
                     </div>
                   </div>
                 </AccordionItem>
 
-                {/* Inference */}
                 <AccordionItem
                   title="Running Inference"
                   icon={<Microscope className="h-4 w-4" />}
                 >
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      Once you have a trained model, use it to automatically detect
-                      landmarks on new images.
+                      Inference is a schema-bound review workflow. Open a session from the card hub,
+                      run detection and landmark prediction, then commit reviewed results back to
+                      schema training data.
                     </p>
                     <div className="space-y-2">
-                      <p className="font-medium text-foreground">Steps:</p>
+                      <p className="font-medium text-foreground">Steps</p>
                       <ol className="ml-4 list-decimal space-y-1">
-                        <li>Go to "Run Inference" from the landing page</li>
-                        <li>Select your trained model</li>
-                        <li>Upload images to analyze</li>
-                        <li>Review the predicted landmarks</li>
-                        <li>Export results as CSV or JSON</li>
+                        <li>Open Inference hub and enter the schema session card</li>
+                        <li>Select any available landmark model for that schema (dlib or CNN)</li>
+                        <li>Add images (saved image paths auto-reload when files still exist)</li>
+                        <li>Run detection, then correct boxes and orientation when needed</li>
+                        <li>Run landmark inference on accepted boxes</li>
+                        <li>Use <span className="font-medium text-foreground">Save All Changes</span> to persist drafts</li>
+                        <li>Use <span className="font-medium text-foreground">Mark Review Complete</span> or <span className="font-medium text-foreground">Mark In Progress</span></li>
+                        <li>Use <span className="font-medium text-foreground">Commit to Training Data</span> to commit only review-complete images</li>
                       </ol>
+                    </div>
+                    <Separator />
+                    <div className="space-y-2">
+                      <p className="font-medium text-foreground">Session Rules</p>
+                      <ul className="ml-4 list-disc space-y-1">
+                        <li>One inference session exists per schema</li>
+                        <li>Inference hub is available once a session with a trained model is selected</li>
+                        <li>Draft edits and landmark corrections are autosaved in-session</li>
+                        <li>Retraining is manual from Annotate/Train after commits</li>
+                      </ul>
+                    </div>
+                    <div className="rounded-md bg-muted/50 p-3">
+                      <p className="text-xs">
+                        Compatibility gate: if a model was trained with OBB canonicalization and no OBB detector is available
+                        at inference time, BioVision warns and requires explicit override.
+                      </p>
                     </div>
                   </div>
                 </AccordionItem>
 
-                {/* Keyboard Shortcuts */}
+                <AccordionItem
+                  title="End-to-End Test Pipeline"
+                  icon={<ListChecks className="h-4 w-4" />}
+                >
+                  <div className="space-y-3 text-sm text-muted-foreground">
+                    <p className="font-medium text-foreground">Session QA Checklist</p>
+                    <ol className="ml-4 list-decimal space-y-1">
+                      <li>Create a fresh schema session and upload 10-20 images</li>
+                      <li>Set orientation policy and run Auto detection on 3-5 images</li>
+                      <li>Correct and rotate OBB boxes, then finalize accepted boxes</li>
+                      <li>Annotate landmarks and verify landmark ID consistency</li>
+                      <li>Train OBB detector (if OBB labels exist), then train dlib or CNN</li>
+                      <li>Open inference hub and create or open the schema inference session</li>
+                      <li>Run detection plus landmark inference on unseen images</li>
+                      <li>Mark some images Review Complete and keep some In Progress</li>
+                      <li>Commit review-complete images to training data</li>
+                      <li>Return to Annotate/Train and confirm retraining uses committed additions</li>
+                    </ol>
+                    <div className="rounded-md bg-muted/50 p-3">
+                      <p className="text-xs">
+                        Minimum acceptance: no import or validation errors, no training crash, inference review
+                        persists across reopen, and only review-complete images are committed.
+                      </p>
+                    </div>
+                  </div>
+                </AccordionItem>
+
                 <AccordionItem
                   title="Keyboard Shortcuts"
                   icon={<Keyboard className="h-4 w-4" />}
@@ -260,7 +376,6 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                   </div>
                 </AccordionItem>
 
-                {/* Tips for Biologists */}
                 <AccordionItem
                   title="Tips for Biologists"
                   icon={<Lightbulb className="h-4 w-4" />}
@@ -271,7 +386,8 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <ul className="ml-4 list-disc space-y-1">
                         <li>Use consistent imaging conditions when possible</li>
                         <li>Include scale markers in training images</li>
-                        <li>Crop to standard orientations for best results</li>
+                        <li>Choose an orientation schema that matches specimen geometry before annotating</li>
+                        <li>When OBB annotations are present, the geometry engine levels specimens to canonical orientation more reliably than PCA-based approaches</li>
                       </ul>
                     </div>
                     <Separator />
@@ -289,7 +405,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                       <p className="font-medium text-foreground">Data Management</p>
                       <ul className="ml-4 list-disc space-y-1">
                         <li>Back up your project directory regularly</li>
-                        <li>Version your trained models (e.g., species_v1, species_v2)</li>
+                        <li>Version your trained models (for example, species_v1, species_v2)</li>
                         <li>Export landmark data for statistical analysis</li>
                       </ul>
                     </div>

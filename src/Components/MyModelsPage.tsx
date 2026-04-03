@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import {
   ArrowLeft,
@@ -12,6 +12,7 @@ import {
   MoreVertical,
   Check,
   X,
+  AlertTriangle,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -32,12 +33,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/Components/ui/dialog";
-import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover, modalContent } from "@/lib/animations";
+import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
 import { TrainedModel, AppView } from "@/types/Image";
 
 interface MyModelsPageProps {
   onNavigate: (view: AppView) => void;
-  onSelectModelForInference: (modelName: string) => void;
+  onSelectModelForInference: (selection: {
+    speciesId?: string;
+    modelKey?: string;
+    modelKind?: "landmark" | "obb_detector";
+  }) => void;
+  onStartAnnotating: () => void;
 }
 
 function formatFileSize(bytes: number): string {
@@ -126,7 +132,24 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
                 </div>
               ) : (
                 <>
-                  <CardTitle className="text-sm font-semibold">{model.name}</CardTitle>
+                  <div className="flex flex-col min-w-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <CardTitle className="text-sm font-semibold truncate">{model.name}</CardTitle>
+                      {model.modelKind === "obb_detector" ? (
+                        <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                          OBB
+                        </span>
+                      ) : model.predictorType === "cnn" ? (
+                        <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-purple-500/15 text-purple-400 border border-purple-500/30">
+                          CNN
+                        </span>
+                      ) : (
+                        <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold bg-blue-500/15 text-blue-400 border border-blue-500/30">
+                          dlib
+                        </span>
+                      )}
+                    </div>
+                  </div>
                   <Popover open={menuOpen} onOpenChange={setMenuOpen}>
                     <PopoverTrigger asChild>
                       <Button variant="ghost" size="icon" className="h-8 w-8">
@@ -134,18 +157,20 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
                       </Button>
                     </PopoverTrigger>
                     <PopoverContent align="end" className="w-40 p-1">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="w-full justify-start"
-                        onClick={() => {
-                          setMenuOpen(false);
-                          setIsRenaming(true);
-                        }}
-                      >
-                        <Edit3 className="mr-2 h-4 w-4" />
-                        Rename
-                      </Button>
+                      {model.modelKind !== "obb_detector" && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="w-full justify-start"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            setIsRenaming(true);
+                          }}
+                        >
+                          <Edit3 className="mr-2 h-4 w-4" />
+                          Rename
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="sm"
@@ -175,14 +200,30 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
                 <span>{formatDate(model.createdAt)}</span>
               </div>
             </div>
+            {model.compatible === false && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <div>
+                    <div className="font-medium">Retrain required</div>
+                    <div>{model.reason || "This model is incompatible with the current heatmap-head CNN runtime."}</div>
+                  </div>
+                </div>
+              </div>
+            )}
             <motion.div {...buttonHover} {...buttonTap}>
               <Button
                 size="sm"
                 className="w-full"
                 onClick={onUse}
+                disabled={model.compatible === false}
               >
                 <Play className="mr-2 h-4 w-4" />
-                Use for Inference
+                {model.compatible === false
+                  ? "Unavailable for Inference"
+                  : model.modelKind === "obb_detector"
+                    ? "Open Inference Session"
+                    : "Use for Inference"}
               </Button>
             </motion.div>
           </CardContent>
@@ -195,6 +236,7 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
 export const MyModelsPage: React.FC<MyModelsPageProps> = ({
   onNavigate,
   onSelectModelForInference,
+  onStartAnnotating,
 }) => {
   const [models, setModels] = useState<TrainedModel[]>([]);
   const [loading, setLoading] = useState(true);
@@ -203,7 +245,7 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     model: null,
   });
 
-  const loadModels = async () => {
+  const loadModels = useCallback(async () => {
     setLoading(true);
     try {
       const result = await window.api.listModels();
@@ -218,14 +260,25 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     loadModels();
-  }, []);
+  }, [loadModels]);
 
   const handleUseModel = (model: TrainedModel) => {
-    onSelectModelForInference(model.name);
+    if (model.compatible === false) {
+      toast.error(model.reason || "This CNN model predates the heatmap-head format and must be retrained.");
+      return;
+    }
+    onSelectModelForInference({
+      speciesId: model.speciesId,
+      modelKey:
+        model.modelKind === "landmark"
+          ? `${model.name}::${model.predictorType ?? "dlib"}`
+          : undefined,
+      modelKind: model.modelKind,
+    });
     onNavigate("inference");
   };
 
@@ -233,7 +286,12 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     if (!deleteDialog.model) return;
 
     try {
-      const result = await window.api.deleteModel(deleteDialog.model.name);
+      const result = await window.api.deleteModel(
+        deleteDialog.model.name,
+        deleteDialog.model.speciesId,
+        deleteDialog.model.predictorType,
+        deleteDialog.model.modelKind
+      );
       if (result.ok) {
         toast.success("Model deleted");
         loadModels();
@@ -248,9 +306,21 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     }
   };
 
-  const handleRenameModel = async (oldName: string, newName: string) => {
+  const handleRenameModel = async (
+    oldName: string,
+    newName: string,
+    predictorType?: "dlib" | "cnn",
+    modelKind?: "landmark" | "obb_detector",
+    speciesId?: string
+  ) => {
     try {
-      const result = await window.api.renameModel(oldName, newName);
+      const result = await window.api.renameModel(
+        oldName,
+        newName,
+        speciesId,
+        predictorType,
+        modelKind
+      );
       if (result.ok) {
         toast.success("Model renamed");
         loadModels();
@@ -297,7 +367,7 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-auto p-6">
+        <div className="flex-1 overflow-auto p-6 scrollbar-app">
           {loading ? (
             <div className="flex h-full items-center justify-center">
               <RefreshCw className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -311,28 +381,49 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
                 annotation workspace.
               </p>
               <motion.div {...buttonHover} {...buttonTap} className="mt-6">
-                <Button onClick={() => onNavigate("workspace")}>
+                <Button onClick={onStartAnnotating}>
                   Start Annotating
                 </Button>
               </motion.div>
             </div>
           ) : (
-            <motion.div
-              variants={staggerContainer}
-              initial="initial"
-              animate="animate"
-              className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
-            >
-              {models.map((model) => (
-                <ModelCard
-                  key={model.name}
-                  model={model}
-                  onUse={() => handleUseModel(model)}
-                  onDelete={() => setDeleteDialog({ open: true, model })}
-                  onRename={(newName) => handleRenameModel(model.name, newName)}
-                />
-              ))}
-            </motion.div>
+            (() => {
+              const grouped = models.reduce<Record<string, TrainedModel[]>>((acc, m) => {
+                const key = m.schemaName ?? m.speciesId ?? "Unknown Schema";
+                (acc[key] ??= []).push(m);
+                return acc;
+              }, {});
+              return (
+                <motion.div
+                  variants={staggerContainer}
+                  initial="initial"
+                  animate="animate"
+                  className="space-y-8"
+                >
+                  {Object.entries(grouped).map(([schemaKey, schemaModels]) => (
+                    <motion.div key={schemaKey} variants={staggerItem} className="space-y-3">
+                      <div>
+                        <h2 className="text-sm font-semibold text-foreground">{schemaKey}</h2>
+                        <div className="mt-1 h-px bg-border/60" />
+                      </div>
+                      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                        {schemaModels.map((model) => (
+                          <ModelCard
+                            key={`${model.speciesId ?? "global"}::${model.modelKind ?? "landmark"}::${model.name}::${model.predictorType ?? "dlib"}`}
+                            model={model}
+                            onUse={() => handleUseModel(model)}
+                            onDelete={() => setDeleteDialog({ open: true, model })}
+                            onRename={(newName) =>
+                              handleRenameModel(model.name, newName, model.predictorType, model.modelKind, model.speciesId)
+                            }
+                          />
+                        ))}
+                      </div>
+                    </motion.div>
+                  ))}
+                </motion.div>
+              );
+            })()
           )}
         </div>
       </div>
@@ -342,38 +433,28 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
         open={deleteDialog.open}
         onOpenChange={(open) => setDeleteDialog({ open, model: open ? deleteDialog.model : null })}
       >
-        <DialogContent asChild>
-          <motion.div
-            variants={modalContent}
-            initial="initial"
-            animate="animate"
-            exit="exit"
-            className="sm:max-w-md"
-          >
-            <DialogHeader>
-              <DialogTitle className="text-sm font-bold">Delete Model</DialogTitle>
-              <DialogDescription className="text-xs">
-                Are you sure you want to delete "{deleteDialog.model?.name}"? This action
-                cannot be undone.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter className="gap-2 sm:gap-0">
-              <motion.div {...buttonHover} {...buttonTap}>
-                <Button
-                  variant="outline"
-                  onClick={() => setDeleteDialog({ open: false, model: null })}
-                >
-                  Cancel
-                </Button>
-              </motion.div>
-              <motion.div {...buttonHover} {...buttonTap}>
-                <Button variant="destructive" onClick={handleDeleteModel}>
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  Delete
-                </Button>
-              </motion.div>
-            </DialogFooter>
-          </motion.div>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-sm font-bold">Delete Model</DialogTitle>
+            <DialogDescription className="text-xs">
+              Are you sure you want to delete "{deleteDialog.model?.name}"
+              {deleteDialog.model?.predictorType ? ` (${deleteDialog.model.predictorType.toUpperCase()})` : ""}?
+              This action
+              cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button
+              variant="outline"
+              onClick={() => setDeleteDialog({ open: false, model: null })}
+            >
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteModel}>
+              <Trash2 className="mr-2 h-4 w-4" />
+              Delete
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </>

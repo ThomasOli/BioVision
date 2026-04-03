@@ -1,2 +1,48 @@
-dlib
-opencv-python
+# BioVision Python Backend Requirements
+# Python 3.10+ required (3.11 recommended).
+#
+# Recommended install path:
+#   Windows:      setup.bat
+#   macOS/Linux:  bash setup.sh
+#
+# These wrappers call setup_backend.py, which:
+# - creates venv
+# - selects the correct torch build (CUDA/MPS/CPU)
+# - installs this requirements file
+# - installs CLIP (optional, for YOLO-World text prompts)
+#
+# Manual install (after activating venv):
+#   pip install -r backend/requirements.txt
+
+# ------------------------------------------------------------------------------
+# Core runtime dependencies
+# ------------------------------------------------------------------------------
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Landmark model training / inference
+# NOTE: dlib needs CMake and a C++ build toolchain.
+#   Windows: Visual Studio Build Tools + CMake
+#   macOS:   brew install cmake
+#   Linux:   apt install cmake build-essential
+dlib>=19.24.0
+
+# Detection + SAM2/YOLO pipeline
+ultralytics>=8.2.0
+
+# Orientation PCA quality path (fallback exists if missing, but this improves it)
+scikit-learn>=1.3.0
+
+# System capability checks (RAM, gating)
+psutil>=5.9.0
+
+# ------------------------------------------------------------------------------
+# Managed separately by setup_backend.py
+# ------------------------------------------------------------------------------
+# torch / torchvision / torchaudio:
+#   Do NOT add here; setup_backend.py installs the correct CUDA/MPS/CPU build.
+#
+# OpenAI CLIP:
+#   setup_backend.py installs from:
+#   git+https://github.com/openai/CLIP.git

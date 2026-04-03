@@ -25,4 +25,23 @@ release
 *.sln
 *.sw?
 
-.venv
+# Python local environments/artifacts
+venv/
+.venv/
+**/__pycache__/
+*.pyc
+
+# Runtime/session/model data (local only)
+images/
+labels/
+corrected_images/
+debug/
+xml/
+runs/
+models/
+sessions/
+
+# Model weights/checkpoints
+*.pt
+*.pth
+*.dat
