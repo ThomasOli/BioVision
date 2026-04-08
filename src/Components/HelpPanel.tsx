@@ -23,6 +23,7 @@ import { buttonHover, buttonTap } from "@/lib/animations";
 interface HelpPanelProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onShowOnboarding?: () => void;
 }
 
 interface AccordionItemProps {
@@ -96,7 +97,7 @@ const KeyboardShortcut: React.FC<KeyboardShortcutProps> = ({ keys, description }
   </div>
 );
 
-export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
+export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange, onShowOnboarding }) => {
   return (
     <AnimatePresence>
       {open && (
@@ -131,6 +132,16 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
 
             <ScrollArea className="h-[calc(100vh-65px)]">
               <div className="space-y-4 p-4">
+                {onShowOnboarding && (
+                  <Button
+                    variant="outline"
+                    className="w-full"
+                    onClick={onShowOnboarding}
+                  >
+                    <Rocket className="mr-2 h-4 w-4" />
+                    Replay Onboarding Guide
+                  </Button>
+                )}
                 <AccordionItem
                   title="Getting Started"
                   icon={<Rocket className="h-4 w-4" />}

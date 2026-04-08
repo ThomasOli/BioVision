@@ -36,6 +36,7 @@ import {
 import type { RootState } from "@/state/store";
 import { SettingsModal } from "./SettingsModal";
 import { HelpPanel } from "./HelpPanel";
+import { OnboardingGuide } from "./OnboardingGuide";
 import { SchemaSelector } from "./SchemaSelector";
 import { CustomSchemaEditor } from "./CustomSchemaEditor";
 import { addSpecies, setActiveSpecies, updateSpecies } from "@/state/speciesState/speciesSlice";
@@ -305,6 +306,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [orientationDialogOpen, setOrientationDialogOpen] = useState(false);
   const [pendingSessionLaunch, setPendingSessionLaunch] = useState<PendingSessionLaunch | null>(null);
   const [selectedOrientationMode, setSelectedOrientationMode] = useState<OrientationPolicy["mode"]>("invariant");
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
 
   // Load existing sessions on mount
   useEffect(() => {
@@ -336,6 +338,17 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       return next;
     });
   };
+
+  // Auto-open onboarding for first-time users
+  useEffect(() => {
+    if (
+      !loadingSessions &&
+      sessions.length === 0 &&
+      !localStorage.getItem("biovision-onboarding-dismissed")
+    ) {
+      setOnboardingOpen(true);
+    }
+  }, [loadingSessions, sessions.length]);
 
   // Auto-open schema dialog when navigated here from models page
   useEffect(() => {
@@ -989,7 +1002,18 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       </Dialog>
 
       <SettingsModal open={settingsOpen} onOpenChange={setSettingsOpen} />
-      <HelpPanel open={helpOpen} onOpenChange={setHelpOpen} />
+      <HelpPanel
+        open={helpOpen}
+        onOpenChange={setHelpOpen}
+        onShowOnboarding={() => {
+          setHelpOpen(false);
+          setOnboardingOpen(true);
+        }}
+      />
+      <OnboardingGuide
+        open={onboardingOpen}
+        onOpenChange={setOnboardingOpen}
+      />
       <SchemaSelector
         open={schemaDialogOpen}
         customSchemas={customSchemaTemplates}
