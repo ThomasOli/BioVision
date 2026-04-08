@@ -30,6 +30,8 @@ venv/
 .venv/
 **/__pycache__/
 *.pyc
+backend/build/
+backend/dist/
 
 # Runtime/session/model data (local only)
 images/
