@@ -39,13 +39,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies
-        run: python -m pip install -r backend/requirements.txt pyinstaller
+      - name: Install CMake (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
 
-      - name: Install dependencies
+      - name: Install CMake (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install cmake
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && pip install cmake dlib pyinstaller opencv-python numpy Pillow scikit-learn psutil ultralytics
+
+      - name: Install Node dependencies
         run: npm ci
 
       - name: Build and publish
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: npm run publish:${{ matrix.target }}
