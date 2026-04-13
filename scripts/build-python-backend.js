@@ -7,7 +7,11 @@ const backendDir = path.join(projectRoot, "backend");
 const distDir = path.join(backendDir, "dist");
 const buildDir = path.join(backendDir, "build");
 const specDir = path.join(buildDir, "spec");
-const scripts = ["prepare_dataset", "train_shape_model", "predict"];
+const scripts = [
+  { name: "prepare_dataset", path: "data/prepare_dataset.py" },
+  { name: "train_shape_model", path: "training/train_shape_model.py" },
+  { name: "predict", path: "inference/predict.py" },
+];
 
 function run(cmd, args) {
   const result = spawnSync(cmd, args, {
@@ -44,17 +48,17 @@ function main() {
   fs.mkdirSync(specDir, { recursive: true });
 
   for (const script of scripts) {
-    const scriptPath = path.join(backendDir, `${script}.py`);
+    const scriptPath = path.join(backendDir, script.path);
     run("pyinstaller", [
       "--noconfirm",
       "--clean",
       "--onefile",
       "--name",
-      script,
+      script.name,
       "--distpath",
       distDir,
       "--workpath",
-      path.join(buildDir, script),
+      path.join(buildDir, script.name),
       "--specpath",
       specDir,
       scriptPath,
