@@ -9,6 +9,7 @@ import {
   Settings,
   Clock,
   ImageIcon,
+  GraduationCap,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -42,6 +43,7 @@ import { CustomSchemaEditor } from "./CustomSchemaEditor";
 import { addSpecies, setActiveSpecies, updateSpecies } from "@/state/speciesState/speciesSlice";
 import { clearFiles, setSessionImages } from "@/state/filesState/fileSlice";
 import { toast } from "sonner";
+import { useTutorial, ContextualHelp } from "./Tutorial";
 
 interface LandingPageProps {
   onNavigate: (view: AppView) => void;
@@ -54,11 +56,12 @@ interface MenuButtonProps {
   title: string;
   description: string;
   onClick: () => void;
+  tutorialId?: string;
 }
 
-const MenuButton: React.FC<MenuButtonProps> = ({ icon, title, description, onClick }) => {
+const MenuButton: React.FC<MenuButtonProps> = ({ icon, title, description, onClick, tutorialId }) => {
   return (
-    <motion.div variants={staggerItem}>
+    <motion.div variants={staggerItem} data-tutorial={tutorialId}>
       <motion.div
         variants={cardHover}
         initial="initial"
@@ -293,6 +296,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 }) => {
   const dispatch = useDispatch();
   const speciesList = useSelector((state: RootState) => state.species.species);
+  const { setLauncherOpen } = useTutorial();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [schemaDialogOpen, setSchemaDialogOpen] = useState(false);
@@ -791,24 +795,28 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       title: "Annotate Images",
       description: "Add landmark points to your images",
       onClick: () => setSchemaDialogOpen(true),
+      tutorialId: "menu-annotate",
     },
     {
       icon: <Microscope className="h-6 w-6" />,
       title: "Run Inference",
       description: "Apply trained models to new images",
       onClick: () => onNavigate("inference"),
+      tutorialId: "menu-inference",
     },
     {
       icon: <Database className="h-6 w-6" />,
       title: "My Models",
       description: "Manage your trained models",
       onClick: () => onNavigate("models"),
+      tutorialId: "menu-models",
     },
     {
       icon: <BookOpen className="h-6 w-6" />,
       title: "Help & Docs",
       description: "Learn how to use BioVision",
       onClick: () => setHelpOpen(true),
+      tutorialId: "menu-help",
     },
   ];
 
@@ -818,8 +826,18 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   return (
     <>
       <div className="flex h-screen w-screen flex-col items-center bg-background p-8 overflow-y-auto scrollbar-app">
-        {/* Settings button */}
-        <div className="absolute right-4 top-4">
+        {/* Top-right controls */}
+        <div className="absolute right-4 top-4 flex items-center gap-1">
+          <motion.div {...buttonHover} {...buttonTap}>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setLauncherOpen(true)}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              <GraduationCap className="h-5 w-5" />
+            </Button>
+          </motion.div>
           <motion.div {...buttonHover} {...buttonTap}>
             <Button
               variant="ghost"
@@ -864,6 +882,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               title={item.title}
               description={item.description}
               onClick={item.onClick}
+              tutorialId={item.tutorialId}
             />
           ))}
         </motion.div>
@@ -875,6 +894,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.3, duration: 0.4 }}
             className="mt-10 w-full max-w-xl"
+            data-tutorial="recent-sessions"
           >
             <Separator className="mb-6" />
             <div className="mb-4 flex items-center gap-2">
@@ -948,7 +968,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       >
         <DialogContent className="max-w-xl">
           <DialogHeader>
-            <DialogTitle>Choose Orientation Schema</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              Choose Orientation Schema
+              <ContextualHelp
+                text="Orientation policy controls how specimens are normalized before landmark prediction. Choose based on your organism's body plan — directional for fish, bilateral for insects with symmetric wings, etc."
+                side="bottom"
+              />
+            </DialogTitle>
             <DialogDescription>
               Select how this session should handle orientation normalization during training and inference.
             </DialogDescription>

@@ -26,6 +26,14 @@ import {
   summarizeRepresentativeImageDimensions,
 } from "./lib/obbDetectorSettings"
 import type { ObbDetectionSettings } from "./types/Image"
+import {
+  TutorialProvider,
+  TutorialOverlay,
+  WelcomeModal,
+  TutorialLauncher,
+  TOURS,
+  useTutorial,
+} from "./Components/Tutorial"
 
 /** Restores session images+annotations from disk whenever the active species changes. */
 function SessionRestorer() {
@@ -67,6 +75,15 @@ function SessionRestorer() {
     return () => { cancelled = true }
   }, [activeSpeciesId, dispatch])
 
+  return null
+}
+
+/** Registers all guided tours once the TutorialProvider is mounted. */
+function TourRegistrar() {
+  const { registerTours } = useTutorial()
+  useEffect(() => {
+    registerTours(TOURS)
+  }, [registerTours])
   return null
 }
 
@@ -437,9 +454,9 @@ const App: React.FC = () => {
       />
 
       {/* Right: fills ALL remaining space */}
-      <div className="flex-1 h-full bg-muted/30 overflow-hidden flex min-w-0">
+      <div className="flex-1 h-full bg-muted/30 overflow-hidden flex min-w-0" data-tutorial="canvas-area">
         <div className="w-full h-full min-w-0 min-h-0 p-2 box-border flex">
-          <div className="w-full h-full min-w-0 min-h-0 flex">
+          <div className="w-full h-full min-w-0 min-h-0 flex" data-tutorial="image-nav">
             <ImageLabelerCarousel
               color={color}
               opacity={opacity}
@@ -492,11 +509,17 @@ const App: React.FC = () => {
   return (
     <ThemeProvider defaultTheme="system" storageKey="biovision-ui-theme">
       <TooltipProvider>
-        <UndoRedoClearContextProvider>
-          <SessionRestorer />
-          {renderContent()}
-          <Toaster position="bottom-center" />
-        </UndoRedoClearContextProvider>
+        <TutorialProvider>
+          <TourRegistrar />
+          <UndoRedoClearContextProvider>
+            <SessionRestorer />
+            {renderContent()}
+            <Toaster position="bottom-center" />
+          </UndoRedoClearContextProvider>
+          <WelcomeModal />
+          <TutorialOverlay />
+          <TutorialLauncher />
+        </TutorialProvider>
       </TooltipProvider>
     </ThemeProvider>
   )

@@ -11,6 +11,8 @@ import {
   Rocket,
   ListChecks,
   Database,
+  GraduationCap,
+  PlayCircle,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -19,6 +21,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
 import { ScrollArea } from "@/Components/ui/scroll-area";
 import { Separator } from "@/Components/ui/separator";
 import { buttonHover, buttonTap } from "@/lib/animations";
+import { useTutorial } from "./Tutorial";
 
 interface HelpPanelProps {
   open: boolean;
@@ -97,7 +100,14 @@ const KeyboardShortcut: React.FC<KeyboardShortcutProps> = ({ keys, description }
   </div>
 );
 
-export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange, onShowOnboarding }) => {
+export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange, onShowOnboarding: _onShowOnboarding }) => {
+  const { setLauncherOpen } = useTutorial();
+
+  const handleOpenTours = () => {
+    onOpenChange(false);
+    setTimeout(() => setLauncherOpen(true), 200);
+  };
+
   return (
     <AnimatePresence>
       {open && (
@@ -132,16 +142,33 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange, onShow
 
             <ScrollArea className="h-[calc(100vh-65px)]">
               <div className="space-y-4 p-4">
-                {onShowOnboarding && (
-                  <Button
-                    variant="outline"
-                    className="w-full"
-                    onClick={onShowOnboarding}
-                  >
-                    <Rocket className="mr-2 h-4 w-4" />
-                    Replay Onboarding Guide
-                  </Button>
-                )}
+                {/* Interactive Tours Card */}
+                <Card className="border-primary/20 bg-gradient-to-br from-primary/5 to-transparent">
+                  <CardContent className="p-4">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                        <GraduationCap className="h-5 w-5" />
+                      </div>
+                      <div className="flex-1">
+                        <h3 className="text-sm font-bold text-foreground">
+                          Interactive Guided Tours
+                        </h3>
+                        <p className="text-xs text-muted-foreground">
+                          Step-by-step walkthroughs of every feature
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        onClick={handleOpenTours}
+                        className="gap-1.5 text-xs font-semibold"
+                      >
+                        <PlayCircle className="h-3.5 w-3.5" />
+                        Open Tours
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+
                 <AccordionItem
                   title="Getting Started"
                   icon={<Rocket className="h-4 w-4" />}
