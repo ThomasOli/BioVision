@@ -787,6 +787,7 @@ interface SessionMeta {
       // SuperAnnotator pipeline
       superAnnotate: (imagePath: string, className: string, modelTag?: string, options?: SuperAnnotateOptions, speciesId?: string) => Promise<SuperAnnotateResult>;
       checkSuperAnnotator: () => Promise<CheckSuperAnnotatorResult>;
+      initSuperAnnotator: () => Promise<{ ok: boolean; mode?: string; yolo_loaded?: boolean; sam2_loaded?: boolean; error?: string }>;
       resegmentBox: (
         imagePath: string,
         boxXyxy: [number, number, number, number],

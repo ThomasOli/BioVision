@@ -137,6 +137,7 @@ export function DetectionModeSelector({
   }, [setCapabilityInfoIfChanged]);
 
   useEffect(() => {
+    window.api.initSuperAnnotator().catch(() => {});
     refreshCapabilities();
   }, [refreshCapabilities]);
 
