@@ -9228,6 +9228,19 @@ class SuperAnnotatorProcess {
             `SuperAnnotator request timed out after ${Math.round(timeoutMs / 1000)}s (cmd="${cmdName}").`
           )
         );
+
+        // Don't restart if a long-running command is still active
+        const hasLongRunning = [...this.pending.values()].some(
+          (p) => this.LONG_RUNNING_CMDS.has(p.cmdName)
+        );
+        if (hasLongRunning && !this.LONG_RUNNING_CMDS.has(cmdName)) {
+          console.log(
+            `[SuperAnnotator] Ignoring timeout restart for "${cmdName}" — long-running command still active.`
+          );
+          this.resetIdleTimer();
+          return;
+        }
+
         void this.restartAfterTimeout(id, cmdName, elapsedSec);
         this.resetIdleTimer();
       }, timeoutMs);
@@ -9350,6 +9363,8 @@ class SuperAnnotatorProcess {
     return 5 * 60 * 1000;
   }
 
+  private readonly LONG_RUNNING_CMDS = new Set(["train_yolo_obb", "annotate"]);
+
   private refreshRequestTimeout(requestId: string): void {
     const entry = this.pending.get(requestId);
     if (!entry) return;
@@ -9365,6 +9380,20 @@ class SuperAnnotatorProcess {
           `SuperAnnotator request timed out after ${Math.round(active.timeoutMs / 1000)}s (cmd="${active.cmdName}").`
         )
       );
+
+      // If a long-running command is still active, don't restart the backend
+      // just because a short-lived command (like "check") timed out.
+      const hasLongRunning = [...this.pending.values()].some(
+        (p) => this.LONG_RUNNING_CMDS.has(p.cmdName)
+      );
+      if (hasLongRunning && !this.LONG_RUNNING_CMDS.has(active.cmdName)) {
+        console.log(
+          `[SuperAnnotator] Ignoring timeout restart for "${active.cmdName}" — long-running command still active.`
+        );
+        this.resetIdleTimer();
+        return;
+      }
+
       void this.restartAfterTimeout(requestId, active.cmdName, elapsedSec);
       this.resetIdleTimer();
     }, entry.timeoutMs);
