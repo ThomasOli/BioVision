@@ -185,12 +185,12 @@ function getPythonPath(): string {
 function resolveBundledScript(scriptName: string): { cmd: string; args: string[] } {
   if (app.isPackaged) {
     const ext = process.platform === "win32" ? ".exe" : "";
-    const bundledPath = path.join(process.resourcesPath, "python", `${scriptName}${ext}`);
+    const bundledPath = path.join(process.resourcesPath, "python", `biovision_backend${ext}`);
     if (fs.existsSync(bundledPath)) {
-      return { cmd: bundledPath, args: [] };
+      return { cmd: bundledPath, args: [scriptName] };
     }
   }
-  // Dev mode: map script name to source path
+  // Dev mode: map script name to source path and run via Python interpreter
   const scriptMap: Record<string, string> = {
     prepare_dataset: "data/prepare_dataset.py",
     train_shape_model: "training/train_shape_model.py",
@@ -9030,8 +9030,7 @@ class SuperAnnotatorProcess {
   private getBackendSignature(): string {
     const files = app.isPackaged
       ? [
-          path.join(process.resourcesPath, "python", `super_annotator${process.platform === "win32" ? ".exe" : ""}`),
-          path.join(process.resourcesPath, "python", `export_yolo_dataset${process.platform === "win32" ? ".exe" : ""}`),
+          path.join(process.resourcesPath, "python", `biovision_backend${process.platform === "win32" ? ".exe" : ""}`),
         ]
       : [
           path.join(__dirname, "../backend/annotation/super_annotator.py"),

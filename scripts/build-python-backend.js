@@ -7,21 +7,6 @@ const backendDir = path.join(projectRoot, "backend");
 const distDir = path.join(backendDir, "dist");
 const buildDir = path.join(backendDir, "build");
 const specDir = path.join(buildDir, "spec");
-const scripts = [
-  { name: "prepare_dataset", path: "data/prepare_dataset.py" },
-  { name: "train_shape_model", path: "training/train_shape_model.py" },
-  { name: "train_cnn_model", path: "training/train_cnn_model.py" },
-  { name: "predict", path: "inference/predict.py" },
-  { name: "predict_worker", path: "inference/predict_worker.py" },
-  { name: "shape_tester", path: "inference/shape_tester.py" },
-  { name: "list_cnn_variants", path: "inference/list_cnn_variants.py" },
-  { name: "detect_specimen", path: "detection/detect_specimen.py" },
-  { name: "super_annotator", path: "annotation/super_annotator.py" },
-  { name: "validate_dlib_xml", path: "data/validate_dlib_xml.py" },
-  { name: "audit_dataset", path: "data/audit_dataset.py" },
-  { name: "export_yolo_dataset", path: "data/export_yolo_dataset.py" },
-  { name: "hardware_probe", path: "hardware_probe.py" },
-];
 
 function run(cmd, args) {
   const result = spawnSync(cmd, args, {
@@ -44,7 +29,7 @@ function assertPyInstaller() {
 
   if (result.status !== 0) {
     console.error("pyinstaller is required to bundle the Python backend.");
-    console.error("Install it with: python -m pip install -r backend/requirements.txt pyinstaller");
+    console.error("Install it with: pip install pyinstaller");
     process.exit(1);
   }
 }
@@ -57,25 +42,38 @@ function main() {
   fs.mkdirSync(distDir, { recursive: true });
   fs.mkdirSync(specDir, { recursive: true });
 
-  for (const script of scripts) {
-    const scriptPath = path.join(backendDir, script.path);
-    run("pyinstaller", [
-      "--noconfirm",
-      "--clean",
-      "--onefile",
-      "--name",
-      script.name,
-      "--distpath",
-      distDir,
-      "--workpath",
-      path.join(buildDir, script.name),
-      "--specpath",
-      specDir,
-      scriptPath,
-    ]);
-  }
+  // Bundle the single CLI dispatcher. PyInstaller automatically discovers
+  // all imported modules, so torch/ultralytics/dlib/opencv are included once.
+  const cliScript = path.join(backendDir, "cli.py");
+  run("pyinstaller", [
+    "--noconfirm",
+    "--clean",
+    "--onefile",
+    "--name", "biovision_backend",
+    "--distpath", distDir,
+    "--workpath", path.join(buildDir, "biovision_backend"),
+    "--specpath", specDir,
+    // Add all backend subpackages as hidden imports so PyInstaller
+    // includes them even though they're loaded dynamically via runpy
+    "--hidden-import", "data.prepare_dataset",
+    "--hidden-import", "data.validate_dlib_xml",
+    "--hidden-import", "data.audit_dataset",
+    "--hidden-import", "data.export_yolo_dataset",
+    "--hidden-import", "training.train_shape_model",
+    "--hidden-import", "training.train_cnn_model",
+    "--hidden-import", "inference.predict",
+    "--hidden-import", "inference.predict_worker",
+    "--hidden-import", "inference.shape_tester",
+    "--hidden-import", "inference.list_cnn_variants",
+    "--hidden-import", "detection.detect_specimen",
+    "--hidden-import", "annotation.super_annotator",
+    "--hidden-import", "hardware_probe",
+    // Add the backend directory to the search path
+    "--paths", backendDir,
+    cliScript,
+  ]);
 
-  console.log(`Bundled backend executables in ${distDir}`);
+  console.log(`Bundled biovision_backend in ${distDir}`);
 }
 
 main();
