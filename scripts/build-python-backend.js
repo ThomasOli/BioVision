@@ -10,7 +10,17 @@ const specDir = path.join(buildDir, "spec");
 const scripts = [
   { name: "prepare_dataset", path: "data/prepare_dataset.py" },
   { name: "train_shape_model", path: "training/train_shape_model.py" },
+  { name: "train_cnn_model", path: "training/train_cnn_model.py" },
   { name: "predict", path: "inference/predict.py" },
+  { name: "predict_worker", path: "inference/predict_worker.py" },
+  { name: "shape_tester", path: "inference/shape_tester.py" },
+  { name: "list_cnn_variants", path: "inference/list_cnn_variants.py" },
+  { name: "detect_specimen", path: "detection/detect_specimen.py" },
+  { name: "super_annotator", path: "annotation/super_annotator.py" },
+  { name: "validate_dlib_xml", path: "data/validate_dlib_xml.py" },
+  { name: "audit_dataset", path: "data/audit_dataset.py" },
+  { name: "export_yolo_dataset", path: "data/export_yolo_dataset.py" },
+  { name: "hardware_probe", path: "hardware_probe.py" },
 ];
 
 function run(cmd, args) {

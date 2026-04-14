@@ -175,6 +175,44 @@ function getPythonPath(): string {
   return getPythonResolution().pythonPath;
 }
 
+/**
+ * Resolve a backend script to either a bundled executable (production) or
+ * a [pythonPath, scriptPath] pair (development).
+ *
+ * @param scriptName - base name without extension, e.g. "predict", "super_annotator"
+ * @returns { cmd, args } where cmd is the executable and args are the remaining arguments
+ */
+function resolveBundledScript(scriptName: string): { cmd: string; args: string[] } {
+  if (app.isPackaged) {
+    const ext = process.platform === "win32" ? ".exe" : "";
+    const bundledPath = path.join(process.resourcesPath, "python", `${scriptName}${ext}`);
+    if (fs.existsSync(bundledPath)) {
+      return { cmd: bundledPath, args: [] };
+    }
+  }
+  // Dev mode: map script name to source path
+  const scriptMap: Record<string, string> = {
+    prepare_dataset: "data/prepare_dataset.py",
+    train_shape_model: "training/train_shape_model.py",
+    train_cnn_model: "training/train_cnn_model.py",
+    predict: "inference/predict.py",
+    predict_worker: "inference/predict_worker.py",
+    shape_tester: "inference/shape_tester.py",
+    list_cnn_variants: "inference/list_cnn_variants.py",
+    detect_specimen: "detection/detect_specimen.py",
+    super_annotator: "annotation/super_annotator.py",
+    validate_dlib_xml: "data/validate_dlib_xml.py",
+    audit_dataset: "data/audit_dataset.py",
+    export_yolo_dataset: "data/export_yolo_dataset.py",
+    hardware_probe: "hardware_probe.py",
+  };
+  const relPath = scriptMap[scriptName];
+  const scriptPath = relPath
+    ? path.join(__dirname, "../backend", relPath)
+    : path.join(__dirname, "../backend", `${scriptName}.py`);
+  return { cmd: getPythonPath(), args: [scriptPath] };
+}
+
 let warnedAboutSystemPythonFallback = false;
 
 function warnIfUsingSystemPython(pythonResolution = getPythonResolution()): void {
@@ -186,11 +224,14 @@ function warnIfUsingSystemPython(pythonResolution = getPythonResolution()): void
   );
 }
 
-function runPython(args: string[]): Promise<string> {
+/**
+ * Run a bundled backend script by name. In production uses the PyInstaller
+ * executable; in dev falls back to the Python interpreter + .py source.
+ */
+function runBundledScript(scriptName: string, extraArgs: string[] = []): Promise<string> {
   return new Promise((resolve, reject) => {
-    const pythonResolution = getPythonResolution();
-    warnIfUsingSystemPython(pythonResolution);
-    const proc = spawn(pythonResolution.pythonPath, args);
+    const resolved = resolveBundledScript(scriptName);
+    const proc = spawn(resolved.cmd, [...resolved.args, ...extraArgs]);
 
     let out = "";
     let err = "";
@@ -200,21 +241,21 @@ function runPython(args: string[]): Promise<string> {
 
     proc.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(err || `Python exited with code ${code}`));
+        return reject(new Error(err || `${scriptName} exited with code ${code}`));
       }
       resolve(out.trim());
     });
   });
 }
 
-function runPythonWithProgress(
-  args: string[],
+function runBundledScriptWithProgress(
+  scriptName: string,
+  extraArgs: string[] = [],
   onProgress?: (percent: number, stage: string, details?: Record<string, unknown>) => void
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const pythonResolution = getPythonResolution();
-    warnIfUsingSystemPython(pythonResolution);
-    const proc = spawn(pythonResolution.pythonPath, args);
+    const resolved = resolveBundledScript(scriptName);
+    const proc = spawn(resolved.cmd, [...resolved.args, ...extraArgs]);
     let out = "";
     let err = "";
 
@@ -252,12 +293,13 @@ function runPythonWithProgress(
 
     proc.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(err || `Python exited with code ${code}`));
+        return reject(new Error(err || `${scriptName} exited with code ${code}`));
       }
       resolve(out.trim());
     });
   });
 }
+
 
 // ---------------------------------------------------------------------------
 // Hardware capability probe Ã¢â‚¬â€ called once at app startup from React
@@ -266,8 +308,7 @@ ipcMain.handle("system:probe-hardware", async () => {
   const pythonResolution = getPythonResolution();
   warnIfUsingSystemPython(pythonResolution);
   try {
-    const script = path.join(__dirname, "../backend/hardware_probe.py");
-    const out = await runPython([script]);
+    const out = await runBundledScript("hardware_probe");
     const parsed = JSON.parse(out.trim());
     return {
       device: parsed.device ?? "cpu",
@@ -3560,7 +3601,7 @@ async function resolveCnnVariantCapabilities(): Promise<{
   warning?: string;
 }> {
   try {
-    const out = await runPython([path.join(__dirname, "../backend/inference/list_cnn_variants.py")]);
+    const out = await runBundledScript("list_cnn_variants");
     const parsed = JSON.parse(out || "{}");
     if (!parsed || !Array.isArray(parsed.variants)) {
       throw new Error("Invalid CNN variant response payload.");
@@ -3617,13 +3658,12 @@ ipcMain.handle(
       const useImportedXml = !!args?.useImportedXml;
 
       if (useImportedXml) {
-        const xmlValidator = path.join(__dirname, "../backend/data/validate_dlib_xml.py");
         const trainXml = path.join(effectiveRoot, "xml", `train_${modelName}.xml`);
         if (!fs.existsSync(trainXml)) {
           return { ok: false, error: `train_${modelName}.xml not found.` };
         }
 
-        const trainValidation = JSON.parse(await runPython([xmlValidator, trainXml]));
+        const trainValidation = JSON.parse(await runBundledScript("validate_dlib_xml", [trainXml]));
         if (!trainValidation.ok) {
           return {
             ok: false,
@@ -3634,7 +3674,7 @@ ipcMain.handle(
         const testXml = path.join(effectiveRoot, "xml", `test_${modelName}.xml`);
         let testValidation: any = null;
         if (fs.existsSync(testXml)) {
-          testValidation = JSON.parse(await runPython([xmlValidator, testXml]));
+          testValidation = JSON.parse(await runBundledScript("validate_dlib_xml", [testXml]));
           if (!testValidation.ok) {
             return {
               ok: false,
@@ -3737,20 +3777,19 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
     emitTrainProgress(3, "preflight", "Validating training inputs...");
 
     if (options?.useImportedXml) {
-      const xmlValidator = path.join(__dirname, "../backend/data/validate_dlib_xml.py");
       const trainXml = path.join(effectiveRoot, "xml", `train_${modelName}.xml`);
       if (!fs.existsSync(trainXml)) {
         throw new Error(`train_${modelName}.xml not found. Import a dlib train XML file first.`);
       }
 
-      const trainValidation = JSON.parse(await runPython([xmlValidator, trainXml]));
+      const trainValidation = JSON.parse(await runBundledScript("validate_dlib_xml", [trainXml]));
       if (!trainValidation.ok) {
         throw new Error(`Train XML validation failed: ${summarizeValidationErrors(trainValidation)}`);
       }
 
       const testXml = path.join(effectiveRoot, "xml", `test_${modelName}.xml`);
       if (fs.existsSync(testXml)) {
-        const testValidation = JSON.parse(await runPython([xmlValidator, testXml]));
+        const testValidation = JSON.parse(await runBundledScript("validate_dlib_xml", [testXml]));
         if (!testValidation.ok) {
           throw new Error(`Test XML validation failed: ${summarizeValidationErrors(testValidation)}`);
         }
@@ -3759,18 +3798,16 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
     } else {
       // Prepare dataset with train/test split
       emitTrainProgress(12, "prepare_dataset", "Preparing dataset...");
-      await runPythonWithProgress([
-        path.join(__dirname, "../backend/data/prepare_dataset.py"),
-        effectiveRoot,
-        modelName,
-        testSplit.toString(),
-        seed.toString(),
-      ], (pct, stage, details) => {
-        const scaled = 12 + Math.round((Math.max(0, Math.min(100, pct)) / 100) * 18);
-        const uiStage = resolveProgressStage("prepare_dataset", details);
-        const uiMessage = resolveProgressMessage(stage, details);
-        emitTrainProgress(scaled, uiStage, uiMessage, details);
-      });
+      await runBundledScriptWithProgress(
+        "prepare_dataset",
+        [effectiveRoot, modelName, testSplit.toString(), seed.toString()],
+        (pct, stage, details) => {
+          const scaled = 12 + Math.round((Math.max(0, Math.min(100, pct)) / 100) * 18);
+          const uiStage = resolveProgressStage("prepare_dataset", details);
+          const uiMessage = resolveProgressMessage(stage, details);
+          emitTrainProgress(scaled, uiStage, uiMessage, details);
+        }
+      );
       emitTrainProgress(30, "prepare_dataset", "Dataset preparation complete.");
     }
 
@@ -3778,19 +3815,15 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
     let auditReport: Record<string, unknown> | null = null;
     emitTrainProgress(35, "evaluation", "Auditing dataset...");
     try {
-      const auditScript = path.join(__dirname, "../backend/data/audit_dataset.py");
-      if (fs.existsSync(auditScript)) {
-        const auditOut = await runPython([
-          auditScript,
-          "--project-root", effectiveRoot,
-          "--tag", modelName,
-        ]).catch(() => null);
-        if (auditOut) {
-          const debugDir = path.join(effectiveRoot, "debug");
-          const auditPath = path.join(debugDir, `audit_${modelName}.json`);
-          if (fs.existsSync(auditPath)) {
-            try { auditReport = JSON.parse(fs.readFileSync(auditPath, "utf-8")); } catch (_) {}
-          }
+      const auditOut = await runBundledScript("audit_dataset", [
+        "--project-root", effectiveRoot,
+        "--tag", modelName,
+      ]).catch(() => null);
+      if (auditOut) {
+        const debugDir = path.join(effectiveRoot, "debug");
+        const auditPath = path.join(debugDir, `audit_${modelName}.json`);
+        if (fs.existsSync(auditPath)) {
+          try { auditReport = JSON.parse(fs.readFileSync(auditPath, "utf-8")); } catch (_) {}
         }
       }
     } catch (_) {}
@@ -3849,7 +3882,6 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       const lrRaw = Number((options as any)?.customOptions?.lr);
       const batchRaw = Number((options as any)?.customOptions?.batch ?? (options as any)?.customOptions?.batch_size);
       const cnnArgs = [
-        path.join(__dirname, "../backend/training/train_cnn_model.py"),
         effectiveRoot,
         modelName,
         "--model-variant", cnnVariant,
@@ -3880,7 +3912,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
         cnnArgs.push("--batch-size", String(Math.round(batchRaw)));
       }
       emitTrainProgress(42, "training", "Training CNN model...");
-      out = await runPythonWithProgress(cnnArgs, (pct, stage, details) => {
+      out = await runBundledScriptWithProgress("train_cnn_model", cnnArgs, (pct, stage, details) => {
         const scaled = 42 + Math.round((Math.max(0, Math.min(100, pct)) / 100) * 50);
         const uiStage = resolveProgressStage("training", details);
         const uiMessage = resolveProgressMessage(stage, details);
@@ -3888,7 +3920,6 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
       });
     } else {
       const trainArgs = [
-        path.join(__dirname, "../backend/training/train_shape_model.py"),
         effectiveRoot,
         modelName,
       ];
@@ -3896,7 +3927,7 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
         trainArgs.push(JSON.stringify(options.customOptions));
       }
       emitTrainProgress(42, "training", "Training dlib shape predictor...");
-      out = await runPythonWithProgress(trainArgs, (pct, stage, details) => {
+      out = await runBundledScriptWithProgress("train_shape_model", trainArgs, (pct, stage, details) => {
         const scaled = 42 + Math.round((Math.max(0, Math.min(100, pct)) / 100) * 50);
         const uiStage = resolveProgressStage("training", details);
         const uiMessage = resolveProgressMessage(stage, details);
@@ -4057,10 +4088,9 @@ ipcMain.handle("ml:import-dlib-xml", async (_event, args: { modelName: string; s
     const effectiveRoot = getEffectiveRoot(args.speciesId);
     ensureTrainingLayout(effectiveRoot);
     const xmlDir = path.join(effectiveRoot, "xml");
-    const xmlValidator = path.join(__dirname, "../backend/data/validate_dlib_xml.py");
 
     const trainDest = path.join(xmlDir, `train_${modelName}.xml`);
-    const trainValidation = JSON.parse(await runPython([xmlValidator, trainXml, trainDest]));
+    const trainValidation = JSON.parse(await runBundledScript("validate_dlib_xml", [trainXml, trainDest]));
     if (!trainValidation.ok) {
       return {
         ok: false,
@@ -4074,7 +4104,7 @@ ipcMain.handle("ml:import-dlib-xml", async (_event, args: { modelName: string; s
     let testValidation: any = null;
     if (testXml) {
       testDest = path.join(xmlDir, `test_${modelName}.xml`);
-      testValidation = JSON.parse(await runPython([xmlValidator, testXml, testDest]));
+      testValidation = JSON.parse(await runBundledScript("validate_dlib_xml", [testXml, testDest]));
       if (!testValidation.ok) {
         return {
           ok: false,
@@ -4118,8 +4148,7 @@ ipcMain.handle("ml:test-model", async (_event, args: string | { modelName: strin
     const speciesId = typeof args === "object" ? args.speciesId : undefined;
     const effectiveRoot = getEffectiveRoot(speciesId);
 
-    const out = await runPython([
-      path.join(__dirname, "../backend/inference/shape_tester.py"),
+    const out = await runBundledScript("shape_tester", [
       effectiveRoot,
       modelName,
     ]);
@@ -4277,8 +4306,7 @@ async function runPredictionRequest(args: {
       );
     }
 
-    const pythonArgs = [
-      path.join(__dirname, "../backend/inference/predict.py"),
+    const predictArgs = [
       modelRoot,
       args.tag,
       effectivePath,
@@ -4286,10 +4314,10 @@ async function runPredictionRequest(args: {
       predictorType,
     ];
     if (args.options?.multiSpecimen) {
-      pythonArgs.push("--multi");
+      predictArgs.push("--multi");
     }
     if (obbDetectorPath) {
-      pythonArgs.push("--yolo-model", obbDetectorPath);
+      predictArgs.push("--yolo-model", obbDetectorPath);
     }
     const boxesForInference =
       Array.isArray(args.options?.boxes) && args.options!.boxes.length > 0 ? args.options!.boxes : undefined;
@@ -4300,10 +4328,10 @@ async function runPredictionRequest(args: {
         `bv_boxes_${Date.now()}_${Math.random().toString(16).slice(2)}.json`
       );
       fs.writeFileSync(tempBoxesFile, JSON.stringify(boxesForInference));
-      pythonArgs.push("--boxes-json", tempBoxesFile);
+      predictArgs.push("--boxes-json", tempBoxesFile);
     }
 
-    const out = await runPythonWithProgress(pythonArgs, args.onProgress);
+    const out = await runBundledScriptWithProgress("predict", predictArgs, args.onProgress);
     return JSON.parse(out);
   } finally {
     if (tempFile) {
@@ -5357,8 +5385,7 @@ ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?
     const sessionObbPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
     if (fs.existsSync(sessionObbPath)) {
       // Route all trained-session detection through the shared OBB detector script.
-      const pythonArgs = [
-        path.join(__dirname, "../backend/detection/detect_specimen.py"),
+      const detectArgs = [
         imagePath,
         "--multi",
         "--yolo-model",
@@ -5375,7 +5402,7 @@ ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?
         String(resolvedDetectionSettings.nmsIou),
       ];
 
-      const out = await runPython(pythonArgs);
+      const out = await runBundledScript("detect_specimen", detectArgs);
       const data = JSON.parse(out.trim());
       if (!data) {
         return { ok: false, error: "No detection result", boxes: [] };
@@ -5436,10 +5463,7 @@ ipcMain.handle("ml:detect-specimens", async (_event, imagePath: string, options?
 // Check OBB detector runtime availability
 ipcMain.handle("ml:check-yolo", async () => {
   try {
-    const out = await runPython([
-      path.join(__dirname, "../backend/detection/detect_specimen.py"),
-      "--check",
-    ]);
+    const out = await runBundledScript("detect_specimen", ["--check"]);
 
     return JSON.parse(out.trim());
   } catch (e: any) {
@@ -9004,10 +9028,15 @@ class SuperAnnotatorProcess {
   private backendSignature: string | null = null;
 
   private getBackendSignature(): string {
-    const files = [
-      path.join(__dirname, "../backend/annotation/super_annotator.py"),
-      path.join(__dirname, "../backend/data/export_yolo_dataset.py"),
-    ];
+    const files = app.isPackaged
+      ? [
+          path.join(process.resourcesPath, "python", `super_annotator${process.platform === "win32" ? ".exe" : ""}`),
+          path.join(process.resourcesPath, "python", `export_yolo_dataset${process.platform === "win32" ? ".exe" : ""}`),
+        ]
+      : [
+          path.join(__dirname, "../backend/annotation/super_annotator.py"),
+          path.join(__dirname, "../backend/data/export_yolo_dataset.py"),
+        ];
     return files
       .map((filePath) => {
         try {
@@ -9023,19 +9052,14 @@ class SuperAnnotatorProcess {
   async start(): Promise<void> {
     if (this.process) return; // already running
 
-    const pythonResolution = getPythonResolution();
-    warnIfUsingSystemPython(pythonResolution);
-    const scriptPath = path.join(__dirname, "../backend/annotation/super_annotator.py");
+    const resolved = resolveBundledScript("super_annotator");
     this.backendSignature = this.getBackendSignature();
     const generation = ++this.generation;
     this.activeGeneration = generation;
 
-    this.process = spawn(pythonResolution.pythonPath, [scriptPath], {
+    this.process = spawn(resolved.cmd, resolved.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      cwd: path.join(__dirname, ".."),
-      // Force UTF-8 for stdin/stdout so non-ASCII paths (e.g. macOS narrow
-      // no-break space U+202F in screenshot filenames) survive the JSON pipe.
-      // Without this, Windows Python defaults to CP1252 and mangles the path.
+      cwd: app.isPackaged ? process.resourcesPath : path.join(__dirname, ".."),
       env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
     });
 
@@ -9405,8 +9429,7 @@ async function checkSam2MinimumRequirements(force = false): Promise<{ ok: boolea
   }
 
   try {
-    const hwScript = path.join(__dirname, "../backend/hardware_probe.py");
-    const hwOut = await runPython([hwScript]);
+    const hwOut = await runBundledScript("hardware_probe");
     const hw = JSON.parse(hwOut.trim());
     const device = String(hw?.device ?? "cpu");
     const ramGb = Number(hw?.ram_gb ?? 0);
@@ -9648,11 +9671,10 @@ class LandmarkInferenceWorkerProcess {
 
   async start(): Promise<void> {
     if (this.process) return;
-    const pyPath = getPythonPath();
-    const scriptPath = path.join(__dirname, "../backend/inference/predict_worker.py");
-    this.process = spawn(pyPath, [scriptPath], {
+    const resolved = resolveBundledScript("predict_worker");
+    this.process = spawn(resolved.cmd, resolved.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      cwd: path.join(__dirname, ".."),
+      cwd: app.isPackaged ? process.resourcesPath : path.join(__dirname, ".."),
       env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
     });
 
@@ -9855,8 +9877,7 @@ ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, option
     // Probe hardware to determine device for routing.
     let hwDevice = "cpu";
     try {
-      const hwScript = path.join(__dirname, "../backend/hardware_probe.py");
-      const hwOut = await runPython([hwScript]);
+      const hwOut = await runBundledScript("hardware_probe");
       const hw = JSON.parse(hwOut.trim());
       hwDevice = hw.device ?? "cpu";
     } catch (_hwErr) {

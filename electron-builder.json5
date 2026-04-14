@@ -16,13 +16,6 @@
   ],
   "extraResources": [
     {
-      "from": "backend",
-      "to": "backend",
-      "filter": [
-        "*.py"
-      ]
-    },
-    {
       "from": "backend/dist",
       "to": "python",
       "filter": [
