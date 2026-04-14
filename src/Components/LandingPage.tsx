@@ -15,7 +15,6 @@ import {
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
 import { Card, CardContent } from "@/Components/ui/card";
-import { Separator } from "@/Components/ui/separator";
 import {
   Dialog,
   DialogContent,
@@ -61,30 +60,31 @@ interface MenuButtonProps {
 
 const MenuButton: React.FC<MenuButtonProps> = ({ icon, title, description, onClick, tutorialId }) => {
   return (
-    <motion.div variants={staggerItem} data-tutorial={tutorialId}>
-      <motion.div
-        variants={cardHover}
-        initial="initial"
-        whileHover="hover"
-        className="h-full"
-      >
-        <motion.div {...buttonHover} {...buttonTap} className="h-full">
-          <Card
-            className={cn(
-              "h-full cursor-pointer border-border/50 bg-card/50 backdrop-blur-sm",
-              "transition-colors hover:border-primary/30 hover:bg-card/80"
-            )}
-            onClick={onClick}
-          >
-            <CardContent className="flex flex-col items-center justify-center p-6 text-center">
-              <div className="mb-3 rounded-xl bg-primary/10 p-3 text-primary">
-                {icon}
-              </div>
-              <h3 className="text-sm font-bold text-foreground">{title}</h3>
-              <p className="mt-1 text-xs text-muted-foreground">{description}</p>
-            </CardContent>
-          </Card>
-        </motion.div>
+    <motion.div variants={staggerItem} className="h-full" data-tutorial={tutorialId}>
+      <motion.div {...buttonTap} className="h-full">
+        <Card
+          className={cn(
+            "h-full cursor-pointer group relative overflow-hidden",
+            "border-border/50 bg-card/70 backdrop-blur-sm",
+            "transition-all duration-200",
+            "hover:border-primary/50 hover:bg-card hover:shadow-lg hover:shadow-primary/5"
+          )}
+          onClick={onClick}
+        >
+          {/* Left accent bar */}
+          <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-primary/0 group-hover:bg-primary/80 transition-all duration-300" />
+          {/* Subtle top-left corner glow */}
+          <div className="absolute top-0 left-0 w-16 h-16 bg-primary/0 group-hover:bg-primary/5 rounded-br-full transition-all duration-300" />
+          <CardContent className="flex flex-col items-start gap-3 p-5 h-full">
+            <div className="rounded-lg bg-primary/10 p-2.5 text-primary group-hover:bg-primary/15 transition-colors duration-200 ring-1 ring-primary/10 group-hover:ring-primary/25">
+              {icon}
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-foreground font-display leading-tight">{title}</h3>
+              <p className="mt-0.5 text-[11px] text-muted-foreground leading-relaxed">{description}</p>
+            </div>
+          </CardContent>
+        </Card>
       </motion.div>
     </motion.div>
   );
@@ -361,6 +361,18 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       onSchemaDialogOpened?.();
     }
   }, [openSchemaDialogOnMount, onSchemaDialogOpened]);
+
+  // ? key opens help panel (skip when focus is inside an input/textarea)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "?") return;
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea") return;
+      setHelpOpen(true);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   const openOrientationDialogForLaunch = (launch: PendingSessionLaunch) => {
     const suggested = launch.orientationPolicy?.mode || inferDefaultOrientationPolicy(launch.landmarkTemplate).mode;
@@ -814,7 +826,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     {
       icon: <BookOpen className="h-6 w-6" />,
       title: "Help & Docs",
-      description: "Learn how to use BioVision",
+      description: "Learn how to use MLTrace",
       onClick: () => setHelpOpen(true),
       tutorialId: "menu-help",
     },
@@ -825,136 +837,174 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
   return (
     <>
-      <div className="flex h-screen w-screen flex-col items-center bg-background p-8 overflow-y-auto scrollbar-app">
-        {/* Top-right controls */}
-        <div className="absolute right-4 top-4 flex items-center gap-1">
-          <motion.div {...buttonHover} {...buttonTap}>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setLauncherOpen(true)}
-              className="text-muted-foreground hover:text-foreground"
-            >
-              <GraduationCap className="h-5 w-5" />
-            </Button>
-          </motion.div>
-          <motion.div {...buttonHover} {...buttonTap}>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setSettingsOpen(true)}
-              className="text-muted-foreground hover:text-foreground"
-            >
-              <Settings className="h-5 w-5" />
-            </Button>
-          </motion.div>
+      <div className="relative flex h-screen w-screen flex-col items-center bg-background overflow-y-auto scrollbar-app">
+        {/* Scientific graph-paper grid background */}
+        <div className="absolute inset-0 grid-bg pointer-events-none" />
+        {/* Radial vignette — fades grid at the center focal point */}
+        <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(ellipse_70%_55%_at_50%_38%,transparent_20%,hsl(var(--background)/0.55)_100%)]" />
+
+        {/* Top chrome bar */}
+        <div className="sticky top-0 z-20 w-full flex items-center justify-between px-5 py-2.5 border-b border-border/40 bg-background/75 backdrop-blur-md">
+          <div className="flex items-center gap-2">
+            <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
+            <span className="font-mono text-[10px] font-medium text-muted-foreground/70 tracking-widest uppercase">
+              MLTrace
+            </span>
+          </div>
+          <div className="flex items-center gap-1">
+            <motion.div {...buttonHover} {...buttonTap}>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setLauncherOpen(true)}
+                className="h-8 w-8 text-muted-foreground hover:text-foreground"
+              >
+                <GraduationCap className="h-4 w-4" />
+              </Button>
+            </motion.div>
+            <motion.div {...buttonHover} {...buttonTap}>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setSettingsOpen(true)}
+                className="h-8 w-8 text-muted-foreground hover:text-foreground"
+              >
+                <Settings className="h-4 w-4" />
+              </Button>
+            </motion.div>
+          </div>
         </div>
 
-        {/* Header */}
-        <motion.div
-          initial={{ opacity: 0, y: -20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4 }}
-          className="mb-12 text-center mt-8"
-        >
-          <div className="mb-4 flex items-center justify-center gap-3">
-            <div className="rounded-xl bg-primary/10 p-3">
-              <Microscope className="h-10 w-10 text-primary" />
-            </div>
-          </div>
-          <h1 className="text-3xl font-bold text-foreground">BioVision</h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Train ML models for biological image landmarking
-          </p>
-        </motion.div>
+        {/* Main content column */}
+        <div className="relative z-10 flex flex-col items-center w-full max-w-xl px-8 py-12">
 
-        {/* Menu Grid — 2x2 */}
-        <motion.div
-          variants={staggerContainer}
-          initial="initial"
-          animate="animate"
-          className="grid w-full max-w-xl grid-cols-2 gap-4"
-        >
-          {menuItems.map((item, index) => (
-            <MenuButton
-              key={index}
-              icon={item.icon}
-              title={item.title}
-              description={item.description}
-              onClick={item.onClick}
-              tutorialId={item.tutorialId}
-            />
-          ))}
-        </motion.div>
-
-        {/* Recently Used Sessions — up to 4 in a row */}
-        {!loadingSessions && recentSessions.length > 0 && (
+          {/* ── Hero ─────────────────────────────────────────────── */}
           <motion.div
-            initial={{ opacity: 0, y: 20 }}
+            initial={{ opacity: 0, y: -18 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.3, duration: 0.4 }}
-            className="mt-10 w-full max-w-xl"
-            data-tutorial="recent-sessions"
+            transition={{ duration: 0.55, ease: [0.22, 1, 0.36, 1] }}
+            className="mb-12 text-center"
           >
-            <Separator className="mb-6" />
-            <div className="mb-4 flex items-center gap-2">
-              <Clock className="h-4 w-4 text-muted-foreground" />
-              <h2 className="text-sm font-bold uppercase tracking-wide text-muted-foreground">
-                Recently Used
-              </h2>
+            <div className="mb-5 flex items-center justify-center">
+              <div className="rounded-xl bg-primary/10 p-3.5 ring-1 ring-primary/20 shadow-lg shadow-primary/10">
+                <Microscope className="h-9 w-9 text-primary" />
+              </div>
             </div>
-            <div className="flex gap-3">
-              {recentSessions.map((session) => (
-                <motion.div
-                  key={session.speciesId}
-                  variants={cardHover}
-                  initial="initial"
-                  whileHover="hover"
-                  className="flex-1 min-w-0"
-                >
-                  <Card
-                    className={cn(
-                      "cursor-pointer border-border/50 bg-card/50 backdrop-blur-sm h-full",
-                      "transition-colors hover:border-primary/30 hover:bg-card/80",
-                      resumingSessionId === session.speciesId && "opacity-60 pointer-events-none"
-                    )}
-                    onClick={() =>
-                      beginResumeWithOrientationCheck(session.speciesId, session.name)
-                    }
-                  >
-                    <CardContent className="p-3">
-                      <h3 className="text-xs font-bold text-foreground truncate">
-                        {session.name}
-                      </h3>
-                      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                        <ImageIcon className="h-3 w-3 shrink-0" />
-                        <span>{session.imageCount} img{session.imageCount !== 1 ? "s" : ""}</span>
-                      </div>
-                      {session.lastModified && (
-                        <p className="mt-0.5 text-[10px] text-muted-foreground/60 truncate">
-                          {formatDate(session.lastModified)}
-                        </p>
-                      )}
-                      {resumingSessionId === session.speciesId && (
-                        <p className="mt-1 text-[10px] font-semibold text-primary">Loading...</p>
-                      )}
-                    </CardContent>
-                  </Card>
-                </motion.div>
-              ))}
-            </div>
-          </motion.div>
-        )}
 
-        {/* Footer */}
-        <motion.p
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ delay: 0.6 }}
-          className="mt-12 mb-8 text-xs text-muted-foreground"
-        >
-          Press <kbd className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">?</kbd> for keyboard shortcuts
-        </motion.p>
+            {/* Platform badge */}
+            <div className="inline-flex items-center gap-2 rounded-full border border-primary/25 bg-primary/8 px-3.5 py-1 mb-4">
+              <span className="h-1.5 w-1.5 rounded-full bg-primary" />
+              <span className="font-mono text-[10px] font-medium text-primary tracking-widest uppercase">
+                Biomorphometric Analysis Platform
+              </span>
+            </div>
+
+            <h1 className="text-4xl font-display font-bold text-foreground tracking-tight mb-3">
+              MLTrace
+            </h1>
+            <p className="text-sm text-muted-foreground max-w-[280px] mx-auto leading-relaxed">
+              Automated landmark placement, model training, and morphometric inference for biological image datasets
+            </p>
+          </motion.div>
+
+          {/* ── Action Grid ──────────────────────────────────────── */}
+          <motion.div
+            variants={staggerContainer}
+            initial="initial"
+            animate="animate"
+            className="grid w-full grid-cols-2 gap-3"
+          >
+            {menuItems.map((item, index) => (
+              <MenuButton
+                key={index}
+                icon={item.icon}
+                title={item.title}
+                description={item.description}
+                onClick={item.onClick}
+                tutorialId={item.tutorialId}
+              />
+            ))}
+          </motion.div>
+
+          {/* ── Recent Sessions ──────────────────────────────────── */}
+          {!loadingSessions && recentSessions.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.3, duration: 0.4 }}
+              className="mt-10 w-full"
+              data-tutorial="recent-sessions"
+            >
+              <div className="mb-3 flex items-center gap-2">
+                <Clock className="h-3.5 w-3.5 text-muted-foreground/70" />
+                <h2 className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
+                  Recent Sessions
+                </h2>
+                <span className="ml-auto font-mono text-[10px] text-muted-foreground/40">
+                  {sessions.length} total
+                </span>
+              </div>
+
+              <div className="flex gap-2.5">
+                {recentSessions.map((session) => (
+                  <motion.div
+                    key={session.speciesId}
+                    variants={cardHover}
+                    initial="initial"
+                    whileHover="hover"
+                    className="flex-1 min-w-0"
+                  >
+                    <Card
+                      className={cn(
+                        "cursor-pointer border-border/40 bg-card/70 h-full group relative overflow-hidden",
+                        "transition-all duration-200 hover:border-primary/40 hover:bg-card hover:shadow-md hover:shadow-primary/5",
+                        resumingSessionId === session.speciesId && "opacity-60 pointer-events-none"
+                      )}
+                      onClick={() =>
+                        beginResumeWithOrientationCheck(session.speciesId, session.name)
+                      }
+                    >
+                      <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-primary/0 group-hover:bg-primary/70 transition-all duration-300" />
+                      <CardContent className="p-3">
+                        <h3 className="text-xs font-semibold text-foreground truncate mb-2">
+                          {session.name}
+                        </h3>
+                        <div className="inline-flex items-center gap-1 rounded bg-muted/70 px-1.5 py-0.5">
+                          <ImageIcon className="h-2.5 w-2.5 text-muted-foreground/60 shrink-0" />
+                          <span className="font-mono text-[10px] text-muted-foreground">
+                            {session.imageCount}
+                          </span>
+                        </div>
+                        {session.lastModified && (
+                          <p className="mt-1.5 text-[10px] text-muted-foreground/45 truncate">
+                            {formatDate(session.lastModified)}
+                          </p>
+                        )}
+                        {resumingSessionId === session.speciesId && (
+                          <p className="mt-1 text-[10px] font-medium text-primary">Resuming...</p>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </motion.div>
+                ))}
+              </div>
+            </motion.div>
+          )}
+
+          {/* ── Footer ───────────────────────────────────────────── */}
+          <motion.p
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 0.7 }}
+            className="mt-14 mb-8 text-[11px] text-muted-foreground/50"
+          >
+            Press{" "}
+            <kbd className="rounded-sm border border-border/60 bg-muted/70 px-1.5 py-0.5 font-mono text-[10px]">
+              ?
+            </kbd>{" "}
+            for keyboard shortcuts
+          </motion.p>
+        </div>
       </div>
 
       <Dialog

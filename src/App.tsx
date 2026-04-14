@@ -1,7 +1,8 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useDispatch, useSelector } from "react-redux"
-import { motion } from "framer-motion"
+import { motion, AnimatePresence } from "framer-motion"
 
+import { ChevronRight } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { ThemeProvider } from "@/Components/theme-provider"
 import { TooltipProvider } from "@/Components/ui/tooltip"
@@ -245,13 +246,13 @@ const App: React.FC = () => {
   const handleOpacityChange = (selectedOpacity: number) => setOpacity(selectedOpacity)
 
   // Adaptive sidebar bounds — scale with viewport width
-  // 13" (~1280px): min 375, max 480 | 15" (~1600px): min 420, max 600
-  // 24" (~1920px): min 480, max 720 | 27"+ (>1920px): min 545, max 860
+  // 13" (~1280px): min 260, max 340 | 15" (~1600px): min 290, max 400
+  // 24" (~1920px): min 320, max 460 | 27"+ (>1920px): min 360, max 520
   const getMenuBounds = (vw: number) => {
-    if (vw < 1280) return { min: 375, max: 480, def: 380 }
-    if (vw < 1600) return { min: 420, max: 600, def: 440 }
-    if (vw < 1920) return { min: 480, max: 720, def: 500 }
-    return           { min: 545, max: 860, def: 580 }
+    if (vw < 1280) return { min: 260, max: 340, def: 270 }
+    if (vw < 1600) return { min: 290, max: 400, def: 300 }
+    if (vw < 1920) return { min: 320, max: 460, def: 340 }
+    return           { min: 360, max: 520, def: 380 }
   }
 
   const [vw, setVw] = useState(window.innerWidth)
@@ -268,6 +269,11 @@ const App: React.FC = () => {
 
   const draggingRef = useRef(false)
   const userResizedRef = useRef(false)
+  const collapsingRef = useRef(false)
+
+  const [menuCollapsed, setMenuCollapsed] = useState(false)
+  const [isDragging, setIsDragging] = useState(false)
+  const [isDragInCollapseZone, setIsDragInCollapseZone] = useState(false)
 
   const [menuWidth, setMenuWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem("menuWidth"))
@@ -310,6 +316,8 @@ const App: React.FC = () => {
     return () => ro.disconnect()
   }, [MIN_MENU, MAX_MENU])
 
+  const COLLAPSE_THRESHOLD = MIN_MENU - 60
+
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
       if (!draggingRef.current) return
@@ -317,7 +325,16 @@ const App: React.FC = () => {
 
       const rect = pageRef.current.getBoundingClientRect()
       const next = e.clientX - rect.left
-      setMenuWidth(clamp(next, MIN_MENU, MAX_MENU))
+
+      if (next < COLLAPSE_THRESHOLD) {
+        collapsingRef.current = true
+        setIsDragInCollapseZone(true)
+        setMenuWidth(clamp(next, 0, MAX_MENU))
+      } else {
+        collapsingRef.current = false
+        setIsDragInCollapseZone(false)
+        setMenuWidth(clamp(next, MIN_MENU, MAX_MENU))
+      }
     }
 
     const onMouseUp = () => {
@@ -325,6 +342,15 @@ const App: React.FC = () => {
       draggingRef.current = false
       document.body.style.cursor = ""
       document.body.style.userSelect = ""
+      setIsDragging(false)
+
+      if (collapsingRef.current) {
+        setMenuCollapsed(true)
+        setMenuWidth(0)
+      }
+
+      collapsingRef.current = false
+      setIsDragInCollapseZone(false)
     }
 
     window.addEventListener("mousemove", onMouseMove)
@@ -333,7 +359,8 @@ const App: React.FC = () => {
       window.removeEventListener("mousemove", onMouseMove)
       window.removeEventListener("mouseup", onMouseUp)
     }
-  }, [MIN_MENU, MAX_MENU])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [MIN_MENU, MAX_MENU, COLLAPSE_THRESHOLD])
 
   useLayoutEffect(() => {
     if (!menuWrapRef.current) return
@@ -352,6 +379,7 @@ const App: React.FC = () => {
   const startDrag = () => {
     userResizedRef.current = true
     draggingRef.current = true
+    setIsDragging(true)
     document.body.style.cursor = "col-resize"
     document.body.style.userSelect = "none"
   }
@@ -391,6 +419,12 @@ const App: React.FC = () => {
     }
   }, [activeSpeciesId, currentView])
 
+  const expandMenu = () => {
+    setMenuCollapsed(false)
+    userResizedRef.current = false
+    setMenuWidth(getMenuBounds(vw).def)
+  }
+
   // Render workspace (annotation view)
   const renderWorkspace = () => (
     <div
@@ -398,63 +432,77 @@ const App: React.FC = () => {
       className="w-screen h-screen min-w-0 min-h-0 bg-background flex overflow-hidden"
     >
       {/* Left: menu container */}
-      <motion.div
-        animate={{ width: menuWidth }}
-        transition={{ duration: 0.15, ease: "easeOut" }}
-        style={{ minWidth: MIN_MENU }}
-        className="shrink-0 h-full overflow-hidden border-r bg-card"
-      >
-        <div
-          ref={menuWrapRef}
-          className="h-full overflow-y-auto overflow-x-hidden bg-card scrollbar-app"
-        >
-          <Menu
-            onOpacityChange={handleOpacityChange}
-            onColorChange={handleColorChange}
-            onSwitchChange={handleSwitchChange}
-            onNavigateToLanding={() => handleNavigate("landing")}
-            openTrainDialogOnMount={openTrainDialogOnMount}
-            onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
-            detectionMode={detectionMode}
-            onDetectionModeChange={setDetectionMode}
-            obbDetectionSettings={obbDetectionSettings}
-            obbDetectionRecommendation={obbDetectionRecommendation.summary}
-            representativeImageDimensions={effectiveRepresentativeImageDimensions}
-            onObbDetectionSettingsChange={(settings) => {
-              const normalized = normalizeObbDetectionSettings(settings)
-              setObbDetectionSettings(normalized)
-              setObbDetectionSettingsCustomized(true)
-              if (activeSpeciesId) {
-                window.api.sessionUpdateObbDetectorSettings(activeSpeciesId, {
-                  obbDetectionSettings: normalized,
-                  obbDetectionSettingsCustomized: true,
-                }).catch(() => {/* ignore */})
-              }
-            }}
-            className={objectClassName}
-            onClassNameChange={setObjectClassName}
-            samEnabled={samEnabled}
-            onSamEnabledChange={setSamEnabled}
-          />
-        </div>
-      </motion.div>
-
-      {/* Drag handle */}
-      <div
-        onMouseDown={startDrag}
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize menu"
-        className={cn(
-          "w-2.5 shrink-0 cursor-col-resize relative bg-transparent",
-          "hover:bg-primary/5 transition-colors",
-          "after:content-[''] after:absolute after:top-0 after:bottom-0 after:left-1/2",
-          "after:-translate-x-1/2 after:w-0.5 after:bg-border after:opacity-95"
+      <AnimatePresence initial={false}>
+        {!menuCollapsed && (
+          <motion.div
+            key="sidebar"
+            initial={{ width: 0, opacity: 0 }}
+            animate={{ width: menuWidth, opacity: 1 }}
+            exit={{ width: 0, opacity: 0 }}
+            transition={{ duration: isDragging ? 0 : 0.25, ease: [0.32, 0, 0.67, 0] }}
+            style={{ minWidth: menuCollapsed ? 0 : MIN_MENU }}
+            className="shrink-0 h-full overflow-hidden border-r bg-card"
+          >
+            <div
+              ref={menuWrapRef}
+              className="h-full overflow-y-auto overflow-x-hidden bg-card scrollbar-app"
+            >
+              <Menu
+                onOpacityChange={handleOpacityChange}
+                onColorChange={handleColorChange}
+                onSwitchChange={handleSwitchChange}
+                onNavigateToLanding={() => handleNavigate("landing")}
+                openTrainDialogOnMount={openTrainDialogOnMount}
+                onTrainDialogOpened={() => setOpenTrainDialogOnMount(false)}
+                detectionMode={detectionMode}
+                onDetectionModeChange={setDetectionMode}
+                obbDetectionSettings={obbDetectionSettings}
+                obbDetectionRecommendation={obbDetectionRecommendation.summary}
+                representativeImageDimensions={effectiveRepresentativeImageDimensions}
+                onObbDetectionSettingsChange={(settings) => {
+                  const normalized = normalizeObbDetectionSettings(settings)
+                  setObbDetectionSettings(normalized)
+                  setObbDetectionSettingsCustomized(true)
+                  if (activeSpeciesId) {
+                    window.api.sessionUpdateObbDetectorSettings(activeSpeciesId, {
+                      obbDetectionSettings: normalized,
+                      obbDetectionSettingsCustomized: true,
+                    }).catch(() => {/* ignore */})
+                  }
+                }}
+                className={objectClassName}
+                onClassNameChange={setObjectClassName}
+                samEnabled={samEnabled}
+                onSamEnabledChange={setSamEnabled}
+              />
+            </div>
+          </motion.div>
         )}
-      />
+      </AnimatePresence>
+
+      {/* Drag handle — hidden when collapsed */}
+      {!menuCollapsed && (
+        <div
+          onMouseDown={startDrag}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize menu"
+          className={cn(
+            "w-2.5 shrink-0 cursor-col-resize relative bg-transparent transition-colors",
+            isDragInCollapseZone
+              ? "bg-destructive/20 after:bg-destructive"
+              : "hover:bg-primary/5 after:bg-border",
+            "after:content-[''] after:absolute after:top-0 after:bottom-0 after:left-1/2",
+            "after:-translate-x-1/2 after:w-0.5 after:opacity-95"
+          )}
+        />
+      )}
 
       {/* Right: fills ALL remaining space */}
-      <div className="flex-1 h-full bg-muted/30 overflow-hidden flex min-w-0" data-tutorial="canvas-area">
+      <div
+        className="relative flex-1 h-full bg-muted/30 overflow-hidden flex min-w-0"
+        data-tutorial="canvas-area"
+      >
         <div className="w-full h-full min-w-0 min-h-0 p-2 box-border flex">
           <div className="w-full h-full min-w-0 min-h-0 flex" data-tutorial="image-nav">
             <ImageLabelerCarousel
@@ -468,6 +516,34 @@ const App: React.FC = () => {
             />
           </div>
         </div>
+
+        {/* Floating expand button — visible when sidebar is collapsed */}
+        <AnimatePresence>
+          {menuCollapsed && (
+            <motion.div
+              key="expand-btn"
+              initial={{ opacity: 0, x: -16 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -16 }}
+              transition={{ duration: 0.22, ease: [0.25, 1, 0.5, 1] }}
+              className="absolute left-2 top-0 bottom-0 z-50 flex items-center pointer-events-none"
+            >
+              <button
+                onClick={expandMenu}
+                aria-label="Expand sidebar"
+                className={cn(
+                  "pointer-events-auto flex items-center justify-center",
+                  "h-8 w-8 rounded-full",
+                  "bg-card border border-border/60 shadow-lg",
+                  "text-muted-foreground hover:text-foreground hover:bg-primary/10 hover:border-primary/40",
+                  "transition-colors"
+                )}
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </div>
   )

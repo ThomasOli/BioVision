@@ -1,68 +1,76 @@
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    /* Backgrounds — cool off-white with a faint blue cast */
+    --background: 210 28% 98%;
+    --foreground: 215 35% 11%;
 
-    --card: 0 0% 98.5%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card: 210 22% 96%;
+    --card-foreground: 215 35% 11%;
 
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
+    --popover: 210 22% 98%;
+    --popover-foreground: 215 35% 11%;
 
-    --primary: 217.2 91.2% 59.8%;
-    --primary-foreground: 210 40% 98%;
+    /* Primary — scientific teal */
+    --primary: 186 72% 34%;
+    --primary-foreground: 0 0% 100%;
 
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
+    /* Secondary — warm amber */
+    --secondary: 37 88% 50%;
+    --secondary-foreground: 215 35% 10%;
 
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
+    --muted: 210 20% 92%;
+    --muted-foreground: 215 13% 46%;
 
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
+    --accent: 186 72% 34%;
+    --accent-foreground: 0 0% 100%;
 
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
+    --destructive: 0 80% 56%;
+    --destructive-foreground: 0 0% 100%;
 
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 217.2 91.2% 59.8%;
+    --border: 215 16% 86%;
+    --input: 215 16% 86%;
+    --ring: 186 72% 34%;
 
-    --radius: 0.625rem;
+    --radius: 0.5rem;
   }
 
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
+    /* Backgrounds — deep navy */
+    --background: 218 32% 7%;
+    --foreground: 210 38% 93%;
 
-    --card: 222.2 84% 6%;
-    --card-foreground: 210 40% 98%;
+    --card: 218 26% 10%;
+    --card-foreground: 210 38% 93%;
 
-    --popover: 222.2 84% 6%;
-    --popover-foreground: 210 40% 98%;
+    --popover: 218 26% 10%;
+    --popover-foreground: 210 38% 93%;
 
-    --primary: 217.2 91.2% 59.8%;
-    --primary-foreground: 222.2 84% 4.9%;
+    /* Primary — bright teal/cyan for dark contrast */
+    --primary: 186 68% 48%;
+    --primary-foreground: 218 32% 7%;
 
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
+    /* Secondary — amber */
+    --secondary: 37 86% 60%;
+    --secondary-foreground: 218 32% 7%;
 
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
+    --muted: 218 22% 14%;
+    --muted-foreground: 215 16% 56%;
 
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
+    --accent: 218 22% 14%;
+    --accent-foreground: 210 38% 93%;
 
-    --destructive: 0 62.8% 50.6%;
-    --destructive-foreground: 210 40% 98%;
+    --destructive: 0 62% 52%;
+    --destructive-foreground: 210 38% 98%;
 
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 224.3 76.3% 48%;
+    --border: 218 18% 18%;
+    --input: 218 18% 18%;
+    --ring: 186 68% 48%;
   }
 }
 
@@ -72,8 +80,8 @@
   }
   body {
     @apply bg-background text-foreground;
-    font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-feature-settings: "rlig" 1, "calt" 1;
+    font-family: 'IBM Plex Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-feature-settings: "rlig" 1, "calt" 1, "ss02" 1;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
@@ -84,7 +92,7 @@
   .scrollbar-thin,
   .scrollbar-app {
     scrollbar-width: thin;
-    scrollbar-color: hsl(var(--muted-foreground) / 0.28) transparent;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.22) transparent;
     scrollbar-gutter: stable;
   }
 
@@ -102,7 +110,7 @@
 
   .scrollbar-thin::-webkit-scrollbar-thumb,
   .scrollbar-app::-webkit-scrollbar-thumb {
-    background: hsl(var(--muted-foreground) / 0.28);
+    background: hsl(var(--muted-foreground) / 0.22);
     border: 2px solid transparent;
     background-clip: content-box;
     border-radius: 9999px;
@@ -111,7 +119,7 @@
 
   .scrollbar-thin::-webkit-scrollbar-thumb:hover,
   .scrollbar-app::-webkit-scrollbar-thumb:hover {
-    background: hsl(var(--muted-foreground) / 0.42);
+    background: hsl(var(--muted-foreground) / 0.36);
     background-clip: content-box;
   }
 
@@ -122,6 +130,18 @@
 
   .scrollbar-soft-edge {
     mask-image: linear-gradient(to bottom, transparent 0, black 12px, black calc(100% - 12px), transparent 100%);
+  }
+}
+
+/* Scientific graph-paper grid background */
+@layer utilities {
+  .grid-bg {
+    background-image:
+      linear-gradient(to right, hsl(var(--border) / 0.55) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--border) / 0.55) 1px, transparent 1px),
+      linear-gradient(to right, hsl(var(--border) / 0.18) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--border) / 0.18) 1px, transparent 1px);
+    background-size: 72px 72px, 72px 72px, 18px 18px, 18px 18px;
   }
 }
 
