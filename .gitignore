@@ -13,6 +13,8 @@ dist-ssr
 dist-electron
 release
 *.local
+.claude/
+CLAUDE.md
 
 # Editor directories and files
 .vscode/*
