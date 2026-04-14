@@ -268,6 +268,7 @@ contextBridge.exposeInMainWorld("api", {
     speciesId?: string
   ) => ipcRenderer.invoke("ml:super-annotate", { imagePath, className, modelTag, options, speciesId }),
   checkSuperAnnotator: () => ipcRenderer.invoke("ml:check-super-annotator"),
+  initSuperAnnotator: () => ipcRenderer.invoke("ml:init-super-annotator"),
   resegmentBox: (
     imagePath: string,
     boxXyxy: [number, number, number, number],
