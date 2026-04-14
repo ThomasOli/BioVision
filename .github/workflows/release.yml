@@ -17,10 +17,16 @@ jobs:
         include:
           - os: windows-latest
             target: win
+            arch: x64
           - os: macos-latest
             target: mac
+            arch: arm64
+          - os: macos-13
+            target: mac
+            arch: x64
           - os: ubuntu-latest
             target: linux
+            arch: x64
 
     runs-on: ${{ matrix.os }}
 
@@ -40,11 +46,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install CMake (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.target == 'linux'
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential
 
       - name: Install CMake (macOS)
-        if: matrix.os == 'macos-latest'
+        if: matrix.target == 'mac'
         run: brew install cmake
 
       - name: Install Python dependencies
@@ -56,4 +62,4 @@ jobs:
       - name: Build and publish
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: npm run publish:${{ matrix.target }}
+        run: npm run publish:${{ matrix.target }} -- --${{ matrix.arch }}
