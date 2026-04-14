@@ -2,7 +2,6 @@ import React from "react";
 import { Check, SkipForward } from "lucide-react";
 
 import { LandmarkSchema, Point } from "@/types/Image";
-import { Card, CardContent } from "@/Components/ui/card";
 import { Button } from "@/Components/ui/button";
 import { Progress } from "@/Components/ui/progress";
 
