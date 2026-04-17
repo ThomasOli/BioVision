@@ -1,0 +1,10 @@
+# BioVision backend — development / test dependencies
+#
+# Install after the regular backend requirements:
+#   pip install -r backend/requirements.txt
+#   pip install -r requirements-dev.txt
+#
+# Then run the suite from the repo root:
+#   pytest
+
+pytest>=7.4
