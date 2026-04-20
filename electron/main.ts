@@ -159,6 +159,18 @@ app.on("ready", () => {
 });
 
 function getPythonResolution(): { pythonPath: string; usingRepoVenv: boolean } {
+  // Packaged: the PyInstaller dispatcher ships its own torch/psutil, so treat
+  // it as a trusted runtime (usingRepoVenv=true silences the fallback-interpreter
+  // warning in the UI). If the bundle is missing, surface that via usingRepoVenv=false.
+  if (app.isPackaged) {
+    const ext = process.platform === "win32" ? ".exe" : "";
+    const bundled = path.join(process.resourcesPath, "python", `biovision_backend${ext}`);
+    if (fs.existsSync(bundled)) {
+      return { pythonPath: bundled, usingRepoVenv: true };
+    }
+    return { pythonPath: bundled, usingRepoVenv: false };
+  }
+
   // Windows: venv\Scripts\python.exe
   const venvWin = path.join(__dirname, "..", "venv", "Scripts", "python.exe");
   if (fs.existsSync(venvWin)) return { pythonPath: venvWin, usingRepoVenv: true };
@@ -189,6 +201,15 @@ function resolveBundledScript(scriptName: string): { cmd: string; args: string[]
     if (fs.existsSync(bundledPath)) {
       return { cmd: bundledPath, args: [scriptName] };
     }
+    // Do NOT silently fall through to the dev-mode branch in a packaged app:
+    // backend/*.py isn't shipped, so spawning a system `python` against a
+    // non-existent script would just produce an opaque failure. Fail loudly
+    // so the caller's error surfaces in the UI.
+    throw new Error(
+      `Bundled Python backend not found at ${bundledPath}. The installer is ` +
+        `missing backend/dist/biovision_backend${ext} — rebuild with "npm run backend:build" ` +
+        `before packaging, or reinstall the app.`
+    );
   }
   // Dev mode: map script name to source path and run via Python interpreter
   const scriptMap: Record<string, string> = {

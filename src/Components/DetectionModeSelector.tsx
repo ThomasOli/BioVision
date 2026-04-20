@@ -224,10 +224,15 @@ export function DetectionModeSelector({
       ? "bg-yellow-500/20 text-yellow-400"
       : "bg-blue-500/20 text-blue-300";
 
-  const interpreterWarning =
-    capabilityInfo.usingRepoVenv === false
-      ? `Using fallback Python interpreter: ${capabilityInfo.pythonPath ?? "python"}. GPU support may be misdetected if that environment is missing torch or psutil.`
-      : null;
+  const interpreterWarning = (() => {
+    if (capabilityInfo.usingRepoVenv !== false) return null;
+    const pythonPath = capabilityInfo.pythonPath ?? "python";
+    const lowerPath = pythonPath.toLowerCase();
+    if (lowerPath.endsWith("biovision_backend.exe") || lowerPath.endsWith("biovision_backend")) {
+      return `Bundled backend not found at ${pythonPath}. Reinstall the app or rebuild the backend (npm run backend:build).`;
+    }
+    return `Using fallback Python interpreter: ${pythonPath}. GPU support may be misdetected if that environment is missing torch or psutil.`;
+  })();
 
   const sam2HelperText = hardwareChecking
     ? "Checking hardware support in the active Python environment"
