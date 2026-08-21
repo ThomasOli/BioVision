@@ -13,7 +13,9 @@ Strategy:
 """
 
 import ast
+import json
 import os
+import re
 import subprocess
 import sys
 
@@ -94,3 +96,72 @@ class TestDispatcherErrorPaths:
         assert "Available:" in result.stderr
         # Spot-check that a known good name appears in the availability hint.
         assert "predict" in result.stderr
+
+
+BUILD_SCRIPT = os.path.join(REPO_ROOT, "scripts", "build-python-backend.js")
+ELECTRON_MAIN = os.path.join(REPO_ROOT, "electron", "main.ts")
+
+
+def _hidden_imports() -> set[str]:
+    """Modules PyInstaller is explicitly told to bundle."""
+    with open(BUILD_SCRIPT, "r", encoding="utf-8") as f:
+        return set(re.findall(r'"--hidden-import",\s*"([\w.]+)"', f.read()))
+
+
+def _electron_dev_script_map() -> dict[str, str]:
+    """The dev-mode name -> relative source path map in resolveBundledScript."""
+    with open(ELECTRON_MAIN, "r", encoding="utf-8") as f:
+        source = f.read()
+    block = source.split("const scriptMap: Record<string, string> = {", 1)
+    if len(block) < 2:
+        raise AssertionError("resolveBundledScript scriptMap not found in electron/main.ts")
+    return dict(re.findall(r'(\w+):\s*"([^"]+\.py)"', block[1].split("};", 1)[0]))
+
+
+class TestBundlingContract:
+    """Every dispatch target must be reachable in dev *and* in the bundle.
+
+    PyInstaller cannot see modules reached only through `runpy`, so a script
+    added to SCRIPT_MAP without a matching `--hidden-import` produces an
+    installer that fails only when a user opens that one feature. The dev-mode
+    map in electron/main.ts has the same failure mode in reverse.
+    """
+
+    @pytest.mark.parametrize("script_name,dotted", sorted(SCRIPT_MAP.items()))
+    def test_every_target_is_a_pyinstaller_hidden_import(self, script_name, dotted):
+        assert dotted in _hidden_imports(), (
+            f"SCRIPT_MAP['{script_name}'] -> '{dotted}' is missing a "
+            f'"--hidden-import" in scripts/build-python-backend.js, so it would '
+            f"not be bundled into the packaged backend."
+        )
+
+    @pytest.mark.parametrize("script_name", sorted(SCRIPT_MAP))
+    def test_every_target_has_a_dev_mode_path(self, script_name):
+        dev_map = _electron_dev_script_map()
+        assert script_name in dev_map, (
+            f"'{script_name}' is dispatchable but has no dev-mode entry in "
+            f"resolveBundledScript(); dev runs would guess the wrong path."
+        )
+        full = os.path.join(BACKEND_DIR, dev_map[script_name].replace("/", os.sep))
+        assert os.path.isfile(full), f"dev-mode path for '{script_name}' missing: {full}"
+
+    def test_dev_map_has_no_entries_the_cli_cannot_dispatch(self):
+        unknown = sorted(set(_electron_dev_script_map()) - set(SCRIPT_MAP))
+        assert not unknown, (
+            f"electron/main.ts can request {unknown}, but cli.py cannot dispatch "
+            f"them; packaged builds would fail with 'Unknown script'."
+        )
+
+    def test_selfcheck_imports_every_dispatch_target(self):
+        """The check the packaged build runs; proves the map is importable."""
+        result = subprocess.run(
+            [sys.executable, CLI_PATH, "--selfcheck"],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+            timeout=600,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["ok"], payload["failures"]
+        assert set(payload["checked"]) == set(SCRIPT_MAP)

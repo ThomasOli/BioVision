@@ -4,7 +4,7 @@ import { Microscope, Pencil, Target, FlaskConical, ArrowRight, Sparkles } from "
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
-import { useTutorial } from "./TutorialContext";
+import { useTutorial } from "./useTutorial";
 
 const WORKFLOW_STEPS = [
   {

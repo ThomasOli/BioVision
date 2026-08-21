@@ -8,6 +8,9 @@ export const DEFAULT_SCHEMAS: LandmarkSchema[] = [
     id: "fly-wing",
     name: "Fly Wing (Drosophila) Landmarks",
     description: "12-point schema for Drosophila wing morphometric analysis",
+    orientationPolicy: {
+      mode: "invariant",
+    },
     landmarks: [
       // Margin Intersections (1–6)
       { index: 1,  name: "L5 × Posterior Margin", description: "Intersection of longitudinal vein 5 (L5) and the posterior wing margin", category: "margin" },
@@ -30,6 +33,14 @@ export const DEFAULT_SCHEMAS: LandmarkSchema[] = [
     id: "fish-morphometrics",
     name: "Fish Lateral Morphometrics",
     description: "11-point schema for single-side fish morphometric analysis",
+    orientationPolicy: {
+      mode: "directional",
+      targetOrientation: "left",
+      headCategories: ["head"],
+      tailCategories: ["caudal-fin"],
+      anteriorAnchorIds: [1],
+      posteriorAnchorIds: [4, 5],
+    },
     landmarks: [
       { index: 1,  name: "Snout Tip",             description: "Tip of upper jaw",                          category: "head" },
       { index: 2,  name: "Dorsal Origin",          description: "Anterior insertion of dorsal fin",          category: "dorsal-fin" },

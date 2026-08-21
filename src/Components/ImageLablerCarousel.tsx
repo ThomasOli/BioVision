@@ -917,7 +917,7 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
     });
 
     try {
-      const result = await window.api.superAnnotate(current.path, promptClass, undefined, {
+      const annotationOptions = {
         samEnabled,
         maxObjects: resolvedDetectionSettings.maxObjects,
         detectionMode: "auto",
@@ -926,7 +926,32 @@ const ImageLabelerCarousel: React.FC<ImageLabelerCarouselProps> = ({
         nmsIou: resolvedDetectionSettings.nmsIou,
         imgsz: resolvedDetectionSettings.imgsz,
         useOrientationHint: true,
-      }, current.speciesId);
+      };
+      let result = await window.api.superAnnotate(
+        current.path,
+        promptClass,
+        undefined,
+        annotationOptions,
+        current.speciesId
+      );
+      if (result.requiresOverride && result.compatibility?.blocking) {
+        const blockingDetails = result.compatibility.issues
+          .filter((issue) => issue.severity === "error")
+          .map((issue) => `- ${issue.message}`)
+          .join("\n");
+        const confirmed = window.confirm(
+          `This OBB detector is incompatible with the active schema and is blocked by default.\n\n${blockingDetails}\n\nRun it anyway for this image?`
+        );
+        if (confirmed) {
+          result = await window.api.superAnnotate(
+            current.path,
+            promptClass,
+            undefined,
+            { ...annotationOptions, allowIncompatible: true },
+            current.speciesId
+          );
+        }
+      }
 
       if (result.ok && Array.isArray(result.objects) && result.objects.length > 0) {
         setBoxesFromSuperAnnotation(result.objects);

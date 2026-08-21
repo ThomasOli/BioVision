@@ -44,8 +44,9 @@ function normalizeOrientationMode(mode?: string | null): OrientationMode | undef
 }
 
 export function normalizeBilateralClassAxis(
-  _axis?: string | null
+  axis?: string | null
 ): BilateralClassAxis {
+  void axis;
   return "vertical_obb";
 }
 

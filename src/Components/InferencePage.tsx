@@ -54,7 +54,18 @@ import {
   DialogTitle,
 } from "@/Components/ui/dialog";
 import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
-import { AppView, OrientationLabel, StoredOrientationLabel, TrainedModel } from "@/types/Image";
+import {
+  AppView,
+  DetectionModelProvenance,
+  OrientationLabel,
+  StoredOrientationLabel,
+  TrainedModel,
+} from "@/types/Image";
+import {
+  getModelArtifactTag,
+  getModelKey,
+  modelMatchesKey,
+} from "@/lib/modelIdentity";
 import { setActiveSpecies, removeSpecies, updateSpecies } from "@/state/speciesState/speciesSlice";
 import type { AppDispatch, RootState } from "@/state/store";
 
@@ -84,7 +95,25 @@ interface PredictionLandmark {
   id: number;
   x: number;
   y: number;
+  confidence?: number;
+  heatmap_entropy?: number;
 }
+
+type ReviewPriority = {
+  score: number;
+  band: "high" | "medium" | "low";
+  reasons: string[];
+};
+
+type RetrainingBatchState = {
+  newSamples: number;
+  corrected: number;
+  unchanged: number;
+  rejected: number;
+  totalCommitted: number;
+  pendingReview: number;
+  pendingCommit: number;
+};
 
 interface DetectedBox {
   left: number;
@@ -135,6 +164,11 @@ interface PredictedSpecimen {
       message?: string;
     } | null;
     clamped_landmark_count?: number;
+    landmark_count?: number;
+    landmark_heatmap_entropy?: number;
+    model_disagreement?: number;
+    ood_score?: number;
+    ood_score_source?: string;
     inferenceSignature?: string;
   };
 }
@@ -148,14 +182,52 @@ interface InferenceResult {
   num_specimens?: number;
   boxSignature?: string;
   inferenceSignature?: string;
+  detectorProvenance?: DetectionModelProvenance;
 }
 
 interface InferenceImage {
   path: string;
   name: string;
   url: string;
+  sourcePath?: string;
+  sourceName?: string;
+  sourceSha256?: string;
+  contentId?: string;
   results?: InferenceResult;
   error?: string;
+}
+
+function stableInferenceImageIdentityKeys(image: InferenceImage): string[] {
+  const keys: string[] = [];
+  const sourcePath = String(image.sourcePath || "").trim();
+  const contentId = String(image.contentId || "").trim().toLowerCase();
+  const sourceSha256 = String(image.sourceSha256 || "").trim().toLowerCase();
+  if (sourcePath) {
+    keys.push(`source:${sourcePath.replace(/\\/g, "/").toLowerCase()}`);
+  }
+  if (contentId) keys.push(`content:${contentId}`);
+  if (sourceSha256) keys.push(`sha256:${sourceSha256}`);
+  return [...new Set(keys)];
+}
+
+function dedupeInferenceImageSelection(
+  existing: InferenceImage[],
+  candidates: InferenceImage[]
+): InferenceImage[] {
+  const seen = new Set(existing.flatMap(stableInferenceImageIdentityKeys));
+  return candidates.filter((candidate) => {
+    const keys = stableInferenceImageIdentityKeys(candidate);
+    if (keys.some((key) => seen.has(key))) return false;
+    keys.forEach((key) => seen.add(key));
+    return true;
+  });
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 interface InferenceReviewDraft {
@@ -182,16 +254,21 @@ interface InferenceReviewDraft {
         tail_point?: [number, number];
       };
     };
-    landmarks: { id: number; x: number; y: number }[];
+    landmarks: PredictionLandmark[];
+    inference_metadata?: PredictedSpecimen["inference_metadata"];
   }[];
   edited: boolean;
+  wasEdited?: boolean;
   saved: boolean;
   reviewComplete?: boolean;
   committedAt?: string | null;
   landmarkModelKey?: string;
-  landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
+  landmarkPredictorType?: "dlib" | "cnn";
   boxSignature?: string;
   inferenceSignature?: string;
+  detectorProvenance?: DetectionModelProvenance;
+  reviewPriority?: ReviewPriority;
+  commitFailureCount?: number;
   updatedAt: string;
 }
 
@@ -212,7 +289,7 @@ interface LocalInferenceSessionManifest {
     landmark: {
       key: string;
       name?: string;
-      predictorType?: "dlib" | "cnn" | "yolo_pose";
+      predictorType?: "dlib" | "cnn";
     };
     detection: {
       key: string;
@@ -221,7 +298,7 @@ interface LocalInferenceSessionManifest {
   };
   preferences?: {
     lastUsedLandmarkModelKey?: string;
-    lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+    lastUsedPredictorType?: "dlib" | "cnn";
     detectionModelKey?: string;
     detectionModelName?: string;
   };
@@ -393,20 +470,22 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const [savedImageIndices, setSavedImageIndices] = useState<Set<number>>(new Set());
   const [reviewFinalizedImageIndices, setReviewFinalizedImageIndices] = useState<Set<number>>(new Set());
   const [committedImageIndices, setCommittedImageIndices] = useState<Set<number>>(new Set());
+  const [reviewPriorities, setReviewPriorities] = useState<Map<number, ReviewPriority>>(new Map());
+  const [retrainingBatch, setRetrainingBatch] = useState<RetrainingBatchState | null>(null);
   const [commitFailures, setCommitFailures] = useState<Map<string, string>>(new Map());
   const [isReviewStateHydrated, setIsReviewStateHydrated] = useState(false);
   const [selectedSpecimenIndex, setSelectedSpecimenIndex] = useState<number | null>(null);
-  const [detectionRerunModelKey, setDetectionRerunModelKey] = useState<string | null>(null);
   const [inferenceRerunModelKey, setInferenceRerunModelKey] = useState<string | null>(null);
   const draggingRef = useRef<{ specIdx: number; lmIdx: number } | null>(null);
   const liveSpecimensRef = useRef<PredictedSpecimen[]>([]); // mutable during drag
   const reviewHydrationRequestRef = useRef(0);
-  const pendingImageLoadRef = useRef<Promise<any> | null>(null);
+  const pendingImageLoadRef = useRef<ReturnType<typeof window.api.sessionLoadInferenceImagePaths> | null>(null);
   const incompatiblePreferenceNoticeRef = useRef<string | null>(null);
   const lastSelectedModelKeyRef = useRef<string>("");
   const sessionPreferredModelKeyRef = useRef<string>("");
   const preferredPredictorTypeRef = useRef<TrainedModel["predictorType"]>("cnn");
   const [isCommittingReview, setIsCommittingReview] = useState(false);
+  const [isUpdatingReviewStatus, setIsUpdatingReviewStatus] = useState(false);
   const [inferenceSessionId, setInferenceSessionId] = useState<string>("");
   const [inferenceSessionManifest, setInferenceSessionManifest] = useState<LocalInferenceSessionManifest | null>(null);
   const [sessionPreferredModelKey, setSessionPreferredModelKey] = useState<string>("");
@@ -443,6 +522,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       return next;
     });
     setCommittedImageIndices((prev) => {
+      const next = new Set(prev);
+      next.delete(index);
+      return next;
+    });
+    setReviewFinalizedImageIndices((prev) => {
       const next = new Set(prev);
       next.delete(index);
       return next;
@@ -486,7 +570,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   );
 
   const modelToKey = useCallback((model: TrainedModel): string => {
-    return `${model.name}::${model.predictorType ?? "dlib"}`;
+    return getModelKey(model);
   }, []);
 
   const getSelectedModel = useCallback((): TrainedModel | undefined => {
@@ -537,7 +621,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const resolveInitialModelKey = useCallback((available: TrainedModel[]): string => {
     if (!available.length) return "";
     if (sessionPreferredModelKeyRef.current) {
-      const exactPreferred = available.find((m) => modelToKey(m) === sessionPreferredModelKeyRef.current);
+      const exactPreferred = available.find((m) => modelMatchesKey(m, sessionPreferredModelKeyRef.current!));
       if (exactPreferred) return modelToKey(exactPreferred);
     }
     const activeForPreferredPredictor = available.find(
@@ -547,7 +631,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       return modelToKey(activeForPreferredPredictor);
     }
     if (!initialModel) return modelToKey(available[0]);
-    const exact = available.find((m) => modelToKey(m) === initialModel);
+    const exact = available.find((m) => modelMatchesKey(m, initialModel));
     if (exact) return modelToKey(exact);
     const byName = available.filter((m) => m.name === initialModel);
     if (byName.length > 0) {
@@ -578,9 +662,10 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     setSavedImageIndices(new Set());
     setReviewFinalizedImageIndices(new Set());
     setCommittedImageIndices(new Set());
+    setReviewPriorities(new Map());
+    setRetrainingBatch(null);
     setIsReviewStateHydrated(false);
     setSelectedSpecimenIndex(null);
-    setDetectionRerunModelKey(null);
     setInferenceRerunModelKey(null);
     setInferProgress(null);
     setIsRunning(false);
@@ -828,22 +913,37 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     return getSpecimensForImageIndex(index).some((specimen) => specimenHasValidBox(specimen));
   }, [getSpecimensForImageIndex, specimenHasValidBox]);
 
-  const hasSuccessfulLandmarksForImageIndex = useCallback((index: number): boolean => {
-    return getSpecimensForImageIndex(index).some(
-      (specimen) => specimenHasValidBox(specimen) && specimenHasLandmarks(specimen)
+  const hasCurrentLandmarkInferenceForImageIndex = useCallback((index: number): boolean => {
+    const image = images[index];
+    const model = getSelectedModel();
+    if (!image?.results || !model || !selectedModelKey) return false;
+    const specimens = getSpecimensForImageIndex(index)
+      .filter((specimen) => specimenHasValidBox(specimen));
+    if (!specimens.some((specimen) => specimenHasLandmarks(specimen))) return false;
+    const boxSignature = getStableBoxSignature(
+      image.path,
+      specimens.map((specimen) => specimen.box)
     );
-  }, [getSpecimensForImageIndex, specimenHasLandmarks, specimenHasValidBox]);
+    const predictorType: PredictorKey = model.predictorType === "cnn" ? "cnn" : "dlib";
+    return image.results.inferenceSignature === getInferenceSignature(
+      selectedModelKey,
+      predictorType,
+      boxSignature
+    );
+  }, [
+    getSelectedModel,
+    getSpecimensForImageIndex,
+    images,
+    selectedModelKey,
+    specimenHasLandmarks,
+    specimenHasValidBox,
+  ]);
 
   const eligibleDetectionIndices = useMemo(
-    () => {
-      if (selectedModelKey && detectionRerunModelKey === selectedModelKey) {
-        return images.map((_, idx) => idx);
-      }
-      return images
-        .map((_, idx) => idx)
-        .filter((idx) => !hasSuccessfulDetectionForImageIndex(idx));
-    },
-    [images, hasSuccessfulDetectionForImageIndex, detectionRerunModelKey, selectedModelKey]
+    () => images
+      .map((_, idx) => idx)
+      .filter((idx) => !hasSuccessfulDetectionForImageIndex(idx)),
+    [images, hasSuccessfulDetectionForImageIndex]
   );
 
   const eligibleInferenceIndices = useMemo(
@@ -851,12 +951,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       const detectedIndices = images
         .map((_, idx) => idx)
         .filter((idx) => hasSuccessfulDetectionForImageIndex(idx));
-      if (selectedModelKey && inferenceRerunModelKey === selectedModelKey) {
-        return detectedIndices;
-      }
-      return detectedIndices.filter((idx) => !hasSuccessfulLandmarksForImageIndex(idx));
+      return detectedIndices.filter(
+        (idx) => !hasCurrentLandmarkInferenceForImageIndex(idx)
+      );
     },
-    [images, hasSuccessfulDetectionForImageIndex, hasSuccessfulLandmarksForImageIndex, inferenceRerunModelKey, selectedModelKey]
+    [images, hasCurrentLandmarkInferenceForImageIndex, hasSuccessfulDetectionForImageIndex]
   );
 
   useEffect(() => {
@@ -924,7 +1023,16 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           id: Number(lm.id),
           x: Math.round(lm.x),
           y: Math.round(lm.y),
+          ...(Number.isFinite(Number(lm.confidence))
+            ? { confidence: Number(lm.confidence) }
+            : {}),
+          ...(Number.isFinite(Number(lm.heatmap_entropy))
+            ? { heatmap_entropy: Number(lm.heatmap_entropy) }
+            : {}),
         })),
+        ...(s.inference_metadata
+          ? { inference_metadata: { ...s.inference_metadata } }
+          : {}),
       }));
   }, []);
 
@@ -1043,21 +1151,29 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       }
 
       try {
-        const [draftResult, finalizedFilenames] = await Promise.all([
+        const [draftResult, finalizedFilenames, batchResult] = await Promise.all([
           window.api.sessionLoadInferenceReviewDrafts(activeSpeciesId, inferenceSessionId),
           loadPersistedFinalizedFilenames(),
+          window.api.sessionGetRetrainingBatch(activeSpeciesId, inferenceSessionId),
         ]);
         if (reviewHydrationRequestRef.current !== requestId) return;
         const drafts = draftResult.ok && Array.isArray(draftResult.drafts) ? draftResult.drafts : [];
 
         const byPath = new Map<string, InferenceReviewDraft>();
         const byName = new Map<string, InferenceReviewDraft>();
+        const ambiguousDraftNames = new Set<string>();
         drafts.forEach((draft: InferenceReviewDraft) => {
           if (draft.imagePath) {
             byPath.set(normalizePathForMatch(draft.imagePath), draft);
           }
           if (draft.filename) {
-            byName.set(draft.filename.toLowerCase(), draft);
+            const normalizedName = draft.filename.toLowerCase();
+            if (byName.has(normalizedName)) {
+              ambiguousDraftNames.add(normalizedName);
+              byName.delete(normalizedName);
+            } else if (!ambiguousDraftNames.has(normalizedName)) {
+              byName.set(normalizedName, draft);
+            }
           }
         });
 
@@ -1066,6 +1182,17 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         const nextSaved = new Set<number>();
         const nextReviewFinalized = new Set<number>();
         const nextCommitted = new Set<number>();
+        const nextPriorities = new Map<number, ReviewPriority>();
+
+        if (batchResult.ok && batchResult.summary) {
+          setRetrainingBatch({
+            ...batchResult.summary,
+            pendingReview: Number(batchResult.pendingReview) || 0,
+            pendingCommit: Number(batchResult.pendingCommit) || 0,
+          });
+        } else {
+          setRetrainingBatch(null);
+        }
 
         // Mutable copy so we can inject synthetic results for images that have drafts but no live results
         const mutableImages = [...sourceImages];
@@ -1083,6 +1210,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             }
             return;
           }
+          if (draft.reviewPriority) nextPriorities.set(idx, draft.reviewPriority);
 
           const convertedDraftSpecimens: PredictedSpecimen[] = (draft.specimens || []).map((s: InferenceReviewDraft["specimens"][number]) => {
             const left = Number(s.box.left) || 0;
@@ -1093,6 +1221,12 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               id: Number(lm.id),
               x: Number(lm.x),
               y: Number(lm.y),
+              confidence: Number.isFinite(Number(lm.confidence))
+                ? Number(lm.confidence)
+                : undefined,
+              heatmap_entropy: Number.isFinite(Number(lm.heatmap_entropy))
+                ? Number(lm.heatmap_entropy)
+                : undefined,
             }));
             return {
               box: {
@@ -1112,6 +1246,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               },
               landmarks,
               num_landmarks: landmarks.length,
+              inference_metadata: s.inference_metadata,
             };
           });
 
@@ -1165,8 +1300,22 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               num_landmarks: mergedSpecimens.reduce((s: number, sp: PredictedSpecimen) => s + sp.landmarks.length, 0),
               boxSignature: draft.boxSignature,
               inferenceSignature: draft.inferenceSignature,
+              detectorProvenance: draft.detectorProvenance,
             };
             mutableImages[idx] = { ...img, results: syntheticResult as InferenceResult };
+            syntheticResultsInjected = true;
+          } else if (
+            img.results &&
+            !img.results.detectorProvenance &&
+            draft.detectorProvenance
+          ) {
+            mutableImages[idx] = {
+              ...img,
+              results: {
+                ...img.results,
+                detectorProvenance: draft.detectorProvenance,
+              },
+            };
             syntheticResultsInjected = true;
           }
         });
@@ -1180,6 +1329,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         setSavedImageIndices(nextSaved);
         setReviewFinalizedImageIndices(nextReviewFinalized);
         setCommittedImageIndices(nextCommitted);
+        setReviewPriorities(nextPriorities);
       } finally {
         if (reviewHydrationRequestRef.current === requestId) {
           setIsReviewStateHydrated(true);
@@ -1202,67 +1352,122 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       options?: {
         specimens?: PredictedSpecimen[];
         edited?: boolean;
+        wasEdited?: boolean;
         saved?: boolean;
         reviewComplete?: boolean;
         committedAt?: string | null;
         landmarkModelKey?: string | null;
-        landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose" | null;
+        landmarkPredictorType?: "dlib" | "cnn" | null;
         boxSignature?: string | null;
         inferenceSignature?: string | null;
+        detectorProvenance?: DetectionModelProvenance | null;
         clear?: boolean;
       }
-    ) => {
-      if (!activeSpeciesId || !inferenceSessionId) return;
+    ): Promise<boolean> => {
+      if (!activeSpeciesId || !inferenceSessionId) return false;
       const image = images[index];
-      if (!image) return;
+      if (!image) return false;
 
-      const specimens = toDraftSpecimens(
-        options?.specimens ?? getSpecimensForImageIndex(index)
-      );
+      const sourceSpecimens = options?.specimens ?? getSpecimensForImageIndex(index);
+      const specimens = toDraftSpecimens(sourceSpecimens);
       const currentResult = image.results;
-
-      const response = await window.api.sessionSaveInferenceReviewDraft(
-        activeSpeciesId,
-        inferenceSessionId,
-        image.path,
-        specimens,
-        {
-          filename: image.name,
-          edited: options?.edited ?? editedImageIndices.has(index),
-          saved: options?.saved ?? savedImageIndices.has(index),
-          reviewComplete:
-            options?.reviewComplete ?? reviewFinalizedImageIndices.has(index),
-          committedAt: options?.committedAt,
-          landmarkModelKey:
-            options?.landmarkModelKey === null
-              ? null
-              : options?.landmarkModelKey ??
-                (currentResult?.inferenceSignature
-                  ? selectedModelKey || inferenceSessionManifest?.preferences?.lastUsedLandmarkModelKey
-                  : undefined),
-          landmarkPredictorType:
-            options?.landmarkPredictorType === null
-              ? null
-              : options?.landmarkPredictorType ??
-                getSelectedModel()?.predictorType ??
-                inferenceSessionManifest?.preferences?.lastUsedPredictorType,
-          boxSignature:
-            options?.boxSignature === null
-              ? null
-              : options?.boxSignature ?? currentResult?.boxSignature,
-          inferenceSignature:
-            options?.inferenceSignature === null
-              ? null
-              : options?.inferenceSignature ?? currentResult?.inferenceSignature,
-          clear: options?.clear,
-        }
+      const finiteMean = (values: unknown[]): number | undefined => {
+        const finite = values.map(Number).filter(Number.isFinite);
+        return finite.length > 0
+          ? finite.reduce((sum, value) => sum + value, 0) / finite.length
+          : undefined;
+      };
+      const detectorConfidence = finiteMean(
+        sourceSpecimens.map((specimen) => specimen.box?.confidence)
       );
-      if (!response.ok) {
-        console.warn(
-          "Failed to persist inference review draft:",
-          image.name,
-          response.error
+      const landmarkConfidence = finiteMean(
+        sourceSpecimens.flatMap((specimen) =>
+          (specimen.landmarks || []).map((landmark) => landmark.confidence)
+        )
+      );
+      const landmarkHeatmapEntropy = finiteMean(
+        sourceSpecimens.flatMap((specimen) =>
+          (specimen.landmarks || []).map((landmark) => landmark.heatmap_entropy)
+        )
+      );
+      const modelDisagreement = finiteMean(
+        sourceSpecimens.map(
+          (specimen) => specimen.inference_metadata?.model_disagreement
+        )
+      );
+      const oodScore = finiteMean(
+        sourceSpecimens.map((specimen) => specimen.inference_metadata?.ood_score)
+      );
+      const invalidatesReview = options?.edited === true;
+
+      try {
+        const response = await window.api.sessionSaveInferenceReviewDraft(
+          activeSpeciesId,
+          inferenceSessionId,
+          image.path,
+          specimens,
+          {
+            filename: image.name,
+            edited: options?.edited ?? editedImageIndices.has(index),
+            wasEdited: options?.wasEdited,
+            saved: options?.saved ?? savedImageIndices.has(index),
+            reviewComplete: invalidatesReview
+              ? false
+              : options?.reviewComplete ?? reviewFinalizedImageIndices.has(index),
+            committedAt: invalidatesReview ? null : options?.committedAt,
+            landmarkModelKey:
+              options?.landmarkModelKey === null
+                ? null
+                : options?.landmarkModelKey ??
+                  (currentResult?.inferenceSignature
+                    ? selectedModelKey || inferenceSessionManifest?.preferences?.lastUsedLandmarkModelKey
+                    : undefined),
+            landmarkPredictorType:
+              options?.landmarkPredictorType === null
+                ? null
+                : options?.landmarkPredictorType ??
+                  getSelectedModel()?.predictorType ??
+                  inferenceSessionManifest?.preferences?.lastUsedPredictorType,
+            boxSignature:
+              options?.boxSignature === null
+                ? null
+                : options?.boxSignature ?? currentResult?.boxSignature,
+            inferenceSignature:
+              options?.inferenceSignature === null
+                ? null
+                : options?.inferenceSignature ?? currentResult?.inferenceSignature,
+            detectorProvenance:
+              options?.detectorProvenance === null
+                ? null
+                : options?.detectorProvenance ?? currentResult?.detectorProvenance,
+            prioritySignals: {
+              detectorConfidence,
+              landmarkConfidence,
+              landmarkHeatmapEntropy,
+              modelDisagreement,
+              oodScore,
+            },
+            clear: options?.clear,
+          }
         );
+        if (!response.ok) {
+          console.warn(
+            "Failed to persist inference review draft:",
+            image.name,
+            response.error
+          );
+          return false;
+        }
+        setReviewPriorities((previous) => {
+          const next = new Map(previous);
+          if (options?.clear) next.delete(index);
+          else if (response.reviewPriority) next.set(index, response.reviewPriority);
+          return next;
+        });
+        return true;
+      } catch (error) {
+        console.warn("Failed to persist inference review draft:", image.name, error);
+        return false;
       }
     },
     [
@@ -1290,12 +1495,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
 
     const specimensToSave = getSpecimensForImageIndex(index)
       .filter((s) => s?.box && s.box.width > 0 && s.box.height > 0);
-    await persistReviewDraft(index, {
+    const persisted = await persistReviewDraft(index, {
       specimens: specimensToSave,
       edited: false,
+      wasEdited: editedImageIndices.has(index),
       saved: true,
       reviewComplete: reviewFinalizedImageIndices.has(index),
     });
+    if (!persisted) return false;
     setSavedImageIndices((prev) => {
       const next = new Set(prev);
       next.add(index);
@@ -1313,6 +1520,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     images,
     getSpecimensForImageIndex,
     persistReviewDraft,
+    editedImageIndices,
     reviewFinalizedImageIndices,
   ]);
 
@@ -1373,6 +1581,9 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   useEffect(() => {
     if (!activeSpeciesId || !inferenceSessionId || images.length === 0) return;
     void hydratePersistedReviewDrafts(images);
+    // Hydration is keyed by session creation/load. Including the mutable review
+    // image array would re-apply drafts after each local correction.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSpeciesId, inferenceSessionId, hydratePersistedReviewDrafts]);
 
   useEffect(() => {
@@ -1489,60 +1700,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             ctx.restore();
           }
         }
-        /* const arrowPts: [number, number][] =
-          obbPts && obbPts.length === 4
-            ? (obbPts as [number, number][])
-            : ([
-                [box.left, box.top],
-                [box.left + box.width, box.top],
-                [box.left + box.width, box.top + box.height],
-                [box.left, box.top + box.height],
-              ] as [number, number][]);
-        if (false && (activeOrientationMode === "directional" || activeOrientationMode === "bilateral") && (orientationLabel === "left" || orientationLabel === "right")) {
-          const [op0, op1, op2, op3] = arrowPts;
-          const oIsLeft = orientationLabel === "left";
-          const isBilateral = activeOrientationMode === "bilateral";
-          // Canonical edge midpoints (from buildObbCorners order):
           // LEFT=cp3â†’cp0, RIGHT=cp1â†’cp2, TOP=cp0â†’cp1, BOTTOM=cp2â†’cp3
-          let emX: number, emY: number;
-          if (!isBilateral) {
-            [emX, emY] = oIsLeft
-              ? [(op3[0]+op0[0])/2, (op3[1]+op0[1])/2]
-              : [(op1[0]+op2[0])/2, (op1[1]+op2[1])/2];
-          } else {
-            [emX, emY] = oIsLeft
-              ? [(op0[0]+op1[0])/2, (op0[1]+op1[1])/2]
-              : [(op2[0]+op3[0])/2, (op2[1]+op3[1])/2];
-          }
-          const ocx = (op0[0]+op1[0]+op2[0]+op3[0])/4;
-          const ocy = (op0[1]+op1[1]+op2[1]+op3[1])/4;
-          const outLen = Math.hypot(emX-ocx, emY-ocy) || 1;
-          const oNx = (emX-ocx)/outLen, oNy = (emY-ocy)/outLen;
-          const arrowLen = Math.min(Math.max(outLen * 0.6, 14), 40);
-          const tipX = emX + oNx * 4, tipY = emY + oNy * 4;
-          const tailX = emX - oNx * arrowLen, tailY = emY - oNy * arrowLen;
-          const fullLen = Math.hypot(tipX-tailX, tipY-tailY);
-          if (fullLen >= 24) {
-            const oHSizeLen = Math.min(Math.max(fullLen * 0.20, 6), 10);
-            const oHSizeW   = Math.min(Math.max(fullLen * 0.15, 5), 8);
-            ctx.save();
-            ctx.globalAlpha = 0.85;
-            ctx.strokeStyle = color; ctx.fillStyle = color;
-            ctx.lineWidth = Math.max(1.5, lineWidth * 0.85);
-            ctx.beginPath();
-            ctx.moveTo(tailX, tailY);
-            ctx.lineTo(tipX - oNx*oHSizeLen, tipY - oNy*oHSizeLen);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.moveTo(tipX, tipY);
-            ctx.lineTo(tipX - oNx*oHSizeLen + (-oNy)*oHSizeW*0.5, tipY - oNy*oHSizeLen + oNx*oHSizeW*0.5);
-            ctx.lineTo(tipX - oNx*oHSizeLen - (-oNy)*oHSizeW*0.5, tipY - oNy*oHSizeLen - oNx*oHSizeW*0.5);
-            ctx.closePath(); ctx.fill();
-            ctx.restore();
-          }
-        }
-
-        */
         ctx.fillStyle = color;
         ctx.font = `bold ${fontSize}px sans-serif`;
         // Compute tilt angle from OBB long axis, folded to [0ï¿½, 90ï¿½]
@@ -1682,47 +1840,6 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             ctx.stroke();
           }
         }
-        /* const previewObbPts: [number,number][] = [[x,y],[x+w,y],[x+w,y+h],[x,y+h]];
-        const [dp0,dp1,dp2,dp3] = previewObbPts;
-        const dLen01 = Math.hypot(dp1[0]-dp0[0], dp1[1]-dp0[1]);
-        const dLen12 = Math.hypot(dp2[0]-dp1[0], dp2[1]-dp1[1]);
-        let dMidA: [number,number], dMidB: [number,number];
-        if (dLen01 >= dLen12) {
-          dMidA = [(dp0[0]+dp3[0])/2, (dp0[1]+dp3[1])/2];
-          dMidB = [(dp1[0]+dp2[0])/2, (dp1[1]+dp2[1])/2];
-        } else {
-          dMidA = [(dp0[0]+dp1[0])/2, (dp0[1]+dp1[1])/2];
-          dMidB = [(dp2[0]+dp3[0])/2, (dp2[1]+dp3[1])/2];
-        }
-        const dIsPrimary = drawDefaultOrientation === "left";
-        const isBilateralPreview = activeOrientationMode === "bilateral";
-        const [dPrimaryEnd, dSecondaryEnd] = isBilateralPreview
-          ? (dMidA[1] <= dMidB[1] ? [dMidA, dMidB] : [dMidB, dMidA])
-          : (dMidA[0] <= dMidB[0] ? [dMidA, dMidB] : [dMidB, dMidA]);
-        const dHead = dIsPrimary ? dPrimaryEnd : dSecondaryEnd;
-        const dTail = dIsPrimary ? dSecondaryEnd : dPrimaryEnd;
-        const dAxisLen = Math.hypot(dHead[0]-dTail[0], dHead[1]-dTail[1]) || 1;
-        if (false && dAxisLen >= 24) {
-          const dNx = (dHead[0]-dTail[0])/dAxisLen, dNy = (dHead[1]-dTail[1])/dAxisLen;
-          const arrowLen  = Math.min(Math.max(dAxisLen * 0.25, 14), 32);
-          const dHSizeLen = Math.min(Math.max(dAxisLen * 0.10, 6), 10);
-          const dHSizeW   = Math.min(Math.max(dAxisLen * 0.07, 5), 8);
-          const tipX = dHead[0], tipY = dHead[1];
-          const tailX = dHead[0] - dNx * arrowLen, tailY = dHead[1] - dNy * arrowLen;
-          ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
-          ctx.fillStyle = "rgba(34, 197, 94, 0.95)";
-          ctx.lineWidth = Math.max(1.5, lineWidth * 0.85);
-          ctx.beginPath();
-          ctx.moveTo(tailX, tailY);
-          ctx.lineTo(tipX - dNx*dHSizeLen, tipY - dNy*dHSizeLen);
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.moveTo(tipX, tipY);
-          ctx.lineTo(tipX - dNx*dHSizeLen + (-dNy)*dHSizeW*0.5, tipY - dNy*dHSizeLen + dNx*dHSizeW*0.5);
-          ctx.lineTo(tipX - dNx*dHSizeLen - (-dNy)*dHSizeW*0.5, tipY - dNy*dHSizeLen - dNx*dHSizeW*0.5);
-          ctx.closePath(); ctx.fill();
-        }
-        ctx.restore(); */
       }
     }
   }, [
@@ -1759,7 +1876,9 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         });
         if (result.ok && result.models) {
           const allModels = result.models.filter(
-            (m) => (m.predictorType ?? "dlib") === "dlib" || m.predictorType === "cnn"
+            (m) =>
+              m.modelKind === "landmark" &&
+              (m.predictorType === "dlib" || m.predictorType === "cnn")
           );
           const available = allModels.filter((m) => {
             if (m.status && m.status !== "active") return false;
@@ -1767,7 +1886,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             return true;
           });
           if (sessionPreferredModelKey) {
-            const persisted = allModels.find((m) => modelToKey(m) === sessionPreferredModelKey);
+            const persisted = allModels.find((m) => modelMatchesKey(m, sessionPreferredModelKey));
             if (persisted?.predictorType === "cnn" && persisted.compatible === false) {
               const message =
                 persisted.reason ||
@@ -1780,8 +1899,9 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           }
           setModels(available);
           setSelectedModelKey((prev) => {
-            if (prev && available.some((m) => modelToKey(m) === prev)) {
-              return prev;
+            const current = prev ? available.find((m) => modelMatchesKey(m, prev)) : undefined;
+            if (current) {
+              return modelToKey(current);
             }
             return resolveInitialModelKey(available);
           });
@@ -1797,11 +1917,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       }
     };
     loadModels();
-  }, [effectiveSessionId, modelToKey, resolveInitialModelKey]);
+  }, [effectiveSessionId, modelToKey, resolveInitialModelKey, sessionPreferredModelKey]);
 
   useEffect(() => {
     if (!initialModel || models.length === 0) return;
-    const exact = models.find((m) => modelToKey(m) === initialModel);
+    const exact = models.find((m) => modelMatchesKey(m, initialModel));
     if (exact) {
       setSelectedModelKey(modelToKey(exact));
       return;
@@ -1847,10 +1967,18 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           setIsReviewStateHydrated(true);
           return;
         }
-        const loaded: InferenceImage[] = res.images.map((f: { data: string; mimeType: string; path: string; name: string }) => {
+        const loaded: InferenceImage[] = res.images.map((f) => {
           const bytes = Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0));
           const url = URL.createObjectURL(new Blob([bytes], { type: f.mimeType }));
-          return { path: f.path, name: f.name, url };
+          return {
+            path: f.path,
+            name: f.name,
+            url,
+            sourcePath: f.sourcePath,
+            sourceName: f.sourceName,
+            sourceSha256: f.sourceSha256,
+            contentId: f.contentId ?? f.sourceSha256,
+          };
         });
         setImages(loaded);
         await hydratePersistedReviewDrafts(loaded);
@@ -1873,7 +2001,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       return;
     }
     window.api
-      .checkModelCompatibility({ speciesId: activeSpeciesId, modelName: selectedModel.name })
+      .checkModelCompatibility({
+        speciesId: activeSpeciesId,
+        modelName: getModelArtifactTag(selectedModel),
+        predictorType: selectedModel.predictorType,
+      })
       .then((result) => {
         setObbDetectorReady(result?.obbDetectorReady ?? false);
       })
@@ -1888,7 +2020,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     try {
       const result = await window.api.selectImages();
       if (!result.canceled && result.files) {
-        const newImages: InferenceImage[] = result.files.map((file) => {
+        const newImages: InferenceImage[] = await Promise.all(result.files.map(async (file) => {
           const byteCharacters = atob(file.data);
           const byteNumbers = new Array(byteCharacters.length);
           for (let i = 0; i < byteCharacters.length; i++) {
@@ -1897,23 +2029,55 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           const byteArray = new Uint8Array(byteNumbers);
           const blob = new Blob([byteArray], { type: file.mimeType });
           const url = URL.createObjectURL(blob);
-          return { path: file.path, name: file.name, url };
-        });
-        const existingPaths = new Set(images.map((img) => img.path));
-        const deduped = newImages.filter((img) => !existingPaths.has(img.path));
+          const sourceSha256 = await sha256Hex(byteArray);
+          return {
+            path: file.path,
+            name: file.name,
+            url,
+            sourcePath: file.path,
+            sourceName: file.name,
+            sourceSha256,
+            contentId: sourceSha256,
+          };
+        }));
+        const deduped = dedupeInferenceImageSelection(images, newImages);
+        newImages
+          .filter((image) => !deduped.includes(image))
+          .forEach((image) => URL.revokeObjectURL(image.url));
         if (deduped.length < newImages.length) {
           toast.info(`${newImages.length - deduped.length} duplicate image(s) skipped.`);
         }
         const combinedImages = [...images, ...deduped];
-        setImages(combinedImages);
-        await hydratePersistedReviewDrafts(combinedImages);
+        let canonicalImages = combinedImages;
         if (inferenceSessionId) {
-          void window.api.sessionSaveInferenceImagePaths(
+          const staged = await window.api.sessionSaveInferenceImagePaths(
             activeSpeciesId,
             inferenceSessionId,
-            combinedImages.map((img) => ({ path: img.path, name: img.name }))
+            combinedImages.map((img) => ({
+              path: img.path,
+              name: img.name,
+              sourcePath: img.sourcePath,
+              sourceName: img.sourceName,
+              sourceSha256: img.sourceSha256,
+              contentId: img.contentId,
+            }))
           );
+          if (!staged.ok || staged.imagePaths?.length !== combinedImages.length) {
+            throw new Error(staged.error || "Failed to stage inference images safely.");
+          }
+          canonicalImages = combinedImages.map((img, index) => ({
+            ...img,
+            path: staged.imagePaths![index].path,
+            name: staged.imagePaths![index].name,
+            sourcePath: img.sourcePath ?? staged.imagePaths![index].sourcePath,
+            sourceName: img.sourceName ?? staged.imagePaths![index].sourceName,
+            sourceSha256:
+              img.sourceSha256 ?? staged.imagePaths![index].sourceSha256,
+            contentId: img.contentId ?? staged.imagePaths![index].contentId,
+          }));
         }
+        setImages(canonicalImages);
+        await hydratePersistedReviewDrafts(canonicalImages);
         if (deduped.length > 0) toast.success(`Added ${deduped.length} image(s)`);
       }
     } catch (err) {
@@ -1977,6 +2141,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
 
     let successCount = 0;
     let errorCount = 0;
+    let allowIncompatibleDetector = false;
     const updatedImages = [...images];
     try {
       for (let processed = 0; processed < targetIndices.length; processed++) {
@@ -1987,9 +2152,32 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           stage: "detecting",
         });
         try {
-          const detectResult = await window.api.detectSpecimens(img.path, {
+          let detectResult = await window.api.detectSpecimens(img.path, {
             speciesId: activeSpeciesId,
+            allowIncompatible: allowIncompatibleDetector,
           });
+          if (detectResult.requiresOverride && detectResult.compatibility?.blocking) {
+            const blockingDetails = detectResult.compatibility.issues
+              .filter((issue) => issue.severity === "error")
+              .map((issue) => `- ${issue.message}`)
+              .join("\n");
+            const confirmed = window.confirm(
+              `This OBB detector is incompatible with the active schema and is blocked by default.\n\n${blockingDetails}\n\nRun it anyway for this batch?`
+            );
+            if (!confirmed) {
+              updatedImages[i] = {
+                ...updatedImages[i],
+                error: detectResult.error || "Detection canceled: incompatible OBB detector.",
+              };
+              errorCount++;
+              continue;
+            }
+            allowIncompatibleDetector = true;
+            detectResult = await window.api.detectSpecimens(img.path, {
+              speciesId: activeSpeciesId,
+              allowIncompatible: true,
+            });
+          }
           if (detectResult.ok && Array.isArray(detectResult.boxes)) {
             const boxes = (detectResult.boxes as Array<DetectedBox & { obbCorners?: [number, number][]; angle?: number }>)
               .filter((b) => Number(b.width) > 0 && Number(b.height) > 0)
@@ -2027,6 +2215,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                 width: Math.max(1, Math.round(inferredWidth || 1)),
                 height: Math.max(1, Math.round(inferredHeight || 1)),
               },
+              detectorProvenance: detectResult.detectorProvenance,
             };
             const stampedDetectionResult = stampInferenceResult(
               detectionResult,
@@ -2039,12 +2228,15 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             await persistReviewDraft(i, {
               specimens: stampedDetectionResult.specimens as PredictedSpecimen[],
               edited: false,
+              wasEdited: false,
+              reviewComplete: false,
               saved: false,
               committedAt: null,
               boxSignature: stampedDetectionResult.boxSignature,
               inferenceSignature: null,
               landmarkModelKey: null,
               landmarkPredictorType: null,
+              detectorProvenance: stampedDetectionResult.detectorProvenance ?? null,
             });
           } else {
             updatedImages[i] = { ...updatedImages[i], error: detectResult.error || "Detection failed" };
@@ -2058,9 +2250,6 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       }
       setImages(updatedImages);
       await hydratePersistedReviewDrafts(updatedImages);
-      if (selectedModelKey && detectionRerunModelKey === selectedModelKey) {
-        setDetectionRerunModelKey(null);
-      }
       if (selectedModelKey) {
         setInferenceRerunModelKey(selectedModelKey);
       }
@@ -2111,12 +2300,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     try {
       const compatibility = await window.api.checkModelCompatibility({
         speciesId: activeSpeciesId,
-        modelName: selectedModel.name,
+        modelName: getModelArtifactTag(selectedModel),
         predictorType: selectedPredictor,
         includeRuntime: true,
       });
       if (!compatibility.ok) {
         toast.error(compatibility.error || "Compatibility check failed.");
+        setInferProgress(null);
+        setIsRunning(false);
         return;
       }
       const blockingIssues = (compatibility.issues || []).filter(
@@ -2133,7 +2324,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         const proceed = window.confirm(
           `Model/session compatibility checks blocked inference:\n\n${message}${sam2RuntimeNote}\n\nPress OK to override and run anyway, or Cancel to stop.`
         );
-        if (!proceed) return;
+        if (!proceed) {
+          setInferProgress(null);
+          setIsRunning(false);
+          return;
+        }
         allowIncompatible = true;
         toast.warning("Running with compatibility override for this inference batch.");
       } else {
@@ -2182,6 +2377,47 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           };
         }>;
       }> = [];
+      const quarantineFailedLandmarks = async (
+        index: number,
+        boxes: (typeof batchItems)[number]["boxes"],
+        error: string
+      ) => {
+        const targetImage = updatedImages[index];
+        if (!targetImage) return;
+        const boxSignature = getStableBoxSignature(targetImage.path, boxes);
+        const boxOnlySpecimens: PredictedSpecimen[] = boxes.map((box) => ({
+          box: box as DetectedBox,
+          landmarks: [],
+          num_landmarks: 0,
+        }));
+        updatedImages[index] = {
+          ...targetImage,
+          error,
+          results: {
+            ...(targetImage.results || { image: targetImage.path }),
+            image: targetImage.path,
+            specimens: boxOnlySpecimens,
+            num_specimens: boxOnlySpecimens.length,
+            landmarks: undefined,
+            boxSignature,
+            inferenceSignature: undefined,
+            detectorProvenance: targetImage.results?.detectorProvenance,
+          },
+        };
+        await persistReviewDraft(index, {
+          specimens: boxOnlySpecimens,
+          edited: false,
+          wasEdited: false,
+          saved: false,
+          reviewComplete: false,
+          committedAt: null,
+          landmarkModelKey: null,
+          landmarkPredictorType: null,
+          boxSignature,
+          inferenceSignature: null,
+          detectorProvenance: targetImage.results?.detectorProvenance ?? null,
+        });
+      };
 
       for (let processed = 0; processed < targetIndices.length; processed++) {
         const i = targetIndices[processed];
@@ -2231,21 +2467,24 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       if (batchItems.length > 0) {
         const result = await window.api.predictImagesBatch({
           speciesId: activeSpeciesId,
-          modelName: selectedModel.name,
+          modelName: getModelArtifactTag(selectedModel),
           predictorType: selectedPredictor,
           allowIncompatible,
           items: batchItems,
-        });
+        }).catch((error) => ({
+          ok: false,
+          results: undefined,
+          error: error instanceof Error ? error.message : "Landmark inference failed",
+        }));
 
         if (!result.ok || !Array.isArray(result.results)) {
           const batchError = result.error || "Landmark inference failed";
           for (const item of batchItems) {
-            const targetImage = updatedImages[item.batchIndex];
-            if (!targetImage) continue;
-            updatedImages[item.batchIndex] = {
-              ...targetImage,
-              error: batchError,
-            };
+            await quarantineFailedLandmarks(
+              item.batchIndex,
+              item.boxes,
+              batchError
+            );
             errorCount++;
           }
         } else {
@@ -2263,7 +2502,10 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                 boxSignature
               );
               const stampedResult = stampInferenceResult(
-                item.data as InferenceResult,
+                {
+                  ...(item.data as InferenceResult),
+                  detectorProvenance: targetImage.results?.detectorProvenance,
+                },
                 targetImage.path,
                 batchItem.boxes,
                 {
@@ -2277,18 +2519,22 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               await persistReviewDraft(i, {
                 specimens: specsToSave,
                 edited: false,
+                wasEdited: false,
+                reviewComplete: false,
                 saved: false,
                 committedAt: null,
                 landmarkModelKey: selectedModelKey,
                 landmarkPredictorType: selectedPredictor,
                 boxSignature,
                 inferenceSignature,
+                detectorProvenance: stampedResult.detectorProvenance,
               });
             } else {
-              updatedImages[i] = {
-                ...targetImage,
-                error: item.error || "Landmark inference failed",
-              };
+              await quarantineFailedLandmarks(
+                i,
+                batchItem.boxes,
+                item.error || "Landmark inference failed"
+              );
               errorCount++;
             }
           }
@@ -2356,6 +2602,54 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     saveCorrectionsForImage,
   ]);
 
+  const handleSetCurrentReviewComplete = useCallback(async (reviewComplete: boolean) => {
+    const index = currentIndex;
+    if (!images[index]?.results) return;
+    if (reviewFinalizedImageIndices.has(index) === reviewComplete) return;
+
+    setIsUpdatingReviewStatus(true);
+    try {
+      const persisted = await persistReviewDraft(index, {
+        specimens: getSpecimensForImageIndex(index),
+        edited: editedImageIndices.has(index),
+        saved: savedImageIndices.has(index),
+        reviewComplete,
+        ...(reviewComplete ? {} : { committedAt: null }),
+      });
+      if (!persisted) {
+        toast.error(
+          reviewComplete
+            ? "Could not mark this review complete. No state was changed."
+            : "Could not return this review to in progress. No state was changed."
+        );
+        return;
+      }
+      setReviewFinalizedImageIndices((previous) => {
+        const next = new Set(previous);
+        if (reviewComplete) next.add(index);
+        else next.delete(index);
+        return next;
+      });
+      if (!reviewComplete) {
+        setCommittedImageIndices((previous) => {
+          const next = new Set(previous);
+          next.delete(index);
+          return next;
+        });
+      }
+    } finally {
+      setIsUpdatingReviewStatus(false);
+    }
+  }, [
+    currentIndex,
+    editedImageIndices,
+    getSpecimensForImageIndex,
+    images,
+    persistReviewDraft,
+    reviewFinalizedImageIndices,
+    savedImageIndices,
+  ]);
+
   const handleCommitReviewComplete = useCallback(async () => {
     if (!activeSpeciesId || !inferenceSessionId) {
       toast.error("Inference session is not ready yet.");
@@ -2379,12 +2673,16 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         editedImageIndices.has(idx)
       );
       for (const idx of editedTargets) {
-        await persistReviewDraft(idx, {
+        const persisted = await persistReviewDraft(idx, {
           specimens: getSpecimensForImageIndex(idx),
           edited: true,
           saved: savedImageIndices.has(idx),
           reviewComplete: true,
         });
+        if (!persisted) {
+          toast.error(`Could not persist ${images[idx]?.name || "an edited review"}; commit cancelled.`);
+          return;
+        }
       }
       const commitRes = await window.api.sessionCommitInferenceReview(
         activeSpeciesId,
@@ -2947,8 +3245,6 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     ? "Open an inference session first"
     : !isReviewStateHydrated
       ? "Restoring persisted review state..."
-    : selectedModelKey && detectionRerunModelKey === selectedModelKey
-      ? `Rerun detection for all ${images.length} image${images.length === 1 ? "" : "s"} after switching models`
     : eligibleDetectionCount > 0
       ? `Run detection on ${eligibleDetectionCount} unseen or failed image${eligibleDetectionCount === 1 ? "" : "s"}`
       : "All images already have detection results";
@@ -2966,10 +3262,15 @@ export const InferencePage: React.FC<InferencePageProps> = ({
   const currentEdited = isReviewStateHydrated && editedImageIndices.has(currentIndex);
   const currentSaved = isReviewStateHydrated && !currentEdited && savedImageIndices.has(currentIndex);
   const currentCommitted = isReviewStateHydrated && committedImageIndices.has(currentIndex);
+  const currentPriority = reviewPriorities.get(currentIndex);
+  const highestPriorityPendingIndex = Array.from(reviewPriorities.entries())
+    .filter(([index]) => !reviewFinalizedImageIndices.has(index))
+    .sort((left, right) => right[1].score - left[1].score)[0]?.[0];
   const reviewActionsDisabled =
     isRunning ||
     isSavingCorrections ||
     isCommittingReview ||
+    isUpdatingReviewStatus ||
     !currentImage?.results ||
     !inferenceSessionId;
   const selectedSpecimenResolvedIndex =
@@ -3230,7 +3531,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
               )}
               {selectedModelKey && (
                 <span className="rounded bg-muted px-1.5 py-0.5">
-                  Landmark: {selectedModelKey}
+                  Landmark: {getSelectedModel()?.name ?? selectedModelKey}
                 </span>
               )}
               {inferenceSessionId && (
@@ -3302,7 +3603,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                 <>
                   <Square className="mr-2 h-4 w-4" />
                   {eligibleDetectionCount > 0
-                    ? `${selectedModelKey && detectionRerunModelKey === selectedModelKey ? "Rerun Detection" : "Run Detection"} (${eligibleDetectionCount})`
+                    ? `Run Detection (${eligibleDetectionCount})`
                     : "Run Detection"}
                 </>
               )}
@@ -3399,7 +3700,6 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             if (newKey !== selectedModelKey) {
                               setSelectedSpecimenIndex(null);
                               setShowMaskOverlay(false);
-                              setDetectionRerunModelKey(newKey);
                               setInferenceRerunModelKey(newKey);
                             }
                             setSelectedModelKey(newKey);
@@ -3465,26 +3765,58 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                         </span>
                       </div>
 
+                      {currentPriority && (
+                        <div className="flex items-center justify-between rounded-md border border-border/70 px-2 py-1.5">
+                          <span className="text-[11px] font-medium text-muted-foreground">
+                            Review priority
+                          </span>
+                          <span
+                            className={cn(
+                              "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                              currentPriority.band === "high" && "bg-red-500/15 text-red-600",
+                              currentPriority.band === "medium" && "bg-amber-500/15 text-amber-600",
+                              currentPriority.band === "low" && "bg-emerald-500/15 text-emerald-600"
+                            )}
+                            title={currentPriority.reasons.join(", ") || "Available uncertainty signals"}
+                          >
+                            {currentPriority.band} {Math.round(currentPriority.score * 100)}
+                          </span>
+                        </div>
+                      )}
+
+                      {retrainingBatch && (
+                        <div className="rounded-md border border-border/70 px-2 py-2 text-[10px] text-muted-foreground">
+                          <div className="mb-1 font-semibold text-foreground">Retraining batch</div>
+                          <div>
+                            {retrainingBatch.newSamples} new · {retrainingBatch.corrected} corrected ·{" "}
+                            {retrainingBatch.unchanged} unchanged · {retrainingBatch.rejected} rejected
+                          </div>
+                          <div className="mt-1">
+                            {retrainingBatch.pendingReview} awaiting review · {retrainingBatch.pendingCommit} ready to commit
+                          </div>
+                        </div>
+                      )}
+
                       <div className="grid grid-cols-1 gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={highestPriorityPendingIndex === undefined}
+                          className="justify-start"
+                          onClick={() => {
+                            if (highestPriorityPendingIndex !== undefined) {
+                              setCurrentIndex(highestPriorityPendingIndex);
+                            }
+                          }}
+                        >
+                          Review Highest Priority
+                        </Button>
                         <Button
                           variant="outline"
                           size="sm"
                           disabled={reviewActionsDisabled || !currentImage?.results}
                           className="justify-start"
-                          onClick={() => {
-                            if (reviewFinalizedImageIndices.has(currentIndex)) return;
-                            setReviewFinalizedImageIndices((prev) => {
-                              const next = new Set(prev);
-                              next.add(currentIndex);
-                              return next;
-                            });
-                            void persistReviewDraft(currentIndex, {
-                              specimens: getSpecimensForImageIndex(currentIndex),
-                              edited: editedImageIndices.has(currentIndex),
-                              saved: savedImageIndices.has(currentIndex),
-                              reviewComplete: true,
-                            });
-                          }}
+                          onClick={() => void handleSetCurrentReviewComplete(true)}
                         >
                           Mark Review Complete
                         </Button>
@@ -3493,26 +3825,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                           size="sm"
                           disabled={reviewActionsDisabled || !currentImage?.results}
                           className="justify-start"
-                          onClick={() => {
-                            if (!reviewFinalizedImageIndices.has(currentIndex)) return;
-                            setReviewFinalizedImageIndices((prev) => {
-                              const next = new Set(prev);
-                              next.delete(currentIndex);
-                              return next;
-                            });
-                            setCommittedImageIndices((prev) => {
-                              const next = new Set(prev);
-                              next.delete(currentIndex);
-                              return next;
-                            });
-                            void persistReviewDraft(currentIndex, {
-                              specimens: getSpecimensForImageIndex(currentIndex),
-                              edited: editedImageIndices.has(currentIndex),
-                              saved: savedImageIndices.has(currentIndex),
-                              reviewComplete: false,
-                              committedAt: null,
-                            });
-                          }}
+                          onClick={() => void handleSetCurrentReviewComplete(false)}
                         >
                           Mark In Progress
                         </Button>
@@ -3786,6 +4099,19 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             {img.results && (
                               <span className="shrink-0 text-green-500">
                                 {getTotalLandmarks(img.results)} pts
+                              </span>
+                            )}
+                            {reviewPriorities.has(idx) && !reviewFinalizedImageIndices.has(idx) && (
+                              <span
+                                className={cn(
+                                  "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                                  reviewPriorities.get(idx)?.band === "high" && "bg-red-500/15 text-red-600",
+                                  reviewPriorities.get(idx)?.band === "medium" && "bg-amber-500/15 text-amber-600",
+                                  reviewPriorities.get(idx)?.band === "low" && "bg-emerald-500/15 text-emerald-600"
+                                )}
+                                title={(reviewPriorities.get(idx)?.reasons || []).join(", ")}
+                              >
+                                {reviewPriorities.get(idx)?.band}
                               </span>
                             )}
                             {img.results && committedImageIndices.has(idx) && (

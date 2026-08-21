@@ -34,6 +34,28 @@ interface TrainOptions {
   cnnVariant?: string;
 }
 
+interface InferenceReviewDraftMetadata {
+  mask_source?: string;
+  canonical_flip_applied?: boolean;
+  direction_source?: string;
+  inferred_direction?: "left" | "right" | null;
+  inferred_direction_confidence?: number;
+  direction_confidence?: number;
+  used_flipped_crop?: boolean;
+  was_flipped?: boolean;
+  selection_reason?: string;
+  detector_hint_orientation?: string | null;
+  detector_hint_source?: string | null;
+  orientation_warning?: { code?: string; message?: string } | null;
+  clamped_landmark_count?: number;
+  landmark_count?: number;
+  landmark_heatmap_entropy?: number;
+  model_disagreement?: number;
+  ood_score?: number;
+  ood_score_source?: string;
+  inferenceSignature?: string;
+}
+
 interface PredictOptions {
   multiSpecimen?: boolean;
   predictorType?: "dlib" | "cnn";
@@ -73,6 +95,20 @@ interface PredictBatchArgs {
 
 interface DetectionOptions {
   speciesId?: string;
+  conf?: number;
+  nmsIou?: number;
+  maxObjects?: number;
+  imgsz?: 640 | 960 | 1280;
+  detectionPreset?: "balanced" | "precision" | "recall" | "single_object" | "custom";
+  allowIncompatible?: boolean;
+}
+
+interface DetectionModelProvenance {
+  modelId: string;
+  artifactSha256: string | null;
+  configSha256?: string | null;
+  displayName: string;
+  kind: "trained_obb" | "zero_shot";
 }
 
 contextBridge.exposeInMainWorld("api", {
@@ -87,6 +123,8 @@ contextBridge.exposeInMainWorld("api", {
     workspaceImages?: number;
     importedImagesHint?: number;
   }) => ipcRenderer.invoke("ml:training-preflight", args),
+  importDlibXml: (args: { modelName: string; speciesId?: string }) =>
+    ipcRenderer.invoke("ml:import-dlib-xml", args),
   predictImage: (
     imagePath: string,
     tag: string,
@@ -109,6 +147,19 @@ contextBridge.exposeInMainWorld("api", {
     activeOnly?: boolean;
     includeDeprecated?: boolean;
   }) => ipcRenderer.invoke("ml:list-models", args),
+  getModelInfo: (modelName: string, speciesId?: string) =>
+    ipcRenderer.invoke("ml:get-model-info", modelName, speciesId),
+  testModel: (args: string | { modelName: string; speciesId?: string }) =>
+    ipcRenderer.invoke("ml:test-model", args),
+  checkYolo: () => ipcRenderer.invoke("ml:check-yolo"),
+  openPath: (targetPath: string) =>
+    ipcRenderer.invoke("shell:show-item-in-folder", targetPath),
+  refineSam: (args: {
+    imagePath: string;
+    objectIndex: number;
+    clickPoint: [number, number];
+    clickLabel: number;
+  }) => ipcRenderer.invoke("ml:refine-sam", args),
   deleteModel: (
     modelName: string,
     speciesId?: string,
@@ -122,6 +173,18 @@ contextBridge.exposeInMainWorld("api", {
     predictorType?: "dlib" | "cnn",
     modelKind?: "landmark" | "obb_detector"
   ) => ipcRenderer.invoke("ml:rename-model", oldName, newName, speciesId, predictorType, modelKind),
+  promoteModel: (
+    modelIdentifier: string,
+    speciesId?: string,
+    predictorType?: "dlib" | "cnn",
+    modelKind?: "landmark" | "obb_detector"
+  ) => ipcRenderer.invoke(
+    "ml:promote-model",
+    modelIdentifier,
+    speciesId,
+    predictorType,
+    modelKind
+  ),
   selectImages: () => ipcRenderer.invoke("select-images"),
   selectFolderPath: () => ipcRenderer.invoke("select-folder-path"),
   selectAnnotationFile: () => ipcRenderer.invoke("select-annotation-file"),
@@ -132,10 +195,6 @@ contextBridge.exposeInMainWorld("api", {
     geometryConfig?: GeometryMappingConfig;
     useSam2BoxDerivation?: boolean;
   }) => ipcRenderer.invoke("ml:load-annotated-folder", args),
-  importPreAnnotatedDataset: (args?: {
-    speciesId?: string;
-    geometryConfig?: GeometryMappingConfig;
-  }) => ipcRenderer.invoke("ml:import-preannotated-dataset", args),
   // Multi-specimen detection
   detectSpecimens: (imagePath: string, options?: DetectionOptions) =>
     ipcRenderer.invoke("ml:detect-specimens", imagePath, options),
@@ -149,6 +208,8 @@ contextBridge.exposeInMainWorld("api", {
       schemaKind?: "default" | "custom";
       schemaSourceId?: string;
       schemaFingerprint?: string;
+      schemaSemanticFingerprint?: string;
+      schemaSemanticVersion?: number;
     }
   ) => ipcRenderer.invoke("session:create", {
     speciesId,
@@ -158,6 +219,8 @@ contextBridge.exposeInMainWorld("api", {
     schemaKind: schemaMetadata?.schemaKind,
     schemaSourceId: schemaMetadata?.schemaSourceId,
     schemaFingerprint: schemaMetadata?.schemaFingerprint,
+    schemaSemanticFingerprint: schemaMetadata?.schemaSemanticFingerprint,
+    schemaSemanticVersion: schemaMetadata?.schemaSemanticVersion,
   }),
   sessionUpdateOrientationPolicy: (speciesId: string, orientationPolicy: OrientationPolicy) =>
     ipcRenderer.invoke("session:update-orientation-policy", { speciesId, orientationPolicy }),
@@ -264,6 +327,7 @@ contextBridge.exposeInMainWorld("api", {
       nmsIou?: number;
       imgsz?: 640 | 960 | 1280;
       useOrientationHint?: boolean;
+      allowIncompatible?: boolean;
     },
     speciesId?: string
   ) => ipcRenderer.invoke("ml:super-annotate", { imagePath, className, modelTag, options, speciesId }),
@@ -353,7 +417,7 @@ contextBridge.exposeInMainWorld("api", {
       displayName?: string;
       preferences?: {
         lastUsedLandmarkModelKey?: string;
-        lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+        lastUsedPredictorType?: "dlib" | "cnn";
         detectionModelKey?: string;
         detectionModelName?: string;
       };
@@ -399,18 +463,35 @@ contextBridge.exposeInMainWorld("api", {
           tail_point?: [number, number];
         };
       };
-      landmarks: { id: number; x: number; y: number }[];
+      landmarks: {
+        id: number;
+        x: number;
+        y: number;
+        confidence?: number;
+        heatmap_entropy?: number;
+      }[];
+      inference_metadata?: InferenceReviewDraftMetadata;
     }[],
     options?: {
       filename?: string;
       edited?: boolean;
+      wasEdited?: boolean;
       saved?: boolean;
       reviewComplete?: boolean;
       committedAt?: string | null;
       landmarkModelKey?: string | null;
-      landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose" | null;
+      landmarkPredictorType?: "dlib" | "cnn" | null;
       boxSignature?: string | null;
       inferenceSignature?: string | null;
+      detectorProvenance?: DetectionModelProvenance | null;
+      prioritySignals?: {
+        detectorConfidence?: number;
+        landmarkConfidence?: number;
+        landmarkHeatmapEntropy?: number;
+        modelDisagreement?: number;
+        oodScore?: number;
+        repeatedFailureCount?: number;
+      };
       clear?: boolean;
     }
   ) =>
@@ -421,6 +502,7 @@ contextBridge.exposeInMainWorld("api", {
       specimens,
       filename: options?.filename,
       edited: options?.edited,
+      wasEdited: options?.wasEdited,
       saved: options?.saved,
       reviewComplete: options?.reviewComplete,
       committedAt: options?.committedAt,
@@ -428,14 +510,25 @@ contextBridge.exposeInMainWorld("api", {
       landmarkPredictorType: options?.landmarkPredictorType,
       boxSignature: options?.boxSignature,
       inferenceSignature: options?.inferenceSignature,
+      detectorProvenance: options?.detectorProvenance,
+      prioritySignals: options?.prioritySignals,
       clear: options?.clear,
     }),
   sessionLoadInferenceReviewDrafts: (speciesId: string, inferenceSessionId?: string) =>
     ipcRenderer.invoke("session:load-inference-review-drafts", { speciesId, inferenceSessionId }),
+  sessionGetRetrainingBatch: (speciesId: string, inferenceSessionId?: string, since?: string) =>
+    ipcRenderer.invoke("session:get-retraining-batch", { speciesId, inferenceSessionId, since }),
   sessionSaveInferenceImagePaths: (
     speciesId: string,
     inferenceSessionId: string,
-    imagePaths: { path: string; name: string }[]
+    imagePaths: Array<{
+      path: string;
+      name: string;
+      sourcePath?: string;
+      sourceName?: string;
+      sourceSha256?: string;
+      contentId?: string;
+    }>
   ) =>
     ipcRenderer.invoke("session:save-inference-image-paths", { speciesId, inferenceSessionId, imagePaths }),
   sessionLoadInferenceImagePaths: (speciesId: string, inferenceSessionId: string) =>

@@ -17,6 +17,7 @@ if _BACKEND_ROOT not in _sys.path:
 
 from bv_utils.image_utils import load_image, safe_imread, safe_imwrite
 import bv_utils.orientation_utils as ou
+import bv_utils.lineage as lineage
 
 
 def _ascii_safe_base(name):
@@ -64,6 +65,911 @@ def _resolve_image_path(images_dir, img_filename):
     raise FileNotFoundError(f"Image not found: {exact}")
 
 STANDARD_SIZE = ou.STANDARD_SIZE
+LANDMARK_COHORT_MANIFEST_VERSION = 4
+LANDMARK_MIN_VALIDATION_SOURCES = 2
+
+
+def _coerce_landmark_id(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _require_explicit_orientation_policy(project_root):
+    """Block training when orientation semantics were inferred rather than chosen."""
+    return ou.require_explicit_orientation_policy(project_root)
+
+
+def _required_schema_landmark_ids(project_root):
+    session_path = os.path.join(project_root, "session.json")
+    session = lineage.read_json(session_path, default={})
+    template = session.get("landmarkTemplate", []) if isinstance(session, dict) else []
+    required = []
+    for position, entry in enumerate(template if isinstance(template, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("required") is False or entry.get("optional") is True:
+            continue
+        landmark_id = _coerce_landmark_id(entry.get("index", position + 1))
+        if landmark_id is not None:
+            required.append(landmark_id)
+    return sorted(set(required))
+
+
+def _valid_landmark_ids(landmarks):
+    result = set()
+    for landmark in landmarks if isinstance(landmarks, list) else []:
+        if not isinstance(landmark, dict) or landmark.get("isSkipped"):
+            continue
+        landmark_id = _coerce_landmark_id(landmark.get("id"))
+        try:
+            x = float(landmark.get("x", -1))
+            y = float(landmark.get("y", -1))
+        except Exception:
+            continue
+        if landmark_id is not None and math.isfinite(x) and math.isfinite(y) and x >= 0 and y >= 0:
+            result.add(landmark_id)
+    return result
+
+
+def _box_allows_landmark_training(box):
+    if not isinstance(box, dict):
+        return True
+    targets = box.get("trainingTargets")
+    if not isinstance(targets, list):
+        return True
+    return "landmark" in {str(value).strip().lower() for value in targets}
+
+
+def _resolve_landmark_training_boxes(payload):
+    """Resolve the authoritative specimen list for landmark preparation.
+
+    Modern finalized/HITL labels declare ``acceptedBoxes``.  An explicitly
+    empty list means the reviewer rejected every draft and must never fall back
+    to the retained top-level ``boxes``.  Only labels without that field use the
+    legacy box list.
+    """
+    if not isinstance(payload, dict):
+        return [], False
+    finalized = payload.get("finalizedDetection")
+    if isinstance(finalized, dict) and "acceptedBoxes" in finalized:
+        accepted = finalized.get("acceptedBoxes")
+        if not isinstance(accepted, list):
+            raise RuntimeError(
+                "finalizedDetection.acceptedBoxes must be an array when declared"
+            )
+        legacy_boxes = payload.get("boxes")
+        legacy_boxes = legacy_boxes if isinstance(legacy_boxes, list) else []
+
+        def geometry_key(box):
+            if not isinstance(box, dict):
+                return None
+            try:
+                return tuple(
+                    int(round(float(box.get(field))))
+                    for field in ("left", "top", "width", "height")
+                )
+            except (TypeError, ValueError):
+                return None
+
+        legacy_by_geometry = {}
+        for legacy_box in legacy_boxes:
+            key = geometry_key(legacy_box)
+            if key is not None:
+                legacy_by_geometry.setdefault(key, []).append(legacy_box)
+
+        resolved = []
+        for accepted_box in accepted:
+            if not isinstance(accepted_box, dict):
+                raise RuntimeError(
+                    "finalizedDetection.acceptedBoxes entries must be objects"
+                )
+            merged = dict(accepted_box)
+            matches = legacy_by_geometry.get(geometry_key(accepted_box), [])
+            legacy_match = matches.pop(0) if matches else None
+            if isinstance(legacy_match, dict):
+                # Older finalized snapshots did not retain these landmark-only
+                # fields. Recover them only from the matching accepted geometry;
+                # unmatched drafts remain excluded.
+                for field in ("landmarks", "trainingTargets"):
+                    if field not in merged and field in legacy_match:
+                        merged[field] = legacy_match[field]
+            resolved.append(merged)
+        return resolved, True
+    legacy_boxes = payload.get("boxes")
+    return (legacy_boxes if isinstance(legacy_boxes, list) else []), False
+
+
+def _validate_training_landmark_contract(json_paths, required_ids):
+    """Reject incomplete specimens instead of silently shrinking model output."""
+    expected = set(required_ids)
+    if not expected:
+        raise RuntimeError(
+            "The session schema must declare at least one required landmark. "
+            "Mark optional landmarks explicitly and keep the fixed training contract required."
+        )
+    observations = []
+    failures = []
+    for label_path in json_paths:
+        payload = lineage.read_json(label_path, default={})
+        if not isinstance(payload, dict):
+            failures.append(f"{os.path.basename(label_path)}: invalid JSON object")
+            continue
+        boxes, finalized_boxes_declared = _resolve_landmark_training_boxes(payload)
+        boxes = [box for box in boxes if _box_allows_landmark_training(box)]
+        specimen_landmarks = []
+        if boxes:
+            specimen_landmarks = [
+                (box_index, box.get("landmarks", []) if isinstance(box, dict) else [])
+                for box_index, box in enumerate(boxes)
+            ]
+        elif (
+            not finalized_boxes_declared
+            and isinstance(payload.get("landmarks"), list)
+            and payload.get("landmarks")
+        ):
+            specimen_landmarks = [(0, payload.get("landmarks"))]
+        else:
+            # Labels with no specimens are not part of landmark training.
+            continue
+
+        for box_index, landmarks in specimen_landmarks:
+            ids = _valid_landmark_ids(landmarks)
+            observations.append((os.path.basename(label_path), box_index, ids))
+
+    if not observations:
+        raise RuntimeError("No trainable specimens with valid landmarks were found.")
+
+    for filename, box_index, ids in observations:
+        missing = sorted(expected - ids)
+        if missing:
+            failures.append(
+                f"{filename} box {box_index}: missing required landmark IDs {missing}"
+            )
+    if failures:
+        preview = failures[:50]
+        suffix = f"\n... and {len(failures) - len(preview)} more" if len(failures) > len(preview) else ""
+        raise RuntimeError(
+            "Landmark schema completeness check failed. Every training specimen must contain "
+            "all required schema landmarks:\n- " + "\n- ".join(preview) + suffix
+        )
+    return sorted(expected)
+
+
+def _source_content_id(source_path, source_name):
+    try:
+        return f"sha256:{lineage.sha256_file(source_path)}"
+    except Exception:
+        return f"name:{str(source_name or os.path.basename(source_path)).strip().casefold()}"
+
+
+def _is_adaptive_training_sample(entry):
+    if not isinstance(entry, dict):
+        return False
+    records = []
+    provenance = entry.get("provenance")
+    if isinstance(provenance, dict):
+        records.append(provenance)
+    review_history = entry.get("reviewHistory")
+    if isinstance(review_history, list):
+        records.extend(record for record in review_history if isinstance(record, dict))
+    adaptive_sources = {
+        "hitl",
+        "hitl_review",
+        "inference_review",
+        "model_assisted_review",
+    }
+    return any(
+        str(record.get("source") or "").strip().lower() in adaptive_sources
+        for record in records
+    )
+
+
+def _read_landmark_cohort_manifest_strict(cohort_path):
+    if not os.path.exists(cohort_path):
+        return {}
+    try:
+        with open(cohort_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        raise RuntimeError(
+            "The existing landmark cohort manifest is malformed; restore it rather "
+            "than silently rebuilding frozen evaluator assignments."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("The existing landmark cohort manifest must be a JSON object")
+    try:
+        version = int(payload.get("version"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "The existing landmark cohort manifest has no recognized version"
+        ) from exc
+    if version < 1 or version > LANDMARK_COHORT_MANIFEST_VERSION:
+        raise RuntimeError(f"Unsupported landmark cohort manifest version: {version}")
+    return payload
+
+
+def _build_landmark_template(entries):
+    """Summarize only training geometry for inference-time orientation scoring.
+
+    Validation and test landmarks must never contribute to this template: the
+    runtime uses these statistics to choose between orientation candidates, so
+    including held-out geometry would leak evaluator information into the
+    deployed prediction path.
+    """
+    template_acc = {}
+    for entry in entries:
+        for landmark in entry.get("landmarks", []):
+            landmark_id = _coerce_landmark_id(landmark.get("id"))
+            if landmark_id is None:
+                continue
+            try:
+                x = float(landmark["x"])
+                y = float(landmark["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(x) or not math.isfinite(y):
+                continue
+            values = template_acc.setdefault(landmark_id, {"x": [], "y": []})
+            values["x"].append(x)
+            values["y"].append(y)
+
+    landmark_template = {}
+    for landmark_id, values in template_acc.items():
+        xs, ys = values["x"], values["y"]
+        if not xs or not ys:
+            continue
+        mean_x = sum(xs) / len(xs)
+        mean_y = sum(ys) / len(ys)
+        landmark_template[landmark_id] = {
+            "x_mean": mean_x,
+            "y_mean": mean_y,
+            "x_std": math.sqrt(sum((x - mean_x) ** 2 for x in xs) / len(xs)),
+            "y_std": math.sqrt(sum((y - mean_y) ** 2 for y in ys) / len(ys)),
+            "count": len(xs),
+        }
+    return landmark_template
+
+
+def _landmark_source_snapshot(source_id, source_entries):
+    """Hash the exact image/crop/annotation content used by a benchmark source."""
+    specimens = []
+    for entry in source_entries:
+        crop_path = entry.get("path")
+        try:
+            crop_sha256 = lineage.sha256_file(crop_path) if crop_path else None
+        except Exception:
+            crop_sha256 = None
+        specimens.append(
+            {
+                "boxIndex": int(entry.get("box_index", 0)),
+                "standardizedCropSha256": crop_sha256,
+                "sourceBox": entry.get("source_box"),
+                "sourceLandmarks": entry.get("source_landmarks"),
+                "standardizedLandmarks": entry.get("landmarks"),
+            }
+        )
+    specimens.sort(key=lineage.sha256_json)
+    return lineage.sha256_json(
+        {
+            "formatVersion": 2,
+            "cohortKind": "test",
+            "sourceId": str(source_id),
+            "specimens": specimens,
+        }
+    )
+
+
+def _landmark_validation_source_snapshot(source_id, source_entries):
+    """Hash the exact evaluator pixels as well as their landmark geometry."""
+    specimens = []
+    for entry in source_entries:
+        crop_path = entry.get("path")
+        try:
+            crop_sha256 = lineage.sha256_file(crop_path) if crop_path else None
+        except Exception:
+            crop_sha256 = None
+        specimens.append(
+            {
+                "boxIndex": int(entry.get("box_index", 0)),
+                "standardizedCropSha256": crop_sha256,
+                "sourceBox": entry.get("source_box"),
+                "sourceLandmarks": entry.get("source_landmarks"),
+                "standardizedLandmarks": entry.get("landmarks"),
+            }
+        )
+    specimens.sort(key=lineage.sha256_json)
+    return lineage.sha256_json(
+        {
+            "formatVersion": 2,
+            "cohortKind": "validation",
+            "sourceId": str(source_id),
+            "specimens": specimens,
+        }
+    )
+
+
+def _landmark_cohort_revision(assignments, source_snapshots, cohort_kind):
+    cohort_ids = sorted(
+        source_id for source_id, cohort in assignments.items() if cohort == cohort_kind
+    )
+    return lineage.sha256_json(
+        {
+            "formatVersion": 1,
+            "cohortKind": str(cohort_kind),
+            "sources": [
+                {
+                    "sourceId": source_id,
+                    "snapshotSha256": source_snapshots.get(source_id),
+                }
+                for source_id in cohort_ids
+            ],
+        }
+    )
+
+
+def _landmark_test_cohort_revision(assignments, test_source_snapshots):
+    # Preserve the v1 digest payload so existing frozen test manifests migrate
+    # without changing their scientific identity.
+    test_ids = sorted(
+        source_id for source_id, cohort in assignments.items() if cohort == "test"
+    )
+    return lineage.sha256_json(
+        {
+            "formatVersion": 1,
+            "testSources": [
+                {
+                    "sourceId": source_id,
+                    "snapshotSha256": test_source_snapshots.get(source_id),
+                }
+                for source_id in test_ids
+            ],
+        }
+    )
+
+
+def _landmark_validation_cohort_revision(assignments, validation_source_snapshots):
+    return _landmark_cohort_revision(
+        assignments,
+        validation_source_snapshots,
+        "validation",
+    )
+
+
+def _stable_landmark_split(entries, *, debug_dir, test_split, seed):
+    """Create frozen train/validation/test cohorts keyed by source content.
+
+    Test is a report-only benchmark. Validation is the only cohort used for
+    promotion, so its source membership and exact standardized annotations are
+    locked independently from test. New and HITL sources are train-only after
+    the first lock.
+    """
+    cohort_path = os.path.join(debug_dir, "cohorts", "landmark_benchmark_v1.json")
+    persisted = _read_landmark_cohort_manifest_strict(cohort_path)
+    persisted_version = int(persisted.get("version", 0)) if persisted else 0
+    raw_assignments = persisted.get("assignments", {}) if isinstance(persisted, dict) else {}
+    if persisted_version == LANDMARK_COHORT_MANIFEST_VERSION and not isinstance(
+        raw_assignments, dict
+    ):
+        raise RuntimeError("The current landmark cohort manifest has invalid assignments")
+    assignments = {
+        str(source_id): (
+            "validation" if str(cohort).strip().lower() == "val" else str(cohort).strip().lower()
+        )
+        for source_id, cohort in raw_assignments.items()
+        if str(cohort).strip().lower() in {"train", "validation", "val", "test"}
+    } if isinstance(raw_assignments, dict) else {}
+    if (
+        persisted_version == LANDMARK_COHORT_MANIFEST_VERSION
+        and len(assignments) != len(raw_assignments)
+    ):
+        raise RuntimeError(
+            "The current landmark cohort manifest contains an invalid cohort assignment"
+        )
+    locked_source_ids = set(assignments)
+    has_locked_cohort = bool(locked_source_ids)
+    had_locked_test = any(cohort == "test" for cohort in assignments.values())
+    had_locked_validation = any(cohort == "validation" for cohort in assignments.values())
+    locked_validation_count = sum(
+        1 for cohort in assignments.values() if cohort == "validation"
+    )
+    persisted_validation_bootstrap_complete = bool(
+        persisted.get("validationBootstrapComplete", False)
+    ) if isinstance(persisted, dict) else False
+    if (
+        persisted_version == LANDMARK_COHORT_MANIFEST_VERSION
+        and persisted_validation_bootstrap_complete
+        and locked_validation_count < LANDMARK_MIN_VALIDATION_SOURCES
+    ):
+        raise RuntimeError(
+            "The landmark cohort manifest marks validation complete without enough sources"
+        )
+    was_single_source_overlap = bool(
+        persisted.get("singleSourceOverlap", False)
+    ) if isinstance(persisted, dict) else False
+    raw_persisted_test_snapshots = (
+        persisted.get("testSourceSnapshots", {}) if isinstance(persisted, dict) else {}
+    )
+    if (
+        persisted_version == LANDMARK_COHORT_MANIFEST_VERSION
+        and not isinstance(raw_persisted_test_snapshots, dict)
+    ):
+        raise RuntimeError("The current landmark test snapshot map is invalid")
+    persisted_test_snapshots = raw_persisted_test_snapshots
+    if not isinstance(persisted_test_snapshots, dict):
+        persisted_test_snapshots = {}
+    persisted_test_snapshots = {
+        str(source_id): str(snapshot)
+        for source_id, snapshot in persisted_test_snapshots.items()
+        if str(snapshot).strip()
+    }
+    raw_persisted_validation_snapshots = (
+        persisted.get("validationSourceSnapshots", {}) if isinstance(persisted, dict) else {}
+    )
+    if (
+        persisted_version == LANDMARK_COHORT_MANIFEST_VERSION
+        and not isinstance(raw_persisted_validation_snapshots, dict)
+    ):
+        raise RuntimeError("The current landmark validation snapshot map is invalid")
+    persisted_validation_snapshots = raw_persisted_validation_snapshots
+    if not isinstance(persisted_validation_snapshots, dict):
+        persisted_validation_snapshots = {}
+    persisted_validation_snapshots = {
+        str(source_id): str(snapshot)
+        for source_id, snapshot in persisted_validation_snapshots.items()
+        if str(snapshot).strip()
+    }
+    persisted_revision = (
+        str(persisted.get("testCohortRevision") or "").strip()
+        if isinstance(persisted, dict)
+        else ""
+    )
+    persisted_validation_revision = (
+        str(persisted.get("validationCohortRevision") or "").strip()
+        if isinstance(persisted, dict)
+        else ""
+    )
+    if persisted_version == LANDMARK_COHORT_MANIFEST_VERSION:
+        expected_assignment_revision = lineage.sha256_json(assignments)
+        if str(persisted.get("assignmentRevision") or "") != expected_assignment_revision:
+            raise RuntimeError(
+                "The current landmark cohort assignment revision is missing or corrupt"
+            )
+        expected_test_ids = {
+            source_id for source_id, cohort in assignments.items() if cohort == "test"
+        }
+        expected_validation_ids = {
+            source_id
+            for source_id, cohort in assignments.items()
+            if cohort == "validation"
+        }
+        if set(persisted_test_snapshots) != expected_test_ids or bool(
+            expected_test_ids
+        ) != bool(persisted_revision):
+            raise RuntimeError(
+                "The current landmark test cohort is missing exact snapshot/revision metadata"
+            )
+        if set(persisted_validation_snapshots) != expected_validation_ids or bool(
+            expected_validation_ids
+        ) != bool(persisted_validation_revision):
+            raise RuntimeError(
+                "The current landmark validation cohort is missing exact snapshot/revision metadata"
+            )
+        persisted_sources_for_validation = persisted.get("sources")
+        if not isinstance(persisted_sources_for_validation, dict) or not set(
+            assignments
+        ).issubset(persisted_sources_for_validation):
+            raise RuntimeError(
+                "The current landmark cohort manifest is missing source history metadata"
+            )
+    if persisted_revision:
+        expected_revision = _landmark_test_cohort_revision(
+            assignments,
+            persisted_test_snapshots,
+        )
+        if persisted_revision != expected_revision:
+            raise RuntimeError(
+                "The frozen landmark benchmark manifest was mutated or is corrupt. "
+                "Restore it or intentionally create a new cohort version."
+            )
+    if persisted_validation_revision:
+        expected_revision = _landmark_validation_cohort_revision(
+            assignments,
+            persisted_validation_snapshots,
+        )
+        if persisted_validation_revision != expected_revision:
+            raise RuntimeError(
+                "The frozen landmark validation manifest was mutated or is corrupt. "
+                "Restore it or intentionally create a new cohort version."
+            )
+
+    by_source = {}
+    source_names = {}
+    source_is_adaptive = {}
+    for entry in entries:
+        source_id = str(entry["source_id"])
+        by_source.setdefault(source_id, []).append(entry)
+        source_names.setdefault(source_id, set()).add(str(entry.get("source_image") or ""))
+        source_is_adaptive[source_id] = source_is_adaptive.get(source_id, False) or _is_adaptive_training_sample(entry)
+
+    persisted_sources = persisted.get("sources", {}) if isinstance(persisted, dict) else {}
+    persisted_sources = persisted_sources if isinstance(persisted_sources, dict) else {}
+    contaminated_evaluators = sorted(
+        source_id
+        for source_id, cohort in assignments.items()
+        if cohort in {"validation", "test"}
+        and (
+            source_is_adaptive.get(source_id, False)
+            or (
+                isinstance(persisted_sources.get(source_id), dict)
+                and persisted_sources[source_id].get("adaptiveTrainingSample") is True
+            )
+        )
+    )
+    if contaminated_evaluators:
+        raise RuntimeError(
+            "Frozen landmark evaluator sources acquired HITL/model-assisted provenance: "
+            f"{contaminated_evaluators}. Restore the independent evaluator labels; "
+            "adaptive sources cannot remain in validation or test."
+        )
+
+    split_seed = (
+        int(persisted.get("seed", seed))
+        if has_locked_cohort and isinstance(persisted, dict)
+        else int(seed)
+    )
+    threshold = max(
+        0.0,
+        min(
+            1.0,
+            float(
+                persisted.get("testFraction", test_split)
+                if has_locked_cohort and isinstance(persisted, dict)
+                else test_split
+            ),
+        ),
+    )
+    current_sources = sorted(by_source)
+    new_sources = [source_id for source_id in current_sources if source_id not in assignments]
+    if not has_locked_cohort:
+        # Bootstrap the three cohorts once. Content hashes make this independent
+        # of filenames and input ordering. Adaptive/HITL data is never eligible
+        # for either evaluation cohort.
+        eligible = [source_id for source_id in current_sources if not source_is_adaptive.get(source_id)]
+        adaptive = [source_id for source_id in current_sources if source_is_adaptive.get(source_id)]
+        assignments.update({source_id: "train" for source_id in adaptive})
+
+        can_form_three_way_split = len(current_sources) >= 3 and len(eligible) >= 2
+        if can_form_three_way_split:
+            reserve_eligible_train = 0 if adaptive else 1
+            max_held_out = len(eligible) - reserve_eligible_train
+            test_count = max(1, int(round(len(eligible) * threshold)))
+            test_count = min(test_count, max_held_out - 1)
+            ordered_test = sorted(
+                eligible,
+                key=lambda source_id: lineage.sha256_bytes(
+                    f"landmark-test-v2:{split_seed}:{source_id}".encode("utf-8")
+                ),
+            )
+            test_sources_initial = set(ordered_test[:test_count])
+            validation_pool = [source_id for source_id in eligible if source_id not in test_sources_initial]
+            validation_count = max(
+                LANDMARK_MIN_VALIDATION_SOURCES,
+                int(round(len(eligible) * threshold)),
+            )
+            validation_count = min(
+                validation_count,
+                len(validation_pool) - reserve_eligible_train,
+            )
+            ordered_validation = sorted(
+                validation_pool,
+                key=lambda source_id: lineage.sha256_bytes(
+                    f"landmark-validation-v1:{split_seed}:{source_id}".encode("utf-8")
+                ),
+            )
+            validation_sources_initial = set(ordered_validation[:validation_count])
+            for source_id in eligible:
+                if source_id in test_sources_initial:
+                    assignments[source_id] = "test"
+                elif source_id in validation_sources_initial:
+                    assignments[source_id] = "validation"
+                else:
+                    assignments[source_id] = "train"
+        else:
+            # Preserve small-dataset trainability, but do not manufacture a
+            # leaky validation metric. Such runs cannot displace an active model.
+            ordered = sorted(
+                eligible,
+                key=lambda source_id: lineage.sha256_bytes(
+                    f"landmark-test-v2:{split_seed}:{source_id}".encode("utf-8")
+                ),
+            )
+            if len(ordered) == 1:
+                # A single source cannot be both training data and a scientific
+                # benchmark. Keep it train-only until unseen sources can seed
+                # frozen evaluation cohorts without historical leakage.
+                assignments[ordered[0]] = "train"
+            elif ordered:
+                assignments[ordered[0]] = "test"
+                for source_id in ordered[1:]:
+                    assignments[source_id] = "train"
+    else:
+        # Evaluation membership is immutable. New production/HITL data can
+        # improve training, but cannot silently expand either evaluator cohort.
+        for source_id in new_sources:
+            assignments[source_id] = "train"
+
+    missing_locked_test_sources = sorted(
+        source_id
+        for source_id in locked_source_ids
+        if assignments.get(source_id) == "test" and source_id not in by_source
+    )
+    if missing_locked_test_sources:
+        raise RuntimeError(
+            "The frozen landmark benchmark is missing test sources: "
+            f"{missing_locked_test_sources}. Restore them or intentionally create a new cohort version."
+        )
+    missing_locked_validation_sources = sorted(
+        source_id
+        for source_id in locked_source_ids
+        if assignments.get(source_id) == "validation" and source_id not in by_source
+    )
+    if missing_locked_validation_sources:
+        raise RuntimeError(
+            "The frozen landmark validation cohort is missing sources: "
+            f"{missing_locked_validation_sources}. Restore them or intentionally create a new cohort version."
+        )
+
+    train_sources = {source_id for source_id in current_sources if assignments.get(source_id) == "train"}
+    validation_sources = {
+        source_id for source_id in current_sources if assignments.get(source_id) == "validation"
+    }
+    test_sources = {source_id for source_id in current_sources if assignments.get(source_id) == "test"}
+
+    if len(current_sources) == 1:
+        only = current_sources[0]
+        train_sources = {only}
+        validation_sources = set()
+        if source_is_adaptive.get(only):
+            # Reviewed production data must never become evaluation data, even
+            # when it is the session's only available source.
+            assignments[only] = "train"
+            test_sources = set()
+        else:
+            # A leakage-free holdout is impossible. Keep this source train-only
+            # and leave the run explicitly unvalidated.
+            assignments[only] = "train"
+            test_sources = set()
+    else:
+        if not test_sources:
+            if has_locked_cohort and was_single_source_overlap:
+                # Migrate a v1 manifest that began with one train/test-overlap
+                # source: that original source becomes the permanent test
+                # member once additional train-only data arrives.
+                pool = [
+                    source_id for source_id in current_sources
+                    if source_id in locked_source_ids and not source_is_adaptive.get(source_id)
+                ]
+            elif has_locked_cohort and not had_locked_test:
+                # An incomplete small-dataset bootstrap has never had a test
+                # cohort. Only a newly observed source is eligible; never move
+                # a source that an earlier model already trained on.
+                pool = [
+                    source_id
+                    for source_id in new_sources
+                    if not source_is_adaptive.get(source_id)
+                ]
+            elif has_locked_cohort:
+                locked_nonadaptive = [
+                    source_id
+                    for source_id in current_sources
+                    if source_id in locked_source_ids
+                    and not source_is_adaptive.get(source_id)
+                ]
+                if locked_nonadaptive:
+                    raise RuntimeError(
+                        "The frozen landmark benchmark has no available test samples. "
+                        "Restore its original source files or intentionally create a new cohort version."
+                    )
+                # A session bootstrapped entirely from reviewed production data
+                # intentionally had no evaluator. Keep it that way until a new,
+                # non-adaptive source can become the first locked test member.
+                pool = [
+                    source_id
+                    for source_id in new_sources
+                    if not source_is_adaptive.get(source_id)
+                ]
+            else:
+                eligible_new = [source_id for source_id in new_sources if not source_is_adaptive.get(source_id)]
+                pool = eligible_new or [source_id for source_id in current_sources if not source_is_adaptive.get(source_id)]
+            if pool:
+                chosen = min(
+                    pool,
+                    key=lambda source_id: lineage.sha256_bytes(
+                        f"landmark-test-bootstrap-v1:{split_seed}:{source_id}".encode("utf-8")
+                    ),
+                )
+                assignments[chosen] = "test"
+                test_sources.add(chosen)
+                train_sources.discard(chosen)
+                validation_sources.discard(chosen)
+        # Complete a small/legacy bootstrap using only never-before-assigned,
+        # non-adaptive sources. A former training source is never a valid future
+        # evaluator. Once the minimum evidence gate is reached, membership locks.
+        validation_bootstrap_complete = bool(
+            persisted_validation_bootstrap_complete
+            or locked_validation_count >= LANDMARK_MIN_VALIDATION_SOURCES
+        )
+        if (
+            has_locked_cohort
+            and not validation_bootstrap_complete
+            and len(validation_sources) < LANDMARK_MIN_VALIDATION_SOURCES
+        ):
+            validation_pool = [
+                source_id
+                for source_id in sorted(new_sources)
+                if source_id in train_sources and not source_is_adaptive.get(source_id)
+            ]
+            ordered_validation_pool = sorted(
+                validation_pool,
+                key=lambda source_id: lineage.sha256_bytes(
+                    f"landmark-validation-bootstrap-v2:{split_seed}:{source_id}".encode(
+                        "utf-8"
+                    )
+                ),
+            )
+            needed = LANDMARK_MIN_VALIDATION_SOURCES - len(validation_sources)
+            available_slots = max(0, len(train_sources) - 1)
+            for chosen in ordered_validation_pool[: min(needed, available_slots)]:
+                assignments[chosen] = "validation"
+                validation_sources.add(chosen)
+                train_sources.discard(chosen)
+        if not train_sources:
+            if has_locked_cohort:
+                raise RuntimeError(
+                    "The frozen landmark benchmark contains all available sources, leaving no "
+                    "training data. Add a new training source rather than moving benchmark samples."
+                )
+            chosen = max(
+                current_sources,
+                key=lambda source_id: lineage.sha256_bytes(
+                    f"landmark-train-bootstrap-v1:{split_seed}:{source_id}".encode("utf-8")
+                ),
+            )
+            assignments[chosen] = "train"
+            train_sources.add(chosen)
+            test_sources.discard(chosen)
+            validation_sources.discard(chosen)
+
+    train_entries = []
+    validation_entries = []
+    test_entries = []
+    for source_id in current_sources:
+        if source_id in train_sources:
+            train_entries.extend(by_source[source_id])
+        if source_id in validation_sources:
+            validation_entries.extend(by_source[source_id])
+        if source_id in test_sources:
+            test_entries.extend(by_source[source_id])
+
+    current_test_snapshots = {
+        source_id: _landmark_source_snapshot(source_id, by_source[source_id])
+        for source_id in sorted(test_sources)
+    }
+    current_validation_snapshots = {
+        source_id: _landmark_validation_source_snapshot(source_id, by_source[source_id])
+        for source_id in sorted(validation_sources)
+    }
+    for source_id, expected_snapshot in persisted_test_snapshots.items():
+        if assignments.get(source_id) != "test":
+            continue
+        current_snapshot = current_test_snapshots.get(source_id)
+        if current_snapshot != expected_snapshot:
+            raise RuntimeError(
+                "The frozen landmark benchmark annotation/crop content changed for "
+                f"{source_id}. Restore the locked label geometry or intentionally create a new cohort version."
+            )
+    for source_id, expected_snapshot in persisted_validation_snapshots.items():
+        if assignments.get(source_id) != "validation":
+            continue
+        current_snapshot = current_validation_snapshots.get(source_id)
+        if current_snapshot != expected_snapshot:
+            raise RuntimeError(
+                "The frozen landmark validation annotation/crop content changed for "
+                f"{source_id}. Restore the locked label geometry or intentionally create a new cohort version."
+            )
+
+    test_source_snapshots = dict(persisted_test_snapshots)
+    test_source_snapshots.update(current_test_snapshots)
+    test_cohort_revision = (
+        _landmark_test_cohort_revision(assignments, test_source_snapshots)
+        if test_sources
+        else None
+    )
+    validation_source_snapshots = dict(persisted_validation_snapshots)
+    validation_source_snapshots.update(current_validation_snapshots)
+    validation_cohort_revision = (
+        _landmark_validation_cohort_revision(assignments, validation_source_snapshots)
+        if validation_sources
+        else None
+    )
+    sources = dict(persisted_sources) if isinstance(persisted_sources, dict) else {}
+    for source_id in sorted(assignments):
+        previous = sources.get(source_id)
+        previous = dict(previous) if isinstance(previous, dict) else {}
+        previous_names = previous.get("names")
+        if not isinstance(previous_names, list):
+            previous_names = []
+        names = {
+            str(name)
+            for name in [*previous_names, *source_names.get(source_id, set())]
+            if str(name).strip()
+        }
+        previous.update(
+            {
+                "names": sorted(names),
+                # Once a content-addressed source has entered through HITL/model-
+                # assisted review, keep that fact sticky across future prepares.
+                # CNN XML has no provenance of its own and relies on this manifest
+                # to keep adaptive samples out of evaluation cohorts.
+                "adaptiveTrainingSample": bool(
+                    previous.get("adaptiveTrainingSample") is True
+                    or source_is_adaptive.get(source_id)
+                ),
+            }
+        )
+        sources[source_id] = previous
+
+    cohort_manifest = {
+        "version": 4,
+        "createdAt": (
+            persisted.get("createdAt")
+            or persisted.get("updatedAt")
+            or lineage.utc_now_iso()
+        ) if isinstance(persisted, dict) else lineage.utc_now_iso(),
+        "seed": int(persisted.get("seed", seed)) if has_locked_cohort else int(seed),
+        "testFraction": (
+            float(persisted.get("testFraction", threshold))
+            if has_locked_cohort
+            else threshold
+        ),
+        "validationFraction": (
+            float(persisted.get("validationFraction", threshold))
+            if has_locked_cohort
+            else threshold
+        ),
+        "assignments": assignments,
+        "sources": sources,
+        "testSourceSnapshots": test_source_snapshots,
+        "testCohortRevision": test_cohort_revision,
+        "validationSourceSnapshots": validation_source_snapshots,
+        "validationCohortRevision": validation_cohort_revision,
+        "assignmentRevision": lineage.sha256_json(assignments),
+        "singleSourceOverlap": bool(train_sources.intersection(test_sources)),
+        "validationSourceOverlap": bool(
+            train_sources.intersection(validation_sources)
+            or test_sources.intersection(validation_sources)
+        ),
+        "validationBootstrapComplete": bool(
+            len(validation_sources) >= LANDMARK_MIN_VALIDATION_SOURCES
+        ),
+        "minimumValidationSources": LANDMARK_MIN_VALIDATION_SOURCES,
+        "newSourcePolicy": (
+            "unseen_nonadaptive_fill_until_validation_ready_then_train_only"
+        ),
+    }
+    if cohort_manifest != persisted:
+        lineage.atomic_write_json(cohort_path, cohort_manifest)
+    return (
+        train_entries,
+        validation_entries,
+        test_entries,
+        train_sources,
+        validation_sources,
+        test_sources,
+        cohort_path,
+    )
 
 
 def _norm_path(value):
@@ -605,6 +1511,8 @@ def _augment_train_entries_with_box_scale(train_entries, corrected_dir, profile,
                     "source_full_image_path": source_path,
                     "source_box": scaled_box,
                     "source_landmarks": [dict(lm) for lm in source_landmarks],
+                    "source_id": entry.get("source_id"),
+                    "provenance": dict(entry.get("provenance") or {}),
                     "is_box_scale_augmented": True,
                 }
             )
@@ -634,6 +1542,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     """
     # Use absolute paths to avoid issues with working directory
     project_root = os.path.abspath(project_root)
+    _require_explicit_orientation_policy(project_root)
     labels_dir = os.path.join(project_root, "labels")
     xml_dir = os.path.join(project_root, "xml")
     images_dir = os.path.join(project_root, "images")
@@ -664,10 +1573,25 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     segment_index = _build_segment_index(project_root) if canonical_training_enabled else {}
 
     debug_log, orientation_log, processed = [], [], []
+    derived_path_owners = {}
+
+    def claim_derived_path(destination, owner):
+        destination_key = os.path.normcase(os.path.abspath(destination))
+        previous_owner = derived_path_owners.get(destination_key)
+        if previous_owner is not None and previous_owner != owner:
+            raise RuntimeError(
+                "Derived landmark dataset path collision for "
+                f"'{destination}'. Sources/targets must have unique content identities."
+            )
+        derived_path_owners[destination_key] = owner
 
     json_paths = sorted(glob.glob(os.path.join(labels_dir, "*.json")))
     if not json_paths:
         raise RuntimeError(f"No JSON files in {labels_dir}")
+    required_landmark_ids = _validate_training_landmark_contract(
+        json_paths,
+        _required_schema_landmark_ids(project_root),
+    )
     print("PROGRESS 5 loading_labels", file=sys.stderr)
     print(
         "PROGRESS_JSON " + json.dumps(
@@ -704,6 +1628,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
 
         img_filename = data.get("imageFilename")
         img_path = _resolve_image_path(images_dir, img_filename)
+        source_id = _source_content_id(img_path, img_filename)
 
         img, w, h = load_image(img_path)
         if img is None:
@@ -716,7 +1641,13 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             w, h = img.shape[1], img.shape[0]
 
         base = _ascii_safe_base(os.path.splitext(img_filename)[0])
-        corrected_path = os.path.join(corrected_dir, f"{base}.png")
+        source_token = (
+            source_id.split(":", 1)[1][:12]
+            if source_id.startswith("sha256:")
+            else lineage.sha256_bytes(source_id.encode("utf-8"))[:12]
+        )
+        corrected_path = os.path.join(corrected_dir, f"{base}_{source_token}.png")
+        claim_derived_path(corrected_path, source_id)
         safe_imwrite(corrected_path, img)
 
         detected = None
@@ -731,7 +1662,11 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         })
 
         # Get boxes from JSON - support both multi-box and legacy single-box format
-        json_boxes = data.get("boxes", [])
+        resolved_boxes, finalized_boxes_declared = _resolve_landmark_training_boxes(data)
+        json_boxes = [
+            box for box in resolved_boxes
+            if _box_allows_landmark_training(box)
+        ]
 
         # Multi-specimen mode: each box has its own bounding region and landmarks
         if json_boxes and any(box.get("left", 0) != 0 or box.get("top", 0) != 0 for box in json_boxes):
@@ -739,7 +1674,14 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             image_boxes = []
             for box_data in json_boxes:
                 box_lm = box_data.get("landmarks", [])
-                valid_lm = [lm for lm in box_lm if not lm.get("isSkipped") and lm.get("x", -1) >= 0 and lm.get("y", -1) >= 0]
+                valid_lm = [
+                    lm
+                    for lm in box_lm
+                    if not lm.get("isSkipped")
+                    and lm.get("x", -1) >= 0
+                    and lm.get("y", -1) >= 0
+                    and _coerce_landmark_id(lm.get("id")) in required_landmark_ids
+                ]
                 if not valid_lm:
                     continue
 
@@ -836,18 +1778,30 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                     "filename": img_filename,
                     "multi_specimen": True,
                     "source_image_path": img_path,
+                    "source_id": source_id,
+                    "provenance": data.get("provenance") if isinstance(data.get("provenance"), dict) else {},
+                    "reviewHistory": data.get("reviewHistory") if isinstance(data.get("reviewHistory"), list) else [],
                 })
         else:
             # Single-specimen mode: flatten all landmarks, derive OBB directly from landmarks
             if json_boxes:
                 all_lm = [lm for box in json_boxes for lm in box.get("landmarks", [])]
-            else:
+            elif not finalized_boxes_declared:
                 all_lm = data.get("landmarks", [])
+            else:
+                all_lm = []
             if not all_lm:
                 continue
 
             # Filter valid landmarks (not skipped, has valid coordinates)
-            valid_lm = [lm for lm in all_lm if not lm.get("isSkipped") and lm.get("x", -1) >= 0 and lm.get("y", -1) >= 0]
+            valid_lm = [
+                lm
+                for lm in all_lm
+                if not lm.get("isSkipped")
+                and lm.get("x", -1) >= 0
+                and lm.get("y", -1) >= 0
+                and _coerce_landmark_id(lm.get("id")) in required_landmark_ids
+            ]
             if not valid_lm:
                 continue
 
@@ -909,6 +1863,9 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "filename": img_filename,
                 "multi_specimen": False,
                 "source_image_path": img_path,
+                "source_id": source_id,
+                "provenance": data.get("provenance") if isinstance(data.get("provenance"), dict) else {},
+                "reviewHistory": data.get("reviewHistory") if isinstance(data.get("reviewHistory"), list) else [],
             })
 
     if not processed:
@@ -927,23 +1884,24 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         file=sys.stderr,
     )
 
-    # Find common landmarks across all boxes in all images
+    # The model output contract is defined by the schema, never by an accidental
+    # intersection of incomplete annotations.
     id_sets = []
     for p in processed:
         for box_data in p["boxes"]:
             id_sets.append(set(lm.get("id", 0) for lm in box_data["landmarks"]))
 
-    common = id_sets[0]
-    for s in id_sets[1:]:
-        common &= s
+    common = set(required_landmark_ids)
     excluded = set().union(*id_sets) - common
-
-    if excluded:
-        print(f"Excluding landmark IDs {sorted(excluded)}, using {len(common)} common landmarks: {sorted(common)}", file=sys.stderr)
     if not common:
-        raise RuntimeError("No common landmarks across all images/boxes")
+        raise RuntimeError("The session schema has no required landmark IDs.")
+    if excluded:
+        print(
+            f"Ignoring non-schema landmark IDs {sorted(excluded)}; training contract is {sorted(common)}",
+            file=sys.stderr,
+        )
 
-    # Filter to only common landmarks in each box
+    # Ignore explicit extras, but required landmarks were already validated.
     for p in processed:
         for box_data in p["boxes"]:
             box_data["landmarks"] = [lm for lm in box_data["landmarks"] if lm.get("id", 0) in common]
@@ -962,7 +1920,11 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
 
         for bi, box_data in enumerate(p["boxes"]):
             box = box_data["box"]
-            landmarks = box_data["landmarks"]
+            landmarks = [
+                landmark
+                for landmark in box_data["landmarks"]
+                if _coerce_landmark_id(landmark.get("id")) in common
+            ]
             has_obb_corners = bool(box.get("obbCorners") or box.get("obb_corners"))
 
             cropped_img, remapped_lm, meta = standardize_crop(
@@ -976,6 +1938,15 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             # Save cropped image — one per box
             suffix = f"_box{bi}" if len(p["boxes"]) > 1 else ""
             crop_path = os.path.join(corrected_dir, f"{base}{suffix}_crop.png")
+            crop_owner = lineage.sha256_json(
+                {
+                    "sourceId": p["source_id"],
+                    "boxIndex": bi,
+                    "sourceBox": box,
+                    "sourceLandmarks": landmarks,
+                }
+            )
+            claim_derived_path(crop_path, crop_owner)
             safe_imwrite(crop_path, cropped_img)
 
             standardized_entries.append({
@@ -986,10 +1957,14 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "source_full_image_path": p["path"],
                 "source_box": dict(box),
                 "source_landmarks": [dict(lm) for lm in landmarks],
+                "source_id": p["source_id"],
+                "provenance": dict(p.get("provenance") or {}),
+                "reviewHistory": list(p.get("reviewHistory") or []),
             })
 
             crop_metadata_log.append({
                 "source_image": p["filename"],
+                "source_id": p["source_id"],
                 "box_index": bi,
                 "crop_path": crop_path,
                 "canonical_training_enabled": canonical_training_enabled,
@@ -1005,7 +1980,10 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "percent": 72,
                 "stage": "prepare_dataset",
                 "substage": "split",
-                "message": f"Generated {len(standardized_entries)} standardized crops. Splitting train/test.",
+                "message": (
+                    f"Generated {len(standardized_entries)} standardized crops. "
+                    "Splitting train/validation/test."
+                ),
                 "crops_total": int(len(standardized_entries)),
             }
         ),
@@ -1026,86 +2004,26 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     id_map = dlib_index_to_original
     rev_map = {orig: i for i, orig in enumerate(sorted_ids)}
 
-    # Build a simple landmark template in standardized 512x512 coordinates.
-    # This lets inference compare normal vs mirrored predictions against the training shape.
-    template_acc = {}
-    for entry in standardized_entries:
-        for lm in entry["landmarks"]:
-            lid = lm.get("id", 0)
-            if lid not in template_acc:
-                template_acc[lid] = {"x": [], "y": []}
-            template_acc[lid]["x"].append(float(lm["x"]))
-            template_acc[lid]["y"].append(float(lm["y"]))
-
-    landmark_template = {}
-    for lid, vals in template_acc.items():
-        xs, ys = vals["x"], vals["y"]
-        if not xs or not ys:
-            continue
-        mean_x = sum(xs) / len(xs)
-        mean_y = sum(ys) / len(ys)
-        std_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs) / len(xs))
-        std_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys) / len(ys))
-        landmark_template[lid] = {
-            "x_mean": mean_x,
-            "y_mean": mean_y,
-            "x_std": std_x,
-            "y_std": std_y,
-            "count": len(xs)
-        }
-
-    # Split into train/test sets grouped by source image to avoid leakage when one
-    # source image yields multiple standardized crops (multi-specimen annotations).
-    random.seed(seed)
-    by_source = {}
-    for entry in standardized_entries:
-        by_source.setdefault(entry["source_image"], []).append(entry)
-    sources = list(by_source.keys())
-    random.shuffle(sources)
-
-    n_total = len(standardized_entries)
-    n_test_target = max(1, int(n_total * test_split))
-    if n_total - n_test_target < 1:
-        n_test_target = n_total - 1
-
-    # If there is only one source image, a clean grouped split is impossible.
-    # Fall back to crop-level split to preserve legacy behavior.
-    if len(sources) <= 1:
-        shuffled = list(standardized_entries)
-        random.shuffle(shuffled)
-        test_entries, train_entries = shuffled[:n_test_target], shuffled[n_test_target:]
-        if len(shuffled) == 1:
-            train_entries = test_entries = shuffled
-        train_source_set = {e["source_image"] for e in train_entries}
-        test_source_set = {e["source_image"] for e in test_entries}
-    else:
-        test_sources = []
-        running_test = 0
-        for src in sources:
-            src_count = len(by_source[src])
-            if running_test >= n_test_target:
-                break
-            # Keep at least one crop in train.
-            if n_total - (running_test + src_count) < 1:
-                continue
-            test_sources.append(src)
-            running_test += src_count
-
-        # Ensure both train and test have sources.
-        if not test_sources:
-            test_sources = [sources[0]]
-        if len(test_sources) == len(sources):
-            test_sources = test_sources[:-1]
-
-        test_source_set = set(test_sources)
-        train_source_set = {s for s in sources if s not in test_source_set}
-        test_entries = []
-        train_entries = []
-        for s in sources:
-            if s in test_source_set:
-                test_entries.extend(by_source[s])
-            else:
-                train_entries.extend(by_source[s])
+    (
+        train_entries,
+        validation_entries,
+        test_entries,
+        train_source_ids,
+        validation_source_ids,
+        test_source_ids,
+        cohort_path,
+    ) = _stable_landmark_split(
+        standardized_entries,
+        debug_dir=debug_dir,
+        test_split=test_split,
+        seed=seed,
+    )
+    # This template affects inference-time orientation selection. Derive it
+    # strictly from the frozen training cohort, never validation or test data.
+    landmark_template = _build_landmark_template(train_entries)
+    train_source_set = {e["source_image"] for e in train_entries}
+    validation_source_set = {e["source_image"] for e in validation_entries}
+    test_source_set = {e["source_image"] for e in test_entries}
 
     train_entries_pre_boxscale = len(train_entries)
     prep_box_scale_profile = _resolve_training_prep_box_jitter_profile(
@@ -1148,8 +2066,10 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
     train_path = os.path.join(xml_dir, f"train_{tag}.xml")
+    validation_path = os.path.join(xml_dir, f"validation_{tag}.xml")
     test_path = os.path.join(xml_dir, f"test_{tag}.xml")
     write_xml(train_entries, train_path)
+    write_xml(validation_entries, validation_path)
     write_xml(test_entries, test_path)
     print(
         "PROGRESS_JSON " + json.dumps(
@@ -1157,8 +2077,9 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "percent": 90,
                 "stage": "prepare_dataset",
                 "substage": "write_xml",
-                "message": "Wrote train/test XML files.",
+                "message": "Wrote train/validation/test XML files.",
                 "train_crops": int(len(train_entries)),
+                "validation_crops": int(len(validation_entries)),
                 "test_crops": int(len(test_entries)),
             }
         ),
@@ -1250,24 +2171,74 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             indent=2,
         )
 
+    cohort_manifest = lineage.read_json(cohort_path, default={})
     with open(os.path.join(debug_dir, f"split_info_{tag}.json"), "w", encoding="utf-8") as f:
         json.dump({
             "train_crops": len(train_entries),
             "train_crops_before_boxscale": train_entries_pre_boxscale,
             "train_crops_after_boxscale": len(train_entries),
             "train_boxscale_crops_added": len(boxscale_augmented_entries),
+            "validation_crops": len(validation_entries),
             "test_crops": len(test_entries),
             "total_crops": len(standardized_entries),
             "train_sources": sorted(train_source_set),
+            "validation_sources": sorted(validation_source_set),
             "test_sources": sorted(test_source_set),
             "train_source_count": len(train_source_set),
+            "validation_source_count": len(validation_source_set),
             "test_source_count": len(test_source_set),
-            "source_overlap_count": len(set(train_source_set) & set(test_source_set)),
+            "source_overlap_count": len(
+                (set(train_source_set) & set(test_source_set))
+                | (set(train_source_set) & set(validation_source_set))
+                | (set(test_source_set) & set(validation_source_set))
+            ),
+            "train_source_ids": sorted(train_source_ids),
+            "validation_source_ids": sorted(validation_source_ids),
+            "test_source_ids": sorted(test_source_ids),
+            "cohort_manifest": cohort_path,
+            "cohort_manifest_sha256": lineage.sha256_file(cohort_path),
+            "test_cohort_revision": (
+                cohort_manifest.get("testCohortRevision")
+                if isinstance(cohort_manifest, dict)
+                else None
+            ),
+            "validation_cohort_revision": (
+                cohort_manifest.get("validationCohortRevision")
+                if isinstance(cohort_manifest, dict)
+                else None
+            ),
+            "singleSourceOverlap": bool(
+                cohort_manifest.get("singleSourceOverlap", False)
+                if isinstance(cohort_manifest, dict)
+                else False
+            ),
+            "validationSourceOverlap": bool(
+                cohort_manifest.get("validationSourceOverlap", False)
+                if isinstance(cohort_manifest, dict)
+                else False
+            ),
+            "split_policy": "stable_source_train_validation_test_v3",
             "standard_size": STANDARD_SIZE,
             "training_prep_box_scale_profile": prep_box_scale_profile,
             "cnn_recommended_box_jitter_profile": cnn_recommended_box_jitter,
             "train_files": [e["path"] for e in train_entries],
-            "test_files": [e["path"] for e in test_entries]
+            "validation_files": [e["path"] for e in validation_entries],
+            "test_files": [e["path"] for e in test_entries],
+            "train_file_source_ids": {
+                os.path.normcase(os.path.abspath(e["path"])): e.get("source_id")
+                for e in train_entries
+                if e.get("source_id")
+            },
+            "test_file_source_ids": {
+                os.path.normcase(os.path.abspath(e["path"])): e.get("source_id")
+                for e in test_entries
+                if e.get("source_id")
+            },
+            "validation_file_source_ids": {
+                os.path.normcase(os.path.abspath(e["path"])): e.get("source_id")
+                for e in validation_entries
+                if e.get("source_id")
+            },
         }, f, indent=2)
     print(
         "PROGRESS_JSON " + json.dumps(
@@ -1277,6 +2248,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "substage": "done",
                 "message": "Dataset preparation complete.",
                 "train_xml": train_path,
+                "validation_xml": validation_path,
                 "test_xml": test_path,
             }
         ),
@@ -1284,6 +2256,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     )
 
     print(train_path)
+    print(validation_path)
     print(test_path)
 
 

@@ -18,17 +18,14 @@ _BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
 
-import bv_utils.orientation_utils as ou
 from inference.predict import (
     STANDARD_SIZE,
     _detect_multi_obb_boxes,
+    _load_landmark_runtime_metadata,
     _load_and_resize_for_inference,
     _load_cnn_model,
     _make_cnn_predict_fn,
     _make_dlib_predict_fn,
-    _resolve_dlib_index_mapping,
-    _resolve_head_landmark_id,
-    _resolve_tail_landmark_id,
     _run_obb_inference_on_box,
 )
 
@@ -54,36 +51,8 @@ class LandmarkPredictWorker:
         _send(payload)
 
     def _load_dlib_context(self, project_root, tag):
-        debug_dir = os.path.join(project_root, "debug")
-        predictor_path = os.path.join(project_root, "models", f"predictor_{tag}.dat")
-        id_mapping_path = os.path.join(debug_dir, f"id_mapping_{tag}.json")
-        if not os.path.exists(predictor_path):
-            raise FileNotFoundError(f"Model not found: {predictor_path}")
-
-        orientation_policy = {}
-        try:
-            orientation_policy = ou.load_orientation_policy(project_root)
-        except Exception:
-            orientation_policy = {}
-
-        id_mapping = {}
-        index_to_original = {}
-        target_orientation = None
-        landmark_template = {}
-        head_landmark_id = None
-        tail_landmark_id = _resolve_tail_landmark_id(project_root, None)
-        if os.path.exists(id_mapping_path):
-            with open(id_mapping_path, "r", encoding="utf-8") as handle:
-                id_mapping = json.load(handle)
-            index_to_original = _resolve_dlib_index_mapping(project_root, tag, id_mapping)
-            target_orientation = id_mapping.get("training_config", {}).get("target_orientation")
-            landmark_template = {
-                int(k): v for k, v in id_mapping.get("landmark_template", {}).items()
-            }
-            head_landmark_id = _resolve_head_landmark_id(project_root, id_mapping)
-            tail_landmark_id = _resolve_tail_landmark_id(project_root, id_mapping)
-        else:
-            head_landmark_id = _resolve_head_landmark_id(project_root, None)
+        metadata = _load_landmark_runtime_metadata(project_root, tag, "dlib")
+        predictor_path = metadata["runtime"]["model_path"]
 
         rect = dlib.rectangle(0, 0, STANDARD_SIZE, STANDARD_SIZE)
         predictor = dlib.shape_predictor(predictor_path)
@@ -91,30 +60,37 @@ class LandmarkPredictWorker:
             "project_root": project_root,
             "tag": tag,
             "predictor_type": "dlib",
-            "orientation_policy": orientation_policy,
-            "predict_fn": _make_dlib_predict_fn(predictor, rect, index_to_original),
-            "target_orientation": target_orientation,
-            "landmark_template": landmark_template,
-            "head_landmark_id": head_landmark_id,
-            "tail_landmark_id": tail_landmark_id,
+            "orientation_policy": metadata["orientation_policy"],
+            "predict_fn": _make_dlib_predict_fn(
+                predictor,
+                rect,
+                metadata["index_to_original"],
+            ),
+            "target_orientation": metadata["target_orientation"],
+            "landmark_template": metadata["landmark_template"],
+            "head_landmark_id": metadata["head_landmark_id"],
+            "tail_landmark_id": metadata["tail_landmark_id"],
         }
 
     def _load_cnn_context(self, project_root, tag):
-        orientation_policy = {}
-        try:
-            orientation_policy = ou.load_orientation_policy(project_root)
-        except Exception:
-            orientation_policy = {}
-
-        model, landmark_ids, target_orientation, landmark_template, head_landmark_id, tail_landmark_id = _load_cnn_model(
+        (
+            model,
+            landmark_ids,
+            target_orientation,
+            landmark_template,
+            head_landmark_id,
+            tail_landmark_id,
+            metadata,
+        ) = _load_cnn_model(
             project_root,
             tag,
+            include_runtime=True,
         )
         return {
             "project_root": project_root,
             "tag": tag,
             "predictor_type": "cnn",
-            "orientation_policy": orientation_policy,
+            "orientation_policy": metadata["orientation_policy"],
             "predict_fn": _make_cnn_predict_fn(model, landmark_ids),
             "target_orientation": target_orientation,
             "landmark_template": landmark_template,

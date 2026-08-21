@@ -4,7 +4,7 @@ import { ChevronLeft, ChevronRight, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/Components/ui/button";
-import { useTutorial } from "./TutorialContext";
+import { useTutorial } from "./useTutorial";
 
 // ─── Geometry helpers ───────────────────────────────────────────────────────
 
@@ -215,7 +215,9 @@ export const TutorialOverlay: React.FC = () => {
       const pos = computeTooltipPos(rect, step.placement, w, h);
       setTooltipPos(pos);
     }
-  });
+    // The size guard above makes this converge after one re-measure; without a
+    // dependency list it would re-measure on every render instead.
+  }, [step, tooltipSize.w, tooltipSize.h]);
 
   if (!isActive || !step) return null;
 

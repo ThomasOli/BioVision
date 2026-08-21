@@ -17,7 +17,7 @@ import { Card, CardContent } from "@/Components/ui/card";
 import { ScrollArea } from "@/Components/ui/scroll-area";
 import { Separator } from "@/Components/ui/separator";
 import { buttonHover, buttonTap } from "@/lib/animations";
-import { useTutorial } from "./TutorialContext";
+import { useTutorial } from "./useTutorial";
 
 const TOUR_ICONS: Record<string, React.ReactNode> = {
   Rocket: <Rocket className="h-5 w-5" />,

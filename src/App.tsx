@@ -24,6 +24,7 @@ import {
   DEFAULT_OBB_DETECTION_SETTINGS,
   getRecommendedObbDetectionSettings,
   normalizeObbDetectionSettings,
+  summarizeObbDatasetProfile,
   summarizeRepresentativeImageDimensions,
 } from "./lib/obbDetectorSettings"
 import type { ObbDetectionSettings } from "./types/Image"
@@ -104,6 +105,7 @@ const App: React.FC = () => {
           device: caps.device,
           ramGb: caps.ramGb,
           gpuName: caps.gpuName,
+          gpuMemoryGb: caps.gpuMemoryGb ?? null,
           sam2Enabled,
           yoloWorldEnabled: true,
           cnnTier: caps.device === "cpu" ? "slow" : "fast",
@@ -180,12 +182,17 @@ const App: React.FC = () => {
   const effectiveImageCount = sessionImageCountHint > 0 ? sessionImageCountHint : workspaceImages.length
   const effectiveRepresentativeImageDimensions =
     workspaceRepresentativeImageDimensions ?? sessionRepresentativeImageDimensions
+  const effectiveObbDatasetProfile = useMemo(
+    () => summarizeObbDatasetProfile(workspaceImages, effectiveRepresentativeImageDimensions),
+    [workspaceImages, effectiveRepresentativeImageDimensions]
+  )
   const obbDetectionRecommendation = useMemo(
     () => getRecommendedObbDetectionSettings(
       effectiveImageCount,
-      effectiveRepresentativeImageDimensions
+      effectiveRepresentativeImageDimensions,
+      effectiveObbDatasetProfile
     ),
-    [effectiveImageCount, effectiveRepresentativeImageDimensions]
+    [effectiveImageCount, effectiveRepresentativeImageDimensions, effectiveObbDatasetProfile]
   )
 
   useEffect(() => {
@@ -222,8 +229,11 @@ const App: React.FC = () => {
           setSessionImageCountHint(0)
           setSessionRepresentativeImageDimensions(undefined)
         }
-      })
+    })
     return () => { cancelled = true }
+    // This effect hydrates persisted settings when the session changes. Live
+    // recommendation changes are applied by the following customization-aware effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSpeciesId])
 
   useEffect(() => {
@@ -359,7 +369,6 @@ const App: React.FC = () => {
       window.removeEventListener("mousemove", onMouseMove)
       window.removeEventListener("mouseup", onMouseUp)
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [MIN_MENU, MAX_MENU, COLLAPSE_THRESHOLD])
 
   useLayoutEffect(() => {
@@ -459,6 +468,7 @@ const App: React.FC = () => {
                 obbDetectionSettings={obbDetectionSettings}
                 obbDetectionRecommendation={obbDetectionRecommendation.summary}
                 representativeImageDimensions={effectiveRepresentativeImageDimensions}
+                obbDatasetProfile={effectiveObbDatasetProfile}
                 onObbDetectionSettingsChange={(settings) => {
                   const normalized = normalizeObbDetectionSettings(settings)
                   setObbDetectionSettings(normalized)

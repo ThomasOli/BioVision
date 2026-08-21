@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useEffect, useMemo, useState } from "react";
 
 // ─── Tour & Step Types ──────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ export interface Tour {
 
 // ─── Context Value ──────────────────────────────────────────────────────────
 
-interface TutorialContextValue {
+export interface TutorialContextValue {
   /** Whether a tour is currently active */
   isActive: boolean;
   /** The currently running tour (null if none) */
@@ -67,7 +67,7 @@ interface TutorialContextValue {
   registerTours: (tours: Tour[]) => void;
 }
 
-const TutorialContext = createContext<TutorialContextValue | null>(null);
+export const TutorialContext = createContext<TutorialContextValue | null>(null);
 
 // ─── localStorage Keys ──────────────────────────────────────────────────────
 
@@ -203,11 +203,3 @@ export const TutorialProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     </TutorialContext.Provider>
   );
 };
-
-// ─── Hook ───────────────────────────────────────────────────────────────────
-
-export function useTutorial(): TutorialContextValue {
-  const ctx = useContext(TutorialContext);
-  if (!ctx) throw new Error("useTutorial must be used within TutorialProvider");
-  return ctx;
-}

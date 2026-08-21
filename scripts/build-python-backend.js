@@ -56,6 +56,7 @@ function main() {
     // Add all backend subpackages as hidden imports so PyInstaller
     // includes them even though they're loaded dynamically via runpy
     "--hidden-import", "data.prepare_dataset",
+    "--hidden-import", "data.prepare_imported_dlib_dataset",
     "--hidden-import", "data.validate_dlib_xml",
     "--hidden-import", "data.audit_dataset",
     "--hidden-import", "data.export_yolo_dataset",
@@ -73,7 +74,55 @@ function main() {
     cliScript,
   ]);
 
+  verifyBundle();
   console.log(`Bundled biovision_backend in ${distDir}`);
+}
+
+/**
+ * Prove the executable can import every script it claims to dispatch.
+ *
+ * PyInstaller cannot see modules reached only through runpy, so each one needs
+ * an explicit --hidden-import above. Without this check a missing entry ships
+ * an installer that fails only when a user opens that specific feature.
+ */
+function verifyBundle() {
+  const ext = process.platform === "win32" ? ".exe" : "";
+  const exePath = path.join(distDir, `biovision_backend${ext}`);
+  if (!fs.existsSync(exePath)) {
+    console.error(`Expected bundled executable at ${exePath}, but it was not produced.`);
+    process.exit(1);
+  }
+
+  const result = spawnSync(exePath, ["--selfcheck"], {
+    cwd: projectRoot,
+    encoding: "utf-8",
+    maxBuffer: 8 * 1024 * 1024,
+  });
+
+  if (result.status !== 0) {
+    console.error("Bundled backend self-check failed:");
+    console.error(result.stdout || "");
+    console.error(result.stderr || "");
+    console.error(
+      "Add a --hidden-import for every module listed under 'failures' above, " +
+        "then rebuild."
+    );
+    process.exit(result.status || 1);
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(result.stdout);
+  } catch {
+    console.error("Bundled backend self-check produced unreadable output:");
+    console.error(result.stdout);
+    process.exit(1);
+  }
+  if (!payload.frozen) {
+    console.error("Self-check did not run against the frozen bundle.");
+    process.exit(1);
+  }
+  console.log(`Self-check passed for ${payload.checked.length} dispatch targets.`);
 }
 
 main();

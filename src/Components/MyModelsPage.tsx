@@ -13,6 +13,7 @@ import {
   Check,
   X,
   AlertTriangle,
+  ArrowUpCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -35,6 +36,7 @@ import {
 } from "@/Components/ui/dialog";
 import { staggerContainer, staggerItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
 import { TrainedModel, AppView } from "@/types/Image";
+import { getModelKey } from "@/lib/modelIdentity";
 
 interface MyModelsPageProps {
   onNavigate: (view: AppView) => void;
@@ -67,12 +69,14 @@ interface ModelCardProps {
   onUse: () => void;
   onDelete: () => void;
   onRename: (newName: string) => void;
+  onPromote: () => void;
 }
 
-const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename }) => {
+const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename, onPromote }) => {
   const [isRenaming, setIsRenaming] = useState(false);
   const [newName, setNewName] = useState(model.name);
   const [menuOpen, setMenuOpen] = useState(false);
+  const isInactiveModel = Boolean(model.status) && model.status !== "active";
 
   const handleRenameSubmit = () => {
     if (newName.trim() && newName !== model.name) {
@@ -148,6 +152,18 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
                           dlib
                         </span>
                       )}
+                      {model.status && (
+                        <span
+                          className={cn(
+                            "shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase",
+                            model.status === "active" && "border-emerald-500/30 bg-emerald-500/15 text-emerald-500",
+                            model.status === "candidate" && "border-amber-500/30 bg-amber-500/15 text-amber-500",
+                            model.status === "deprecated" && "border-slate-500/30 bg-slate-500/15 text-slate-500"
+                          )}
+                        >
+                          {model.status}
+                        </span>
+                      )}
                     </div>
                   </div>
                   <Popover open={menuOpen} onOpenChange={setMenuOpen}>
@@ -211,16 +227,50 @@ const ModelCard: React.FC<ModelCardProps> = ({ model, onUse, onDelete, onRename 
                 </div>
               </div>
             )}
+            {isInactiveModel && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+                <div className="font-medium">
+                  {model.status === "candidate" ? "Held for review" : "Inactive model"}
+                </div>
+                {model.status === "candidate" ? (
+                  <div className="mt-1">
+                    {model.promotion?.metric || "Locked-cohort metric"}: candidate{" "}
+                    {Number.isFinite(Number(model.promotion?.candidateScore))
+                      ? Number(model.promotion?.candidateScore).toFixed(4)
+                      : "unavailable"}
+                    {Number.isFinite(Number(model.promotion?.baselineScore))
+                      ? ` vs active ${Number(model.promotion?.baselineScore).toFixed(4)}`
+                      : ""}
+                  </div>
+                ) : (
+                  <div className="mt-1">
+                    Activate this archived model explicitly before using it for inference.
+                  </div>
+                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-2 h-7 w-full justify-start"
+                  onClick={onPromote}
+                >
+                  <ArrowUpCircle className="mr-2 h-3.5 w-3.5" />
+                  {model.status === "candidate" ? "Promote with override" : "Activate model"}
+                </Button>
+              </div>
+            )}
             <motion.div {...buttonHover} {...buttonTap}>
               <Button
                 size="sm"
                 className="w-full"
                 onClick={onUse}
-                disabled={model.compatible === false}
+                disabled={model.compatible === false || isInactiveModel}
+                title={isInactiveModel ? "Promote this model before inference." : undefined}
               >
                 <Play className="mr-2 h-4 w-4" />
                 {model.compatible === false
                   ? "Unavailable for Inference"
+                  : isInactiveModel
+                    ? "Promote to Use for Inference"
                   : model.modelKind === "obb_detector"
                     ? "Open Inference Session"
                     : "Use for Inference"}
@@ -271,11 +321,19 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
       toast.error(model.reason || "This CNN model predates the heatmap-head format and must be retrained.");
       return;
     }
+    if (
+      model.modelKind !== "obb_detector" &&
+      model.status &&
+      model.status !== "active"
+    ) {
+      toast.error("Promote this model to active before using it for inference.");
+      return;
+    }
     onSelectModelForInference({
       speciesId: model.speciesId,
       modelKey:
         model.modelKind === "landmark"
-          ? `${model.name}::${model.predictorType ?? "dlib"}`
+          ? getModelKey(model)
           : undefined,
       modelKind: model.modelKind,
     });
@@ -287,7 +345,7 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
 
     try {
       const result = await window.api.deleteModel(
-        deleteDialog.model.name,
+        deleteDialog.model.modelId ?? deleteDialog.model.name,
         deleteDialog.model.speciesId,
         deleteDialog.model.predictorType,
         deleteDialog.model.modelKind
@@ -307,7 +365,7 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
   };
 
   const handleRenameModel = async (
-    oldName: string,
+    modelIdentifier: string,
     newName: string,
     predictorType?: "dlib" | "cnn",
     modelKind?: "landmark" | "obb_detector",
@@ -315,7 +373,7 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
   ) => {
     try {
       const result = await window.api.renameModel(
-        oldName,
+        modelIdentifier,
         newName,
         speciesId,
         predictorType,
@@ -330,6 +388,33 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
     } catch (err) {
       console.error("Failed to rename model:", err);
       toast.error("Failed to rename model");
+    }
+  };
+
+  const handlePromoteModel = async (model: TrainedModel) => {
+    const identifier = model.modelId ?? getModelKey(model);
+    const confirmation = model.status === "candidate"
+      ? `Promote "${model.name}" despite the automatic locked-cohort gate? This changes the active runtime alias.`
+      : `Activate archived model "${model.name}"? This replaces the current active runtime alias.`;
+    if (!window.confirm(
+      confirmation
+    )) return;
+    try {
+      const result = await window.api.promoteModel(
+        identifier,
+        model.speciesId,
+        model.predictorType,
+        model.modelKind
+      );
+      if (!result.ok) {
+        toast.error(result.error || "Failed to promote model");
+        return;
+      }
+      toast.success("Model promoted");
+      await loadModels();
+    } catch (error) {
+      console.error("Failed to promote model:", error);
+      toast.error("Failed to promote model");
     }
   };
 
@@ -409,13 +494,14 @@ export const MyModelsPage: React.FC<MyModelsPageProps> = ({
                       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                         {schemaModels.map((model) => (
                           <ModelCard
-                            key={`${model.speciesId ?? "global"}::${model.modelKind ?? "landmark"}::${model.name}::${model.predictorType ?? "dlib"}`}
+                            key={model.modelId ?? `${model.speciesId ?? "global"}::${model.modelKind ?? "landmark"}::${model.name}::${model.predictorType ?? "dlib"}`}
                             model={model}
                             onUse={() => handleUseModel(model)}
                             onDelete={() => setDeleteDialog({ open: true, model })}
                             onRename={(newName) =>
-                              handleRenameModel(model.name, newName, model.predictorType, model.modelKind, model.speciesId)
+                              handleRenameModel(model.modelId ?? model.name, newName, model.predictorType, model.modelKind, model.speciesId)
                             }
+                            onPromote={() => handlePromoteModel(model)}
                           />
                         ))}
                       </div>

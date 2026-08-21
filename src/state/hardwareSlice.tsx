@@ -8,6 +8,8 @@ export interface HardwareState {
   device: Device;
   ramGb: number | null;
   gpuName: string | null;
+  /** Dedicated GPU memory reported by the runtime probe, when available. */
+  gpuMemoryGb: number | null;
   /** True only when device is cuda/mps AND system RAM >= 8 GB */
   sam2Enabled: boolean;
   /** Legacy runtime capability flag retained for compatibility */
@@ -21,6 +23,7 @@ const initialState: HardwareState = {
   device: null,
   ramGb: null,
   gpuName: null,
+  gpuMemoryGb: null,
   sam2Enabled: false,
   yoloWorldEnabled: true,
   cnnTier: "slow",

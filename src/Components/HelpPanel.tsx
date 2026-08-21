@@ -100,7 +100,9 @@ const KeyboardShortcut: React.FC<KeyboardShortcutProps> = ({ keys, description }
   </div>
 );
 
-export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange, onShowOnboarding: _onShowOnboarding }) => {
+// onShowOnboarding stays in the props contract for callers, but the panel now
+// routes onboarding through the tutorial launcher instead of invoking it.
+export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
   const { setLauncherOpen } = useTutorial();
 
   const handleOpenTours = () => {

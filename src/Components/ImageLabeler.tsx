@@ -167,6 +167,14 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     redo,
   } = useContext(UndoRedoClearContext);
 
+  const normalizedOrientationMode = typeof orientationMode === "string"
+    ? orientationMode.trim().toLowerCase()
+    : undefined;
+  // For bilateral mode, undefined axis defaults to vertical_obb (the current standard).
+  const effectiveBilateralClassAxis =
+    bilateralClassAxis ??
+    (normalizedOrientationMode === "bilateral" ? "vertical_obb" : undefined);
+
   // Track which boxes are currently being re-segmented by SAM2 (supports concurrent)
   const [resegmentingBoxIds, setResegmentingBoxIds] = useState<Set<number>>(new Set());
   // Track box IDs that have already been auto-triggered for the current image
@@ -345,7 +353,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
         await triggerResegment(box.id, box.left, box.top, box.width, box.height);
       }
     })();
-  }, [boxes, samEnabled, imagePath]); // intentionally excludes triggerResegment/resegmentingBoxIds to avoid loops
+    // triggerResegment changes identity while its in-flight set changes; including
+    // it here would retrigger the same automatic segmentation cycle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [boxes, samEnabled, imagePath]);
 
   // Keep one shared box set across manual/auto modes so switching modes
   // never hides or drops accepted boxes.
@@ -523,7 +534,7 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       setDrawStart(null);
       setDrawCurrent(null);
     },
-    [isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox, triggerResegment, drawDefaultOrientation]
+    [isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox, triggerResegment, drawDefaultOrientation, effectiveBilateralClassAxis, normalizedOrientationMode]
   );
 
   // Preview rectangle for drag-to-draw
@@ -621,20 +632,9 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
     tr.getLayer()?.batchDraw();
   }, [mode, lockBoxes, detectionMode, autoCorrectionMode, selectedBoxId, visibleBoxes]);
 
-  if (imageError) {
-    return <div className="text-destructive">Error loading image.</div>;
-  }
-
   const stageW = imageDimensions ? imageDimensions.width * scale : 0;
   const stageH = imageDimensions ? imageDimensions.height * scale : 0;
 
-  const normalizedOrientationMode = typeof orientationMode === "string"
-    ? orientationMode.trim().toLowerCase()
-    : undefined;
-  // For bilateral mode, undefined axis defaults to vertical_obb (the current standard).
-  const effectiveBilateralClassAxis =
-    bilateralClassAxis ??
-    (normalizedOrientationMode === "bilateral" ? "vertical_obb" : undefined);
   const orientationRenderMode = getOrientationRenderMode(normalizedOrientationMode);
   const isVectorSchema = orientationRenderMode === "arrow";
 
@@ -656,6 +656,10 @@ const ImageLabeler: React.FC<ImageLabelerProps> = ({
       normalizedStored !== "uncertain" ? normalizedStored : sessionDefaultOrientation
     );
   }, [effectiveBilateralClassAxis, normalizedOrientationMode, sessionDefaultOrientation]);
+
+  if (imageError) {
+    return <div className="text-destructive">Error loading image.</div>;
+  }
 
   const activeOrientation: StoredOrientationLabel = selectedBox
     ? (() => {

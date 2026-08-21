@@ -1,4 +1,4 @@
-import React, { ChangeEvent, useEffect, useState, DragEvent } from "react";
+import React, { ChangeEvent, useEffect, useMemo, useState, DragEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Upload, Folder, Trash2, X, ImageIcon, Loader2, FileText, FolderOpen, Tag } from "lucide-react";
 import { useDispatch, useSelector } from "react-redux";
@@ -49,7 +49,10 @@ const UploadImages: React.FC = () => {
   const activeSpecies = useSelector((state: RootState) =>
     state.species.species.find((species) => species.id === state.species.activeSpeciesId)
   );
-  const fallbackLandmarkTemplate = activeSpecies?.landmarkTemplate ?? [];
+  const fallbackLandmarkTemplate = useMemo(
+    () => activeSpecies?.landmarkTemplate ?? [],
+    [activeSpecies?.landmarkTemplate]
+  );
 
   const [activeTab, setActiveTab] = useState<"upload" | "preannotated">("upload");
 
