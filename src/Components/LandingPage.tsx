@@ -41,6 +41,11 @@ import { CustomSchemaEditor } from "./CustomSchemaEditor";
 import { addSpecies, setActiveSpecies, updateSpecies } from "@/state/speciesState/speciesSlice";
 import { clearFiles, setSessionImages } from "@/state/filesState/fileSlice";
 import { toast } from "sonner";
+import {
+  computeLegacySchemaFingerprint as computeSchemaFingerprint,
+  computeSchemaSemanticFingerprint,
+  SCHEMA_SEMANTIC_VERSION,
+} from "@/lib/schemaFingerprint";
 
 interface LandingPageProps {
   onNavigate: (view: AppView) => void;
@@ -112,32 +117,12 @@ type EditableSchemaDraft = {
   orientationPolicy?: OrientationPolicy;
 };
 
-function normalizeSchemaComponent(value: string | undefined): string {
-  return String(value || "").trim().toLowerCase();
-}
-
 function normalizeSchemaSlug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
-function computeSchemaFingerprint(landmarkTemplate: LandmarkDefinition[]): string {
-  const normalized = (landmarkTemplate || []).map((landmark, position) => ({
-    index: Number.isFinite(Number(landmark?.index)) ? Math.max(1, Number(landmark.index)) : position + 1,
-    name: normalizeSchemaComponent(landmark?.name),
-    category: normalizeSchemaComponent(landmark?.category),
-  }));
-
-  let hash = 2166136261;
-  const input = JSON.stringify(normalized);
-  for (let index = 0; index < input.length; index += 1) {
-    hash ^= input.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
-}
-
 function shortSchemaFingerprint(fingerprint: string): string {
-  return String(fingerprint || "").slice(0, 8);
+  return String(fingerprint || "").replace(/^v\d+-/i, "").slice(0, 12);
 }
 
 function schemaToSessionId(schema: LandmarkSchema): string {
@@ -234,7 +219,7 @@ const ORIENTATION_MODE_DETAILS: Record<OrientationPolicy["mode"], string> = {
   bilateral:
     "Backend goal: the OBB detector levels the crop along the symmetry axis; class_id encodes canonical up/down orientation for vertically symmetric specimens.",
   axial:
-    "Backend goal: the OBB detector levels the long axis; class_id (0=up, 1=down) triggers a 180° rotation to a canonical up-facing orientation.",
+    "Backend goal: the OBB detector levels the long axis as one pole-invariant class; 180° augmentation teaches that either end is equivalent.",
   invariant:
     "Backend goal: OBB crops the specimen without orientation enforcement; wide rotational augmentation (±6° dlib, full 360° CNN) exploits complete angular coverage.",
 };
@@ -270,13 +255,9 @@ function buildOrientationPolicy(
     };
   }
   if (mode === "bilateral") {
-    const distal = landmarkTemplate.find((lm) => Number(lm.index) === 3)?.index;
-    const basal = landmarkTemplate.find((lm) => Number(lm.index) === 12)?.index;
     return {
       mode,
       bilateralClassAxis: "vertical_obb",
-      ...(Number.isFinite(Number(distal)) ? { anteriorAnchorIds: [Number(distal)] } : {}),
-      ...(Number.isFinite(Number(basal)) ? { posteriorAnchorIds: [Number(basal)] } : {}),
     };
   }
   if (mode === "axial") {
@@ -356,6 +337,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     schemaKind: SchemaKind;
     schemaSourceId: string;
     schemaFingerprint: string;
+    schemaSemanticFingerprint?: string;
+    schemaSemanticVersion?: number;
     baseSessionId: string;
     preferredSessionId: string;
   }): Promise<{ speciesId: string; exists: boolean }> => {
@@ -363,7 +346,10 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       (session) =>
         session.schemaKind === args.schemaKind &&
         session.schemaSourceId === args.schemaSourceId &&
-        session.schemaFingerprint === args.schemaFingerprint
+        (args.schemaSemanticFingerprint
+          ? session.schemaSemanticFingerprint === args.schemaSemanticFingerprint &&
+            session.schemaSemanticVersion === args.schemaSemanticVersion
+          : session.schemaFingerprint === args.schemaFingerprint)
     );
     if (exact) {
       return { speciesId: exact.speciesId, exists: true };
@@ -380,7 +366,18 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           const loadedFingerprint =
             String(loaded.meta?.schemaFingerprint || "") ||
             computeSchemaFingerprint(loadedTemplate);
-          if (loadedFingerprint === args.schemaFingerprint) {
+          const loadedPolicy = loaded.meta?.orientationPolicy;
+          const loadedSemanticFingerprint =
+            String(loaded.meta?.schemaSemanticFingerprint || "") ||
+            (loadedPolicy?.mode
+              ? computeSchemaSemanticFingerprint(loadedTemplate, loadedPolicy)
+              : "");
+          const matchesRequestedSchema = args.schemaSemanticFingerprint
+            ? loadedSemanticFingerprint === args.schemaSemanticFingerprint &&
+              Number(loaded.meta?.schemaSemanticVersion ?? SCHEMA_SEMANTIC_VERSION) ===
+                args.schemaSemanticVersion
+            : loadedFingerprint === args.schemaFingerprint;
+          if (matchesRequestedSchema) {
             return { speciesId: args.baseSessionId, exists: true };
           }
         }
@@ -389,14 +386,18 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       }
     }
 
-    const speciesId =
+    let speciesId =
       args.schemaKind === "default" && !legacyBase
         ? args.baseSessionId
         : args.preferredSessionId;
-    return {
-      speciesId,
-      exists: sessions.some((session) => session.speciesId === speciesId),
-    };
+    if (sessions.some((session) => session.speciesId === speciesId)) {
+      let suffix = 2;
+      while (sessions.some((session) => session.speciesId === `${args.preferredSessionId}-${suffix}`)) {
+        suffix += 1;
+      }
+      speciesId = `${args.preferredSessionId}-${suffix}`;
+    }
+    return { speciesId, exists: false };
   };
 
   const beginResumeWithOrientationCheck = async (
@@ -489,6 +490,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           schemaKind: launch.schemaKind,
           schemaSourceId: launch.schemaSourceId,
           schemaFingerprint: launch.schemaFingerprint,
+          schemaSemanticFingerprint: computeSchemaSemanticFingerprint(
+            launch.landmarkTemplate,
+            policy
+          ),
+          schemaSemanticVersion: SCHEMA_SEMANTIC_VERSION,
         }
       );
       return;
@@ -596,6 +602,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       schemaKind: SchemaKind;
       schemaSourceId: string;
       schemaFingerprint: string;
+      schemaSemanticFingerprint?: string;
+      schemaSemanticVersion?: number;
     }
   ) => {
     const orientationPolicy =
@@ -632,13 +640,21 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
   const handleLaunchCustomTemplate = async (schema: ReusableSchemaTemplate) => {
     const schemaFingerprint = computeSchemaFingerprint(schema.landmarks);
+    const schemaSemanticFingerprint = schema.orientationPolicy?.mode
+      ? computeSchemaSemanticFingerprint(schema.landmarks, schema.orientationPolicy)
+      : undefined;
     const schemaSourceId = schema.id;
     const baseSessionId = customSchemaBaseSessionId(schema.id);
-    const preferredSessionId = buildForkedSessionId(baseSessionId, schemaFingerprint);
+    const preferredSessionId = buildForkedSessionId(
+      baseSessionId,
+      schemaSemanticFingerprint ?? schemaFingerprint
+    );
     const resolved = await resolveSchemaSession({
       schemaKind: "custom",
       schemaSourceId,
       schemaFingerprint,
+      schemaSemanticFingerprint,
+      schemaSemanticVersion: schemaSemanticFingerprint ? SCHEMA_SEMANTIC_VERSION : undefined,
       baseSessionId,
       preferredSessionId,
     });
@@ -682,12 +698,20 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     setSchemaDialogOpen(false);
 
     const schemaFingerprint = computeSchemaFingerprint(schema.landmarks);
+    const schemaSemanticFingerprint = schema.orientationPolicy?.mode
+      ? computeSchemaSemanticFingerprint(schema.landmarks, schema.orientationPolicy)
+      : undefined;
     const baseSessionId = schemaToSessionId(schema);
-    const preferredSessionId = buildForkedSessionId(baseSessionId, schemaFingerprint);
+    const preferredSessionId = buildForkedSessionId(
+      baseSessionId,
+      schemaSemanticFingerprint ?? schemaFingerprint
+    );
     const resolved = await resolveSchemaSession({
       schemaKind: "default",
       schemaSourceId: schema.id,
       schemaFingerprint,
+      schemaSemanticFingerprint,
+      schemaSemanticVersion: schemaSemanticFingerprint ? SCHEMA_SEMANTIC_VERSION : undefined,
       baseSessionId,
       preferredSessionId,
     });
@@ -704,6 +728,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         speciesId: resolved.speciesId,
         name: schema.name,
         landmarkTemplate: schema.landmarks,
+        orientationPolicy: schema.orientationPolicy,
         schemaKind: "default",
         schemaSourceId: schema.id,
         schemaFingerprint,
@@ -753,7 +778,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       description: schema.description,
       landmarks: schema.landmarks,
       sourcePresetId: schema.id,
-      orientationPolicy: inferDefaultOrientationPolicy(schema.landmarks),
+      orientationPolicy: schema.orientationPolicy || inferDefaultOrientationPolicy(schema.landmarks),
     });
     setCustomSchemaDialogOpen(true);
   };

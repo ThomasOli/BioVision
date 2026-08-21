@@ -7,6 +7,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { selectSam2Enabled } from "../state/hardwareSlice";
 import type { ObbDetectionPreset, ObbDetectionSettings } from "@/types/Image";
 import { DEFAULT_OBB_DETECTION_SETTINGS, normalizeObbDetectionSettings } from "@/lib/obbDetectorSettings";
+import type { RootState } from "@/state/store";
 
 export type DetectionMode = "manual" | "auto";
 export type DetectionPreset = ObbDetectionPreset;
@@ -60,6 +61,7 @@ type HardwareSelectorState = {
   device: "cpu" | "mps" | "cuda" | null;
   ramGb: number | null;
   gpuName: string | null;
+  gpuMemoryGb: number | null;
   sam2Enabled: boolean;
 };
 
@@ -96,9 +98,7 @@ export function DetectionModeSelector({
   onSamEnabledChange,
 }: DetectionModeSelectorProps) {
   const reduxSam2Enabled = useSelector(selectSam2Enabled);
-  const hardware = useSelector(
-    (state: any) => state.hardware as HardwareSelectorState
-  );
+  const hardware = useSelector((state: RootState) => state.hardware as HardwareSelectorState);
 
   const [capabilityInfo, setCapabilityInfo] = useState<CapabilityInfo>(INITIAL_CAPABILITY_INFO);
   const resolvedDetectionSettings = normalizeObbDetectionSettings({

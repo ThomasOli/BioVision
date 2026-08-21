@@ -18,6 +18,7 @@ import { TrainModelDialog } from "./PopUp";
 import { DetectionModeSelector, DetectionMode } from "./DetectionModeSelector";
 import type {
   ObbDetectionSettings,
+  ObbDatasetProfile,
   ObbTrainProgressEvent,
   ObbTrainingSettings,
   RepresentativeImageDimensions,
@@ -53,6 +54,7 @@ interface MenuProps {
   obbDetectionSettings?: ObbDetectionSettings;
   obbDetectionRecommendation?: string;
   representativeImageDimensions?: RepresentativeImageDimensions;
+  obbDatasetProfile?: ObbDatasetProfile;
   onObbDetectionSettingsChange?: (settings: ObbDetectionSettings) => void;
   // Auto mode class name
   className?: string;
@@ -109,6 +111,7 @@ const Menu: React.FC<MenuProps> = ({
   obbDetectionSettings,
   obbDetectionRecommendation,
   representativeImageDimensions,
+  obbDatasetProfile,
   onObbDetectionSettingsChange,
   className = "",
   onClassNameChange,
@@ -155,6 +158,9 @@ const Menu: React.FC<MenuProps> = ({
   const [modelPath, setModelPath] = useState("");
   const [preflightSummary, setPreflightSummary] = useState("");
   const [preflightWarning, setPreflightWarning] = useState("");
+  const [useImportedXml, setUseImportedXml] = useState(false);
+  const [importedXmlModelName, setImportedXmlModelName] = useState("");
+  const [importedXmlSummary, setImportedXmlSummary] = useState("");
   const [predictorType, setPredictorType] = useState<"dlib" | "cnn">("dlib");
   const [cnnVariants, setCnnVariants] = useState<CnnVariantOption[]>([]);
   const [cnnVariant, setCnnVariant] = useState<string>("simplebaseline");
@@ -258,8 +264,13 @@ const Menu: React.FC<MenuProps> = ({
     [cnnDatasetBucket]
   );
   const obbTrainingRecommendation = useMemo(
-    () => getRecommendedObbTrainingSettings(datasetSizeCount, hardware, representativeImageDimensions),
-    [datasetSizeCount, hardware, representativeImageDimensions]
+    () => getRecommendedObbTrainingSettings(
+      datasetSizeCount,
+      hardware,
+      representativeImageDimensions,
+      obbDatasetProfile
+    ),
+    [datasetSizeCount, hardware, representativeImageDimensions, obbDatasetProfile]
   );
 
   // Load augmentationPolicy and orientationMode from session when the train dialog opens
@@ -407,18 +418,32 @@ const Menu: React.FC<MenuProps> = ({
         samEnabled,
       });
       if (result?.ok) {
-        setObbDetectorReady(true);
         const mapStr = typeof result.map50 === "number" ? ` (mAP50: ${result.map50.toFixed(3)})` : "";
         const warningText = Array.isArray(result.warnings) && result.warnings.length > 0
           ? ` Warnings: ${result.warnings.join(" ")}`
           : "";
-        setObbTrainingMessage(`OBB detector trained${mapStr} — ready.${warningText}`);
-        setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
-          percent: 100,
-          stage: "done",
-          message: "OBB detector training complete",
-          details: prev?.details,
-        }));
+        if (result.modelStatus === "candidate") {
+          const reason = result.promotion?.reason
+            ? ` ${result.promotion.reason.replace(/_/g, " ")}.`
+            : "";
+          const message = `OBB candidate retained${mapStr}; active detector unchanged.${reason}${warningText}`;
+          setObbTrainingMessage(message);
+          setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
+            percent: 100,
+            stage: "candidate",
+            message: "Candidate retained; active OBB detector unchanged",
+            details: prev?.details,
+          }));
+        } else {
+          setObbDetectorReady(true);
+          setObbTrainingMessage(`OBB detector trained${mapStr} — active and ready.${warningText}`);
+          setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
+            percent: 100,
+            stage: "done",
+            message: "Active OBB detector training complete",
+            details: prev?.details,
+          }));
+        }
       } else {
         setObbTrainingMessage(`OBB training failed: ${result?.error ?? "unknown error"}`);
         setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
@@ -475,9 +500,10 @@ const Menu: React.FC<MenuProps> = ({
   const handleOpenFolder = async () => {
     if (!modelPath) return;
     try {
-      // @ts-expect-error - API may not exist in preload yet
-      if (window.api?.openPath) await window.api.openPath(modelPath);
-      else toast.info("Open folder is not implemented yet.");
+      const result = await window.api.openPath(modelPath);
+      if (!result?.ok) {
+        toast.error(result?.error || "Could not open folder.");
+      }
     } catch (err) {
       console.error("Failed to open folder", err);
       toast.error("Could not open folder.");
@@ -501,6 +527,7 @@ const Menu: React.FC<MenuProps> = ({
     const preflight = await window.api.trainingPreflight({
       speciesId: activeSpeciesId ?? undefined,
       modelName: name,
+      useImportedXml,
       workspaceImages: latestFileArray.length,
     });
 
@@ -509,7 +536,11 @@ const Menu: React.FC<MenuProps> = ({
     }
 
     setPreflightSummary(
-      `Preflight: ${preflight.totalTrainableImages ?? 0} trainable image(s) - Landmarks: ${preflight.landmarkMessage}`
+      preflight.useImportedXml
+        ? `Preflight: ${preflight.trainXmlImages ?? 0} train, ` +
+          `${preflight.validationXmlImages ?? 0} validation, ` +
+          `${preflight.testXmlImages ?? 0} test image(s) - Landmarks: ${preflight.landmarkMessage}`
+        : `Preflight: ${preflight.totalTrainableImages ?? 0} trainable image(s) - Landmarks: ${preflight.landmarkMessage}`
     );
 
     const warningText = (preflight.warnings || []).join(" | ");
@@ -551,15 +582,30 @@ const Menu: React.FC<MenuProps> = ({
       const preflight = await runPreflight(true);
       if (!preflight) return;
 
-      toast.info("Training from session data...");
+      toast.info(useImportedXml ? "Training from imported dlib XML..." : "Training from session data...");
       const result = await window.api.trainModel(name, {
         speciesId: activeSpeciesId ?? undefined,
+        useImportedXml,
         predictorType,
         cnnVariant: predictorType === "cnn" ? cnnVariant : undefined,
       });
       if (!result.ok) throw new Error(result.error);
       console.log("Training output:", result.output);
-      toast.success("Training complete.");
+      if (
+        result.modelStatus === "candidate" ||
+        result.promotion?.promoted === false
+      ) {
+        const reason = result.promotion?.reason
+          ? ` (${result.promotion.reason.replace(/_/g, " ")})`
+          : "";
+        toast.info(
+          `Training complete: candidate retained; active landmark model unchanged${reason}.`
+        );
+      } else if (result.modelStatus === "active") {
+        toast.success("Training complete. The new landmark model is active.");
+      } else {
+        toast.success("Training complete.");
+      }
 
       setOpenTrainDialog(false);
     } catch (err) {
@@ -571,6 +617,47 @@ const Menu: React.FC<MenuProps> = ({
       setTrainingProgress(null);
     }
   };
+
+  const handleImportDlibXml = async () => {
+    const name = modelName.trim();
+    if (!activeSpeciesId) {
+      toast.error("Select a session before importing dlib XML.");
+      return;
+    }
+    if (!name) {
+      toast.error("Enter the model name before importing XML.");
+      return;
+    }
+    try {
+      const result = await window.api.importDlibXml({
+        modelName: name,
+        speciesId: activeSpeciesId,
+      });
+      if (result.canceled) return;
+      if (!result.ok) throw new Error(result.error || "dlib XML import failed.");
+      setUseImportedXml(true);
+      setImportedXmlModelName(name);
+      setImportedXmlSummary(
+        `${result.trainStats?.num_images ?? 0} train, ` +
+        `${result.validationStats?.num_images ?? 0} validation, ` +
+        `${result.testStats?.num_images ?? 0} test image(s); ` +
+        `mapping ${result.mappingMode || "verified"}.`
+      );
+      setPreflightSummary("");
+      setPreflightWarning((result.warnings || []).join(" | "));
+      toast.success("Imported dlib XML and froze its validation contract.");
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : "Failed to import dlib XML.");
+    }
+  };
+
+  useEffect(() => {
+    if (!useImportedXml) return;
+    if (modelName.trim() === importedXmlModelName) return;
+    setUseImportedXml(false);
+    setImportedXmlModelName("");
+    setImportedXmlSummary("");
+  }, [modelName, importedXmlModelName, useImportedXml]);
   useEffect(() => {
     if (!openTrainDialog) return;
     runPreflight(false).catch((err) => {
@@ -612,6 +699,15 @@ const Menu: React.FC<MenuProps> = ({
           setModelName={setModelName}
           preflightSummary={preflightSummary}
           preflightWarning={preflightWarning}
+          useImportedXml={useImportedXml}
+          importedXmlSummary={importedXmlSummary}
+          onImportDlibXml={handleImportDlibXml}
+          onUseSessionData={() => {
+            setUseImportedXml(false);
+            setImportedXmlModelName("");
+            setImportedXmlSummary("");
+            setPreflightSummary("");
+          }}
           predictorType={predictorType}
           setPredictorType={setPredictorType}
           cnnVariants={datasetAwareCnnVariants}

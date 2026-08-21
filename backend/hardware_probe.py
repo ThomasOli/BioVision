@@ -11,6 +11,7 @@ import sys
 def probe() -> dict:
     device = "cpu"
     gpu_name = None
+    gpu_memory_gb = None
 
     try:
         import torch  # noqa: PLC0415
@@ -21,6 +22,11 @@ def probe() -> dict:
                 gpu_name = torch.cuda.get_device_name(0)
             except Exception:
                 gpu_name = "NVIDIA GPU"
+            try:
+                properties = torch.cuda.get_device_properties(0)
+                gpu_memory_gb = round(properties.total_memory / (1024**3), 1)
+            except Exception:
+                gpu_memory_gb = None
         elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             device = "mps"
             gpu_name = "Apple Silicon MPS"
@@ -52,7 +58,12 @@ def probe() -> dict:
         except Exception:
             pass
 
-    return {"device": device, "gpu_name": gpu_name, "ram_gb": ram_gb}
+    return {
+        "device": device,
+        "gpu_name": gpu_name,
+        "gpu_memory_gb": gpu_memory_gb,
+        "ram_gb": ram_gb,
+    }
 
 
 if __name__ == "__main__":

@@ -104,6 +104,8 @@ export interface LandmarkDefinition {
   name: string; // "Left Forewing Apex"
   description?: string;
   category?: string; // "forewing", "head", "body", etc.
+  /** Optional landmarks may be omitted from an individual annotation. Defaults to true. */
+  required?: boolean;
 }
 
 export type OrientationMode = "directional" | "bilateral" | "axial" | "invariant";
@@ -119,11 +121,38 @@ export type ObbDetectionPreset =
   | "single_object"
   | "custom";
 
+export interface DetectionModelProvenance {
+  modelId: string;
+  artifactSha256: string | null;
+  configSha256?: string | null;
+  displayName: string;
+  kind: "trained_obb" | "zero_shot";
+}
+
 export interface RepresentativeImageDimensions {
   width: number;
   height: number;
   sampleCount?: number;
   megapixels?: number;
+}
+
+/**
+ * Annotation-derived signals used to tune OBB defaults. All fields are optional
+ * so older sessions and callers that only know image count/resolution remain valid.
+ */
+export interface ObbDatasetProfile {
+  sampledImageCount?: number;
+  annotatedImageCount?: number;
+  objectCount?: number;
+  medianObjectsPerImage?: number;
+  p90ObjectsPerImage?: number;
+  medianObjectShortSidePx?: number;
+  p10ObjectShortSidePx?: number;
+  medianObjectAreaFraction?: number;
+  classCounts?: Record<string, number>;
+  classImbalanceRatio?: number;
+  rotatedObjectFraction?: number;
+  overlapProxyFraction?: number;
 }
 
 export interface OrientationPolicy {
@@ -198,6 +227,7 @@ export interface LandmarkSchema {
   name: string;
   description: string;
   landmarks: LandmarkDefinition[];
+  orientationPolicy?: OrientationPolicy;
 }
 
 export interface ReusableSchemaTemplate extends LandmarkSchema {
@@ -245,6 +275,10 @@ export type AppView = 'landing' | 'workspace' | 'models' | 'inference' | 'agent'
 
 // Trained model metadata
 export interface TrainedModel {
+  /** Immutable registry identity. Preferred for UI selection and persisted references. */
+  modelId?: string;
+  /** Stable artifact lookup tag/path key; display-name changes must not alter it. */
+  artifactTag?: string;
   name: string;
   path: string;
   size: number;
@@ -253,7 +287,16 @@ export interface TrainedModel {
   modelKind?: "landmark" | "obb_detector";
   speciesId?: string;
   schemaName?: string;
-  status?: "active" | "deprecated";
+  status?: "active" | "candidate" | "deprecated";
+  metrics?: Record<string, unknown>;
+  promotion?: {
+    promoted?: boolean;
+    reason?: string;
+    metric?: string;
+    candidateScore?: number | null;
+    baselineScore?: number | null;
+    baselineModelId?: string | null;
+  };
   compatible?: boolean;
   reason?: string;
 }

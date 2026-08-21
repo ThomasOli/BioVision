@@ -13,10 +13,254 @@ if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
 
 import bv_utils.debug_io as dio
+import bv_utils.lineage as lineage
 import bv_utils.orientation_utils as ou
+from bv_utils.landmark_artifacts import bundle_id_mapping
 
 STANDARD_SIZE = 512
+DLIB_PROMOTION_MIN_ABSOLUTE_IMPROVEMENT = 1e-4
+DLIB_PROMOTION_MIN_RELATIVE_IMPROVEMENT = 0.005
 import numpy as np
+
+
+def _dlib_promotion_policy() -> dict:
+    return {
+        "policyVersion": "dlib_normalized_error_effect_v1",
+        "minimumAbsoluteImprovement": DLIB_PROMOTION_MIN_ABSOLUTE_IMPROVEMENT,
+        "minimumRelativeImprovement": DLIB_PROMOTION_MIN_RELATIVE_IMPROVEMENT,
+    }
+
+
+def _build_dlib_validation_evaluator_protocol(id_mapping: dict) -> dict:
+    """Pin the exact dlib validation metric/mapping contract used for promotion."""
+    raw_indices = id_mapping.get("dlib_index_to_original", {})
+    indexed_ids = sorted(
+        ((int(index), int(original_id)) for index, original_id in raw_indices.items()),
+        key=lambda item: item[0],
+    )
+    names_by_original: dict[int, list[str]] = {}
+    for part_name, original_id in id_mapping.get("dlib_name_to_original", {}).items():
+        try:
+            names_by_original.setdefault(int(original_id), []).append(str(part_name))
+        except (TypeError, ValueError):
+            continue
+    landmark_order = []
+    for model_index, original_id in indexed_ids:
+        matching_names = sorted(
+            names_by_original.get(original_id, []),
+            key=lambda value: (
+                int(value) if value.isdigit() else float("inf"),
+                value,
+            ),
+        )
+        landmark_order.append(
+            {
+                "modelIndex": model_index,
+                "xmlPartName": matching_names[0] if matching_names else str(model_index),
+                "schemaLandmarkId": original_id,
+            }
+        )
+
+    return lineage.build_validation_evaluator_protocol(
+        {
+            "formatVersion": 1,
+            "role": "landmark_validation_model_promotion",
+            "modelType": "dlib",
+            "evaluator": {
+                "implementation": "backend.training.train_shape_model",
+                "implementationVersion": "dlib_validation_evaluator_v1",
+                "nativeMeanCallable": "dlib.test_shape_predictor(dataset_filename,predictor_filename)",
+                "medianCallable": "_compute_dlib_per_image_errors",
+                "framework": "dlib",
+                "frameworkVersion": str(getattr(dlib, "__version__", "unknown")),
+                "numpyVersion": str(np.__version__),
+                "opencvVersion": str(cv2.__version__),
+            },
+            "preprocessing": {
+                "canonicalImageSize": [STANDARD_SIZE, STANDARD_SIZE],
+                "imageDecoder": "cv2.imread",
+                "colorConversion": "cv2.COLOR_BGR2RGB",
+                "predictionRectangleInclusive": [
+                    0,
+                    0,
+                    STANDARD_SIZE - 1,
+                    STANDARD_SIZE - 1,
+                ],
+                "xmlBoxSelection": "first_box",
+                "targetPartOrdering": "numeric_then_lexical_part_name",
+                "missingOrUnreadableSamplePolicy": "skip",
+                "predictionPartCount": "min(predicted_parts,target_parts)",
+            },
+            "landmarkOrder": landmark_order,
+            "metricDefinitions": {
+                "validationMedianError": {
+                    "implementation": "numpy.median",
+                    "perLandmark": "euclidean_l2(predicted_xy,target_xy)",
+                    "perImageReduction": "mean",
+                    "normalizationDenominator": float(STANDARD_SIZE),
+                    "cohortReduction": "median",
+                    "promotionPriority": 1,
+                },
+                "validationError": {
+                    "implementation": "dlib.test_shape_predictor",
+                    "definition": "native_mean_average_part_error",
+                    "explicitScaleNormalization": False,
+                    "promotionPriority": 2,
+                },
+                "validationP95Error": {
+                    "source": "validationMedianError_per_image_values",
+                    "cohortReduction": "numpy.percentile(method=linear,p=95)",
+                },
+                "validationMaxError": {
+                    "source": "validationMedianError_per_image_values",
+                    "cohortReduction": "max",
+                },
+            },
+            "stabilityGate": {
+                "implementation": "_dlib_validation_stability_gate",
+                "implementationVersion": "dlib_validation_tail_gate_v1",
+                "meanFailure": {"ratioGte": 4.0, "absoluteGte": 0.08},
+                "p95Failure": {"ratioGte": 6.0, "absoluteGte": 0.15},
+                "maxFailure": {"ratioGte": 10.0, "absoluteGte": 0.20},
+                "combination": "reject_if_any_failure",
+            },
+        }
+    )
+
+
+def _resolve_xml_image_path(xml_path: str, image_reference: str) -> str:
+    reference = os.path.expanduser(str(image_reference or "").strip())
+    if not reference:
+        raise RuntimeError(f"Training XML {xml_path} contains an image with no file path.")
+    return reference if os.path.isabs(reference) else os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(xml_path)), reference)
+    )
+
+
+def _effective_xml_role_snapshot(xml_path: str, role: str) -> dict:
+    """Fingerprint the exact XML geometry and canonical pixels consumed by dlib."""
+    if not os.path.isfile(xml_path):
+        raise RuntimeError(f"Effective {role} XML is missing: {xml_path}")
+    try:
+        root = ET.parse(xml_path).getroot()
+    except Exception as exc:
+        raise RuntimeError(f"Effective {role} XML is unreadable: {xml_path}: {exc}") from exc
+
+    images_node = root.find("images")
+    samples = []
+    for image_node in images_node.findall("image") if images_node is not None else []:
+        image_path = _resolve_xml_image_path(xml_path, image_node.get("file", ""))
+        if not os.path.isfile(image_path):
+            raise RuntimeError(
+                f"Effective {role} XML references a missing canonical crop: {image_path}"
+            )
+        boxes = []
+        for box_node in image_node.findall("box"):
+            parts = [
+                {
+                    "name": str(part.get("name") or ""),
+                    "x": int(part.get("x", 0)),
+                    "y": int(part.get("y", 0)),
+                }
+                for part in box_node.findall("part")
+            ]
+            parts.sort(key=lambda item: (item["name"], item["x"], item["y"]))
+            boxes.append(
+                {
+                    "left": int(box_node.get("left", 0)),
+                    "top": int(box_node.get("top", 0)),
+                    "width": int(box_node.get("width", 0)),
+                    "height": int(box_node.get("height", 0)),
+                    "parts": parts,
+                }
+            )
+        boxes.sort(key=lineage.sha256_json)
+        image_sha256 = lineage.sha256_file(image_path)
+        samples.append(
+            {
+                "contentId": f"sha256:{image_sha256}",
+                "imageSha256": image_sha256,
+                "boxes": boxes,
+            }
+        )
+    samples.sort(key=lineage.sha256_json)
+    payload = {
+        "formatVersion": 1,
+        "role": str(role),
+        "xmlSha256": lineage.sha256_file(xml_path),
+        "sampleCount": len(samples),
+        "boxCount": sum(len(sample["boxes"]) for sample in samples),
+        "partCount": sum(
+            len(box["parts"])
+            for sample in samples
+            for box in sample["boxes"]
+        ),
+        "samples": samples,
+    }
+    payload["revision"] = lineage.sha256_json(payload)
+    return payload
+
+
+def _build_effective_dlib_dataset_snapshot(role_paths: dict[str, str], artifact_dir: str) -> dict:
+    """Create an artifact-local, path-independent descriptor of every effective role."""
+    roles = {}
+    for role, xml_path in sorted(role_paths.items()):
+        if not xml_path:
+            continue
+        snapshot = _effective_xml_role_snapshot(xml_path, role)
+        relative_path = os.path.join("datasets", f"{role}.xml").replace("\\", "/")
+        artifact_xml_path = os.path.join(artifact_dir, *relative_path.split("/"))
+        lineage.atomic_copy_file(xml_path, artifact_xml_path)
+        if lineage.sha256_file(artifact_xml_path) != snapshot["xmlSha256"]:
+            raise RuntimeError(f"Immutable {role} XML copy failed integrity verification.")
+        roles[role] = {
+            **snapshot,
+            "artifactRelativePath": relative_path,
+        }
+    canonical = {"formatVersion": 1, "modelType": "dlib", "roles": roles}
+    return {**canonical, "revision": lineage.sha256_json(canonical)}
+
+
+def _assert_effective_dlib_dataset_unchanged(
+    role_paths: dict[str, str],
+    expected: dict,
+) -> None:
+    """Fail if any trainer/evaluator XML, geometry, or crop byte changed mid-run."""
+    roles = {}
+    for role, xml_path in sorted(role_paths.items()):
+        if not xml_path:
+            continue
+        relative_path = os.path.join("datasets", f"{role}.xml").replace("\\", "/")
+        roles[role] = {
+            **_effective_xml_role_snapshot(xml_path, role),
+            "artifactRelativePath": relative_path,
+        }
+    canonical = {"formatVersion": 1, "modelType": "dlib", "roles": roles}
+    observed_revision = lineage.sha256_json(canonical)
+    expected_revision = str(expected.get("revision") or "")
+    if not expected_revision or observed_revision != expected_revision:
+        raise RuntimeError(
+            "The effective dlib dataset changed while training or evaluation was running. "
+            "The artifact was not published; restore the prepared XML/crops and retry."
+        )
+
+
+def _build_dlib_training_protocol(params_log: dict, effective_dataset_revision: str) -> dict:
+    excluded = {"model_id", "artifact_tag", "run_id", "augmented_xml"}
+    parameters = {
+        key: value
+        for key, value in params_log.items()
+        if key not in excluded
+    }
+    canonical = {
+        "formatVersion": 1,
+        "modelType": "dlib",
+        "trainer": "dlib.train_shape_predictor",
+        "effectiveDatasetRevision": str(effective_dataset_revision),
+        "parameters": parameters,
+        "promotionPolicy": _dlib_promotion_policy(),
+    }
+    return {**canonical, "revision": lineage.sha256_json(canonical)}
 
 
 def _apply_photo_jitter(
@@ -58,10 +302,11 @@ def _resolve_dlib_aug_angles(orientation_mode: str, aug_angles_param) -> list:
     """
     if aug_angles_param is not None:
         return list(aug_angles_param)
-    mode = str(orientation_mode or "").strip().lower()
-    if mode in ("directional", "axial"):
-        return [-5, 5]
-    return [-30, -15, 15, 30]
+    profile = ou.get_schema_augmentation_profile(
+        orientation_mode,
+        engine="dlib",
+    )
+    return list(profile.get("angles", []))
 
 
 def _resolve_orientation_mode(project_root, tag):
@@ -136,6 +381,7 @@ def augment_training_data(
     name_swap_map=None,
     max_augmented_copies_per_image=None,
     photo_jitter_profile=None,
+    random_seed=42,
 ):
     """
     Pre-augment a dlib training XML by generating rotated (and optionally flipped)
@@ -167,7 +413,7 @@ def augment_training_data(
 
     cx, cy = STANDARD_SIZE / 2.0, STANDARD_SIZE / 2.0
     augmented_entries = []  # list of (file_path, parts_list) where parts_list = [(name,x,y),...]
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(int(random_seed))
 
     for img_el in images_el.findall("image"):
         img_file = img_el.get("file")
@@ -566,6 +812,66 @@ def _compute_dlib_per_image_error_details(xml_path: str, predictor_path: str) ->
     return details
 
 
+def _dlib_validation_stability_gate(per_image_errors, mean_error, median_error):
+    """Reject candidates whose median improvement hides catastrophic tails."""
+    finite_errors = []
+    for value in per_image_errors or []:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric) and numeric >= 0.0:
+            finite_errors.append(numeric)
+    if not finite_errors or mean_error is None or median_error is None:
+        return {
+            "available": False,
+            "passed": None,
+            "reason": "validation_stability_unavailable",
+        }
+    median = float(median_error)
+    denominator = max(median, 1e-12)
+    p95 = float(np.percentile(finite_errors, 95))
+    maximum = float(max(finite_errors))
+    mean_median_ratio = float(mean_error) / denominator
+    p95_median_ratio = p95 / denominator
+    max_median_ratio = maximum / denominator
+    # Ratio-only gates are unstable when a strong model has a near-zero median.
+    # Require both extreme relative divergence and a biologically material
+    # absolute normalized error before declaring a catastrophic tail.
+    mean_tail_failure = mean_median_ratio >= 4.0 and float(mean_error) >= 0.08
+    p95_tail_failure = p95_median_ratio >= 6.0 and p95 >= 0.15
+    max_tail_failure = max_median_ratio >= 10.0 and maximum >= 0.20
+    passed = not (
+        mean_tail_failure
+        or p95_tail_failure
+        or max_tail_failure
+    )
+    return {
+        "available": True,
+        "passed": passed,
+        "reason": "validation_tail_stable" if passed else "catastrophic_validation_outliers",
+        "meanMedianRatio": mean_median_ratio,
+        "p95MedianRatio": p95_median_ratio,
+        "maxMedianRatio": max_median_ratio,
+        "p95Error": p95,
+        "maxError": maximum,
+        "sampleCount": len(finite_errors),
+        "failedChecks": {
+            "meanTail": mean_tail_failure,
+            "p95Tail": p95_tail_failure,
+            "maxTail": max_tail_failure,
+        },
+        "thresholds": {
+            "meanMedianRatioExclusiveMax": 4.0,
+            "meanErrorMaterialMinimum": 0.08,
+            "p95MedianRatioExclusiveMax": 6.0,
+            "p95ErrorMaterialMinimum": 0.15,
+            "maxMedianRatioExclusiveMax": 10.0,
+            "maxErrorMaterialMinimum": 0.20,
+        },
+    }
+
+
 def train_shape_model(project_root, tag, custom_options=None,
                       aug_angles=None, aug_flip=None):
     """
@@ -588,6 +894,9 @@ def train_shape_model(project_root, tag, custom_options=None,
     os.makedirs(modeldir, exist_ok=True)
     os.makedirs(debug_dir, exist_ok=True)
     run_dir, run_id = dio.create_model_run_dir(project_root, "dlib", tag)
+    model_id = lineage.build_model_id("dlib", run_id)
+    artifact_tag = lineage.build_artifact_tag(tag, run_id)
+    artifact_dir = lineage.create_model_artifact_dir(project_root, "dlib", run_id)
     dio.write_run_manifest(
         run_dir,
         model_type="dlib",
@@ -597,11 +906,18 @@ def train_shape_model(project_root, tag, custom_options=None,
     )
 
     train_xml = os.path.join(xmldir, f"train_{tag}.xml")
+    validation_xml = os.path.join(xmldir, f"validation_{tag}.xml")
     test_xml = os.path.join(xmldir, f"test_{tag}.xml")
-    predictor_path = os.path.join(modeldir, f"predictor_{tag}.dat")
+    # Train directly into an immutable run directory. Compatibility aliases are
+    # published only after training and evaluation complete successfully.
+    predictor_path = os.path.join(artifact_dir, "predictor.dat")
 
     if not os.path.exists(train_xml):
         raise FileNotFoundError(f"Train XML not found at {train_xml}")
+    artifact_id_mapping_path, id_mapping_descriptor, artifact_id_mapping = bundle_id_mapping(
+        os.path.join(debug_dir, f"id_mapping_{tag}.json"),
+        artifact_dir,
+    )
     print("PROGRESS 8 loading_dataset", file=sys.stderr)
     print(
         "PROGRESS_JSON " + json.dumps(
@@ -637,6 +953,17 @@ def train_shape_model(project_root, tag, custom_options=None,
     #   directional/axial → ±5° (mean-shape stability)
     #   invariant/bilateral → [-30, -15, 15, 30] (no chirality to protect)
     aug_angles = _resolve_dlib_aug_angles(orientation_mode, aug_angles)
+    raw_augmentation_seed = (custom_options or {}).get(
+        "augmentation_seed",
+        (custom_options or {}).get("random_seed", 42),
+    )
+    try:
+        augmentation_seed = int(raw_augmentation_seed)
+    except (TypeError, ValueError):
+        augmentation_seed = int(
+            lineage.sha256_bytes(str(raw_augmentation_seed).encode("utf-8"))[:16],
+            16,
+        ) % (2 ** 32)
     print("PROGRESS 15 preparing_augmentation", file=sys.stderr)
 
     actual_train_xml = train_xml
@@ -654,6 +981,7 @@ def train_shape_model(project_root, tag, custom_options=None,
             name_swap_map=name_swap_map,
             max_augmented_copies_per_image=aug_profile.get("max_augmented_copies_per_image"),
             photo_jitter_profile=aug_profile,
+            random_seed=augmentation_seed,
         )
 
     # Count effective images/landmarks after augmentation
@@ -703,10 +1031,14 @@ def train_shape_model(project_root, tag, custom_options=None,
 
     # Log training parameters
     params_log = {
+        "model_id": model_id,
+        "artifact_tag": artifact_tag,
+        "run_id": run_id,
         "raw_num_images": raw_num_images,
         "raw_num_landmarks": raw_num_landmarks,
         "source_counts": {
             "train": raw_num_images,
+            "validation": count_landmarks_in_xml(validation_xml)[0] if os.path.exists(validation_xml) else 0,
             "test": count_landmarks_in_xml(test_xml)[0] if os.path.exists(test_xml) else 0,
         },
         "num_images": num_images,
@@ -723,6 +1055,10 @@ def train_shape_model(project_root, tag, custom_options=None,
         "oversampling_translation_jitter": options.oversampling_translation_jitter,
         "feature_pool_region_padding": options.feature_pool_region_padding,
         "lambda_param": options.lambda_param,
+        "random_seed": options.random_seed,
+        "augmentation_seed": augmentation_seed,
+        "num_threads": options.num_threads,
+        "be_verbose": options.be_verbose,
         "aug_angles": aug_angles,
         "aug_flip": aug_flip,
         "aug_profile": aug_profile,
@@ -737,6 +1073,69 @@ def train_shape_model(project_root, tag, custom_options=None,
         json.dump(params_log, f, indent=2)
     print(f"Training parameters saved to: {params_path}", file=sys.stderr)
     dio.write_run_json(run_dir, "train_params.json", params_log)
+
+    role_paths = {
+        "fit": actual_train_xml,
+        "trainReport": train_xml,
+        **({"validation": validation_xml} if os.path.isfile(validation_xml) else {}),
+        **({"test": test_xml} if os.path.isfile(test_xml) else {}),
+    }
+    effective_dataset = _build_effective_dlib_dataset_snapshot(role_paths, artifact_dir)
+    effective_dataset_path = os.path.join(artifact_dir, "effective_dataset.json")
+    lineage.atomic_write_json(effective_dataset_path, effective_dataset)
+    training_protocol = _build_dlib_training_protocol(
+        params_log,
+        effective_dataset["revision"],
+    )
+    training_protocol_path = os.path.join(artifact_dir, "training_parameters.json")
+    lineage.atomic_write_json(training_protocol_path, training_protocol)
+    validation_evaluator_protocol = _build_dlib_validation_evaluator_protocol(
+        artifact_id_mapping
+    )
+    validation_evaluator_protocol_path = os.path.join(
+        artifact_dir,
+        "validation_evaluator_protocol.json",
+    )
+    lineage.atomic_write_json(
+        validation_evaluator_protocol_path,
+        validation_evaluator_protocol,
+    )
+
+    baseline_record = lineage.get_active_model_record(project_root, "dlib")
+    baseline_model_id = (
+        str(baseline_record.get("modelId")) if baseline_record else None
+    )
+    lineage_payload = lineage.build_run_lineage(
+        project_root,
+        split_paths=[os.path.join(debug_dir, f"split_info_{tag}.json")],
+        # dlib has no warm-start API here: every run is fit from scratch.  The
+        # active model is the scientific comparison baseline, not a weight
+        # parent, and those identities must not be conflated in lineage.
+        parent_model_id=None,
+        baseline_model_id=baseline_model_id,
+        training_mode="retrain_from_base" if baseline_model_id else "train_from_base",
+        initialization={
+            "strategy": "from_scratch",
+            "framework": "dlib",
+            "checkpoint": None,
+        },
+    )
+    lineage_payload["projectStateRevision"] = (
+        lineage_payload.get("dataset", {}).get("revision")
+        if isinstance(lineage_payload.get("dataset"), dict)
+        else None
+    )
+    lineage_payload["effectiveDataset"] = {
+        "revision": effective_dataset["revision"],
+        "descriptorSha256": lineage.sha256_file(effective_dataset_path),
+    }
+    lineage_payload["trainingProtocol"] = {
+        "revision": training_protocol["revision"],
+        "descriptorSha256": lineage.sha256_file(training_protocol_path),
+    }
+    lineage_payload["validationEvaluatorProtocol"] = validation_evaluator_protocol
+    lineage_payload["promotionPolicy"] = _dlib_promotion_policy()
+    dio.write_run_json(run_dir, "lineage.json", lineage_payload)
 
     # Capture the dataset/debug artifacts used to train this run.
     for name in [
@@ -791,7 +1190,9 @@ def train_shape_model(project_root, tag, custom_options=None,
     print("MODEL_PATH", predictor_path)
 
     # ── Evaluate mean error (dlib native) + per-image median ──────────────────
-    print("PROGRESS 88 evaluating_train_test_error", file=sys.stderr)
+    # Validation alone gates promotion; the permanently locked test set is
+    # evaluated only for the final report.
+    print("PROGRESS 88 evaluating_train_validation_error", file=sys.stderr)
     train_error = dlib.test_shape_predictor(train_xml, predictor_path)
     print("TRAIN_ERROR", train_error)
     _train_per = _compute_dlib_per_image_errors(train_xml, predictor_path)
@@ -799,49 +1200,126 @@ def train_shape_model(project_root, tag, custom_options=None,
     train_median_error = float(np.median(_train_per)) if _train_per else float("nan")
     print("TRAIN_MEDIAN_ERROR", round(train_median_error, 6))
 
+    validation_error = None
+    validation_mean_normalized_error = None
+    validation_median_error = None
+    validation_error_details: list[dict] = []
+    validation_per_image: list[float] = []
+    if os.path.exists(validation_xml) and count_landmarks_in_xml(validation_xml)[0] > 0:
+        validation_error = dlib.test_shape_predictor(validation_xml, predictor_path)
+        print("VALIDATION_ERROR", validation_error)
+        validation_per_image = _compute_dlib_per_image_errors(validation_xml, predictor_path)
+        validation_error_details = _compute_dlib_per_image_error_details(
+            validation_xml,
+            predictor_path,
+        )
+        validation_mean_normalized_error = (
+            float(np.mean(validation_per_image)) if validation_per_image else None
+        )
+        validation_median_error = (
+            float(np.median(validation_per_image)) if validation_per_image else float("nan")
+        )
+        print("VALIDATION_MEDIAN_ERROR", round(validation_median_error, 6))
+
+    # Report-only frozen-test evaluation.
+    #
+    # Model selection is validation-only: `lineage` ranks candidates on
+    # `validationMedianError`/`validationError` and never reads a test metric,
+    # and the stability gate below is computed from validation errors alone.
+    # The frozen test cohort is measured here purely so a promoted artifact
+    # carries an unbiased generalization number, matching what the CNN and OBB
+    # trainers already record.
     test_error = None
     test_median_error = None
+    test_mean_normalized_error = None
+    test_per_image: list[float] = []
     test_error_details: list[dict] = []
-    if os.path.exists(test_xml):
+    test_landmark_count = count_landmarks_in_xml(test_xml)[0] if os.path.exists(test_xml) else 0
+    if test_landmark_count > 0:
         test_error = dlib.test_shape_predictor(test_xml, predictor_path)
         print("TEST_ERROR", test_error)
-        _test_per = _compute_dlib_per_image_errors(test_xml, predictor_path)
+        test_per_image = _compute_dlib_per_image_errors(test_xml, predictor_path)
         test_error_details = _compute_dlib_per_image_error_details(test_xml, predictor_path)
-        test_median_error = float(np.median(_test_per)) if _test_per else float("nan")
+        test_mean_normalized_error = (
+            float(np.mean(test_per_image)) if test_per_image else None
+        )
+        test_median_error = (
+            float(np.median(test_per_image)) if test_per_image else float("nan")
+        )
         print("TEST_MEDIAN_ERROR", round(test_median_error, 6))
+        test_evaluation = {
+            "status": "measured",
+            "role": "report_only",
+            "reason": "never_used_for_model_selection",
+            "cohort": "frozen_test",
+            "sampleCount": len(test_per_image),
+            "meanNormalizedError": test_mean_normalized_error,
+            "medianNormalizedError": test_median_error,
+        }
+    else:
+        test_evaluation = {
+            "status": "unavailable",
+            "role": "report_only",
+            "reason": (
+                "missing_frozen_test_cohort"
+                if not os.path.exists(test_xml)
+                else "empty_frozen_test_cohort"
+            ),
+            "cohort": "frozen_test",
+            "sampleCount": 0,
+        }
 
-    instability_ratio = None
-    if test_error is not None and test_median_error is not None and test_median_error > 0:
-        instability_ratio = float(test_error) / float(test_median_error)
-    elif train_median_error and train_median_error > 0:
-        instability_ratio = float(train_error) / float(train_median_error)
-    unstable = bool(instability_ratio is not None and instability_ratio >= 10.0)
+    _assert_effective_dlib_dataset_unchanged(role_paths, effective_dataset)
+
+    stability_gate = _dlib_validation_stability_gate(
+        validation_per_image,
+        validation_mean_normalized_error,
+        validation_median_error,
+    )
+    instability_ratio = stability_gate.get("meanMedianRatio")
+    unstable = stability_gate.get("passed") is False
     instability_warning = (
         {
             "code": "high_mean_median_divergence",
             "severity": "warning",
             "message": "Mean error diverges sharply from median error; catastrophic outliers detected.",
             "ratio": float(instability_ratio),
+            "stabilityGate": stability_gate,
         }
         if unstable and instability_ratio is not None
         else None
     )
     worst_train_failures = sorted(train_error_details, key=lambda item: item["mean_error"], reverse=True)[:10]
+    worst_validation_failures = sorted(
+        validation_error_details,
+        key=lambda item: item["mean_error"],
+        reverse=True,
+    )[:10]
     worst_test_failures = sorted(test_error_details, key=lambda item: item["mean_error"], reverse=True)[:10]
 
     # Save results
     results = {
+        "model_id": model_id,
+        "artifact_tag": artifact_tag,
+        "run_id": run_id,
         "model_path": predictor_path,
         "train_error": train_error,
         "train_median_error": train_median_error,
+        "validation_error": validation_error,
+        "validation_mean_normalized_error": validation_mean_normalized_error,
+        "validation_median_error": validation_median_error,
         "test_error": test_error,
+        "test_mean_normalized_error": test_mean_normalized_error,
         "test_median_error": test_median_error,
         "source_counts": params_log["source_counts"],
         "instability_ratio": instability_ratio,
         "unstable": unstable,
+        "stability_gate": stability_gate,
         "instability_warning": instability_warning,
         "train_error_details": train_error_details,
+        "validation_error_details": validation_error_details,
         "test_error_details": test_error_details,
+        "test_evaluation": test_evaluation,
         "num_images": num_images,
         "num_landmarks": num_landmarks,
     }
@@ -851,6 +1329,7 @@ def train_shape_model(project_root, tag, custom_options=None,
     print(f"Results saved to: {results_path}", file=sys.stderr)
     dio.write_run_json(run_dir, "worst_failures.json", {
         "train": worst_train_failures,
+        "validation": worst_validation_failures,
         "test": worst_test_failures,
     })
     dio.write_json(
@@ -859,6 +1338,7 @@ def train_shape_model(project_root, tag, custom_options=None,
             "tag": tag,
             "run_id": run_id,
             "train": worst_train_failures,
+            "validation": worst_validation_failures,
             "test": worst_test_failures,
         },
     )
@@ -871,6 +1351,7 @@ def train_shape_model(project_root, tag, custom_options=None,
             "tag": tag,
             "run_id": run_id,
             "train_xml": train_xml,
+            "validation_xml": validation_xml if os.path.exists(validation_xml) else None,
             "test_xml": test_xml if os.path.exists(test_xml) else None,
             "augmented_xml": actual_train_xml if actual_train_xml != train_xml else None,
         },
@@ -882,15 +1363,118 @@ def train_shape_model(project_root, tag, custom_options=None,
         project_root=project_root,
         extra={
             "status": "completed",
+            "model_id": model_id,
+            "artifact_tag": artifact_tag,
             "model_path": predictor_path,
             "train_error": train_error,
             "train_median_error": train_median_error,
+            "validation_error": validation_error,
+            "validation_median_error": validation_median_error,
             "test_error": test_error,
             "test_median_error": test_median_error,
             "unstable": unstable,
             "instability_warning": instability_warning,
         },
     )
+
+    # Publish immutable metadata, a unique backend tag for this exact run, and a
+    # legacy current-name alias.  A display-name rename updates only the registry.
+    artifact_manifest_path = os.path.join(artifact_dir, "manifest.json")
+    artifact_manifest = {
+        "formatVersion": 2,
+        "modelId": model_id,
+        "modelType": "dlib",
+        "predictorType": "dlib",
+        "displayName": tag,
+        "artifactTag": artifact_tag,
+        "runId": run_id,
+        "createdAt": lineage.utc_now_iso(),
+        "artifact": {
+            "path": predictor_path,
+            "relativePath": "predictor.dat",
+            "sha256": lineage.sha256_file(predictor_path),
+        },
+        "sidecars": {
+            "idMapping": id_mapping_descriptor,
+            "effectiveDataset": {
+                "format": "biovision.effective-landmark-dataset.v1",
+                "path": effective_dataset_path,
+                "relativePath": "effective_dataset.json",
+                "sha256": lineage.sha256_file(effective_dataset_path),
+            },
+            "trainingParameters": {
+                "format": "biovision.dlib-training-parameters.v1",
+                "path": training_protocol_path,
+                "relativePath": "training_parameters.json",
+                "sha256": lineage.sha256_file(training_protocol_path),
+            },
+            "validationEvaluatorProtocol": {
+                "format": "biovision.landmark-validation-evaluator-protocol.v1",
+                "path": validation_evaluator_protocol_path,
+                "relativePath": "validation_evaluator_protocol.json",
+                "sha256": lineage.sha256_file(validation_evaluator_protocol_path),
+                "fingerprint": validation_evaluator_protocol["fingerprint"],
+            },
+        },
+        "metrics": {
+            "trainError": train_error,
+            "trainMedianError": train_median_error,
+            "validationError": validation_error,
+            "validationMeanNormalizedError": validation_mean_normalized_error,
+            "validationMedianError": validation_median_error,
+            "validationP95Error": stability_gate.get("p95Error"),
+            "validationMaxError": stability_gate.get("maxError"),
+            "stabilityGatePassed": stability_gate.get("passed"),
+            "stabilityGate": stability_gate,
+            "unstable": unstable,
+        },
+        "lineage": lineage_payload,
+        "validationEvaluatorProtocol": validation_evaluator_protocol,
+        "testEvaluation": test_evaluation,
+        "promotionPolicy": _dlib_promotion_policy(),
+    }
+    lineage.atomic_write_json(artifact_manifest_path, artifact_manifest)
+
+    unique_alias_path = os.path.join(modeldir, f"predictor_{artifact_tag}.dat")
+    legacy_alias_path = os.path.join(modeldir, f"predictor_{tag}.dat")
+    lineage.atomic_copy_file(predictor_path, unique_alias_path)
+    for stem in (
+        "id_mapping",
+        "crop_metadata",
+        "box_scale",
+        "orientation",
+        "training_boxes",
+        "split_info",
+        "training_params",
+    ):
+        original_sidecar = os.path.join(debug_dir, f"{stem}_{tag}.json")
+        if os.path.isfile(original_sidecar):
+            lineage.atomic_copy_file(
+                original_sidecar,
+                os.path.join(debug_dir, f"{stem}_{artifact_tag}.json"),
+            )
+
+    registry_record = lineage.publish_model_run(
+        project_root,
+        model_type="dlib",
+        predictor_type="dlib",
+        run_id=run_id,
+        display_name=tag,
+        artifact_tag=artifact_tag,
+        artifact_path=predictor_path,
+        legacy_path=unique_alias_path,
+        run_manifest_path=artifact_manifest_path,
+        current_alias_path=legacy_alias_path,
+        metrics=artifact_manifest["metrics"],
+        promotion_policy=_dlib_promotion_policy(),
+        active_aliases=[(predictor_path, legacy_alias_path)],
+    )
+    results["registry"] = registry_record
+    results["id_mapping_path"] = artifact_id_mapping_path
+    print("MODEL_ID", model_id)
+    print("MODEL_TAG", artifact_tag)
+    print("MODEL_STATUS", registry_record.get("status"))
+    print("PROMOTION_JSON", json.dumps(registry_record.get("promotion", {}), sort_keys=True))
     print(f"dlib run debug saved to: {run_dir}", file=sys.stderr)
     print("PROGRESS 99 finalize", file=sys.stderr)
     print(

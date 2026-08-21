@@ -19,6 +19,7 @@ from detection.detect_specimen import detect_specimen
 from bv_utils.image_utils import load_image
 import bv_utils.orientation_utils as ou
 import bv_utils.debug_io as dio
+from bv_utils.landmark_artifacts import resolve_landmark_runtime
 
 STANDARD_SIZE = ou.STANDARD_SIZE
 
@@ -211,6 +212,69 @@ def _resolve_tail_landmark_id(project_root, id_mapping_data=None):
     except Exception:
         pass
     return _resolve_landmark_id_by_category(project_root, "tail")
+
+
+def _load_landmark_runtime_metadata(project_root, tag, predictor_type):
+    """Resolve a model and the exact metadata contract used to train it.
+
+    New immutable runs are authoritative: their model, ID mapping, template,
+    and orientation policy all come from the verified artifact directory.
+    Passing ``allow_legacy=True`` here is the deliberate compatibility path for
+    pre-registry models that still use models/debug aliases.
+    """
+    runtime = resolve_landmark_runtime(
+        project_root,
+        tag,
+        predictor_type,
+        allow_legacy=True,
+    )
+    id_mapping = runtime.get("id_mapping")
+    if not isinstance(id_mapping, dict):
+        id_mapping = {}
+    training_config = id_mapping.get("training_config")
+    if not isinstance(training_config, dict):
+        training_config = {}
+
+    if runtime.get("immutable"):
+        # The immutable resolver has already validated that this policy exists
+        # and agrees with the stored orientation mode.  Do not merge it with
+        # mutable session.json state.
+        orientation_policy = dict(training_config["orientation_policy"])
+    else:
+        try:
+            orientation_policy = ou.load_orientation_policy(project_root)
+        except Exception:
+            orientation_policy = {}
+
+    landmark_template = {}
+    for landmark_id, template in id_mapping.get("landmark_template", {}).items():
+        try:
+            landmark_template[int(landmark_id)] = template
+        except (TypeError, ValueError):
+            if runtime.get("immutable"):
+                raise
+
+    if runtime.get("immutable"):
+        def _artifact_landmark_id(field):
+            value = training_config.get(field)
+            return int(value) if value is not None else None
+
+        head_landmark_id = _artifact_landmark_id("head_landmark_id")
+        tail_landmark_id = _artifact_landmark_id("tail_landmark_id")
+    else:
+        head_landmark_id = _resolve_head_landmark_id(project_root, id_mapping or None)
+        tail_landmark_id = _resolve_tail_landmark_id(project_root, id_mapping or None)
+
+    return {
+        "runtime": runtime,
+        "id_mapping": id_mapping,
+        "index_to_original": _resolve_dlib_index_mapping(project_root, tag, id_mapping),
+        "orientation_policy": orientation_policy,
+        "target_orientation": training_config.get("target_orientation"),
+        "landmark_template": landmark_template,
+        "head_landmark_id": head_landmark_id,
+        "tail_landmark_id": tail_landmark_id,
+    }
 
 
 def _extract_landmarks(shape, index_to_original):
@@ -491,7 +555,13 @@ def _sam2_mask_for_box(image_bgr, box):
         return None
 
 
-def _build_inference_metadata(orientation_debug, *, clamped_landmark_count=0, box_source=None):
+def _build_inference_metadata(
+    orientation_debug,
+    *,
+    clamped_landmark_count=0,
+    landmark_count=0,
+    box_source=None,
+):
     """
     Build a stable metadata payload describing canonicalization + orientation choice.
     """
@@ -519,6 +589,18 @@ def _build_inference_metadata(orientation_debug, *, clamped_landmark_count=0, bo
         debug.get("was_flipped", debug.get("used_flipped_crop", False))
     )
     clamp_count = int(max(0, clamped_landmark_count))
+    total_landmarks = int(max(0, landmark_count))
+    clamp_fraction = float(clamp_count / total_landmarks) if total_landmarks > 0 else 0.0
+    template_score = debug.get(
+        "candidate_b_template_score"
+        if bool(debug.get("used_flipped_crop", False))
+        else "candidate_a_template_score"
+    )
+    try:
+        template_ood = max(0.0, min(1.0, float(template_score) / 2.0))
+    except Exception:
+        template_ood = 0.0
+    ood_score = max(clamp_fraction, template_ood)
     requires_review = clamp_count >= 3
     return {
         "mask_source": canonical.get("mask_source"),
@@ -537,6 +619,11 @@ def _build_inference_metadata(orientation_debug, *, clamped_landmark_count=0, bo
         "detector_hint_source": hint_source,
         "orientation_warning": debug.get("orientation_warning"),
         "clamped_landmark_count": clamp_count,
+        "landmark_count": total_landmarks,
+        "landmark_heatmap_entropy": debug.get("landmark_heatmap_entropy"),
+        "model_disagreement": debug.get("model_disagreement"),
+        "ood_score": float(max(0.0, min(1.0, ood_score))),
+        "ood_score_source": "geometry_template_proxy",
         "box_source": box_source,
         "landmark_health_warning": (
             {
@@ -794,11 +881,16 @@ if _torch_available:
             self.deconv = nn.Sequential(*layers)
             self.heatmap_head = nn.Conv2d(in_ch, self.n_landmarks, kernel_size=1, stride=1, padding=0)
 
-        def forward(self, x):
+        def forward_heatmaps(self, x):
             x = self.features(x)
             up = self.deconv(x)
-            heatmaps = self.heatmap_head(up)
-            return _spatial_soft_argmax_2d(heatmaps, beta=self.softargmax_beta)
+            return self.heatmap_head(up)
+
+        def forward(self, x):
+            return _spatial_soft_argmax_2d(
+                self.forward_heatmaps(x),
+                beta=self.softargmax_beta,
+            )
 
     _CNN_TRANSFORM = tv_transforms.Compose([
         tv_transforms.ToPILImage(),
@@ -831,7 +923,12 @@ def map_landmarks_to_original(
         image_shape=image_shape,
     )
     return [
-        {"id": lm["id"], "x": float(lm["x"]), "y": float(lm["y"])}
+        {
+            **{key: value for key, value in lm.items() if key not in {"id", "x", "y"}},
+            "id": lm["id"],
+            "x": float(lm["x"]),
+            "y": float(lm["y"]),
+        }
         for lm in mapped
     ]
 
@@ -879,6 +976,7 @@ def _clamp_landmarks_to_box(landmarks, box, *, image_shape=None):
             clamped_count += 1
             clamped_ids.append(int(lm.get("id", -1)))
         clamped.append({
+            **{key: value for key, value in lm.items() if key not in {"id", "x", "y"}},
             "id": int(lm["id"]),
             "x": int(round(new_x)),
             "y": int(round(new_y)),
@@ -980,8 +1078,32 @@ def _make_cnn_predict_fn(model, landmark_ids):
         img_rgb = cv2.cvtColor(crop_512, cv2.COLOR_BGR2RGB)
         img_tensor = _CNN_TRANSFORM(img_rgb).unsqueeze(0)
         with torch.no_grad():
-            coords = model(img_tensor)[0].cpu().numpy()
-        return _cnn_landmarks_from_coords(coords, landmark_ids, flip=False)
+            if hasattr(model, "forward_heatmaps"):
+                heatmaps = model.forward_heatmaps(img_tensor)
+                coords_tensor = _spatial_soft_argmax_2d(
+                    heatmaps,
+                    beta=getattr(model, "softargmax_beta", 25.0),
+                )
+                flat_logits = heatmaps.view(heatmaps.shape[0], heatmaps.shape[1], -1)
+                probabilities = torch.softmax(
+                    flat_logits * float(getattr(model, "softargmax_beta", 25.0)),
+                    dim=-1,
+                )
+                entropy = -torch.sum(
+                    probabilities * torch.log(probabilities.clamp_min(1e-12)),
+                    dim=-1,
+                ) / math.log(max(2, probabilities.shape[-1]))
+                entropy_np = entropy[0].cpu().numpy()
+            else:
+                coords_tensor = model(img_tensor)
+                entropy_np = None
+            coords = coords_tensor[0].cpu().numpy()
+        return _cnn_landmarks_from_coords(
+            coords,
+            landmark_ids,
+            flip=False,
+            heatmap_entropy=entropy_np,
+        )
 
     return _predict
 
@@ -1232,6 +1354,17 @@ def _run_obb_inference_on_box(
         orientation_debug["was_flipped"] = bool(was_flipped)
         orientation_debug["orientation_hint"] = orientation_hint
         orientation_debug["orientation_hint_raw"] = box.get("orientation_hint")
+        heatmap_entropies = [
+            float(landmark["heatmap_entropy"])
+            for landmark in landmarks_512
+            if isinstance(landmark, dict)
+            and isinstance(landmark.get("heatmap_entropy"), (int, float))
+            and math.isfinite(float(landmark["heatmap_entropy"]))
+        ]
+        if heatmap_entropies:
+            orientation_debug["landmark_heatmap_entropy"] = float(
+                sum(heatmap_entropies) / len(heatmap_entropies)
+            )
 
     mapped_landmarks = map_landmarks_to_original(
         landmarks_512,
@@ -1258,6 +1391,7 @@ def _run_obb_inference_on_box(
         "inference_metadata": _build_inference_metadata(
             orientation_debug,
             clamped_landmark_count=clamped_landmark_count,
+            landmark_count=len(landmarks),
             box_source=box.get("detection_method", "provided_obb"),
         ),
         "clamped_landmark_count": clamped_landmark_count,
@@ -1290,38 +1424,15 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box
         input_box: Optional pre-detected OBB box dict. When provided with obbCorners, the
                    detector stage is skipped and inference uses the supplied OBB geometry.
     """
-    modeldir = os.path.join(project_root, "models")
     debug_dir = os.path.join(project_root, "debug")
-    predictor_path = os.path.join(modeldir, f"predictor_{tag}.dat")
-    id_mapping_path = os.path.join(debug_dir, f"id_mapping_{tag}.json")
-
-    if not os.path.exists(predictor_path):
-        raise FileNotFoundError(f"Model not found: {predictor_path}")
-
-    # Load ID mapping and training metadata.
-    orientation_policy = {}
-    try:
-        orientation_policy = ou.load_orientation_policy(project_root)
-    except Exception:
-        orientation_policy = {}
-    id_mapping = {}
-    index_to_original = {}
-    target_orientation = None
-    landmark_template = {}
-    head_landmark_id = None
-    tail_landmark_id = _resolve_tail_landmark_id(project_root, None)
-    if os.path.exists(id_mapping_path):
-        with open(id_mapping_path, 'r', encoding='utf-8') as f:
-            id_mapping = json.load(f)
-            index_to_original = _resolve_dlib_index_mapping(project_root, tag, id_mapping)
-            target_orientation = id_mapping.get("training_config", {}).get("target_orientation")
-            landmark_template = {
-                int(k): v for k, v in id_mapping.get("landmark_template", {}).items()
-            }
-            head_landmark_id = _resolve_head_landmark_id(project_root, id_mapping)
-            tail_landmark_id = _resolve_tail_landmark_id(project_root, id_mapping)
-    else:
-        head_landmark_id = _resolve_head_landmark_id(project_root, None)
+    metadata = _load_landmark_runtime_metadata(project_root, tag, "dlib")
+    predictor_path = metadata["runtime"]["model_path"]
+    orientation_policy = metadata["orientation_policy"]
+    index_to_original = metadata["index_to_original"]
+    target_orientation = metadata["target_orientation"]
+    landmark_template = metadata["landmark_template"]
+    head_landmark_id = metadata["head_landmark_id"]
+    tail_landmark_id = metadata["tail_landmark_id"]
 
     print("PROGRESS 10 loading_model", file=sys.stderr)
 
@@ -1415,38 +1526,15 @@ def predict_multi_specimen(
     input_boxes=None,
 ):
     """Predict landmarks for multiple specimens using OBB detection + dlib."""
-    modeldir = os.path.join(project_root, "models")
     debug_dir = os.path.join(project_root, "debug")
-    predictor_path = os.path.join(modeldir, f"predictor_{tag}.dat")
-    id_mapping_path = os.path.join(debug_dir, f"id_mapping_{tag}.json")
-
-    if not os.path.exists(predictor_path):
-        raise FileNotFoundError(f"Model not found: {predictor_path}")
-
-    # Load ID mapping and training metadata.
-    orientation_policy = {}
-    try:
-        orientation_policy = ou.load_orientation_policy(project_root)
-    except Exception:
-        orientation_policy = {}
-    id_mapping = {}
-    index_to_original = {}
-    target_orientation = None
-    landmark_template = {}
-    head_landmark_id = None
-    tail_landmark_id = _resolve_tail_landmark_id(project_root, None)
-    if os.path.exists(id_mapping_path):
-        with open(id_mapping_path, 'r', encoding='utf-8') as f:
-            id_mapping = json.load(f)
-            index_to_original = _resolve_dlib_index_mapping(project_root, tag, id_mapping)
-            target_orientation = id_mapping.get("training_config", {}).get("target_orientation")
-            landmark_template = {
-                int(k): v for k, v in id_mapping.get("landmark_template", {}).items()
-            }
-            head_landmark_id = _resolve_head_landmark_id(project_root, id_mapping)
-            tail_landmark_id = _resolve_tail_landmark_id(project_root, id_mapping)
-    else:
-        head_landmark_id = _resolve_head_landmark_id(project_root, None)
+    metadata = _load_landmark_runtime_metadata(project_root, tag, "dlib")
+    predictor_path = metadata["runtime"]["model_path"]
+    orientation_policy = metadata["orientation_policy"]
+    index_to_original = metadata["index_to_original"]
+    target_orientation = metadata["target_orientation"]
+    landmark_template = metadata["landmark_template"]
+    head_landmark_id = metadata["head_landmark_id"]
+    tail_landmark_id = metadata["tail_landmark_id"]
 
     print("PROGRESS 10 loading_model", file=sys.stderr)
     img_original, img_detector, orig_w, orig_h, scale, detector_w, detector_h = _load_and_resize_for_inference(image_path)
@@ -1549,29 +1637,45 @@ def predict_multi_specimen(
 
 # ── CNN inference paths ────────────────────────────────────────────────────────
 
-def _load_cnn_model(project_root, tag):
+def _load_cnn_model(project_root, tag, *, include_runtime=False):
     """
     Load CNN model + config + orientation metadata.
 
     Returns:
-        (model, landmark_ids, target_orientation, landmark_template, head_landmark_id, tail_landmark_id)
+        (model, landmark_ids, target_orientation, landmark_template,
+         head_landmark_id, tail_landmark_id)
+
+        With include_runtime=True, the verified runtime metadata dictionary is
+        appended as a seventh item.  The default preserves the established
+        internal worker interface.
     """
     if not _torch_available:
         raise RuntimeError(
             "torch/torchvision not installed. Cannot use CNN predictor. "
             "Install with: pip install torch torchvision"
         )
-    modeldir = os.path.join(project_root, "models")
-    model_path = os.path.join(modeldir, f"cnn_{tag}.pth")
-    config_path = os.path.join(modeldir, f"cnn_{tag}_config.json")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"CNN model not found: {model_path}")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"CNN config not found: {config_path}")
+    metadata = _load_landmark_runtime_metadata(project_root, tag, "cnn")
+    model_path = metadata["runtime"]["model_path"]
+    config_path = metadata["runtime"]["config_path"]
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
     n_landmarks = config["n_landmarks"]
     landmark_ids = config.get("landmark_ids", list(range(n_landmarks)))
+    if metadata["runtime"].get("immutable"):
+        expected_landmark_ids = [
+            metadata["index_to_original"][index]
+            for index in range(len(metadata["index_to_original"]))
+        ]
+        try:
+            normalized_config_ids = [int(value) for value in landmark_ids]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Immutable CNN config contains invalid schema landmark IDs."
+            ) from exc
+        if int(n_landmarks) != len(expected_landmark_ids) or normalized_config_ids != expected_landmark_ids:
+            raise RuntimeError(
+                "Immutable CNN config and ID mapping sidecar disagree on schema landmark IDs."
+            )
     model_variant = config.get("model_variant_resolved") or config.get("model_variant_requested") or "efficientnet_b0"
     head_type = str(config.get("cnn_head_type", "")).strip().lower()
     format_version = int(config.get("cnn_format_version", 1) or 1)
@@ -1606,29 +1710,23 @@ def _load_cnn_model(project_root, tag):
         ) from exc
     model.eval()
 
-    # Load orientation / template data from id_mapping (same as dlib path)
-    target_orientation = None
-    landmark_template = {}
-    head_landmark_id = None
-    tail_landmark_id = _resolve_tail_landmark_id(project_root, None)
-    id_mapping_path = os.path.join(project_root, "debug", f"id_mapping_{tag}.json")
-    if os.path.exists(id_mapping_path):
-        try:
-            with open(id_mapping_path, "r", encoding="utf-8") as f:
-                id_map = json.load(f)
-            target_orientation = id_map.get("training_config", {}).get("target_orientation")
-            landmark_template = {
-                int(k): v for k, v in id_map.get("landmark_template", {}).items()
-            }
-            head_landmark_id = _resolve_head_landmark_id(project_root, id_map)
-            tail_landmark_id = _resolve_tail_landmark_id(project_root, id_map)
-        except Exception:
-            pass
-
-    return model, landmark_ids, target_orientation, landmark_template, head_landmark_id, tail_landmark_id
+    result = (
+        model,
+        landmark_ids,
+        metadata["target_orientation"],
+        metadata["landmark_template"],
+        metadata["head_landmark_id"],
+        metadata["tail_landmark_id"],
+    )
+    return result + (metadata,) if include_runtime else result
 
 
-def _cnn_landmarks_from_coords(coords_np, landmark_ids, flip=False):
+def _cnn_landmarks_from_coords(
+    coords_np,
+    landmark_ids,
+    flip=False,
+    heatmap_entropy=None,
+):
     """Convert flat CNN output coords to landmark dicts, optionally un-flipping X."""
     denom = float(max(1, STANDARD_SIZE - 1))
     lms = []
@@ -1639,7 +1737,12 @@ def _cnn_landmarks_from_coords(coords_np, landmark_ids, flip=False):
             x = (STANDARD_SIZE - 1) - x
         x = max(0.0, min(float(STANDARD_SIZE - 1), x))
         y = max(0.0, min(float(STANDARD_SIZE - 1), y))
-        lms.append({"id": lm_id, "x": x, "y": y})
+        landmark = {"id": lm_id, "x": x, "y": y}
+        if heatmap_entropy is not None and i < len(heatmap_entropy):
+            entropy = max(0.0, min(1.0, float(heatmap_entropy[i])))
+            landmark["heatmap_entropy"] = entropy
+            landmark["confidence"] = 1.0 - entropy
+        lms.append(landmark)
     return lms
 
 
@@ -1650,15 +1753,17 @@ def predict_cnn_image(project_root, tag, image_path, yolo_model_path=None, input
     """
     debug_dir = os.path.join(project_root, "debug")
 
-    orientation_policy = {}
-    try:
-        orientation_policy = ou.load_orientation_policy(project_root)
-    except Exception:
-        orientation_policy = {}
-
     print("PROGRESS 10 loading_model", file=sys.stderr)
-    model, landmark_ids, target_orientation, landmark_template, head_landmark_id, tail_landmark_id = \
-        _load_cnn_model(project_root, tag)
+    (
+        model,
+        landmark_ids,
+        target_orientation,
+        landmark_template,
+        head_landmark_id,
+        tail_landmark_id,
+        metadata,
+    ) = _load_cnn_model(project_root, tag, include_runtime=True)
+    orientation_policy = metadata["orientation_policy"]
 
     img_original, img_detector, orig_w, orig_h, scale, detector_w, detector_h = _load_and_resize_for_inference(image_path)
 
@@ -1753,15 +1858,17 @@ def predict_cnn_multi_specimen(
     """Predict landmarks for multiple specimens using OBB detection + CNN."""
     debug_dir = os.path.join(project_root, "debug")
 
-    orientation_policy = {}
-    try:
-        orientation_policy = ou.load_orientation_policy(project_root)
-    except Exception:
-        orientation_policy = {}
-
     print("PROGRESS 10 loading_model", file=sys.stderr)
-    model, landmark_ids, target_orientation, landmark_template, head_landmark_id, tail_landmark_id = \
-        _load_cnn_model(project_root, tag)
+    (
+        model,
+        landmark_ids,
+        target_orientation,
+        landmark_template,
+        head_landmark_id,
+        tail_landmark_id,
+        metadata,
+    ) = _load_cnn_model(project_root, tag, include_runtime=True)
+    orientation_policy = metadata["orientation_policy"]
 
     img_original, img_detector, orig_w, orig_h, scale, detector_w, detector_h = _load_and_resize_for_inference(image_path)
     detection_result = _detect_multi_obb_boxes(

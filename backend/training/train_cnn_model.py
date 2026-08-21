@@ -16,8 +16,10 @@ Stdout protocol (same as train_shape_model.py so main.ts can parse identically):
 import os
 import sys
 import json
+import hashlib
 import math
 import argparse
+import random
 import time
 from contextlib import nullcontext
 import xml.etree.ElementTree as ET
@@ -33,7 +35,9 @@ if _BACKEND_ROOT not in _sys.path:
     _sys.path.insert(0, _BACKEND_ROOT)
 
 import bv_utils.debug_io as dio
+import bv_utils.lineage as lineage
 import bv_utils.orientation_utils as ou
+from bv_utils.landmark_artifacts import bundle_id_mapping
 
 try:
     import torch
@@ -49,6 +53,260 @@ except ImportError as e:
 STANDARD_SIZE = 512
 HEATMAP_SIGMA_PX = 2.5
 TRAIN_VAL_FRACTION = 0.125
+CNN_DEFAULT_RUN_SEED = 42
+# A candidate must improve by both a small absolute floor and a relative
+# effect size.  This keeps floating-point jitter (and negligible sub-pixel
+# changes) from replacing the active model while remaining conservative for
+# already-low validation errors.
+CNN_PROMOTION_MIN_ABSOLUTE_IMPROVEMENT = 1e-4
+CNN_PROMOTION_MIN_RELATIVE_IMPROVEMENT = 0.005
+CNN_MIN_VALIDATION_SOURCES = 2
+CNN_VALIDATION_MANIFEST_VERSION = 3
+CNN_NEW_SOURCE_POLICY = "fill_missing_validation_from_unseen_nonadaptive_then_train_only"
+CNN_ADAPTIVE_SOURCE_POLICY = "train_only"
+
+
+def _normalize_run_seed(seed):
+    """Return a portable NumPy/PyTorch seed or reject an ambiguous value."""
+    try:
+        normalized = int(seed)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"CNN run seed must be an integer, got {seed!r}") from exc
+    if normalized < 0 or normalized > 0xFFFFFFFF:
+        raise ValueError("CNN run seed must be between 0 and 4294967295")
+    return normalized
+
+
+def _configure_reproducibility(seed):
+    """Seed every CNN random source and enable deterministic torch settings."""
+    seed = _normalize_run_seed(seed)
+    cublas_workspace_config = ":4096:8"
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", cublas_workspace_config)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    cuda_seeded = False
+    try:
+        torch.cuda.manual_seed_all(seed)
+        cuda_seeded = True
+    except Exception:
+        # CPU-only PyTorch builds may expose torch.cuda but reject CUDA calls.
+        pass
+
+    deterministic_algorithms = False
+    deterministic_warn_only = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        deterministic_algorithms = True
+        deterministic_warn_only = True
+    except TypeError:
+        # Older supported PyTorch releases do not accept warn_only.
+        torch.use_deterministic_algorithms(True)
+        deterministic_algorithms = True
+
+    try:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    except Exception:
+        pass
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+    except Exception:
+        pass
+    try:
+        torch.backends.cudnn.allow_tf32 = False
+    except Exception:
+        pass
+    float32_matmul_precision = "framework_default"
+    try:
+        torch.set_float32_matmul_precision("highest")
+        float32_matmul_precision = "highest"
+    except Exception:
+        pass
+
+    return {
+        "protocolVersion": "cnn_reproducibility_v1",
+        "seed": seed,
+        "pythonRandomSeeded": True,
+        "numpySeeded": True,
+        "torchSeeded": True,
+        "cudaSeeded": cuda_seeded,
+        "dataLoaderShuffleGeneratorSeeded": True,
+        "dataLoaderWorkerSeedAlgorithm": "torch.initial_seed_mod_2^32",
+        "deterministicAlgorithms": deterministic_algorithms,
+        "deterministicAlgorithmsWarnOnly": deterministic_warn_only,
+        "cudnnBenchmark": False,
+        "cudnnDeterministic": True,
+        "tf32Allowed": False,
+        "float32MatmulPrecision": float32_matmul_precision,
+        "cublasWorkspaceConfig": os.environ.get(
+            "CUBLAS_WORKSPACE_CONFIG", cublas_workspace_config
+        ),
+    }
+
+
+def _seed_dataloader_worker(_worker_id):
+    """Seed Python, NumPy, and the dataset-local augmentation RNG per worker."""
+    worker_seed = int(torch.initial_seed() % (2 ** 32))
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    worker_info = torch.utils.data.get_worker_info()
+    dataset = getattr(worker_info, "dataset", None) if worker_info is not None else None
+    if dataset is not None and hasattr(dataset, "_rng"):
+        dataset._rng = np.random.default_rng(worker_seed)
+
+
+def _make_dataloader_generator(seed, stream=0):
+    """Create an independent deterministic random stream for one DataLoader."""
+    generator = torch.Generator()
+    stream_seed = (_normalize_run_seed(seed) + int(stream)) % (2 ** 63 - 1)
+    generator.manual_seed(stream_seed)
+    return generator, stream_seed
+
+
+def _cnn_promotion_policy():
+    return {
+        "policyVersion": "cnn_validation_effect_v1",
+        "minimumAbsoluteImprovement": CNN_PROMOTION_MIN_ABSOLUTE_IMPROVEMENT,
+        "minimumRelativeImprovement": CNN_PROMOTION_MIN_RELATIVE_IMPROVEMENT,
+    }
+
+
+def _build_cnn_training_protocol(parameters):
+    """Freeze the effective, result-affecting CNN parameter contract."""
+    canonical_parameters = json.loads(json.dumps(parameters, sort_keys=True))
+    revision_payload = {
+        "formatVersion": 1,
+        "parameters": canonical_parameters,
+    }
+    return {
+        **revision_payload,
+        "revision": lineage.sha256_json(revision_payload),
+    }
+
+
+def _build_cnn_validation_evaluator_protocol(
+    id_mapping,
+    landmark_keys,
+    *,
+    device,
+):
+    """Pin the exact CNN validation metric/mapping contract used for promotion."""
+    explicit = id_mapping.get("dlib_index_to_original", {})
+    named = id_mapping.get("dlib_name_to_original", {})
+    landmark_order = []
+    for model_index, part_name in enumerate(landmark_keys):
+        mapped_id = named.get(str(part_name))
+        if mapped_id is None:
+            mapped_id = explicit.get(str(model_index), explicit.get(model_index))
+        landmark_order.append(
+            {
+                "modelIndex": int(model_index),
+                "xmlPartName": str(part_name),
+                "schemaLandmarkId": int(mapped_id),
+            }
+        )
+
+    device_type = str(device)
+    if device_type == "cuda":
+        autocast = {"enabled": True, "deviceType": "cuda", "dtype": "float16"}
+    elif device_type == "mps":
+        autocast = {"enabled": True, "deviceType": "mps", "dtype": "bfloat16"}
+    else:
+        autocast = {"enabled": False, "deviceType": "cpu", "dtype": "float32"}
+
+    torchvision_module = sys.modules.get("torchvision")
+    return lineage.build_validation_evaluator_protocol(
+        {
+            "formatVersion": 1,
+            "role": "landmark_validation_model_promotion",
+            "modelType": "cnn",
+            "evaluator": {
+                "implementation": "backend.training.train_cnn_model._compute_error_stats",
+                "implementationVersion": "cnn_validation_evaluator_v1",
+                "framework": "torch",
+                "frameworkVersion": str(getattr(torch, "__version__", "unknown")),
+                "torchvisionVersion": str(
+                    getattr(torchvision_module, "__version__", "unknown")
+                ),
+                "numpyVersion": str(np.__version__),
+                "opencvVersion": str(cv2.__version__),
+                "deviceType": device_type,
+                "autocast": autocast,
+                "gradientMode": "torch.no_grad",
+            },
+            "preprocessing": {
+                "datasetImplementation": "LandmarkDataset.__getitem__@v1",
+                "imageDecoder": "cv2.imread",
+                "imageReadFailure": "zero_uint8_rgb_512x512",
+                "colorConversion": "cv2.COLOR_BGR2RGB",
+                "resize": {
+                    "implementation": "torchvision.transforms.Resize",
+                    "size": [STANDARD_SIZE, STANDARD_SIZE],
+                    "interpolation": "default_bilinear",
+                    "antialias": "torchvision_default",
+                },
+                "tensorConversion": "torchvision.transforms.ToTensor_uint8_to_float_[0,1]",
+                "normalization": {
+                    "mean": [0.485, 0.456, 0.406],
+                    "std": [0.229, 0.224, 0.225],
+                },
+                "augmentationEnabled": False,
+                "targetCoordinateDenominator": STANDARD_SIZE - 1,
+                "missingLandmarkFallbackPx": [STANDARD_SIZE // 2, STANDARD_SIZE // 2],
+            },
+            "landmarkOrder": landmark_order,
+            "metricDefinitions": {
+                "validationMedianError": {
+                    "perLandmark": "torch.linalg_vector_norm(predicted_normalized_xy-target_normalized_xy,l2)",
+                    "perImageReduction": "mean",
+                    "cohortReduction": "numpy.median(float64)",
+                    "coordinateUnits": "fraction_of_511_pixel_extent",
+                    "promotionPriority": 1,
+                },
+                "validationError": {
+                    "perLandmark": "torch.linalg_vector_norm(predicted_normalized_xy-target_normalized_xy,l2)",
+                    "perImageReduction": "mean",
+                    "cohortReduction": "numpy.mean(float64)",
+                    "coordinateUnits": "fraction_of_511_pixel_extent",
+                    "promotionPriority": 2,
+                },
+                "validationP95Error": {
+                    "source": "per_image_mean_normalized_l2",
+                    "cohortReduction": "numpy.percentile(method=linear,p=95)",
+                },
+                "validationMaxError": {
+                    "source": "per_image_mean_normalized_l2",
+                    "cohortReduction": "numpy.max",
+                },
+            },
+            "stabilityGate": {
+                "implementation": "_cnn_validation_stability_gate",
+                "implementationVersion": "cnn_validation_tail_gate_v1",
+                "meanFailure": {"ratioGte": 4.0, "absoluteGte": 0.08},
+                "p95Failure": {"ratioGte": 6.0, "absoluteGte": 0.15},
+                "maxFailure": {"ratioGte": 10.0, "absoluteGte": 0.20},
+                "combination": "reject_if_any_failure",
+            },
+        }
+    )
+
+
+def _hash_torch_state_dict(state_dict):
+    """Hash exact initializer tensors without depending on torch.save metadata."""
+    digest = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name].detach().cpu().contiguous()
+        digest.update(str(name).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(tensor.view(torch.uint8).numpy().tobytes(order="C"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _resolve_orientation_aug_policy(project_root):
@@ -250,7 +508,7 @@ def _collect_landmark_ids(records):
     return sorted(common, key=lambda n: (int(n) if n.isdigit() else float("inf"), n))
 
 
-def _record_source_key(image_path: str) -> str:
+def _legacy_record_source_key(image_path: str) -> str:
     stem = os.path.splitext(os.path.basename(str(image_path or "")))[0]
     stem = re.sub(r"_boxscale_\d+_\d+$", "", stem)
     stem = re.sub(r"_jit_\d+_\d+$", "", stem)
@@ -259,25 +517,678 @@ def _record_source_key(image_path: str) -> str:
     return stem
 
 
-def _split_train_val_records(records, *, val_fraction=TRAIN_VAL_FRACTION, seed=42):
+def _record_source_key(image_path: str, source_ids_by_path=None) -> str:
+    normalized_path = os.path.normcase(os.path.abspath(str(image_path or "")))
+    if isinstance(source_ids_by_path, dict):
+        source_id = source_ids_by_path.get(normalized_path)
+        if source_id:
+            return str(source_id)
+    try:
+        return f"sha256:{lineage.sha256_file(normalized_path)}"
+    except Exception:
+        return f"name:{_legacy_record_source_key(image_path).casefold()}"
+
+
+def _build_effective_cnn_dataset(
+    train_records,
+    val_records,
+    test_records,
+    *,
+    landmark_keys,
+    source_ids_by_path=None,
+):
+    """Describe the exact canonical crops and targets consumed by this run."""
+    ordered_landmark_keys = [str(key) for key in landmark_keys]
+
+    def _record_descriptor(record, split_name):
+        image_path, parts = record
+        landmarks = []
+        for key in ordered_landmark_keys:
+            present = key in parts
+            point = parts.get(key, (STANDARD_SIZE // 2, STANDARD_SIZE // 2))
+            landmarks.append(
+                {
+                    "part": key,
+                    "x": int(point[0]),
+                    "y": int(point[1]),
+                    "present": bool(present),
+                }
+            )
+        payload = {
+            "split": split_name,
+            "sourceId": _record_source_key(image_path, source_ids_by_path),
+            "canonicalCropSha256": lineage.sha256_file(image_path),
+            "landmarks": landmarks,
+        }
+        return {**payload, "recordRevision": lineage.sha256_json(payload)}
+
+    def _split_descriptor(split_name, records):
+        described = [_record_descriptor(record, split_name) for record in records]
+        described.sort(
+            key=lambda item: (
+                item["sourceId"],
+                item["canonicalCropSha256"],
+                item["recordRevision"],
+            )
+        )
+        revision_payload = {
+            "name": split_name,
+            "records": described,
+        }
+        return {
+            **revision_payload,
+            "recordCount": len(described),
+            "sourceCount": len({item["sourceId"] for item in described}),
+            "revision": lineage.sha256_json(revision_payload),
+        }
+
+    splits = {
+        "train": _split_descriptor("train", train_records),
+        "validation": _split_descriptor("validation", val_records),
+        "test": _split_descriptor("test", test_records),
+    }
+    revision_payload = {
+        "formatVersion": 1,
+        "identityContract": "canonical_crop_sha256+landmark_geometry+source_assignment",
+        "landmarkKeys": ordered_landmark_keys,
+        "splits": splits,
+    }
+    return {
+        **revision_payload,
+        "revision": lineage.sha256_json(revision_payload),
+    }
+
+
+def _assert_effective_cnn_dataset_unchanged(
+    train_records,
+    val_records,
+    test_records,
+    *,
+    landmark_keys,
+    source_ids_by_path,
+    expected,
+):
+    """Fail if canonical crop bytes, targets, or assignments mutate mid-run."""
+    observed = _build_effective_cnn_dataset(
+        train_records,
+        val_records,
+        test_records,
+        landmark_keys=landmark_keys,
+        source_ids_by_path=source_ids_by_path,
+    )
+    if observed.get("revision") != expected.get("revision"):
+        raise RuntimeError(
+            "The effective CNN dataset changed while training or evaluation was running. "
+            "The artifact was not published; restore the prepared crops and retry."
+        )
+
+
+def _group_cnn_records_by_source(records, source_ids_by_path=None):
+    grouped = {}
+    legacy_to_sources = {}
+    fallback_groups = {}
+    for record in records:
+        image_path = record[0]
+        normalized_path = os.path.normcase(os.path.abspath(str(image_path or "")))
+        mapped_source = (
+            source_ids_by_path.get(normalized_path)
+            if isinstance(source_ids_by_path, dict)
+            else None
+        )
+        legacy_key = _legacy_record_source_key(image_path)
+        if mapped_source:
+            source_key = str(mapped_source)
+            grouped.setdefault(source_key, []).append(record)
+            legacy_to_sources.setdefault(legacy_key, set()).add(source_key)
+        else:
+            fallback_groups.setdefault(legacy_key, []).append(record)
+
+    for legacy_key, legacy_records in fallback_groups.items():
+        if len(legacy_records) == 1:
+            source_key = _record_source_key(legacy_records[0][0])
+        else:
+            image_hashes = []
+            for image_path, _parts in legacy_records:
+                try:
+                    image_hashes.append(lineage.sha256_file(image_path))
+                except Exception:
+                    image_hashes.append(f"name:{os.path.basename(str(image_path)).casefold()}")
+            source_key = f"sha256:{lineage.sha256_json(sorted(image_hashes))}"
+        grouped.setdefault(source_key, []).extend(legacy_records)
+        legacy_to_sources.setdefault(legacy_key, set()).add(source_key)
+
+    unambiguous_legacy_map = {
+        legacy: next(iter(source_keys))
+        for legacy, source_keys in legacy_to_sources.items()
+        if len(source_keys) == 1
+    }
+    return grouped, unambiguous_legacy_map
+
+
+def _cnn_validation_source_snapshot(source_id, records):
+    specimens = []
+    for image_path, parts in records:
+        try:
+            image_sha = lineage.sha256_file(image_path)
+        except Exception:
+            image_sha = None
+        specimens.append(
+            {
+                "imageSha256": image_sha,
+                "parts": {
+                    str(name): [int(point[0]), int(point[1])]
+                    for name, point in sorted(parts.items())
+                },
+            }
+        )
+    specimens.sort(key=lineage.sha256_json)
+    return lineage.sha256_json(
+        {
+            "formatVersion": 1,
+            "sourceId": str(source_id),
+            "specimens": specimens,
+        }
+    )
+
+
+def _cnn_validation_cohort_revision(assignments, source_snapshots):
+    val_sources = sorted(
+        source for source, cohort in assignments.items() if cohort == "val"
+    )
+    return lineage.sha256_json(
+        {
+            "formatVersion": 1,
+            "validationSources": [
+                {
+                    "sourceId": source,
+                    "snapshotSha256": source_snapshots.get(source),
+                }
+                for source in val_sources
+            ],
+        }
+    )
+
+
+def _read_split_info_strict(split_info_path):
+    """Read split_info_<tag>.json without silently degrading source identity.
+
+    An absent file is legitimate: imported dlib XML and hand-placed XML both
+    train without one.  A file that exists but cannot be parsed is not - it
+    would drop every record back to filename identity, which lets a frozen
+    train-only lock be reissued under new IDs.
+    """
+    split_info = lineage.read_json_strict(
+        split_info_path,
+        description="CNN dataset split_info manifest",
+        missing_default={},
+    )
+    if not isinstance(split_info, dict):
+        raise RuntimeError(
+            f"The CNN dataset split_info manifest at {split_info_path} must be a JSON object. "
+            "Re-run dataset preparation rather than training with degraded source identity."
+        )
+    for field in ("train_file_source_ids", "test_file_source_ids"):
+        if field in split_info and not isinstance(split_info[field], dict):
+            raise RuntimeError(
+                f"The CNN dataset split_info manifest at {split_info_path} has a malformed "
+                f"{field}. Re-run dataset preparation rather than training with degraded "
+                "source identity."
+            )
+    return split_info
+
+
+def _adaptive_source_ids_from_split_info(split_info, *, debug_dir=None):
+    """Return content IDs that originated from model-assisted/HITL review.
+
+    Dataset preparation is the authority for this provenance because CNN XML
+    records contain only canonical crop paths and landmark coordinates.  This
+    reader is deliberately version-agnostic: it consumes both the native
+    landmark cohort manifest and the imported-dlib manifest, which carries no
+    ``sources`` key at all.
+    """
+    if not isinstance(split_info, dict):
+        return set()
+    raw_cohort_path = split_info.get("cohort_manifest")
+    if not raw_cohort_path:
+        return set()
+    cohort_path = str(raw_cohort_path)
+    if not os.path.exists(cohort_path) and debug_dir:
+        # prepare_dataset records an absolute path; copying or moving a session
+        # directory leaves it dangling.  Retry the canonical location before
+        # concluding the manifest is gone.
+        relocated = os.path.join(debug_dir, "cohorts", os.path.basename(cohort_path))
+        if os.path.exists(relocated):
+            cohort_path = relocated
+    if not os.path.exists(cohort_path):
+        raise RuntimeError(
+            f"The landmark cohort manifest referenced by split_info is missing: {cohort_path}. "
+            "Re-run dataset preparation rather than training with the HITL contamination gate "
+            "disabled."
+        )
+    expected_sha256 = split_info.get("cohort_manifest_sha256")
+    if expected_sha256 and str(lineage.sha256_file(cohort_path)) != str(expected_sha256):
+        raise RuntimeError(
+            f"The landmark cohort manifest at {cohort_path} does not match the digest recorded "
+            "during dataset preparation. Restore it, or re-run dataset preparation to bless the "
+            "current cohort."
+        )
+    cohort = lineage.read_json_strict(
+        cohort_path,
+        description="landmark cohort manifest referenced by split_info",
+        missing_default={},
+    )
+    if not isinstance(cohort, dict):
+        raise RuntimeError(
+            f"The landmark cohort manifest at {cohort_path} must be a JSON object. "
+            "Restore it rather than training with the HITL contamination gate disabled."
+        )
+    if "sources" not in cohort:
+        # The imported-dlib manifest legitimately carries no source provenance.
+        return set()
+    sources = cohort.get("sources")
+    if not isinstance(sources, dict):
+        raise RuntimeError(
+            f"The landmark cohort manifest at {cohort_path} has a malformed sources map. "
+            "Restore it rather than training with the HITL contamination gate disabled."
+        )
+    return {
+        str(source_id)
+        for source_id, metadata in sources.items()
+        if isinstance(metadata, dict) and metadata.get("adaptiveTrainingSample") is True
+    }
+
+
+def _read_cnn_validation_manifest_strict(assignment_path):
+    """Return ``(payload, version)`` for the frozen CNN validation manifest.
+
+    Structural checks only; the cross-field digest checks need the normalized
+    assignments and live in ``_split_train_val_records``.  A missing file is the
+    legitimate first-run case, but a corrupt one must never be mistaken for it.
+    """
+    if not assignment_path or not os.path.exists(assignment_path):
+        return {}, 1
+    payload = lineage.read_json_strict(
+        assignment_path,
+        description="frozen CNN validation cohort manifest",
+        missing_default={},
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "The frozen CNN validation cohort manifest must be a JSON object. Restore it, or "
+            "delete it to intentionally create a new cohort version."
+        )
+    if "version" not in payload:
+        # Manifests written before the key existed are genuinely version 1.
+        version = 1
+    else:
+        try:
+            version = int(payload.get("version"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "The frozen CNN validation cohort manifest has no recognized version. Restore "
+                "it, or delete it to intentionally create a new cohort version."
+            ) from exc
+    if version < 1 or version > CNN_VALIDATION_MANIFEST_VERSION:
+        raise RuntimeError(
+            f"Unsupported CNN validation cohort manifest version: {version}"
+        )
+    if "assignments" in payload:
+        if not isinstance(payload["assignments"], dict):
+            raise RuntimeError(
+                "The frozen CNN validation cohort manifest has a malformed assignments map. "
+                "Restore it, or delete it to intentionally create a new cohort version."
+            )
+    elif version == CNN_VALIDATION_MANIFEST_VERSION:
+        raise RuntimeError(
+            "The frozen CNN validation cohort manifest is missing its assignments map. "
+            "Restore it, or delete it to intentionally create a new cohort version."
+        )
+    return payload, version
+
+
+def _split_train_val_records(
+    records,
+    *,
+    val_fraction=TRAIN_VAL_FRACTION,
+    seed=42,
+    assignment_path=None,
+    source_ids_by_path=None,
+    adaptive_source_ids=None,
+):
     if not records:
         return [], [], {"train_sources": [], "val_sources": []}
 
-    grouped = {}
-    for record in records:
-        grouped.setdefault(_record_source_key(record[0]), []).append(record)
+    grouped, legacy_to_source = _group_cnn_records_by_source(
+        records,
+        source_ids_by_path,
+    )
 
     source_keys = sorted(grouped.keys())
-    if len(source_keys) <= 1:
-        return list(records), [], {"train_sources": source_keys, "val_sources": []}
+    adaptive_sources = {
+        str(source_id)
+        for source_id in (adaptive_source_ids or set())
+        if str(source_id) in grouped
+    }
+    persisted, persisted_version = _read_cnn_validation_manifest_strict(assignment_path)
+    is_current_manifest = persisted_version == CNN_VALIDATION_MANIFEST_VERSION
+    raw_assignments = persisted.get("assignments", {}) if isinstance(persisted, dict) else {}
+    assignments = {
+        str(source): str(cohort)
+        for source, cohort in raw_assignments.items()
+        if str(cohort) in {"train", "val"}
+    } if isinstance(raw_assignments, dict) else {}
+    # Both checks must run before the legacy migration below, which rewrites and
+    # collapses the key space, and before the bootstrap loop, which mutates
+    # `assignments` in place.  Legacy manifests predate `assignmentRevision`.
+    if is_current_manifest and len(assignments) != len(raw_assignments):
+        raise RuntimeError(
+            "The current CNN validation manifest contains an invalid cohort assignment. "
+            "Restore it, or delete it to intentionally create a new cohort version."
+        )
+    if is_current_manifest and str(
+        persisted.get("assignmentRevision") or ""
+    ) != lineage.sha256_json(assignments):
+        raise RuntimeError(
+            "The current CNN validation cohort assignment revision is missing or corrupt. "
+            "Restore it, or delete it to intentionally create a new cohort version."
+        )
+    if assignments and persisted_version < 2:
+        migrated_assignments = {}
+        for source, cohort in assignments.items():
+            migrated_source = legacy_to_source.get(source, source)
+            prior = migrated_assignments.get(migrated_source)
+            if prior is not None and prior != cohort:
+                raise RuntimeError(
+                    "The legacy CNN validation manifest maps one content source to conflicting cohorts."
+                )
+            migrated_assignments[migrated_source] = cohort
+        assignments = migrated_assignments
+    contaminated_validation = sorted(
+        source
+        for source in adaptive_sources
+        if assignments.get(source) == "val"
+    )
+    if contaminated_validation:
+        raise RuntimeError(
+            "The frozen CNN validation cohort contains model-assisted/HITL sources: "
+            f"{contaminated_validation}. Restore a clean cohort or intentionally create a new "
+            "cohort version; reviewed production data is train-only."
+        )
+    if is_current_manifest:
+        declared_adaptive = persisted.get("adaptiveTrainSources", [])
+        if not isinstance(declared_adaptive, list):
+            raise RuntimeError(
+                "The current CNN validation manifest has a malformed adaptiveTrainSources list. "
+                "Restore it, or delete it to intentionally create a new cohort version."
+            )
+        declared_in_validation = sorted(
+            str(source)
+            for source in declared_adaptive
+            if assignments.get(str(source)) == "val"
+        )
+        if declared_in_validation:
+            raise RuntimeError(
+                "The frozen CNN validation cohort contains sources the manifest itself declares "
+                f"as model-assisted/HITL: {declared_in_validation}. Restore a clean cohort or "
+                "intentionally create a new cohort version; reviewed production data is train-only."
+            )
 
-    rng = np.random.default_rng(int(seed))
-    shuffled = list(source_keys)
-    rng.shuffle(shuffled)
+    has_locked_assignments = bool(assignments)
+    had_locked_validation = any(cohort == "val" for cohort in assignments.values())
+    locked_source_ids = set(assignments)
+    persisted_snapshots = (
+        persisted.get("validationSourceSnapshots", {})
+        if isinstance(persisted, dict)
+        else {}
+    )
+    if not isinstance(persisted_snapshots, dict):
+        if is_current_manifest:
+            raise RuntimeError(
+                "The current CNN validation manifest has a malformed validationSourceSnapshots "
+                "map. Restore it, or delete it to intentionally create a new cohort version."
+            )
+        persisted_snapshots = {}
+    persisted_snapshots = {
+        str(source): str(snapshot)
+        for source, snapshot in persisted_snapshots.items()
+        if str(snapshot).strip()
+    }
+    persisted_revision = (
+        str(persisted.get("validationCohortRevision") or "").strip()
+        if isinstance(persisted, dict)
+        else ""
+    )
+    if is_current_manifest:
+        expected_val_ids = {
+            source for source, cohort in assignments.items() if cohort == "val"
+        }
+        if set(persisted_snapshots) != expected_val_ids or bool(
+            expected_val_ids
+        ) != bool(persisted_revision):
+            raise RuntimeError(
+                "The current CNN validation cohort is missing exact snapshot/revision metadata. "
+                "Restore it, or delete it to intentionally create a new cohort version."
+            )
+        if persisted.get("validationSourceOverlap") is not False:
+            raise RuntimeError(
+                "The current CNN validation manifest does not assert disjoint train/validation "
+                "sources. Restore it, or delete it to intentionally create a new cohort version."
+            )
+        if persisted.get("newSourcePolicy") != CNN_NEW_SOURCE_POLICY:
+            raise RuntimeError(
+                "The current CNN validation manifest declares an unrecognized new-source policy. "
+                "Restore it, or delete it to intentionally create a new cohort version."
+            )
+        if persisted.get("adaptiveSourcePolicy") != CNN_ADAPTIVE_SOURCE_POLICY:
+            raise RuntimeError(
+                "The current CNN validation manifest declares an unrecognized adaptive-source "
+                "policy. Restore it, or delete it to intentionally create a new cohort version."
+            )
+        try:
+            _normalize_run_seed(persisted.get("seed"))
+        except ValueError as exc:
+            raise RuntimeError(
+                "The current CNN validation manifest has a malformed seed. Restore it, or "
+                "delete it to intentionally create a new cohort version."
+            ) from exc
+        try:
+            persisted_fraction = float(persisted.get("validationFraction"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "The current CNN validation manifest has a malformed validationFraction. "
+                "Restore it, or delete it to intentionally create a new cohort version."
+            ) from exc
+        if not math.isfinite(persisted_fraction) or not 0.0 <= persisted_fraction <= 1.0:
+            raise RuntimeError(
+                "The current CNN validation manifest has a validationFraction outside [0, 1]. "
+                "Restore it, or delete it to intentionally create a new cohort version."
+            )
+    if persisted_revision:
+        expected_revision = _cnn_validation_cohort_revision(
+            assignments,
+            persisted_snapshots,
+        )
+        if persisted_revision != expected_revision:
+            raise RuntimeError(
+                "The frozen CNN validation manifest was mutated or is corrupt. "
+                "Restore it or intentionally create a new cohort version."
+            )
+    # Bootstrap validation once without ever repurposing data used by an older
+    # model. A one-source run is immediately locked as train-only; when the
+    # dataset later grows, only a previously unseen, non-adaptive source may
+    # fill the still-missing validation cohort.
+    requested_threshold = max(0.0, min(1.0, float(val_fraction)))
+    threshold = (
+        float(persisted.get("validationFraction", requested_threshold))
+        if has_locked_assignments and isinstance(persisted, dict)
+        else requested_threshold
+    )
+    resolved_seed = (
+        int(persisted.get("seed", seed))
+        if has_locked_assignments and isinstance(persisted, dict)
+        else int(seed)
+    )
+    for source in source_keys:
+        if source in assignments:
+            continue
+        if source in adaptive_sources:
+            assignments[source] = "train"
+            continue
+        if has_locked_assignments:
+            assignments[source] = "train"
+            continue
+        digest = lineage.sha256_bytes(f"cnn-val-v1:{resolved_seed}:{source}".encode("utf-8"))
+        unit = int(digest[:16], 16) / float(0xFFFFFFFFFFFFFFFF)
+        assignments[source] = "val" if unit < threshold else "train"
 
-    val_sources_target = max(1, int(round(len(shuffled) * float(val_fraction))))
-    val_sources_target = min(max(1, len(shuffled) - 1), val_sources_target)
-    val_sources = set(sorted(shuffled[:val_sources_target]))
+    locked_validation_count = sum(
+        1 for source in locked_source_ids if assignments.get(source) == "val"
+    )
+    if has_locked_assignments and locked_validation_count < CNN_MIN_VALIDATION_SOURCES:
+        unseen_nonadaptive_sources = [
+            source
+            for source in source_keys
+            if source not in locked_source_ids and source not in adaptive_sources
+        ]
+        if unseen_nonadaptive_sources:
+            ordered_candidates = sorted(
+                unseen_nonadaptive_sources,
+                key=lambda source: lineage.sha256_bytes(
+                    f"cnn-val-growth-v1:{resolved_seed}:{source}".encode("utf-8")
+                ),
+            )
+            needed = CNN_MIN_VALIDATION_SOURCES - locked_validation_count
+            for chosen in ordered_candidates[:needed]:
+                assignments[chosen] = "val"
+
+    missing_locked_val_sources = sorted(
+        source
+        for source, cohort in assignments.items()
+        if cohort == "val" and source not in grouped
+    )
+    if missing_locked_val_sources:
+        raise RuntimeError(
+            "The frozen CNN validation cohort is missing sources: "
+            f"{missing_locked_val_sources}. Restore them or intentionally create a new cohort version."
+        )
+
+    val_sources = {source for source in source_keys if assignments.get(source) == "val"}
+    train_source_set = {source for source in source_keys if assignments.get(source) != "val"}
+    if not val_sources:
+        if had_locked_validation:
+            raise RuntimeError(
+                "The frozen CNN validation cohort has no available records. Restore its original "
+                "sources or intentionally create a new cohort version."
+            )
+        # Once any source has been used for fitting, it is no longer eligible
+        # to bootstrap validation. If this growth step supplied no unseen clean
+        # source, keep the cohort explicitly unvalidated for now.
+        eligible_validation_sources = (
+            []
+            if has_locked_assignments
+            else [source for source in source_keys if source not in adaptive_sources]
+        )
+        if not eligible_validation_sources:
+            # An all-HITL dataset can train a model but cannot create an honest
+            # validation gate. Preserve the historical no-manifest behaviour
+            # for a multi-source adaptive bootstrap, but a lone source must be
+            # durably locked as train so it cannot move after dataset growth.
+            if len(source_keys) > 1 and not has_locked_assignments:
+                return list(records), [], {
+                    "train_sources": source_keys,
+                    "val_sources": [],
+                    "adaptive_train_sources": sorted(adaptive_sources),
+                    "validation_cohort_revision": None,
+                }
+        # Bootstrap a single validation source only from non-adaptive data when
+        # no locked validation cohort exists. The choice is then immutable.
+        if eligible_validation_sources:
+            chosen = min(
+                eligible_validation_sources,
+                key=lambda source: lineage.sha256_bytes(
+                    f"cnn-val-bootstrap-v1:{resolved_seed}:{source}".encode("utf-8")
+                ),
+            )
+            assignments[chosen] = "val"
+            val_sources.add(chosen)
+            train_source_set.discard(chosen)
+    if not has_locked_assignments and len(val_sources) < CNN_MIN_VALIDATION_SOURCES:
+        eligible_promotions = sorted(
+            (
+                source
+                for source in train_source_set
+                if source not in adaptive_sources
+            ),
+            key=lambda source: lineage.sha256_bytes(
+                f"cnn-val-bootstrap-v2:{resolved_seed}:{source}".encode("utf-8")
+            ),
+        )
+        needed = CNN_MIN_VALIDATION_SOURCES - len(val_sources)
+        # Preserve at least one independent fitting source.
+        for chosen in eligible_promotions[: min(needed, max(0, len(train_source_set) - 1))]:
+            assignments[chosen] = "val"
+            val_sources.add(chosen)
+            train_source_set.discard(chosen)
+    if not train_source_set:
+        if had_locked_validation:
+            raise RuntimeError(
+                "The frozen CNN validation cohort leaves no training records. Add new training "
+                "sources rather than moving validation samples."
+            )
+        chosen = max(
+            source_keys,
+            key=lambda source: lineage.sha256_bytes(
+                f"cnn-train-bootstrap-v1:{resolved_seed}:{source}".encode("utf-8")
+            ),
+        )
+        assignments[chosen] = "train"
+        train_source_set.add(chosen)
+        val_sources.discard(chosen)
+
+    current_snapshots = {
+        source: _cnn_validation_source_snapshot(source, grouped[source])
+        for source in sorted(val_sources)
+    }
+    for source, expected_snapshot in persisted_snapshots.items():
+        if assignments.get(source) != "val":
+            continue
+        if current_snapshots.get(source) != expected_snapshot:
+            raise RuntimeError(
+                "The frozen CNN validation image/landmark content changed for "
+                f"{source}. Restore it or intentionally create a new cohort version."
+            )
+    source_snapshots = dict(persisted_snapshots)
+    source_snapshots.update(current_snapshots)
+    validation_revision = (
+        _cnn_validation_cohort_revision(assignments, source_snapshots)
+        if val_sources
+        else None
+    )
+    if assignment_path:
+        manifest = {
+            "version": CNN_VALIDATION_MANIFEST_VERSION,
+            "createdAt": (
+                persisted.get("createdAt")
+                or persisted.get("updatedAt")
+                or lineage.utc_now_iso()
+            ) if isinstance(persisted, dict) else lineage.utc_now_iso(),
+            "seed": resolved_seed,
+            "validationFraction": (
+                float(persisted.get("validationFraction", threshold))
+                if has_locked_assignments
+                else threshold
+            ),
+            "assignments": assignments,
+            "validationSourceSnapshots": source_snapshots,
+            "validationCohortRevision": validation_revision,
+            "validationSourceOverlap": False,
+            "assignmentRevision": lineage.sha256_json(assignments),
+            "newSourcePolicy": CNN_NEW_SOURCE_POLICY,
+            "adaptiveSourcePolicy": CNN_ADAPTIVE_SOURCE_POLICY,
+            "adaptiveTrainSources": sorted(adaptive_sources),
+        }
+        if manifest != persisted:
+            lineage.atomic_write_json(assignment_path, manifest)
     train_sources = [src for src in source_keys if src not in val_sources]
 
     train_records = []
@@ -291,7 +1202,18 @@ def _split_train_val_records(records, *, val_fraction=TRAIN_VAL_FRACTION, seed=4
     return train_records, val_records, {
         "train_sources": train_sources,
         "val_sources": sorted(val_sources),
+        "adaptive_train_sources": sorted(adaptive_sources),
+        "validation_cohort_revision": validation_revision,
     }
+
+
+def _should_restore_validation_checkpoint(validation_available, best_model_state):
+    """Return true only when an independent validation cohort ranked a state.
+
+    Single-source training intentionally has no validation split. Restoring a
+    snapshot in that case would silently replace the final epoch with epoch one.
+    """
+    return bool(validation_available and best_model_state is not None)
 
 
 class LandmarkDataset(Dataset):
@@ -687,6 +1609,8 @@ def _compute_error_stats(model, loader, device):
             "median": float("nan"),
             "mean_px": float("nan"),
             "median_px": float("nan"),
+            "p95": float("nan"),
+            "max": float("nan"),
             "per_landmark_median": [],
             "per_landmark_median_px": [],
         }
@@ -698,12 +1622,72 @@ def _compute_error_stats(model, loader, device):
         "median": float(np.median(arr)),
         "mean_px": float(arr.mean() * denom),
         "median_px": float(np.median(arr) * denom),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(np.max(arr)),
         "per_landmark_median": per_landmark.size and np.median(per_landmark, axis=0).astype(float).tolist() or [],
         "per_landmark_median_px": per_landmark.size and (np.median(per_landmark, axis=0) * denom).astype(float).tolist() or [],
     }
 
 
-def _build_heldout_crop_report(model, records, landmark_keys, transform, device):
+def _cnn_validation_stability_gate(stats):
+    """Reject median improvements that conceal catastrophic CNN outliers."""
+    if not isinstance(stats, dict):
+        return {
+            "available": False,
+            "passed": None,
+            "reason": "validation_stability_unavailable",
+        }
+    try:
+        mean = float(stats["mean"])
+        median = float(stats["median"])
+        p95 = float(stats["p95"])
+        maximum = float(stats["max"])
+    except (KeyError, TypeError, ValueError):
+        return {
+            "available": False,
+            "passed": None,
+            "reason": "validation_stability_unavailable",
+        }
+    if not all(np.isfinite(value) and value >= 0.0 for value in (mean, median, p95, maximum)):
+        return {
+            "available": False,
+            "passed": None,
+            "reason": "validation_stability_unavailable",
+        }
+    denominator = max(median, 1e-12)
+    mean_median_ratio = mean / denominator
+    p95_median_ratio = p95 / denominator
+    max_median_ratio = maximum / denominator
+    mean_tail_failure = mean_median_ratio >= 4.0 and mean >= 0.08
+    p95_tail_failure = p95_median_ratio >= 6.0 and p95 >= 0.15
+    max_tail_failure = max_median_ratio >= 10.0 and maximum >= 0.20
+    passed = not (mean_tail_failure or p95_tail_failure or max_tail_failure)
+    return {
+        "available": True,
+        "passed": passed,
+        "reason": "validation_tail_stable" if passed else "catastrophic_validation_outliers",
+        "meanMedianRatio": mean_median_ratio,
+        "p95MedianRatio": p95_median_ratio,
+        "maxMedianRatio": max_median_ratio,
+        "p95Error": p95,
+        "maxError": maximum,
+        "failedChecks": {
+            "meanTail": mean_tail_failure,
+            "p95Tail": p95_tail_failure,
+            "maxTail": max_tail_failure,
+        },
+    }
+
+
+def _build_heldout_crop_report(
+    model,
+    records,
+    landmark_keys,
+    transform,
+    device,
+    *,
+    seed=CNN_DEFAULT_RUN_SEED,
+):
     if not records:
         return []
     ds = LandmarkDataset(
@@ -711,10 +1695,17 @@ def _build_heldout_crop_report(model, records, landmark_keys, transform, device)
         landmark_keys,
         transform=transform,
         augment=False,
-        seed=42,
+        seed=seed,
         return_meta=True,
     )
-    loader = DataLoader(ds, batch_size=1, shuffle=False)
+    report_generator, _report_seed = _make_dataloader_generator(seed, 4)
+    loader = DataLoader(
+        ds,
+        batch_size=1,
+        shuffle=False,
+        generator=report_generator,
+        worker_init_fn=_seed_dataloader_worker,
+    )
     model.eval()
     entries = []
     dev_str = str(device)
@@ -757,7 +1748,8 @@ def _build_heldout_crop_report(model, records, landmark_keys, transform, device)
 
 
 def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
-                    model_variant="simplebaseline", device_override=None):
+                    model_variant="simplebaseline", device_override=None,
+                    seed=CNN_DEFAULT_RUN_SEED):
     """
     Train a CNN landmark predictor for a given session + model tag.
 
@@ -767,23 +1759,17 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         epochs: Training epochs (None -> adaptive by dataset size).
         lr: AdamW learning rate (None -> adaptive by dataset size).
         batch_size: Mini-batch size (None -> adaptive by dataset size).
+        seed: Explicit run seed applied to Python, NumPy, PyTorch, CUDA, and loaders.
     """
     project_root = os.path.abspath(project_root)
+    run_seed = _normalize_run_seed(seed)
+    reproducibility_protocol = _configure_reproducibility(run_seed)
     orientation_policy, orientation_mode, aug_profile = _resolve_orientation_aug_policy(project_root)
     xmldir = os.path.join(project_root, "xml")
     modeldir = os.path.join(project_root, "models")
     debug_dir = os.path.join(project_root, "debug")
     os.makedirs(modeldir, exist_ok=True)
     os.makedirs(debug_dir, exist_ok=True)
-    run_dir, run_id = dio.create_model_run_dir(project_root, "cnn", tag)
-    dio.write_run_manifest(
-        run_dir,
-        model_type="cnn",
-        tag=tag,
-        project_root=project_root,
-        extra={"status": "started"},
-    )
-
     train_xml = os.path.join(xmldir, f"train_{tag}.xml")
     test_xml = os.path.join(xmldir, f"test_{tag}.xml")
 
@@ -798,13 +1784,54 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     if not train_records_all:
         raise ValueError(f"No valid training samples found in {train_xml}")
 
+    # Resolve the frozen cohort before creating any run/artifact directory: every
+    # integrity gate below fails closed, and aborting first keeps a rejected run
+    # from leaving an orphan artifact behind.
+    split_info = _read_split_info_strict(
+        os.path.join(debug_dir, f"split_info_{tag}.json")
+    )
+    raw_source_ids_by_path = {}
+    for field in ("train_file_source_ids", "test_file_source_ids"):
+        value = split_info.get(field, {})
+        if isinstance(value, dict):
+            raw_source_ids_by_path.update(value)
+    source_ids_by_path = {
+        os.path.normcase(os.path.abspath(str(path))): str(source_id)
+        for path, source_id in raw_source_ids_by_path.items()
+        if source_id
+    }
+    adaptive_source_ids = _adaptive_source_ids_from_split_info(
+        split_info,
+        debug_dir=debug_dir,
+    )
     train_records, val_records, split_meta = _split_train_val_records(
         train_records_all,
         val_fraction=TRAIN_VAL_FRACTION,
-        seed=42,
+        seed=run_seed,
+        assignment_path=os.path.join(debug_dir, "cohorts", "cnn_validation_v1.json"),
+        source_ids_by_path=source_ids_by_path,
+        adaptive_source_ids=adaptive_source_ids,
     )
     if not train_records:
         raise ValueError("CNN training split produced no train records.")
+
+    run_dir, run_id = dio.create_model_run_dir(project_root, "cnn", tag)
+    model_id = lineage.build_model_id("cnn", run_id)
+    artifact_tag = lineage.build_artifact_tag(tag, run_id)
+    artifact_dir = lineage.create_model_artifact_dir(project_root, "cnn", run_id)
+    dio.write_run_manifest(
+        run_dir,
+        model_type="cnn",
+        tag=tag,
+        project_root=project_root,
+        extra={"status": "started"},
+    )
+
+    id_mapping_path = os.path.join(debug_dir, f"id_mapping_{tag}.json")
+    artifact_id_mapping_path, id_mapping_descriptor, id_map = bundle_id_mapping(
+        id_mapping_path,
+        artifact_dir,
+    )
 
     requested_epochs = None
     try:
@@ -835,8 +1862,12 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
 
     train_source_count = len(set(split_meta.get("train_sources", [])))
     val_source_count = len(set(split_meta.get("val_sources", [])))
-    test_source_count = len({_record_source_key(path) for path, _ in test_records})
-    source_count_for_bucket = len({_record_source_key(path) for path, _ in train_records_all})
+    test_source_count = len({
+        _record_source_key(path, source_ids_by_path) for path, _ in test_records
+    })
+    source_count_for_bucket = len({
+        _record_source_key(path, source_ids_by_path) for path, _ in train_records_all
+    })
 
     adaptive_profile, size_bucket = _resolve_cnn_training_profile(
         source_count_for_bucket,
@@ -866,6 +1897,16 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     n_landmarks = len(landmark_keys)
     if n_landmarks == 0:
         raise ValueError("No common landmarks found across all training images.")
+    effective_dataset = _build_effective_cnn_dataset(
+        train_records,
+        val_records,
+        test_records,
+        landmark_keys=landmark_keys,
+        source_ids_by_path=source_ids_by_path,
+    )
+    effective_dataset_path = os.path.join(artifact_dir, "effective_dataset.json")
+    lineage.atomic_write_json(effective_dataset_path, effective_dataset)
+    dio.write_run_json(run_dir, "effective_dataset.json", effective_dataset)
     bilateral_index_pairs = _build_cnn_bilateral_index_pairs(
         project_root,
         tag,
@@ -917,6 +1958,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     loader_kwargs = {
         "num_workers": int(loader_workers),
         "pin_memory": bool(pin_memory),
+        "worker_init_fn": _seed_dataloader_worker,
     }
     if int(loader_workers) > 0:
         loader_kwargs["persistent_workers"] = True
@@ -936,13 +1978,34 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         use_amp = False
         amp_device_type = "cpu"
         amp_dtype = torch.float32
+    validation_evaluator_protocol = _build_cnn_validation_evaluator_protocol(
+        id_map,
+        landmark_keys,
+        device=device,
+    )
+    validation_evaluator_protocol_path = os.path.join(
+        artifact_dir,
+        "validation_evaluator_protocol.json",
+    )
+    lineage.atomic_write_json(
+        validation_evaluator_protocol_path,
+        validation_evaluator_protocol,
+    )
+    dio.write_run_json(
+        run_dir,
+        "validation_evaluator_protocol.json",
+        validation_evaluator_protocol,
+    )
     if str(device) == "cuda":
         try:
-            torch.set_float32_matmul_precision("high")
+            torch.set_float32_matmul_precision("highest")
         except Exception:
             pass
+        # Reproducibility takes precedence over cuDNN autotuning.  The global
+        # deterministic settings were applied before any model/data creation.
         try:
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
         except Exception:
             pass
 
@@ -952,6 +2015,10 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "model_type": "cnn",
         "tag": tag,
         "run_id": run_id,
+        "run_seed": run_seed,
+        "reproducibility": reproducibility_protocol,
+        "effective_dataset": effective_dataset,
+        "effective_dataset_revision": effective_dataset["revision"],
         "train_xml": train_xml,
         "test_xml": test_xml if os.path.exists(test_xml) else None,
         "dataset_size_bucket": size_bucket,
@@ -1032,7 +2099,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         landmark_keys,
         transform=train_transform,
         augment=True,
-        seed=42,
+        seed=run_seed,
         flip_prob=float(aug_profile.get("flip_prob", 0.5)),
         vertical_flip_prob=float(aug_profile.get("vertical_flip_prob", 0.0)),
         rotation_range=tuple(aug_profile.get("rotation_range", (-35.0, 35.0))),
@@ -1042,8 +2109,15 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         bilateral_index_pairs=bilateral_index_pairs,
         occlusion_prob=float(aug_profile.get("occlusion_prob", 0.1)),
     )
-    train_loader = DataLoader(train_ds, batch_size=resolved_batch_size,
-                              shuffle=True, drop_last=False, **loader_kwargs)
+    train_generator, train_loader_seed = _make_dataloader_generator(run_seed, 0)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=resolved_batch_size,
+        shuffle=True,
+        drop_last=False,
+        generator=train_generator,
+        **loader_kwargs,
+    )
 
     val_loader = None
     if val_records:
@@ -1052,10 +2126,18 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             landmark_keys,
             transform=val_transform,
             augment=False,
-            seed=42,
+            seed=run_seed,
         )
-        val_loader = DataLoader(val_ds, batch_size=resolved_batch_size,
-                                shuffle=False, **loader_kwargs)
+        val_generator, val_loader_seed = _make_dataloader_generator(run_seed, 1)
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=resolved_batch_size,
+            shuffle=False,
+            generator=val_generator,
+            **loader_kwargs,
+        )
+    else:
+        val_loader_seed = None
 
     test_loader = None
     if test_records:
@@ -1064,10 +2146,18 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             landmark_keys,
             transform=val_transform,
             augment=False,
-            seed=42,
+            seed=run_seed,
         )
-        test_loader = DataLoader(test_ds, batch_size=resolved_batch_size,
-                                 shuffle=False, **loader_kwargs)
+        test_generator, test_loader_seed = _make_dataloader_generator(run_seed, 2)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=resolved_batch_size,
+            shuffle=False,
+            generator=test_generator,
+            **loader_kwargs,
+        )
+    else:
+        test_loader_seed = None
 
     # Train-set loader without augmentation for final error computation
     train_val_ds = LandmarkDataset(
@@ -1075,10 +2165,26 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         landmark_keys,
         transform=val_transform,
         augment=False,
-        seed=42,
+        seed=run_seed,
     )
-    train_val_loader = DataLoader(train_val_ds, batch_size=resolved_batch_size,
-                                  shuffle=False, **loader_kwargs)
+    train_eval_generator, train_eval_loader_seed = _make_dataloader_generator(run_seed, 3)
+    train_val_loader = DataLoader(
+        train_val_ds,
+        batch_size=resolved_batch_size,
+        shuffle=False,
+        generator=train_eval_generator,
+        **loader_kwargs,
+    )
+
+    reproducibility_protocol["dataLoaderStreamSeeds"] = {
+        "trainShuffle": train_loader_seed,
+        "validation": val_loader_seed,
+        "test": test_loader_seed,
+        "trainEvaluation": train_eval_loader_seed,
+    }
+    train_params_log["reproducibility"] = reproducibility_protocol
+    dio.write_run_json(run_dir, "train_params.json", train_params_log)
+    dio.write_json(os.path.join(debug_dir, f"training_params_{tag}_cnn.json"), train_params_log)
 
     model = CNNLandmarkPredictor(
         n_landmarks,
@@ -1089,11 +2195,74 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         deconv_filters=cnn_deconv_filters,
         softargmax_beta=cnn_softargmax_beta,
     ).to(device)
+    initializer_state_sha256 = _hash_torch_state_dict(model.state_dict())
     resolved_variant = getattr(model, "model_variant", model_variant)
     variant_fallback_reason = getattr(model, "variant_fallback_reason", None)
     train_params_log["model_variant_resolved"] = resolved_variant
     if variant_fallback_reason:
         train_params_log["model_variant_fallback_reason"] = variant_fallback_reason
+    training_protocol = _build_cnn_training_protocol(
+        {
+            "seed": run_seed,
+            "reproducibility": reproducibility_protocol,
+            "effectiveDatasetRevision": effective_dataset["revision"],
+            "landmarkKeys": landmark_keys,
+            "standardSize": STANDARD_SIZE,
+            "coordinateDenominator": STANDARD_SIZE - 1,
+            "model": {
+                "requestedVariant": model_variant,
+                "resolvedVariant": resolved_variant,
+                "fallbackReason": variant_fallback_reason,
+                "pretrainedWeights": {
+                    "efficientnet_b0": "IMAGENET1K_V1",
+                    "mobilenet_v3_large": "IMAGENET1K_V1",
+                    "resnet50": "IMAGENET1K_V2",
+                    "hrnet_w32": "IMAGENET1K_V1",
+                }.get(resolved_variant),
+                "initializerStateSha256": initializer_state_sha256,
+                "headType": cnn_head_type,
+                "deconvLayers": cnn_deconv_layers,
+                "deconvFilters": cnn_deconv_filters,
+                "softargmaxBeta": cnn_softargmax_beta,
+                "dropout": resolved_dropout,
+            },
+            "optimization": {
+                "optimizer": "AdamW",
+                "scheduler": "CosineAnnealingLR",
+                "epochs": resolved_epochs,
+                "learningRate": resolved_lr,
+                "weightDecay": resolved_weight_decay,
+                "batchSize": resolved_batch_size,
+                "earlyStopPatience": resolved_patience,
+                "loss": {
+                    "coordinate": "adaptive_wing",
+                    "heatmap": "sigmoid_mse",
+                    "coordinateWeight": 0.25,
+                    "heatmapWeight": 1.0,
+                    "heatmapSigmaPx": HEATMAP_SIGMA_PX,
+                },
+                "ampInitiallyEnabled": bool(use_amp),
+            },
+            "dataLoader": {
+                "workers": int(loader_workers),
+                "pinMemory": bool(pin_memory),
+                "persistentWorkers": bool(loader_workers > 0),
+                "prefetchFactor": 2 if loader_workers > 0 else None,
+                "streamSeeds": reproducibility_protocol["dataLoaderStreamSeeds"],
+            },
+            "augmentation": {
+                "geometric": aug_profile,
+                "visual": visual_aug_profile,
+                "bilateralIndexPairs": bilateral_index_pairs,
+            },
+            "orientationMode": orientation_mode,
+        }
+    )
+    training_protocol_path = os.path.join(artifact_dir, "training_protocol.json")
+    lineage.atomic_write_json(training_protocol_path, training_protocol)
+    dio.write_run_json(run_dir, "training_protocol.json", training_protocol)
+    train_params_log["training_protocol"] = training_protocol
+    train_params_log["training_protocol_revision"] = training_protocol["revision"]
     dio.write_run_json(run_dir, "train_params.json", train_params_log)
     dio.write_json(os.path.join(debug_dir, f"training_params_{tag}_cnn.json"), train_params_log)
     optimizer = optim.AdamW(model.parameters(), lr=resolved_lr, weight_decay=resolved_weight_decay)
@@ -1111,7 +2280,9 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     train_started_at = time.time()
     consecutive_nan_batches = 0
     MAX_CONSECUTIVE_NAN = 3
-    # Early stopping state
+    # Early stopping state. A one-source dataset has no independent validation
+    # signal, so that case retains the final epoch.
+    validation_available = val_loader is not None
     _best_val_error = float("inf")
     _best_model_state = None
     _no_improve_epochs = 0
@@ -1214,10 +2385,6 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
                         file=sys.stderr,
                     )
                     break
-        elif _best_model_state is None:
-            _best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            best_epoch = epoch
-
         avg_loss = epoch_loss / max(len(train_records), 1)
         avg_coord_loss = epoch_coord_loss / max(len(train_records), 1)
         avg_heatmap_loss = epoch_heatmap_loss / max(len(train_records), 1)
@@ -1269,8 +2436,12 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             file=sys.stderr,
         )
 
-    # Restore best checkpoint if early stopping saved one
-    if _best_model_state is not None:
+    if not validation_available:
+        best_epoch = epochs_completed
+        stop_reason = "completed_no_validation"
+
+    # Restore only a checkpoint ranked by a real validation cohort.
+    if _should_restore_validation_checkpoint(validation_available, _best_model_state):
         model.load_state_dict({k: v.to(device) for k, v in _best_model_state.items()})
         print(
             f"Restored best checkpoint (val_error={_best_val_error:.6f})",
@@ -1278,7 +2449,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         )
 
     # Save weights
-    model_path = os.path.join(modeldir, f"cnn_{tag}.pth")
+    model_path = os.path.join(artifact_dir, "model.pth")
     torch.save(model.state_dict(), model_path)
 
     # ── Resolve original schema landmark IDs ─────────────────────────────────
@@ -1286,8 +2457,6 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     # prepare_dataset.py.  We need to remap these back to the user's original
     # schema IDs (e.g. 1..11) via id_mapping_{tag}.json so that CNN inference
     # emits landmarks with the same IDs as the dlib predictor.
-    id_mapping_path = os.path.join(debug_dir, f"id_mapping_{tag}.json")
-
     # Default: convert part-name strings to ints (may be 0-indexed dlib parts)
     landmark_ids_raw = []
     for k in landmark_keys:
@@ -1296,37 +2465,31 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         except ValueError:
             landmark_ids_raw.append(k)
 
-    landmark_ids = landmark_ids_raw  # will be overwritten if mapping exists
-    if os.path.exists(id_mapping_path):
-        try:
-            with open(id_mapping_path, "r", encoding="utf-8") as f:
-                id_map = json.load(f)
-            explicit = id_map.get("dlib_index_to_original", {})
-            if explicit:
-                # landmark_keys are the sorted XML part names ("0", "1", ..., "10").
-                # Their sort order matches the dlib part index (0, 1, ..., n-1).
-                sorted_keys = sorted(
-                    landmark_keys,
-                    key=lambda n: (int(n) if n.isdigit() else float("inf"), n),
-                )
-                remapped = []
-                for i, _ in enumerate(sorted_keys):
-                    mapped_id = explicit.get(str(i))
-                    if mapped_id is not None:
-                        remapped.append(int(mapped_id))
-                    else:
-                        remapped.append(landmark_ids_raw[i])
-                landmark_ids = remapped
-                print(
-                    f"CNN config: remapped {len(landmark_ids)} landmark IDs "
-                    f"from dlib indices to schema IDs via id_mapping_{tag}.json",
-                    file=sys.stderr,
-                )
-        except Exception as exc:
-            print(f"Warning: could not load id_mapping_{tag}.json: {exc}", file=sys.stderr)
+    landmark_ids = landmark_ids_raw
+    explicit = id_map.get("dlib_index_to_original", {})
+    # landmark_keys are sorted XML part names. Their order matches the dlib
+    # part index and therefore the required immutable mapping sidecar.
+    sorted_keys = sorted(
+        landmark_keys,
+        key=lambda n: (int(n) if n.isdigit() else float("inf"), n),
+    )
+    remapped = []
+    for i, _ in enumerate(sorted_keys):
+        mapped_id = explicit.get(str(i))
+        remapped.append(int(mapped_id) if mapped_id is not None else landmark_ids_raw[i])
+    landmark_ids = remapped
+    print(
+        f"CNN config: remapped {len(landmark_ids)} landmark IDs "
+        f"from dlib indices to schema IDs via immutable id_mapping.json",
+        file=sys.stderr,
+    )
 
     config = {
         "cnn_format_version": 2,
+        "run_seed": run_seed,
+        "reproducibility": reproducibility_protocol,
+        "effective_dataset_revision": effective_dataset["revision"],
+        "training_protocol_revision": training_protocol["revision"],
         "n_landmarks": n_landmarks,
         "landmark_keys": landmark_keys,
         "landmark_ids": landmark_ids,
@@ -1348,11 +2511,12 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "best_epoch": int(best_epoch),
         "epochs_completed": int(epochs_completed),
         "stop_reason": stop_reason,
+        "early_stopping_available": validation_available,
         "best_val_error": None if not np.isfinite(_best_val_error) else float(_best_val_error),
     }
-    config_path = os.path.join(modeldir, f"cnn_{tag}_config.json")
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    config.update({"model_id": model_id, "artifact_tag": artifact_tag, "run_id": run_id})
+    config_path = os.path.join(artifact_dir, "config.json")
+    lineage.atomic_write_json(config_path, config)
     dio.write_run_json(run_dir, "model_config.json", config)
 
     print("PROGRESS 97 evaluating_train_test_error", file=sys.stderr)
@@ -1372,13 +2536,23 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     train_stats = _compute_error_stats(model, train_val_loader, device)
     val_stats = _compute_error_stats(model, val_loader, device) if val_loader else None
     test_stats = _compute_error_stats(model, test_loader, device) if test_loader else None
+    stability_gate = _cnn_validation_stability_gate(val_stats)
     heldout_crop_report = _build_heldout_crop_report(
         model,
         test_records,
         landmark_keys,
         val_transform,
         device,
+        seed=run_seed,
     ) if test_records else []
+    _assert_effective_cnn_dataset_unchanged(
+        train_records,
+        val_records,
+        test_records,
+        landmark_keys=landmark_keys,
+        source_ids_by_path=source_ids_by_path,
+        expected=effective_dataset,
+    )
     # Stdout protocol matching train_shape_model.py
     print("MODEL_PATH", model_path)
     print("TRAIN_ERROR", round(float(train_stats["mean"]), 6))
@@ -1388,6 +2562,14 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         print("TEST_MEDIAN_ERROR", round(float(test_stats["median"]), 6))
 
     results = {
+        "model_id": model_id,
+        "artifact_tag": artifact_tag,
+        "run_id": run_id,
+        "run_seed": run_seed,
+        "reproducibility": reproducibility_protocol,
+        "effective_dataset_revision": effective_dataset["revision"],
+        "training_protocol_revision": training_protocol["revision"],
+        "promotion_policy": _cnn_promotion_policy(),
         "model_path": model_path,
         "config_path": config_path,
         "train_error": float(train_stats["mean"]),
@@ -1400,6 +2582,8 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "val_median_error": float(val_stats["median"]) if val_stats is not None else None,
         "val_error_px": float(val_stats["mean_px"]) if val_stats is not None else None,
         "val_median_error_px": float(val_stats["median_px"]) if val_stats is not None else None,
+        "val_p95_error": float(val_stats["p95"]) if val_stats is not None else None,
+        "val_max_error": float(val_stats["max"]) if val_stats is not None else None,
         "val_per_landmark_median": list(val_stats["per_landmark_median"]) if val_stats is not None else [],
         "val_per_landmark_median_px": list(val_stats["per_landmark_median_px"]) if val_stats is not None else [],
         "best_val_error": None if not np.isfinite(_best_val_error) else float(_best_val_error),
@@ -1412,6 +2596,8 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "best_epoch": int(best_epoch),
         "epochs_completed": int(epochs_completed),
         "stop_reason": stop_reason,
+        "early_stopping_available": validation_available,
+        "validation_stability_gate": stability_gate,
         "source_counts": {
             "train": int(train_source_count),
             "val": int(val_source_count),
@@ -1463,6 +2649,8 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         project_root=project_root,
         extra={
             "status": "completed",
+            "model_id": model_id,
+            "artifact_tag": artifact_tag,
             "model_path": model_path,
             "train_error": float(train_stats["mean"]),
             "train_median_error": float(train_stats["median"]),
@@ -1473,8 +2661,170 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             "best_epoch": int(best_epoch),
             "epochs_completed": int(epochs_completed),
             "stop_reason": stop_reason,
+            "early_stopping_available": validation_available,
+            "validation_stability_gate": stability_gate,
+            "run_seed": run_seed,
+            "effective_dataset_revision": effective_dataset["revision"],
+            "training_protocol_revision": training_protocol["revision"],
         },
     )
+
+    baseline_record = lineage.get_active_model_record(project_root, "cnn")
+    baseline_model_id = (
+        str(baseline_record.get("modelId")) if baseline_record else None
+    )
+    lineage_payload = lineage.build_run_lineage(
+        project_root,
+        split_paths=[
+            os.path.join(debug_dir, f"split_info_{tag}.json"),
+            os.path.join(debug_dir, "cohorts", "cnn_validation_v1.json"),
+        ],
+        # This trainer constructs a fresh torchvision backbone for every run;
+        # it does not load the prior BioVision artifact.  Keep the prior active
+        # model solely as the promotion baseline and record the real weight
+        # initializer explicitly.
+        parent_model_id=None,
+        baseline_model_id=baseline_model_id,
+        training_mode="retrain_from_base" if baseline_model_id else "train_from_base",
+        initialization={
+            "strategy": "pretrained_backbone",
+            "framework": "torchvision",
+            "requestedVariant": model_variant,
+            "resolvedVariant": resolved_variant,
+            "weights": {
+                "efficientnet_b0": "IMAGENET1K_V1",
+                "mobilenet_v3_large": "IMAGENET1K_V1",
+                "resnet50": "IMAGENET1K_V2",
+                "hrnet_w32": "IMAGENET1K_V1",
+            }.get(resolved_variant),
+            "initializerStateSha256": initializer_state_sha256,
+            "fallbackReason": variant_fallback_reason,
+        },
+    )
+    lineage_payload["effectiveDataset"] = effective_dataset
+    lineage_payload["trainingProtocol"] = training_protocol
+    lineage_payload["reproducibility"] = reproducibility_protocol
+    lineage_payload["validationEvaluatorProtocol"] = validation_evaluator_protocol
+    lineage_payload["promotionPolicy"] = _cnn_promotion_policy()
+    dio.write_run_json(run_dir, "lineage.json", lineage_payload)
+    metrics = {
+        "trainError": results["train_error"],
+        "trainMedianError": results["train_median_error"],
+        "validationError": results["val_error"],
+        "validationMedianError": results["val_median_error"],
+        "testError": results["test_error"],
+        "testMedianError": results["test_median_error"],
+        "bestEpoch": int(best_epoch),
+        "epochsCompleted": int(epochs_completed),
+        "earlyStoppingAvailable": validation_available,
+        "validationP95Error": results["val_p95_error"],
+        "validationMaxError": results["val_max_error"],
+        "stabilityGateAvailable": stability_gate.get("available"),
+        "stabilityGatePassed": stability_gate.get("passed"),
+        "stabilityGateReason": stability_gate.get("reason"),
+        "unstable": stability_gate.get("passed") is False,
+        "trainingSeed": run_seed,
+        "reproducibilityProtocol": reproducibility_protocol,
+        "effectiveDatasetRevision": effective_dataset["revision"],
+        "trainingProtocolRevision": training_protocol["revision"],
+        "promotionPolicy": _cnn_promotion_policy(),
+    }
+    artifact_manifest_path = os.path.join(artifact_dir, "manifest.json")
+    lineage.atomic_write_json(
+        artifact_manifest_path,
+        {
+            "formatVersion": 2,
+            "modelId": model_id,
+            "modelType": "cnn",
+            "predictorType": "cnn",
+            "displayName": tag,
+            "artifactTag": artifact_tag,
+            "runId": run_id,
+            "createdAt": lineage.utc_now_iso(),
+            "artifact": {
+                "path": model_path,
+                "relativePath": "model.pth",
+                "sha256": lineage.sha256_file(model_path),
+            },
+            "config": {
+                "path": config_path,
+                "relativePath": "config.json",
+                "sha256": lineage.sha256_file(config_path),
+            },
+            "sidecars": {
+                "idMapping": id_mapping_descriptor,
+                "effectiveDataset": {
+                    "path": effective_dataset_path,
+                    "relativePath": "effective_dataset.json",
+                    "sha256": lineage.sha256_file(effective_dataset_path),
+                    "revision": effective_dataset["revision"],
+                },
+                "trainingProtocol": {
+                    "path": training_protocol_path,
+                    "relativePath": "training_protocol.json",
+                    "sha256": lineage.sha256_file(training_protocol_path),
+                    "revision": training_protocol["revision"],
+                },
+                "validationEvaluatorProtocol": {
+                    "format": "biovision.landmark-validation-evaluator-protocol.v1",
+                    "path": validation_evaluator_protocol_path,
+                    "relativePath": "validation_evaluator_protocol.json",
+                    "sha256": lineage.sha256_file(validation_evaluator_protocol_path),
+                    "fingerprint": validation_evaluator_protocol["fingerprint"],
+                },
+            },
+            "metrics": metrics,
+            "lineage": lineage_payload,
+            "validationEvaluatorProtocol": validation_evaluator_protocol,
+        },
+    )
+
+    unique_model_alias = os.path.join(modeldir, f"cnn_{artifact_tag}.pth")
+    legacy_model_alias = os.path.join(modeldir, f"cnn_{tag}.pth")
+    unique_config_alias = os.path.join(modeldir, f"cnn_{artifact_tag}_config.json")
+    legacy_config_alias = os.path.join(modeldir, f"cnn_{tag}_config.json")
+    lineage.atomic_copy_file(model_path, unique_model_alias)
+    lineage.atomic_copy_file(config_path, unique_config_alias)
+
+    for original_name, unique_name in (
+        (f"id_mapping_{tag}.json", f"id_mapping_{artifact_tag}.json"),
+        (f"crop_metadata_{tag}.json", f"crop_metadata_{artifact_tag}.json"),
+        (f"orientation_{tag}.json", f"orientation_{artifact_tag}.json"),
+        (f"training_boxes_{tag}.json", f"training_boxes_{artifact_tag}.json"),
+        (f"split_info_{tag}.json", f"split_info_{artifact_tag}.json"),
+        (f"training_params_{tag}_cnn.json", f"training_params_{artifact_tag}_cnn.json"),
+        (f"training_results_{tag}_cnn.json", f"training_results_{artifact_tag}_cnn.json"),
+        (f"heldout_crop_report_{tag}_cnn.json", f"heldout_crop_report_{artifact_tag}_cnn.json"),
+    ):
+        original_path = os.path.join(debug_dir, original_name)
+        if os.path.isfile(original_path):
+            lineage.atomic_copy_file(original_path, os.path.join(debug_dir, unique_name))
+
+    registry_record = lineage.publish_model_run(
+        project_root,
+        model_type="cnn",
+        predictor_type="cnn",
+        run_id=run_id,
+        display_name=tag,
+        artifact_tag=artifact_tag,
+        artifact_path=model_path,
+        legacy_path=unique_model_alias,
+        config_path=config_path,
+        run_manifest_path=artifact_manifest_path,
+        current_alias_path=legacy_model_alias,
+        metrics=metrics,
+        promotion_policy=_cnn_promotion_policy(),
+        active_aliases=[
+            (model_path, legacy_model_alias),
+            (config_path, legacy_config_alias),
+        ],
+    )
+    results["registry"] = registry_record
+    results["id_mapping_path"] = artifact_id_mapping_path
+    print("MODEL_ID", model_id)
+    print("MODEL_TAG", artifact_tag)
+    print("MODEL_STATUS", registry_record.get("status"))
+    print("PROMOTION_JSON", json.dumps(registry_record.get("promotion", {}), sort_keys=True))
     print(f"CNN run debug saved to: {run_dir}", file=sys.stderr)
     return results
 
@@ -1501,6 +2851,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--model-variant", type=str, default="simplebaseline")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=CNN_DEFAULT_RUN_SEED,
+        help="Seed Python, NumPy, PyTorch, CUDA, DataLoader shuffle, and workers.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -1517,4 +2873,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         model_variant=args.model_variant,
         device_override=args.device,
+        seed=args.seed,
     )

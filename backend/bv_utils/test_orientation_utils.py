@@ -1,6 +1,7 @@
 import math
 import unittest
 
+import cv2
 import numpy as np
 
 from backend.bv_utils import orientation_utils as ou
@@ -94,6 +95,142 @@ class OrientationTransformTests(unittest.TestCase):
         legacy_meta.pop("padding_coordinate_space", None)
         restored_legacy = ou.map_to_original(standardized_landmarks, legacy_meta, image_shape=image.shape[:2])
         self.assert_round_trip_close(landmarks, restored_legacy, tolerance=1.1)
+
+    def test_landmark_ids_three_and_twelve_do_not_imply_bilateral_schema(self):
+        policy = ou.infer_orientation_policy_from_template(
+            [
+                {"index": 3, "name": "Arbitrary point"},
+                {"index": 12, "name": "Another arbitrary point"},
+            ]
+        )
+        self.assertEqual(policy["mode"], "invariant")
+
+    def test_landmark_derived_obb_keeps_rectangular_geometry_beyond_image_edge(self):
+        derived = ou.derive_obb_from_landmarks(
+            [
+                {"id": 1, "x": 1.0, "y": 18.0},
+                {"id": 2, "x": 32.0, "y": 42.0},
+                {"id": 3, "x": 58.0, "y": 64.0},
+            ],
+            image_shape=(80, 90),
+            head_id=1,
+            tail_id=3,
+            mode="directional",
+            pad_ratio=0.25,
+            min_pad_px=8.0,
+        )
+
+        corners = np.asarray(derived["obbCorners"], dtype=np.float64)
+        self.assertTrue(
+            bool(np.any(corners[:, 0] < 0.0) or np.any(corners[:, 1] < 0.0)),
+            "edge-crossing padding must survive for the exporter's rigid canvas repair",
+        )
+        edges = np.roll(corners, -1, axis=0) - corners
+        lengths = np.linalg.norm(edges, axis=1)
+        self.assertGreater(float(np.min(lengths)), 0.0)
+        self.assertAlmostEqual(float(lengths[0]), float(lengths[2]), places=5)
+        self.assertAlmostEqual(float(lengths[1]), float(lengths[3]), places=5)
+        for index in range(4):
+            cosine = abs(
+                float(np.dot(edges[index], edges[(index + 1) % 4]))
+                / float(lengths[index] * lengths[(index + 1) % 4])
+            )
+            self.assertLess(cosine, 1e-5)
+
+    def test_axial_mode_is_one_class_and_never_applies_class_driven_half_turn(self):
+        landmarks = [
+            {"id": 1, "x": 20.0, "y": 80.0},
+            {"id": 2, "x": 20.0, "y": 10.0},
+        ]
+        self.assertEqual(
+            ou.derive_class_id_from_landmarks(landmarks, mode="axial", head_id=1, tail_id=2),
+            0,
+        )
+        crop = np.arange(32 * 32 * 3, dtype=np.uint8).reshape((32, 32, 3))
+        routed, metadata, debug = ou.apply_obb_geometry(
+            crop.copy(),
+            {"rotation": 90.0},
+            1,
+            {"mode": "axial"},
+        )
+        self.assertTrue(np.array_equal(routed, crop))
+        self.assertFalse(metadata.get("rotated_180", False))
+        self.assertTrue(debug.get("pole_invariant"))
+
+    def test_bilateral_class_one_rotation_keeps_pixels_and_landmarks_aligned(self):
+        image = np.zeros((320, 480, 3), dtype=np.uint8)
+        cv2.circle(image, (105, 105), 9, (0, 255, 0), thickness=-1)
+        cv2.circle(image, (375, 215), 9, (0, 0, 255), thickness=-1)
+        box = {
+            "left": 40,
+            "top": 60,
+            "width": 400,
+            "height": 200,
+            "obbCorners": [[40, 60], [440, 60], [440, 260], [40, 260]],
+            "class_id": 1,
+        }
+        original_landmarks = [
+            {"id": 3, "x": 105.0, "y": 105.0},
+            {"id": 12, "x": 375.0, "y": 215.0},
+        ]
+        crop, landmarks, metadata = prepare_standardize_crop(
+            image,
+            box,
+            original_landmarks,
+            orientation_policy={
+                "mode": "bilateral",
+                "bilateralClassAxis": "vertical_obb",
+                "obbLevelingMode": "on",
+            },
+        )
+
+        self.assertTrue(metadata["rotated_180"])
+        self.assertFalse(metadata.get("canonical_flip_applied", False))
+        marker_masks = {
+            3: (crop[:, :, 1] > 180) & (crop[:, :, 1] > crop[:, :, 2] * 1.5),
+            12: (crop[:, :, 2] > 180) & (crop[:, :, 2] > crop[:, :, 1] * 1.5),
+        }
+        by_id = {int(landmark["id"]): landmark for landmark in landmarks}
+        for landmark_id, mask in marker_masks.items():
+            ys, xs = np.nonzero(mask)
+            self.assertGreater(len(xs), 20)
+            self.assertLess(abs(float(xs.mean()) - float(by_id[landmark_id]["x"])), 3.0)
+            self.assertLess(abs(float(ys.mean()) - float(by_id[landmark_id]["y"])), 3.0)
+
+        restored = ou.map_to_original(landmarks, metadata, image_shape=image.shape[:2])
+        self.assert_round_trip_close(original_landmarks, restored, tolerance=1.1)
+
+    def test_bilateral_geometry_rejects_missing_legacy_axis_contract(self):
+        crop = np.zeros((32, 32, 3), dtype=np.uint8)
+        with self.assertRaisesRegex(ValueError, "bilateralClassAxis"):
+            ou.apply_obb_geometry(crop, {}, 1, {"mode": "bilateral"})
+
+    def test_uncertainty_metadata_survives_mapping_and_flip_disagreement_is_measured(self):
+        image = np.zeros((120, 160, 3), dtype=np.uint8)
+        _crop, meta = ou.base_standardize(image, [10, 10, 150, 110], pad_ratio=0.0)
+        mapped = ou.map_to_original(
+            [{"id": 1, "x": 256.0, "y": 256.0, "confidence": 0.8, "heatmap_entropy": 0.2}],
+            meta,
+            image_shape=image.shape[:2],
+        )
+        self.assertAlmostEqual(mapped[0]["confidence"], 0.8)
+        self.assertAlmostEqual(mapped[0]["heatmap_entropy"], 0.2)
+
+        asymmetric = np.zeros((512, 512, 3), dtype=np.uint8)
+        asymmetric[:, :32] = 255
+
+        def predict_fn(crop):
+            left_bright = float(crop[:, :32].mean()) > float(crop[:, -32:].mean())
+            x = 100.0 if left_bright else 300.0
+            return [{"id": 1, "x": x, "y": 200.0}]
+
+        _landmarks, _flipped, debug = ou.select_orientation(
+            asymmetric,
+            predict_fn,
+            landmark_template={1: {"x": 0.5, "y": 0.5}},
+        )
+        self.assertIsNotNone(debug.get("model_disagreement"))
+        self.assertGreater(debug["model_disagreement"], 0.0)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@
     "dev": "vite",
     "build": "tsc && vite build && electron-builder",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "test:electron": "node scripts/run-electron-tests.cjs",
+    "test:contracts": "node scripts/frontend_contract_tests.cjs",
     "preview": "vite preview"
   },
   "dependencies": {

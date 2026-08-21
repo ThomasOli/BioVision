@@ -185,6 +185,13 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     updateBox,
   } = useContext(UndoRedoClearContext);
 
+  const normalizedOrientationMode = typeof orientationMode === "string"
+    ? orientationMode.trim().toLowerCase()
+    : undefined;
+  const effectiveBilateralClassAxis =
+    bilateralClassAxis ??
+    (normalizedOrientationMode === "bilateral" ? "vertical_obb" : undefined);
+
   const [resegmentingBoxId, setResegmentingBoxId] = useState<number | null>(null);
 
   const triggerResegment = useCallback(
@@ -667,7 +674,7 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     setIsRedrawingSelected(false);
     setDrawStart(null);
     setDrawCurrent(null);
-  }, [isDragging, isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox, triggerResegment, drawDefaultOrientation]);
+  }, [isDragging, isDrawingBox, drawStart, drawCurrent, imageDimensions, addBox, detectionMode, autoCorrectionMode, isRedrawingSelected, selectedBoxId, updateBox, triggerResegment, drawDefaultOrientation, effectiveBilateralClassAxis, normalizedOrientationMode]);
 
   // Draw preview rect
   const drawPreview = useMemo(() => {
@@ -721,21 +728,10 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
     tr.getLayer()?.batchDraw();
   }, [mode, lockBoxes, detectionMode, autoCorrectionMode, selectedBoxId, visibleBoxes]);
 
-  if (imageError) {
-    return <div className="text-destructive">Error loading image.</div>;
-  }
-
-  const normalizedOrientationMode = typeof orientationMode === "string"
-    ? orientationMode.trim().toLowerCase()
-    : undefined;
   // Gate orientation arrows on vector schemas (directional + bilateral).
   // Unknown/unset mode defaults to showing arrows.
   const orientationRenderMode = getOrientationRenderMode(normalizedOrientationMode);
   const isVectorSchema = orientationRenderMode === "arrow";
-
-  const effectiveBilateralClassAxis =
-    bilateralClassAxis ??
-    (normalizedOrientationMode === "bilateral" ? "vertical_obb" : undefined);
 
   // Derive active orientation from selected box (reflects its class_id or hint)
   const selectedBox = selectedBoxId !== null ? boxes.find(b => b.id === selectedBoxId) ?? null : null;
@@ -755,6 +751,10 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
       normalizedStored !== "uncertain" ? normalizedStored : sessionDefaultOrientation
     );
   }, [effectiveBilateralClassAxis, normalizedOrientationMode, sessionDefaultOrientation]);
+
+  if (imageError) {
+    return <div className="text-destructive">Error loading image.</div>;
+  }
 
   const activeOrientation: StoredOrientationLabel = selectedBox
     ? (() => {

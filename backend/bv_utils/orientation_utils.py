@@ -13,6 +13,26 @@ STANDARDIZED_OBB_INTERPOLATION = cv2.INTER_LINEAR
 ORIENTATION_MODES = {"directional", "bilateral", "axial", "invariant"}
 
 
+def require_explicit_orientation_policy(project_root: str) -> dict[str, Any]:
+    """Return the confirmed session policy or refuse to run a training path."""
+    session_path = os.path.join(project_root, "session.json")
+    try:
+        with open(session_path, "r", encoding="utf-8") as handle:
+            session = json.load(handle)
+    except Exception as exc:
+        raise RuntimeError(
+            "Training requires a readable session.json with an explicit orientation policy."
+        ) from exc
+    policy = session.get("orientationPolicy") if isinstance(session, dict) else None
+    mode = str(policy.get("mode") or "").strip().lower() if isinstance(policy, dict) else ""
+    if mode not in ORIENTATION_MODES or session.get("orientationPolicyConfigured") is not True:
+        raise RuntimeError(
+            "Training requires an explicit session orientation policy (directional, bilateral, "
+            "axial, or invariant). Open the schema settings, confirm the policy, and retry."
+        )
+    return sanitize_orientation_policy(policy, session.get("landmarkTemplate", []))
+
+
 def load_augmentation_policy(session_dir: str) -> dict:
     """Load augmentationPolicy block from session.json, or {} if absent/unreadable."""
     session_path = os.path.join(session_dir, "session.json")
@@ -118,21 +138,6 @@ def infer_orientation_policy_from_template(
             "posteriorAnchorIds": [upper_caudal, lower_caudal]
             if upper_caudal is not None and lower_caudal is not None
             else [],
-            "obbLevelingMode": "on",
-        }
-    template_indices = set()
-    if isinstance(landmark_template, Sequence):
-        for lm in landmark_template:
-            try:
-                template_indices.add(int(lm.get("index")))
-            except Exception:
-                continue
-    if 3 in template_indices and 12 in template_indices:
-        return {
-            "mode": "bilateral",
-            "anteriorAnchorIds": [3],
-            "posteriorAnchorIds": [12],
-            "bilateralClassAxis": "vertical_obb",
             "obbLevelingMode": "on",
         }
     return {
@@ -1300,10 +1305,12 @@ def derive_obb_from_landmarks(
             ],
             dtype=np.float32,
         )
-        if image_shape is not None:
-            img_h, img_w = image_shape[:2]
-            corners[:, 0] = np.clip(corners[:, 0], 0.0, float(img_w - 1))
-            corners[:, 1] = np.clip(corners[:, 1], 0.0, float(img_h - 1))
+        # Keep the repaired rectangle rigid even when its biological padding
+        # extends beyond the source canvas.  Downstream OBB export pads and
+        # translates the canvas as one transform; clipping individual vertices
+        # here would turn the rectangle into a trapezoid before that repair can
+        # run.  The derived AABB below may still be bounded for legacy crop/UI
+        # fields, but ``obbCorners`` remains the authoritative geometry.
         corners_list = corners.tolist()
         return {
             **obb_corners_to_aabb(corners_list, image_shape=image_shape),
@@ -1363,10 +1370,10 @@ def derive_obb_from_landmarks(
         ],
         dtype=np.float32,
     )
-    if image_shape is not None:
-        img_h, img_w = image_shape[:2]
-        corners[:, 0] = np.clip(corners[:, 0], 0.0, float(img_w - 1))
-        corners[:, 1] = np.clip(corners[:, 1], 0.0, float(img_h - 1))
+    # Do not clamp vertices independently.  A corner-wise clamp changes edge
+    # lengths and angles, corrupting the repaired OBB.  Out-of-canvas corners
+    # are intentional and are handled later by rigid canvas padding/translation
+    # during real OBB export.
 
     corners_list = corners.tolist()
     return {
@@ -1385,7 +1392,7 @@ def derive_class_id_from_landmarks(
     tail_id: int | None = None,
 ) -> int:
     resolved_mode = _safe_orientation_mode(mode)
-    if resolved_mode == "invariant":
+    if resolved_mode in {"axial", "invariant"}:
         return 0
 
     valid = [
@@ -1405,9 +1412,6 @@ def derive_class_id_from_landmarks(
         tail = next((lm for lm in valid if int(lm.get("id", -99999)) == int(tail_id)), None)
     if head is None or tail is None:
         return 0
-
-    if resolved_mode == "axial":
-        return 0 if float(head["y"]) < float(tail["y"]) else 1
 
     return 0 if float(head["x"]) < float(tail["x"]) else 1
 
@@ -1591,7 +1595,21 @@ def select_orientation(
 
     score_b = score_landmarks_against_template(lms_b, landmark_template)
     ori_b = detect_orientation(lms_b, head_id=head_id, tail_id=tail_id)
-    ori_b_unflipped = detect_orientation(mirror_landmarks_512(lms_b), head_id=head_id, tail_id=tail_id)
+    lms_b_unflipped = mirror_landmarks_512(lms_b)
+    ori_b_unflipped = detect_orientation(lms_b_unflipped, head_id=head_id, tail_id=tail_id)
+    primary_by_id = {int(lm["id"]): lm for lm in lms_a if "id" in lm}
+    flipped_by_id = {int(lm["id"]): lm for lm in lms_b_unflipped if "id" in lm}
+    shared_ids = sorted(set(primary_by_id) & set(flipped_by_id))
+    model_disagreement = None
+    if shared_ids:
+        distances = [
+            math.hypot(
+                float(primary_by_id[lm_id]["x"]) - float(flipped_by_id[lm_id]["x"]),
+                float(primary_by_id[lm_id]["y"]) - float(flipped_by_id[lm_id]["y"]),
+            ) / float(STANDARD_SIZE)
+            for lm_id in shared_ids
+        ]
+        model_disagreement = float(max(0.0, min(1.0, sum(distances) / len(distances))))
 
     use_flipped = False
     selection_reason = "keep_primary"
@@ -1677,6 +1695,7 @@ def select_orientation(
         "template_gain_ratio_threshold": template_gain_ratio,
         "primary_bad_score_threshold": primary_bad_score,
         "candidate_b_evaluated": True,
+        "model_disagreement": model_disagreement,
     }
 
 
@@ -1769,6 +1788,7 @@ def map_to_original(
                 y_orig = max(0.0, min(float(img_h - 1), y_orig))
 
             mapped.append({
+                **{key: value for key, value in lm.items() if key not in {"id", "x", "y"}},
                 "id": int(lm["id"]),
                 "x": round(x_orig, 1),
                 "y": round(y_orig, 1),
@@ -1812,6 +1832,7 @@ def map_to_original(
             y_orig = max(0.0, min(float(img_h - 1), y_orig))
 
         mapped.append({
+            **{key: value for key, value in lm.items() if key not in {"id", "x", "y"}},
             "id": int(lm["id"]),
             "x": round(x_orig, 1),
             "y": round(y_orig, 1),
@@ -2119,33 +2140,25 @@ def apply_obb_geometry(
 
     elif mode == "bilateral":
         bilateral_axis = str(orientation_policy.get("bilateralClassAxis", "")).strip().lower()
-        if bilateral_axis == "vertical_obb":
-            if class_id == 1:
-                crop_512 = cv2.rotate(crop_512, cv2.ROTATE_180)
-                metadata = {
-                    **metadata,
-                    "canonical_flip_applied": True,
-                    "bilateral_flip": True,
-                    "rotated_180": True,
-                }
-                debug["flip_applied"] = True
-                debug["rotated_180"] = True
-                debug["flip_reason"] = "bilateral vertical normalization"
-        else:
-            # Legacy bilateral sessions normalize with the historical left/right flip.
-            if class_id == 1:
-                crop_512 = cv2.flip(crop_512, 1)
-                metadata = {**metadata, "canonical_flip_applied": True, "bilateral_flip": True}
-                debug["flip_applied"] = True
-                debug["flip_reason"] = "bilateral normalization"
+        if bilateral_axis != "vertical_obb":
+            raise ValueError(
+                "Bilateral OBB geometry requires the explicit "
+                'bilateralClassAxis="vertical_obb" contract.'
+            )
+        if class_id == 1:
+            crop_512 = cv2.rotate(crop_512, cv2.ROTATE_180)
+            metadata = {
+                **metadata,
+                "bilateral_flip": True,
+                "rotated_180": True,
+            }
+            debug["rotated_180"] = True
+            debug["flip_reason"] = "bilateral vertical normalization"
 
     elif mode == "axial":
-        # If OBB angle is significantly off from horizontal, rotate 180°
-        obb_angle = float(metadata.get("rotation", 0.0))
-        if abs(obb_angle) > 45:
-            crop_512 = cv2.rotate(crop_512, cv2.ROTATE_180)
-            metadata = {**metadata, "rotated_180": True}
-            debug["rotated_180"] = True
+        # The detector exports one pole-invariant class. OBB deskewing aligns the
+        # dominant axis, while 180° training augmentation handles either end.
+        debug["pole_invariant"] = True
 
     # invariant: deskew was applied by extract_obb_crop; no flip needed
 

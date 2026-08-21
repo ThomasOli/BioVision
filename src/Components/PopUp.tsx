@@ -34,6 +34,10 @@ interface TrainModelDialogProps {
   modelName: string;
   preflightSummary?: string;
   preflightWarning?: string;
+  useImportedXml?: boolean;
+  importedXmlSummary?: string;
+  onImportDlibXml?: () => Promise<void>;
+  onUseSessionData?: () => void;
   predictorType?: "dlib" | "cnn";
   setPredictorType?: (type: "dlib" | "cnn") => void;
   // OBB detector training (Phase 3 - step before landmarker)
@@ -99,6 +103,10 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   isTraining = false,
   preflightSummary,
   preflightWarning,
+  useImportedXml = false,
+  importedXmlSummary,
+  onImportDlibXml,
+  onUseSessionData,
   predictorType = "dlib",
   setPredictorType,
   cnnVariants = [],
@@ -170,7 +178,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     trimmed.length > 0 &&
     nameOk &&
     !isTraining &&
-    (!showObbStep || obbDetectorReady);
+    (!showObbStep || obbDetectorReady || useImportedXml);
 
   const helperText = useMemo(() => {
     if (!touched)
@@ -340,6 +348,8 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     isTraining,
     preflightSummary,
     preflightWarning,
+    useImportedXml,
+    importedXmlSummary,
     cnnVariantWarning,
     orientationMode,
     speciesId,
@@ -652,7 +662,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
           </details>
         )}
 
-        {(!showObbStep || obbDetectorReady) && <div className="space-y-4 py-4">
+        <div className="space-y-4 py-4">
           <div className="space-y-2">
             <Label htmlFor="model-name" className="text-sm font-medium">
               Model name
@@ -686,6 +696,44 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
               {helperText}
             </p>
           </div>
+
+          {onImportDlibXml && (
+            <div className="space-y-2 rounded-md border border-border/60 bg-muted/20 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <Label className="text-sm font-medium">Training data</Label>
+                  <p className="text-[11px] text-muted-foreground">
+                    {useImportedXml
+                      ? "Using schema-validated imported dlib XML."
+                      : "Using annotations saved in this BioVision session."}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={isTraining || !nameOk}
+                  onClick={() => void onImportDlibXml()}
+                >
+                  {useImportedXml ? "Replace XML" : "Import dlib XML"}
+                </Button>
+              </div>
+              {importedXmlSummary && (
+                <p className="text-[11px] text-muted-foreground">{importedXmlSummary}</p>
+              )}
+              {useImportedXml && onUseSessionData && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  disabled={isTraining}
+                  onClick={onUseSessionData}
+                >
+                  Use session annotations instead
+                </Button>
+              )}
+            </div>
+          )}
 
           {/* Predictor type selection */}
           {setPredictorType && (
@@ -967,12 +1015,12 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
               )}
             </div>
           )}
-            </div>}
+            </div>
             </div>
           </ScrollArea>
         </div>
 
-        {(!showObbStep || obbDetectorReady) && <DialogFooter className="shrink-0 gap-2 px-6 pb-6 pt-2 sm:gap-0">
+        {(!showObbStep || obbDetectorReady || useImportedXml) && <DialogFooter className="shrink-0 gap-2 px-6 pb-6 pt-2 sm:gap-0">
           <Button
             variant="outline"
             onClick={handleClose}

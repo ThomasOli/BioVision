@@ -46,6 +46,17 @@ interface TrainModelResult {
   trainMedianError?: number | null;  // Training set median error (normalized)
   testMedianError?: number | null;   // Test set median error (normalized)
   modelPath?: string | null;         // Path to saved model
+  modelId?: string | null;
+  artifactTag?: string | null;
+  modelStatus?: "active" | "candidate" | "deprecated" | null;
+  promotion?: {
+    promoted?: boolean;
+    reason?: string;
+    metric?: string | null;
+    candidateScore?: number | null;
+    baselineScore?: number | null;
+    baselineModelId?: string | null;
+  } | null;
   auditReport?: Record<string, unknown>;  // Dataset audit results from audit_dataset.py
 }
 
@@ -197,6 +208,12 @@ interface ModelCompatibilityResult {
   error?: string;
   obbDetectorReady?: boolean;
   obbDetectorPath?: string;
+  obbDetector?: {
+    provenance: DetectionModelProvenance;
+    compatible: boolean;
+    blocking: boolean;
+    issues: ModelCompatibilityIssue[];
+  };
 }
 
 interface SelectImageFolderResult {
@@ -211,6 +228,15 @@ interface DetectionOptions {
   maxObjects?: number;
   imgsz?: import("./Image").ObbImageSize;
   detectionPreset?: import("./Image").ObbDetectionPreset;
+  allowIncompatible?: boolean;
+}
+
+interface DetectionModelProvenance {
+  modelId: string;
+  artifactSha256: string | null;
+  configSha256?: string | null;
+  displayName: string;
+  kind: "trained_obb" | "zero_shot";
 }
 
 interface DetectedBox {
@@ -241,6 +267,15 @@ interface DetectSpecimensResult {
   image_height?: number;
   num_detections?: number;
   fallback?: boolean;
+  detection_method?: string;
+  detectorProvenance?: DetectionModelProvenance;
+  requiresOverride?: boolean;
+  compatibility?: {
+    compatible: boolean;
+    blocking: boolean;
+    requiresOverride: boolean;
+    issues: ModelCompatibilityIssue[];
+  };
 }
 
 interface LoadAnnotatedFolderResult {
@@ -271,10 +306,28 @@ interface TrainingPreflightResult {
   importedImages?: number;
   totalTrainableImages?: number;
   trainXmlImages?: number;
+  validationXmlImages?: number;
   testXmlImages?: number;
   landmarkStatus?: "ok" | "warning";
   landmarkMessage: string;
   warnings?: string[];
+  error?: string;
+}
+
+interface ImportDlibXmlResult {
+  ok: boolean;
+  canceled: boolean;
+  warnings?: string[];
+  trainXmlPath?: string;
+  validationXmlPath?: string;
+  testXmlPath?: string;
+  mappingPath?: string;
+  splitInfoPath?: string;
+  validationCohortRevision?: string;
+  mappingMode?: string;
+  trainStats?: { num_images: number; num_boxes: number; num_parts: number };
+  validationStats?: { num_images: number; num_boxes: number; num_parts: number };
+  testStats?: { num_images: number; num_boxes: number; num_parts: number } | null;
   error?: string;
 }
 
@@ -288,6 +341,7 @@ interface SuperAnnotateOptions {
   nmsIou?: number;
   imgsz?: import("./Image").ObbImageSize;
   useOrientationHint?: boolean;
+  allowIncompatible?: boolean;
 }
 
 interface InstanceMetadata {
@@ -330,6 +384,14 @@ interface SuperAnnotateResult {
   detection_method: string;
   num_detections: number;
   error?: string;
+  detectorProvenance?: DetectionModelProvenance;
+  requiresOverride?: boolean;
+  compatibility?: {
+    compatible: boolean;
+    blocking: boolean;
+    requiresOverride: boolean;
+    issues: ModelCompatibilityIssue[];
+  };
 }
 
 interface CheckSuperAnnotatorResult {
@@ -404,6 +466,28 @@ interface SegmentSaveStatus {
   details?: import("./Image").FinalizeFailureDetail[];
 }
 
+interface InferenceReviewDraftMetadata {
+  mask_source?: string;
+  canonical_flip_applied?: boolean;
+  direction_source?: string;
+  inferred_direction?: "left" | "right" | null;
+  inferred_direction_confidence?: number;
+  direction_confidence?: number;
+  used_flipped_crop?: boolean;
+  was_flipped?: boolean;
+  selection_reason?: string;
+  detector_hint_orientation?: string | null;
+  detector_hint_source?: string | null;
+  orientation_warning?: { code?: string; message?: string } | null;
+  clamped_landmark_count?: number;
+  landmark_count?: number;
+  landmark_heatmap_entropy?: number;
+  model_disagreement?: number;
+  ood_score?: number;
+  ood_score_source?: string;
+  inferenceSignature?: string;
+}
+
 interface InferenceReviewDraftSpecimen {
   box: {
     left: number;
@@ -424,7 +508,36 @@ interface InferenceReviewDraftSpecimen {
       tail_point?: [number, number];
     };
   };
-  landmarks: { id: number; x: number; y: number }[];
+  landmarks: {
+    id: number;
+    x: number;
+    y: number;
+    confidence?: number;
+    heatmap_entropy?: number;
+  }[];
+  inference_metadata?: InferenceReviewDraftMetadata;
+}
+
+interface HitlPrioritySignals {
+  detectorConfidence?: number;
+  landmarkConfidence?: number;
+  landmarkHeatmapEntropy?: number;
+  modelDisagreement?: number;
+  oodScore?: number;
+  repeatedFailureCount?: number;
+}
+
+interface HitlReviewPriority {
+  score: number;
+  band: "high" | "medium" | "low";
+  factors: {
+    detectorUncertainty?: number;
+    landmarkUncertainty?: number;
+    modelDisagreement?: number;
+    oodScore?: number;
+    repeatedFailure?: number;
+  };
+  reasons: string[];
 }
 
 interface InferenceReviewDraftItem {
@@ -433,13 +546,18 @@ interface InferenceReviewDraftItem {
   filename: string;
   specimens: InferenceReviewDraftSpecimen[];
   edited: boolean;
+  wasEdited?: boolean;
   saved: boolean;
   reviewComplete?: boolean;
   committedAt?: string | null;
   landmarkModelKey?: string;
-  landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose";
+  landmarkPredictorType?: "dlib" | "cnn";
   boxSignature?: string;
   inferenceSignature?: string;
+  detectorProvenance?: DetectionModelProvenance;
+  prioritySignals?: HitlPrioritySignals;
+  reviewPriority?: HitlReviewPriority;
+  commitFailureCount?: number;
   updatedAt: string;
 }
 
@@ -452,7 +570,7 @@ interface InferenceSessionManifest {
     landmark: {
       key: string;
       name?: string;
-      predictorType?: "dlib" | "cnn" | "yolo_pose";
+      predictorType?: "dlib" | "cnn";
     };
     detection: {
       key: string;
@@ -461,7 +579,7 @@ interface InferenceSessionManifest {
   };
   preferences?: {
     lastUsedLandmarkModelKey?: string;
-    lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+    lastUsedPredictorType?: "dlib" | "cnn";
     detectionModelKey?: string;
     detectionModelName?: string;
   };
@@ -512,6 +630,8 @@ interface SessionMeta {
   lastModified: string;
   landmarkCount: number;
   schemaFingerprint?: string;
+  schemaSemanticFingerprint?: string;
+  schemaSemanticVersion?: number;
   schemaKind?: "default" | "custom";
   schemaSourceId?: string;
   orientationPolicy?: OrientationPolicy;
@@ -537,6 +657,10 @@ interface SessionMeta {
         workspaceImages?: number;
         importedImagesHint?: number;
       }) => Promise<TrainingPreflightResult>;
+      importDlibXml: (args: {
+        modelName: string;
+        speciesId?: string;
+      }) => Promise<ImportDlibXmlResult>;
       predictImage: (
         imagePath: string,
         tag: string,
@@ -558,12 +682,45 @@ interface SessionMeta {
         activeOnly?: boolean;
         includeDeprecated?: boolean;
       }) => Promise<{ ok: boolean; models?: TrainedModel[]; error?: string }>;
+      /** Metadata for one trained model (paths, schema name, predictor type). */
+      getModelInfo: (
+        modelName: string,
+        speciesId?: string
+      ) => Promise<Record<string, unknown> & { ok?: boolean; error?: string }>;
+      /** Detailed per-image evaluation of a trained landmark model. */
+      testModel: (
+        args: string | { modelName: string; speciesId?: string }
+      ) => Promise<{
+        ok: boolean;
+        results?: unknown;
+        output?: string;
+        error?: string;
+      }>;
+      /** Reports whether the YOLO OBB detection backend is importable. */
+      checkYolo: () => Promise<{
+        available: boolean;
+        primary_method?: string;
+        error?: string;
+      }>;
+      /** Reveal a project-root file in the OS file manager. */
+      openPath: (targetPath: string) => Promise<{ ok: boolean; error?: string }>;
+      /** Refine one SAM2 mask with an additional include/exclude click. */
+      refineSam: (args: {
+        imagePath: string;
+        objectIndex: number;
+        clickPoint: [number, number];
+        clickLabel: number;
+      }) => Promise<{ ok: boolean; error?: string } & Record<string, unknown>>;
       deleteModel: (
         modelName: string,
         speciesId?: string,
         predictorType?: "dlib" | "cnn",
         modelKind?: "landmark" | "obb_detector"
-      ) => Promise<{ ok: boolean; error?: string }>;
+      ) => Promise<{
+        ok: boolean;
+        imagePaths?: { path: string; name: string }[];
+        error?: string;
+      }>;
       renameModel: (
         oldName: string,
         newName: string,
@@ -571,6 +728,12 @@ interface SessionMeta {
         predictorType?: "dlib" | "cnn",
         modelKind?: "landmark" | "obb_detector"
       ) => Promise<{ ok: boolean; error?: string }>;
+      promoteModel: (
+        modelIdentifier: string,
+        speciesId?: string,
+        predictorType?: "dlib" | "cnn",
+        modelKind?: "landmark" | "obb_detector"
+      ) => Promise<{ ok: boolean; modelId?: string; status?: "active"; error?: string }>;
       selectImages: () => Promise<{ canceled: boolean; files?: { path: string; name: string; data: string; mimeType: string }[] }>;
       selectFolderPath: () => Promise<{ canceled: boolean; folderPath?: string }>;
       selectAnnotationFile: () => Promise<{ canceled: boolean; filePath?: string }>;
@@ -581,28 +744,6 @@ interface SessionMeta {
         geometryConfig?: GeometryMappingConfig;
         useSam2BoxDerivation?: boolean;
       }) => Promise<LoadAnnotatedFolderResult>;
-      importPreAnnotatedDataset: (args?: {
-        speciesId?: string;
-        geometryConfig?: GeometryMappingConfig;
-      }) => Promise<{
-        ok: boolean;
-        canceled?: boolean;
-        sourceDir?: string;
-        importedImages?: number;
-        importedLabels?: number;
-        overwrittenImages?: number;
-        overwrittenLabels?: number;
-        warnings?: string[];
-        importSummary?: {
-          sourceObbPreserved: number;
-          manualAnchorDerived: number;
-          autoDerived: number;
-          fallbackBoxes: number;
-          usedAsymmetricPadding: boolean;
-          translatedToFitImage?: number;
-        };
-        error?: string;
-      }>;
       // Classic CV detection
       detectSpecimens: (imagePath: string, options?: DetectionOptions) => Promise<DetectSpecimensResult>;
       // Session management
@@ -615,6 +756,8 @@ interface SessionMeta {
           schemaKind?: "default" | "custom";
           schemaSourceId?: string;
           schemaFingerprint?: string;
+          schemaSemanticFingerprint?: string;
+          schemaSemanticVersion?: number;
         }
       ) => Promise<{ ok: boolean; error?: string }>;
       sessionUpdateOrientationPolicy: (
@@ -726,6 +869,8 @@ interface SessionMeta {
           speciesId?: string;
           imageCount?: number;
           schemaFingerprint?: string;
+          schemaSemanticFingerprint?: string;
+          schemaSemanticVersion?: number;
           schemaKind?: "default" | "custom";
           schemaSourceId?: string;
           orientationPolicy?: OrientationPolicy;
@@ -812,7 +957,21 @@ interface SessionMeta {
       }) => Promise<{
         ok: boolean;
         modelPath?: string;
+        modelId?: string | null;
+        modelStatus?: "active" | "candidate" | "deprecated" | null;
+        promotion?: {
+          promoted?: boolean;
+          reason?: string;
+          metric?: string | null;
+          candidateScore?: number | null;
+          baselineScore?: number | null;
+          baselineModelId?: string | null;
+        } | null;
         map50?: number | null;
+        map50_95?: number | null;
+        precision?: number | null;
+        recall?: number | null;
+        perClass?: Record<string, unknown> | null;
         warnings?: string[];
         error?: string;
       }>;
@@ -871,7 +1030,7 @@ interface SessionMeta {
           displayName?: string;
           preferences?: {
             lastUsedLandmarkModelKey?: string;
-            lastUsedPredictorType?: "dlib" | "cnn" | "yolo_pose";
+            lastUsedPredictorType?: "dlib" | "cnn";
             detectionModelKey?: string;
             detectionModelName?: string;
           };
@@ -903,29 +1062,89 @@ interface SessionMeta {
         options?: {
           filename?: string;
           edited?: boolean;
+          wasEdited?: boolean;
           saved?: boolean;
           reviewComplete?: boolean;
           committedAt?: string | null;
           landmarkModelKey?: string | null;
-          landmarkPredictorType?: "dlib" | "cnn" | "yolo_pose" | null;
+          landmarkPredictorType?: "dlib" | "cnn" | null;
           boxSignature?: string | null;
           inferenceSignature?: string | null;
+          detectorProvenance?: DetectionModelProvenance | null;
+          prioritySignals?: HitlPrioritySignals;
           clear?: boolean;
         }
-      ) => Promise<{ ok: boolean; error?: string }>;
+      ) => Promise<{ ok: boolean; reviewPriority?: HitlReviewPriority; error?: string }>;
       sessionLoadInferenceReviewDrafts: (
         speciesId: string,
         inferenceSessionId?: string
       ) => Promise<{ ok: boolean; drafts?: InferenceReviewDraftItem[]; error?: string }>;
+      sessionGetRetrainingBatch: (
+        speciesId: string,
+        inferenceSessionId?: string,
+        since?: string
+      ) => Promise<{
+        ok: boolean;
+        since?: string | null;
+        baselineModelId?: string | null;
+        summary?: {
+          newSamples: number;
+          corrected: number;
+          unchanged: number;
+          rejected: number;
+          totalCommitted: number;
+        };
+        pendingReview?: number;
+        pendingCommit?: number;
+        pendingItems?: Array<{
+          key: string;
+          filename: string;
+          reviewComplete: boolean;
+          edited: boolean;
+          priority: HitlReviewPriority;
+          updatedAt: string;
+        }>;
+        error?: string;
+      }>;
       sessionSaveInferenceImagePaths: (
         speciesId: string,
         inferenceSessionId: string,
-        imagePaths: { path: string; name: string }[]
-      ) => Promise<{ ok: boolean; error?: string }>;
+        imagePaths: Array<{
+          path: string;
+          name: string;
+          sourcePath?: string;
+          sourceName?: string;
+          sourceSha256?: string;
+          contentId?: string;
+        }>
+      ) => Promise<{
+        ok: boolean;
+        imagePaths?: Array<{
+          path: string;
+          name: string;
+          sourcePath: string;
+          sourceName: string;
+          sourceSha256: string;
+          contentId: string;
+        }>;
+        error?: string;
+      }>;
       sessionLoadInferenceImagePaths: (
         speciesId: string,
         inferenceSessionId: string
-      ) => Promise<{ ok: boolean; images?: { path: string; name: string; data: string; mimeType: string }[] }>;
+      ) => Promise<{
+        ok: boolean;
+        images?: Array<{
+          path: string;
+          name: string;
+          sourcePath?: string;
+          sourceName?: string;
+          sourceSha256?: string;
+          contentId?: string;
+          data: string;
+          mimeType: string;
+        }>;
+      }>;
       /** Lightweight hardware probe — called once at startup to populate Redux hardwareSlice */
       probeHardware: () => Promise<HardwareCapabilities>;
     };
@@ -937,6 +1156,8 @@ interface HardwareCapabilities {
   device: "cpu" | "mps" | "cuda";
   /** Human-readable GPU name, or null for CPU-only */
   gpuName: string | null;
+  /** Dedicated GPU memory in GB, or null when the runtime cannot report it. */
+  gpuMemoryGb?: number | null;
   /** Total system RAM in GB, or null if detection failed */
   ramGb: number | null;
   runtimeState?: "not_started" | "checking" | "not_initialized" | "initializing" | "ready" | "failed";
