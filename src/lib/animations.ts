@@ -48,9 +48,9 @@ export const buttonTap = {
 export const cardHover: Variants = {
   initial: {},
   hover: {
-    y: -2,
-    boxShadow: "0 8px 30px rgba(0, 0, 0, 0.08)",
-    transition: { duration: 0.2 },
+    y: -3,
+    boxShadow: "0 10px 32px rgba(0, 0, 0, 0.10), 0 2px 8px rgba(0, 0, 0, 0.06)",
+    transition: { duration: 0.18, ease: [0.22, 1, 0.36, 1] },
   },
 }
 

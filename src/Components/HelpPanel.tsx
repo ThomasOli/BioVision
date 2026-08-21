@@ -11,6 +11,8 @@ import {
   Rocket,
   ListChecks,
   Database,
+  GraduationCap,
+  PlayCircle,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -19,10 +21,12 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/Components/ui/card";
 import { ScrollArea } from "@/Components/ui/scroll-area";
 import { Separator } from "@/Components/ui/separator";
 import { buttonHover, buttonTap } from "@/lib/animations";
+import { useTutorial } from "./Tutorial";
 
 interface HelpPanelProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onShowOnboarding?: () => void;
 }
 
 interface AccordionItemProps {
@@ -96,7 +100,16 @@ const KeyboardShortcut: React.FC<KeyboardShortcutProps> = ({ keys, description }
   </div>
 );
 
+// onShowOnboarding stays in the props contract for callers, but the panel now
+// routes onboarding through the tutorial launcher instead of invoking it.
 export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
+  const { setLauncherOpen } = useTutorial();
+
+  const handleOpenTours = () => {
+    onOpenChange(false);
+    setTimeout(() => setLauncherOpen(true), 200);
+  };
+
   return (
     <AnimatePresence>
       {open && (
@@ -105,19 +118,20 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm"
+            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm"
             onClick={() => onOpenChange(false)}
           />
 
+          <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
           <motion.div
-            initial={{ x: "100%" }}
-            animate={{ x: 0 }}
-            exit={{ x: "100%" }}
-            transition={{ type: "spring", damping: 30, stiffness: 300 }}
-            className="fixed right-0 top-0 z-50 h-full w-full max-w-md border-l bg-background shadow-xl"
+            initial={{ opacity: 0, scale: 0.96, y: 12 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 12 }}
+            transition={{ type: "spring", damping: 30, stiffness: 320 }}
+            className="w-full max-w-2xl rounded-lg border bg-background shadow-xl pointer-events-auto"
           >
             <div className="flex items-center justify-between border-b p-4">
-              <h2 className="text-lg font-bold">Help & Documentation</h2>
+              <h2 className="font-display text-base font-semibold">Help & Documentation</h2>
               <motion.div {...buttonHover} {...buttonTap}>
                 <Button
                   variant="ghost"
@@ -129,8 +143,35 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
               </motion.div>
             </div>
 
-            <ScrollArea className="h-[calc(100vh-65px)]">
+            <ScrollArea className="h-[75vh]">
               <div className="space-y-4 p-4">
+                {/* Interactive Tours Card */}
+                <Card className="border-primary/20 bg-gradient-to-br from-primary/5 to-transparent">
+                  <CardContent className="p-4">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                        <GraduationCap className="h-5 w-5" />
+                      </div>
+                      <div className="flex-1">
+                        <h3 className="text-sm font-bold text-foreground">
+                          Interactive Guided Tours
+                        </h3>
+                        <p className="text-xs text-muted-foreground">
+                          Step-by-step walkthroughs of every feature
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        onClick={handleOpenTours}
+                        className="gap-1.5 text-xs font-semibold"
+                      >
+                        <PlayCircle className="h-3.5 w-3.5" />
+                        Open Tours
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+
                 <AccordionItem
                   title="Getting Started"
                   icon={<Rocket className="h-4 w-4" />}
@@ -414,6 +455,7 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
               </div>
             </ScrollArea>
           </motion.div>
+          </div>
         </>
       )}
     </AnimatePresence>

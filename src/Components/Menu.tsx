@@ -40,6 +40,7 @@ import {
   TooltipTrigger,
 } from "@/Components/ui/tooltip";
 import { sidebarContainer, sidebarItem, buttonHover, buttonTap, cardHover } from "@/lib/animations";
+import { ContextualHelp } from "@/Components/Tutorial";
 
 interface MenuProps {
   onOpacityChange: (selectedOpacity: number) => void;
@@ -792,8 +793,12 @@ const Menu: React.FC<MenuProps> = ({
               <motion.div variants={cardHover} initial="initial" whileHover="hover">
                 <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
                   <CardHeader className="pb-3">
-                    <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                    <CardTitle className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-muted-foreground">
                       Model
+                      <ContextualHelp
+                        text="The directory where trained models and session data are stored. Change this to use a custom project location."
+                        side="right"
+                      />
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-3">
@@ -857,12 +862,16 @@ const Menu: React.FC<MenuProps> = ({
             </motion.div>
 
             {/* Image Upload Card */}
-            <motion.div variants={sidebarItem}>
+            <motion.div variants={sidebarItem} data-tutorial="upload-images">
               <motion.div variants={cardHover} initial="initial" whileHover="hover">
                 <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
                   <CardHeader className="pb-3">
-                    <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                    <CardTitle className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-muted-foreground">
                       Image Upload
+                      <ContextualHelp
+                        text="Upload JPG, PNG, TIFF, or BMP images. Files are copied into the session directory — originals remain untouched. Use Ctrl+N as a shortcut."
+                        side="right"
+                      />
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-3">
@@ -900,7 +909,7 @@ const Menu: React.FC<MenuProps> = ({
             </motion.div>
 
             {/* Landmark Controls */}
-            <motion.div variants={sidebarItem}>
+            <motion.div variants={sidebarItem} data-tutorial="landmark-controls">
               <Landmark
                 onOpacityChange={onOpacityChange}
                 onColorChange={onColorChange}
@@ -910,12 +919,17 @@ const Menu: React.FC<MenuProps> = ({
 
             {/* Detection Mode */}
             {onDetectionModeChange && (
-              <motion.div variants={sidebarItem}>
+              <motion.div variants={sidebarItem} data-tutorial="detection-mode">
+
                 <motion.div variants={cardHover} initial="initial" whileHover="hover">
                   <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
                     <CardHeader className="pb-3">
-                      <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                      <CardTitle className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-muted-foreground">
                         Detection Mode
+                        <ContextualHelp
+                          text="Manual: draw bounding boxes by hand. Auto: use YOLO-World AI detection with optional SAM2 segmentation. Auto mode requires a class name (e.g., 'fish', 'butterfly')."
+                          side="right"
+                        />
                       </CardTitle>
                     </CardHeader>
                     <CardContent>
@@ -948,8 +962,12 @@ const Menu: React.FC<MenuProps> = ({
               <motion.div variants={cardHover} initial="initial" whileHover="hover">
                 <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
                   <CardHeader className="pb-3">
-                    <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                    <CardTitle className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-muted-foreground">
                       Training
+                      <ContextualHelp
+                        text="Finalize boxes and annotate landmarks on at least a few images before training. The 'Train model' button at the bottom activates once ready."
+                        side="right"
+                      />
                     </CardTitle>
                   </CardHeader>
                   <CardContent>
@@ -974,7 +992,7 @@ const Menu: React.FC<MenuProps> = ({
         </div>
 
         {/* Sticky footer */}
-        <div className="border-t bg-background p-4">
+        <div className="border-t bg-background p-4" data-tutorial="train-button">
           <motion.div {...buttonHover} {...buttonTap}>
             <Button
               className="w-full font-bold"

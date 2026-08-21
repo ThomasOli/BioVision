@@ -779,3 +779,46 @@ class StrictJsonReadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PackagedCodeStateTests(unittest.TestCase):
+    """A packaged build has no source tree, but must still identify itself."""
+
+    def test_frozen_build_records_executable_identity_instead_of_a_temp_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            executable = os.path.join(root, "biovision_backend.exe")
+            with open(executable, "wb") as handle:
+                handle.write(b"pretend-bundle")
+
+            with (
+                patch.object(lineage.sys, "frozen", True, create=True),
+                patch.object(lineage.sys, "executable", executable),
+            ):
+                state = lineage.collect_code_state()
+
+            self.assertTrue(state["packaged"])
+            self.assertEqual(state["executable"], os.path.abspath(executable))
+            self.assertEqual(state["root"], os.path.abspath(root))
+            self.assertEqual(state["executableSize"], len(b"pretend-bundle"))
+            self.assertTrue(state["buildRevision"])
+            # Never claim a git identity the packaged build does not have.
+            self.assertIsNone(state["commit"])
+            self.assertFalse(state["dirty"])
+
+    def test_frozen_build_revision_changes_when_the_executable_changes(self):
+        def revision_for(payload):
+            with tempfile.TemporaryDirectory() as root:
+                executable = os.path.join(root, "biovision_backend.exe")
+                with open(executable, "wb") as handle:
+                    handle.write(payload)
+                with (
+                    patch.object(lineage.sys, "frozen", True, create=True),
+                    patch.object(lineage.sys, "executable", executable),
+                ):
+                    return lineage.collect_code_state()["buildRevision"]
+
+        self.assertNotEqual(revision_for(b"build-one"), revision_for(b"build-two-longer"))
+
+    def test_unfrozen_build_is_not_marked_packaged(self):
+        state = lineage.collect_code_state()
+        self.assertFalse(state["packaged"])

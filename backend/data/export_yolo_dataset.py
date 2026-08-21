@@ -3603,10 +3603,16 @@ def export_obb_dataset(
                     f"{missing_classes}; its class-specific metrics will be incomplete."
                 )
     yaml_path = os.path.join(out_dir, "dataset.yaml")
+    val_split_path = "images/train" if not val_set else "images/val"
+    if not val_set:
+        warnings.append(
+            "Only 1 sample available; using training images as validation (val = train). "
+            "Add more annotated images for a proper train/val split."
+        )
     yaml_lines = [
         f"path: {out_dir}",
         "train: images/train",
-        "val: images/val",
+        f"val: {val_split_path}",
         "test: images/test",
         f"nc: {nc}",
         f"names: {names}",

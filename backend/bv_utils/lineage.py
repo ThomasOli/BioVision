@@ -396,10 +396,54 @@ def _code_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _frozen_code_state() -> dict[str, Any] | None:
+    """Identify a packaged build, which has no source tree or git metadata.
+
+    In a PyInstaller bundle ``__file__`` points into a temporary extraction
+    directory, so the git probe below would silently record no code identity at
+    all. Identify the executable itself instead. Its size and mtime are used
+    rather than a content hash because the one-file bundle embeds torch and is
+    multi-gigabyte; hashing it on every training run would be prohibitive.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    executable = os.path.abspath(sys.executable)
+    state: dict[str, Any] = {
+        "root": os.path.dirname(executable),
+        "packaged": True,
+        "executable": executable,
+        "commit": None,
+        "dirty": False,
+        "diffSha256": None,
+        "trackedDiffSha256": None,
+        "untrackedFiles": {},
+        "dependencyLocks": {},
+    }
+    try:
+        stat = os.stat(executable)
+        state["executableSize"] = int(stat.st_size)
+        state["executableMtime"] = float(stat.st_mtime)
+        state["buildRevision"] = sha256_json(
+            {
+                "executable": os.path.basename(executable),
+                "size": int(stat.st_size),
+                "mtime": float(stat.st_mtime),
+            }
+        )
+    except OSError:
+        pass
+    return state
+
+
 def collect_code_state() -> dict[str, Any]:
+    frozen_state = _frozen_code_state()
+    if frozen_state is not None:
+        return frozen_state
+
     root = _code_root()
     state: dict[str, Any] = {
         "root": root,
+        "packaged": False,
         "commit": None,
         "dirty": None,
         "diffSha256": None,

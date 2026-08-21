@@ -1,14 +1,25 @@
 {
   "name": "biovisionapp",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.1",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build && electron-builder",
+    "build": "tsc && vite build",
+    "backend:build": "node scripts/build-python-backend.js",
+    "dist": "npm run backend:build && npm run build && electron-builder",
+    "dist:win": "npm run backend:build && npm run build && electron-builder --win nsis --x64",
+    "dist:mac": "npm run backend:build && npm run build && electron-builder --mac dmg",
+    "dist:linux": "npm run backend:build && npm run build && electron-builder --linux AppImage --x64",
+    "publish": "npm run backend:build && npm run build && electron-builder --publish always",
+    "publish:win": "npm run backend:build && npm run build && electron-builder --win nsis --x64 --publish always",
+    "publish:mac": "npm run backend:build && npm run build && electron-builder --mac dmg --publish always",
+    "publish:linux": "npm run backend:build && npm run build && electron-builder --linux AppImage --x64 --publish always",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "test:python": "python -m pytest",
     "test:electron": "node scripts/run-electron-tests.cjs",
     "test:contracts": "node scripts/frontend_contract_tests.cjs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "npm run test:contracts && npm run test:electron && npm run test:python"
   },
   "dependencies": {
     "@electron/remote": "^2.1.0",

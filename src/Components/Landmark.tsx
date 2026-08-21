@@ -135,16 +135,18 @@ const Landmark: React.FC<LandmarkProps> = ({
         <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
-              <CardTitle className="text-sm font-semibold tracking-wide uppercase">
+              <CardTitle className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
                 Annotation Tools
               </CardTitle>
-              <span className="text-xs text-muted-foreground">
-                {totalLandmarks} landmark{totalLandmarks !== 1 ? "s" : ""}
-              </span>
+              {totalLandmarks > 0 && (
+                <span className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-primary">
+                  {totalLandmarks} pt{totalLandmarks !== 1 ? "s" : ""}
+                </span>
+              )}
             </div>
-            <div className="flex items-center justify-between pt-1">
+            <div className="flex items-center justify-between pt-1.5">
               <Label htmlFor="preview-mode" className="text-xs text-muted-foreground">
-                View Only
+                View only
               </Label>
               <Switch
                 id="preview-mode"
@@ -196,17 +198,17 @@ const Landmark: React.FC<LandmarkProps> = ({
 
               {/* Action buttons */}
               <div className="flex justify-center">
-                <div className="flex items-center gap-6 rounded-full border bg-muted/50 px-3 py-1.5">
+                <div className="flex items-center gap-1 rounded-lg border border-border/50 bg-muted/40 p-1">
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <motion.div {...buttonHover} {...buttonTap}>
                         <Button
                           variant="ghost"
                           size="icon"
-                          className="h-8 w-8 rounded-full"
+                          className="h-7 w-7 rounded-md"
                           onClick={() => clear()}
                         >
-                          <Trash2 className="h-4 w-4" />
+                          <Trash2 className="h-3.5 w-3.5" />
                         </Button>
                       </motion.div>
                     </TooltipTrigger>
@@ -219,10 +221,10 @@ const Landmark: React.FC<LandmarkProps> = ({
                         <Button
                           variant="ghost"
                           size="icon"
-                          className="h-8 w-8 rounded-full"
+                          className="h-7 w-7 rounded-md"
                           onClick={() => undo()}
                         >
-                          <Undo2 className="h-4 w-4" />
+                          <Undo2 className="h-3.5 w-3.5" />
                         </Button>
                       </motion.div>
                     </TooltipTrigger>
@@ -235,10 +237,10 @@ const Landmark: React.FC<LandmarkProps> = ({
                         <Button
                           variant="ghost"
                           size="icon"
-                          className="h-8 w-8 rounded-full"
+                          className="h-7 w-7 rounded-md"
                           onClick={() => redo()}
                         >
-                          <Redo2 className="h-4 w-4" />
+                          <Redo2 className="h-3.5 w-3.5" />
                         </Button>
                       </motion.div>
                     </TooltipTrigger>

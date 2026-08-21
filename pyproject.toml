@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+# Repo root on sys.path so `from backend.xxx import ...` works.
+# `backend/` is a PEP 420 namespace package (no __init__.py).
+pythonpath = ["."]
+testpaths = ["backend"]
+python_files = ["test_*.py"]
+python_classes = ["Test*", "*Tests"]
+python_functions = ["test_*"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
