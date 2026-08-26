@@ -17,6 +17,14 @@
 - Add transactional HITL commits with rollback-safe recovery and deterministic source staging.
 - Verify all orientation modes through mocked live retraining and inference flows.
 
+### Packaging
+
+- Pin NumPy and OpenCV to preserve the PyTorch NumPy bridge on Intel macOS.
+- Package the standard Linux AppImage with CPU-only PyTorch to keep the release
+  asset below GitHub's 2 GiB limit. Linux CUDA acceleration remains available
+  for source installations through `setup.sh`/`setup_backend.py`; Windows and
+  macOS package acceleration behavior is unchanged.
+
 ## [0.1.0] - 2026-04-13
 
 ### Initial Release
