@@ -18,6 +18,20 @@ BioVision has three cooperating layers:
 - `backend/` contains dataset preparation, orientation transforms, dlib/CNN
   landmark training and inference, YOLO OBB export/training, and lineage logic.
 
+### Packaged release acceleration
+
+The prebuilt Linux AppImage intentionally bundles CPU-only PyTorch so the
+installer remains below GitHub's 2 GiB release-asset limit. Consequently, that
+AppImage does not use NVIDIA CUDA: Torch-backed training and inference fall back
+to the CPU, and GPU-only features such as SAM2 are unavailable. This restriction
+does not apply to Windows or macOS packages; macOS retains its standard
+MPS-capable build.
+
+Linux users who require NVIDIA acceleration can run BioVision from source and
+use `setup.sh`/`setup_backend.py`, which detects supported CUDA hardware and
+installs the corresponding PyTorch build. A CUDA-enabled Linux binary is not
+currently distributed as a GitHub release asset.
+
 Training data and artifacts live below the selected project root. Every new
 training run receives an immutable model ID and artifact directory. A mutable
 display name is only a label; inference resolves the active immutable artifact.
