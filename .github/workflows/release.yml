@@ -61,8 +61,9 @@ jobs:
           python -m pip install --upgrade pip
           # PyInstaller's pkg_resources runtime hook still requires
           # NullProvider, which setuptools removed in 82. Keep the build
-          # environment on the last compatible major until that hook is gone.
-          pip install "setuptools<82" cmake pyinstaller
+          # environment on the last compatible release until that hook is gone.
+          # 81 also satisfies torch 2.13's setuptools>=77 requirement.
+          pip install "setuptools==81.0.0" cmake pyinstaller
           pip install -r backend/requirements.txt
           pip install -r requirements-dev.txt
           python -c "import pkg_resources; assert hasattr(pkg_resources, 'NullProvider'), 'PyInstaller requires pkg_resources.NullProvider'"
