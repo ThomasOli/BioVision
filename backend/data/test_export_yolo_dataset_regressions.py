@@ -14,9 +14,12 @@ import backend.data.export_yolo_dataset as export_yolo_dataset_module
 from backend.data.export_yolo_dataset import (
     OBB_LEGACY_SPLIT_ASSIGNMENTS_VERSION,
     OBB_SPLIT_ASSIGNMENTS_VERSION,
+    _augment_segment_chip,
     _get_finalized_boxes,
+    _generate_synthetic_obb_images,
     _is_confirmed_negative_review,
     _prepare_real_sample_for_export,
+    _resolve_obb_class_id,
     _stable_sample_identity,
     export_obb_dataset,
 )
@@ -40,6 +43,16 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
 
     def tearDown(self):
         self._tempdir.cleanup()
+
+    def _set_directional_policy(self):
+        session_path = Path(self.session_dir, "session.json")
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session["landmarkTemplate"] = []
+        session["orientationPolicy"] = {
+            "mode": "directional",
+            "targetOrientation": "left",
+        }
+        session_path.write_text(json.dumps(session), encoding="utf-8")
 
     def _add_sample(
         self,
@@ -116,6 +129,18 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
             )
             for index in range(4)
         ]
+
+    def test_schema_augmentation_class_transforms_preserve_existing_contracts(self):
+        transform = export_yolo_dataset_module._apply_schema_class_transform
+        self.assertEqual(transform(0, {"mirror_axis": None}, "directional"), 0)
+        self.assertEqual(transform(1, {"mirror_axis": None}, "directional"), 1)
+        self.assertEqual(transform(0, {"mirror_axis": "horizontal"}, "directional"), 1)
+        self.assertEqual(transform(1, {"mirror_axis": "horizontal"}, "directional"), 0)
+        self.assertEqual(transform(1, {"mirror_axis": "vertical"}, "directional"), 1)
+        self.assertEqual(transform(1, {"is_half_turn": True}, "bilateral"), 0)
+        self.assertEqual(transform(1, {"is_half_turn": False}, "bilateral"), 1)
+        self.assertEqual(transform(1, {"mirror_axis": "horizontal"}, "axial"), 0)
+        self.assertEqual(transform(1, {"mirror_axis": "horizontal"}, "invariant"), 0)
 
     def test_in_bounds_export_keeps_image_bytes_and_historical_normalization(self):
         corners = [(10, 10), (40, 10), (40, 30), (10, 30)]
@@ -583,13 +608,10 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
         self.assertEqual(post_lock["split"], "train")
         self.assertEqual(third["validation_cohort"]["sha256"], locked_revision)
 
-    def test_late_rare_orientation_class_closes_incomplete_validation_once(self):
-        session_path = Path(self.session_dir, "session.json")
-        session = json.loads(session_path.read_text(encoding="utf-8"))
-        session["orientationPolicy"] = {"mode": "directional"}
-        session_path.write_text(json.dumps(session), encoding="utf-8")
-        corners = [(12, 12), (42, 12), (42, 32), (12, 32)]
-        for index in range(4):
+    def test_directional_validation_mirror_closes_class_coverage_deterministically(self):
+        self._set_directional_policy()
+        corners = self._rotated_rectangle((50, 40), 42, 18, 27)
+        for index in range(6):
             self._add_sample(
                 f"common_{index}.png",
                 corners,
@@ -599,61 +621,127 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
 
         first = export_obb_dataset(self.session_dir, seed=83, generate_synthetic=False)
         self.assertTrue(first["ok"], first)
-        self.assertEqual(first["validation_cohort"]["group_count"], 2)
-        self.assertFalse(first["validation_cohort"]["frozen"])
-        self.assertEqual(first["validation_cohort"]["real_class_histogram"]["1"], 0)
+        cohort = first["validation_cohort"]
+        self.assertEqual(cohort["group_count"], 2)
+        self.assertTrue(cohort["frozen"])
+        self.assertEqual(cohort["real_class_histogram"]["1"], 0)
+        self.assertGreater(cohort["evaluator_class_histogram"]["0"], 0)
+        self.assertGreater(cohort["evaluator_class_histogram"]["1"], 0)
+        self.assertEqual(cohort["evaluation_sample_count"], cohort["sample_count"] * 2)
+        self.assertEqual(cohort["derivation"]["type"], "horizontal_mirror")
+        self.assertEqual(len(cohort["derivatives"]), cohort["sample_count"])
 
-        self._add_sample("more_common.png", corners, pixel_value=95, class_id=0)
+        manifest = json.loads(Path(first["export_manifest_path"]).read_text(encoding="utf-8"))
+        train_entries = [entry for entry in manifest["real_images"] if entry["split"] == "train"]
+        self.assertEqual(len(manifest["training_derivatives"]), len(train_entries))
+        effective_train = manifest["effective_training_class_histogram"]
+        self.assertEqual(effective_train["0"], effective_train["1"])
+        self.assertTrue(
+            any("Natural real training annotations lack" in warning for warning in first["warnings"])
+        )
+        source_by_id = {
+            entry["sample_id"]: entry
+            for entry in manifest["real_images"]
+            if entry["split"] == "val"
+        }
+        for derivative in manifest["validation_derivatives"]:
+            source = source_by_id[derivative["source_sample_id"]]
+            source_image = cv2.imread(str(Path(self.session_dir, "obb_dataset", source["exported_image"])))
+            mirror_image = cv2.imread(str(Path(self.session_dir, "obb_dataset", derivative["image"])))
+            self.assertTrue(np.array_equal(mirror_image, cv2.flip(source_image, 1)))
+            source_label = Path(
+                self.session_dir, "obb_dataset", source["exported_label"]
+            ).read_text(encoding="utf-8").strip().split()
+            mirror_label = Path(
+                self.session_dir, "obb_dataset", derivative["label"]
+            ).read_text(encoding="utf-8").strip().split()
+            self.assertEqual(int(source_label[0]), 0)
+            self.assertEqual(int(mirror_label[0]), 1)
+            source_points = [float(value) for value in source_label[1:]]
+            mirror_points = [float(value) for value in mirror_label[1:]]
+            expected_points = []
+            reflected = [
+                (1.0 - source_points[i], source_points[i + 1])
+                for i in range(0, 8, 2)
+            ]
+            for index in (1, 0, 3, 2):
+                expected_points.extend(reflected[index])
+            self.assertTrue(np.allclose(mirror_points, expected_points, atol=1e-6))
+
         second = export_obb_dataset(self.session_dir, seed=83, generate_synthetic=False)
         self.assertTrue(second["ok"], second)
-        second_manifest = json.loads(
-            Path(second["export_manifest_path"]).read_text(encoding="utf-8")
-        )
-        more_common = next(
-            entry for entry in second_manifest["real_images"]
-            if entry["source_image"] == "more_common.png"
-        )
-        self.assertEqual(more_common["split"], "train")
-        self.assertFalse(second["validation_cohort"]["frozen"])
+        self.assertEqual(second["validation_cohort"], first["validation_cohort"])
 
-        self._add_sample("late_rare.png", corners, pixel_value=96, class_id=1)
+        self._add_sample("post_lock_opposite.png", corners, pixel_value=97, class_id=1)
         third = export_obb_dataset(self.session_dir, seed=83, generate_synthetic=False)
         self.assertTrue(third["ok"], third)
         third_manifest = json.loads(
             Path(third["export_manifest_path"]).read_text(encoding="utf-8")
         )
-        late_rare = next(
-            entry for entry in third_manifest["real_images"]
-            if entry["source_image"] == "late_rare.png"
-        )
-        self.assertEqual(late_rare["split"], "val")
-        self.assertTrue(third["validation_cohort"]["frozen"])
-        self.assertGreater(third["validation_cohort"]["real_class_histogram"]["1"], 0)
-        locked_revision = third["validation_cohort"]["sha256"]
-
-        self._add_sample("late_rare_after_lock.png", corners, pixel_value=97, class_id=1)
-        fourth = export_obb_dataset(self.session_dir, seed=83, generate_synthetic=False)
-        self.assertTrue(fourth["ok"], fourth)
-        fourth_manifest = json.loads(
-            Path(fourth["export_manifest_path"]).read_text(encoding="utf-8")
-        )
         after_lock = next(
-            entry for entry in fourth_manifest["real_images"]
-            if entry["source_image"] == "late_rare_after_lock.png"
+            entry for entry in third_manifest["real_images"]
+            if entry["source_image"] == "post_lock_opposite.png"
         )
         self.assertEqual(after_lock["split"], "train")
-        self.assertEqual(fourth["validation_cohort"]["sha256"], locked_revision)
+        self.assertEqual(third["validation_cohort"], first["validation_cohort"])
+
+    def test_synthetic_directional_chip_defers_small_angle_rotation_to_yolo(self):
+        chip = np.zeros((20, 30, 4), dtype=np.uint8)
+        chip[4:16, 5:25, :3] = 200
+        chip[4:16, 5:25, 3] = 255
+        rng = export_yolo_dataset_module.random.Random(123)
+        _aug, _points, info = _augment_segment_chip(
+            chip,
+            rng,
+            orientation_schema="directional",
+            scale_range=(1.0, 1.0),
+            flip_prob=0.0,
+            rotation_enabled=False,
+        )
+        self.assertEqual(info["rotation_deg"], 0.0)
+        self.assertFalse(info["is_half_turn"])
+
+    def test_synthetic_instance_budget_caps_multi_image_generation(self):
+        rgba = np.zeros((40, 60, 4), dtype=np.uint8)
+        rgba[5:35, 8:52, :3] = 180
+        rgba[5:35, 8:52, 3] = 255
+        segments = [{"id": "segment-1", "rgba": rgba, "source_class_id": None}]
+        with patch.object(
+            export_yolo_dataset_module,
+            "_collect_finalized_segments",
+            return_value=(segments, {"segments_total": 1, "segments_missing_anchors": 0}),
+        ):
+            result = _generate_synthetic_obb_images(
+                self.session_dir,
+                os.path.join(self.session_dir, "bounded_synthetic"),
+                positives=[],
+                orientation_schema="invariant",
+                n_per_segment=10,
+                max_images=10,
+                max_instances=2,
+                seed=19,
+            )
+        self.assertEqual(result["num_generated"], 2)
+        self.assertEqual(result["num_instances_generated"], 2)
+        self.assertEqual(result["max_instances"], 2)
 
     def test_hitl_groups_are_train_only_during_first_three_way_bootstrap(self):
+        self._set_directional_policy()
         corners = [(12, 12), (42, 12), (42, 32), (12, 32)]
         self._add_sample(
             "reviewed.png",
             corners,
             pixel_value=50,
             provenance={"source": "hitl_review", "commitId": "commit-1"},
+            class_id=1,
         )
         for index in range(3):
-            self._add_sample(f"manual_{index}.png", corners, pixel_value=51 + index)
+            self._add_sample(
+                f"manual_{index}.png",
+                corners,
+                pixel_value=51 + index,
+                class_id=0,
+            )
 
         result = export_obb_dataset(self.session_dir, seed=17, generate_synthetic=False)
         self.assertTrue(result["ok"], result)
@@ -670,6 +758,12 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
         }
         self.assertNotIn("reviewed.png", evaluation_names)
         self.assertEqual({entry["split"] for entry in manifest["real_images"]}, {"train", "val", "test"})
+        reviewed_label_path = Path(
+            self.session_dir,
+            "obb_dataset",
+            reviewed["exported_label"],
+        )
+        self.assertEqual(reviewed_label_path.read_text(encoding="utf-8").split()[0], "1")
 
     def test_hitl_rejected_all_does_not_resurrect_nonempty_draft_boxes(self):
         corners = [(12, 12), (42, 12), (42, 32), (12, 32)]
@@ -1122,10 +1216,7 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
                 )
 
     def test_directional_export_requires_a_trusted_binary_class_for_every_box(self):
-        session_path = Path(self.session_dir, "session.json")
-        session = json.loads(session_path.read_text(encoding="utf-8"))
-        session["orientationPolicy"] = {"mode": "directional"}
-        session_path.write_text(json.dumps(session), encoding="utf-8")
+        self._set_directional_policy()
         corners = [(12, 12), (42, 12), (42, 32), (12, 32)]
         self._add_sample("directional_invalid.png", corners, pixel_value=224)
         label_path = Path(self.session_dir, "labels", "directional_invalid.json")
@@ -1139,6 +1230,19 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
                 "orientation is explicitly uncertain",
             ),
             ("out-of-range class", {"class_id": 2}, "class_id 2 is out of range"),
+            (
+                "conflicting class and reviewed arrow",
+                {
+                    "class_id": 0,
+                    "orientation_override": "right",
+                    "orientation_hint": {
+                        "orientation": "right",
+                        "confidence": 1.0,
+                        "source": "user_review",
+                    },
+                },
+                "class_id 0 conflicts with orientation metadata 'right'",
+            ),
         )
         for case_name, metadata, expected_error in invalid_cases:
             with self.subTest(case=case_name):
@@ -1164,11 +1268,24 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
                 self.assertIn("trusted class in {0, 1}", rejected["error"])
                 self.assertFalse(Path(self.session_dir, "obb_dataset").exists())
 
+    def test_directional_class_never_falls_back_to_landmark_anchors(self):
+        with self.assertRaisesRegex(ValueError, "saved OBB arrow"):
+            _resolve_obb_class_id(
+                {
+                    "landmarks": [
+                        {"id": 1, "x": 10, "y": 20},
+                        {"id": 2, "x": 90, "y": 20},
+                    ]
+                },
+                orientation_class_enabled=True,
+                head_id=1,
+                tail_id=2,
+                orientation_policy={"mode": "directional"},
+                require_trusted=True,
+            )
+
     def test_directional_validation_cohort_persists_normalized_class_coverage(self):
-        session_path = Path(self.session_dir, "session.json")
-        session = json.loads(session_path.read_text(encoding="utf-8"))
-        session["orientationPolicy"] = {"mode": "directional"}
-        session_path.write_text(json.dumps(session), encoding="utf-8")
+        self._set_directional_policy()
         corners = [(12, 12), (42, 12), (42, 32), (12, 32)]
         for index in range(6):
             filename = f"directional_coverage_{index}.png"
@@ -1198,12 +1315,18 @@ class ObbDatasetExportRegressionTests(unittest.TestCase):
         cohort = result["validation_cohort"]
         self.assertEqual(cohort["expected_class_count"], 2)
         self.assertEqual(set(cohort["real_class_histogram"]), {"0", "1"})
+        self.assertEqual(set(cohort["evaluator_class_histogram"]), {"0", "1"})
         self.assertEqual(
             sum(cohort["real_class_histogram"].values()),
             cohort["sample_count"],
         )
         self.assertGreater(cohort["real_class_histogram"]["0"], 0)
         self.assertGreater(cohort["real_class_histogram"]["1"], 0)
+        self.assertGreater(cohort["evaluator_class_histogram"]["0"], 0)
+        self.assertGreater(cohort["evaluator_class_histogram"]["1"], 0)
+        self.assertEqual(cohort["evaluation_sample_count"], cohort["sample_count"] * 2)
+        self.assertNotIn("anteriorAnchorIds", cohort["derivation"])
+        self.assertNotIn("posteriorAnchorIds", cohort["derivation"])
         manifest = json.loads(
             Path(result["export_manifest_path"]).read_text(encoding="utf-8")
         )

@@ -27,7 +27,81 @@ function loadTypeScriptModule(relativePath) {
 const obb = loadTypeScriptModule("src/lib/obbDetectorSettings.ts");
 const schema = loadTypeScriptModule("src/lib/schemaFingerprint.ts");
 const modelIdentity = loadTypeScriptModule("src/lib/modelIdentity.ts");
+const trainingPipeline = loadTypeScriptModule("src/lib/trainingPipelineGate.ts");
+const hitlReviewUi = loadTypeScriptModule("src/lib/hitlReviewUi.ts");
+const orientationDisplay = loadTypeScriptModule("src/lib/orientationDisplay.ts");
 const { DEFAULT_SCHEMAS } = loadTypeScriptModule("src/data/defaultSchemas.ts");
+
+assert.equal(orientationDisplay.getOrientationLabelForClassId("directional", 0), "left");
+assert.equal(orientationDisplay.getOrientationLabelForClassId("directional", 1), "right");
+assert.equal(
+  orientationDisplay.getOrientationLabelForClassId("bilateral", 1, "vertical_obb"),
+  "down"
+);
+assert.equal(orientationDisplay.getOrientationLabelForClassId("axial", 0), "up");
+assert.equal(orientationDisplay.getOrientationLabelForClassId("axial", 1), null);
+assert.equal(orientationDisplay.getOrientationLabelForClassId("invariant", 1), null);
+assert.equal(orientationDisplay.getClassIdForOrientationLabel("axial", "down"), 0);
+assert.equal(orientationDisplay.getClassIdForOrientationLabel("invariant", "right"), 0);
+
+assert.deepEqual(
+  trainingPipeline.resolveTrainingPipelineGate({
+    hasActiveSession: true,
+    hasFinalizedBoxes: true,
+    obbDetectorVerified: false,
+  }),
+  { showObbStep: true, canTrainObb: true, showLandmarkStep: false }
+);
+
+assert.equal(
+  hitlReviewUi.resolveHitlReviewUiState({
+    hasResults: true,
+    hydrated: true,
+    edited: true,
+    saved: false,
+    approved: false,
+    committed: false,
+  }).key,
+  "changes_pending"
+);
+assert.equal(
+  hitlReviewUi.resolveHitlReviewUiState({
+    hasResults: true,
+    hydrated: true,
+    edited: false,
+    saved: true,
+    approved: true,
+    committed: false,
+  }).key,
+  "approved"
+);
+assert.equal(
+  hitlReviewUi.resolveHitlReviewUiState({
+    hasResults: true,
+    hydrated: true,
+    edited: false,
+    saved: true,
+    approved: true,
+    committed: true,
+  }).key,
+  "added_to_training"
+);
+assert.deepEqual(
+  trainingPipeline.resolveTrainingPipelineGate({
+    hasActiveSession: true,
+    hasFinalizedBoxes: false,
+    obbDetectorVerified: false,
+  }),
+  { showObbStep: true, canTrainObb: false, showLandmarkStep: false }
+);
+assert.deepEqual(
+  trainingPipeline.resolveTrainingPipelineGate({
+    hasActiveSession: true,
+    hasFinalizedBoxes: true,
+    obbDetectorVerified: true,
+  }),
+  { showObbStep: true, canTrainObb: true, showLandmarkStep: true }
+);
 
 const makeImage = (id, boxCount) => ({
   id,
@@ -138,6 +212,11 @@ const landingSource = fs.readFileSync(
   "utf8"
 );
 assert.doesNotMatch(landingSource, /Number\(lm\.index\) === (?:3|12)/);
+assert.match(landingSource, /built-in schema's orientation policy is part of its versioned/);
+assert.match(
+  landingSource,
+  /built-in schema's orientation policy is part of its versioned[\s\S]{0,900}await createNewSession\(/
+);
 
 const inferenceSource = fs.readFileSync(
   path.join(projectRoot, "src", "Components", "InferencePage.tsx"),
@@ -164,6 +243,17 @@ assert.match(inferenceSource, /dedupeInferenceImageSelection\(images, newImages\
 assert.doesNotMatch(inferenceSource, /new Set\(images\.map\(\(img\) => img\.path\)\)/);
 assert.doesNotMatch(inferenceSource, /if \(false &&/);
 assert.doesNotMatch(inferenceSource, /previewObbPts/);
+assert.match(inferenceSource, /Correct, approve, then add to training\./);
+assert.match(inferenceSource, /Approve image/);
+assert.match(inferenceSource, /Add approved reviews/);
+assert.match(inferenceSource, /No JSON or XML export is required\./);
+assert.match(inferenceSource, /Downloads are not used by the HITL training workflow\./);
+assert.doesNotMatch(inferenceSource, /Mark Review Complete/);
+assert.doesNotMatch(inferenceSource, /Commit to Training Data/);
+assert.match(
+  inferenceSource,
+  /Approval is also the explicit save boundary[\s\S]{0,500}edited:\s*false,[\s\S]{0,250}saved:\s*reviewComplete \? true/
+);
 
 const electronMainSource = fs.readFileSync(path.join(projectRoot, "electron", "main.ts"), "utf8");
 const preloadSource = fs.readFileSync(path.join(projectRoot, "electron", "preload.ts"), "utf8");
@@ -270,6 +360,22 @@ const menuSource = fs.readFileSync(
   "utf8"
 );
 assert.match(menuSource, /candidate retained; active landmark model unchanged/);
+assert.match(menuSource, /resolveTrainingPipelineGate\(\{/);
+assert.match(menuSource, /canTrainObb=\{trainingPipelineGate\.canTrainObb\}/);
+
+const trainDialogSource = fs.readFileSync(
+  path.join(projectRoot, "src", "Components", "PopUp.tsx"),
+  "utf8"
+);
+assert.match(trainDialogSource, /const showLandmarkStep = showObbStep && obbDetectorReady/);
+assert.match(trainDialogSource, /\{showLandmarkStep && \(\s*<div className="space-y-4 py-4">/);
+assert.doesNotMatch(trainDialogSource, /obbDetectorReady \|\| useImportedXml/);
+assert.doesNotMatch(trainDialogSource, /showObbStep \|\| obbDetectorReady/);
+assert.match(electronMainSource, /function landmarkTrainingObbGateError\(/);
+assert.ok(
+  (electronMainSource.match(/landmarkTrainingObbGateError\(/g) || []).length >= 3,
+  "verified OBB gating must cover the helper, preflight, and direct landmark training"
+);
 
 const registeredModel = {
   modelId: "model-123",
@@ -283,11 +389,28 @@ assert.ok(modelIdentity.modelMatchesKey(registeredModel, "Friendly name::cnn"));
 
 assert.equal(
   DEFAULT_SCHEMAS.find((entry) => entry.id === "fly-wing").orientationPolicy.mode,
-  "invariant"
+  "directional"
 );
+for (const preset of DEFAULT_SCHEMAS.filter((entry) => entry.orientationPolicy?.mode === "directional")) {
+  assert.equal(preset.orientationPolicy.targetOrientation, "left");
+  assert.equal(preset.orientationPolicy.anteriorAnchorIds, undefined);
+  assert.equal(preset.orientationPolicy.posteriorAnchorIds, undefined);
+}
 const fishPolicy = DEFAULT_SCHEMAS.find((entry) => entry.id === "fish-morphometrics").orientationPolicy;
 assert.equal(fishPolicy.mode, "directional");
-assert.deepEqual(fishPolicy.anteriorAnchorIds, [1]);
-assert.deepEqual(fishPolicy.posteriorAnchorIds, [4, 5]);
+
+const customSchemaEditorSource = fs.readFileSync(
+  path.join(projectRoot, "src", "Components", "CustomSchemaEditor.tsx"),
+  "utf8"
+);
+assert.doesNotMatch(customSchemaEditorSource, /Select at least one anterior and one posterior anchor/);
+assert.doesNotMatch(customSchemaEditorSource, /Anterior Anchors|Posterior Anchors/);
+
+const orientationDisplaySource = fs.readFileSync(
+  path.join(projectRoot, "src", "lib", "orientationDisplay.ts"),
+  "utf8"
+);
+assert.doesNotMatch(orientationDisplaySource, /Head \u2192|\u2190 Head|Head \u2193|\u2191 Head/);
+assert.match(orientationDisplaySource, /Direction/);
 
 console.log("Frontend contract tests passed.");

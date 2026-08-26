@@ -1,7 +1,7 @@
 {
   "name": "biovisionapp",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -15,7 +15,7 @@
     "publish:mac": "npm run backend:build && npm run build && electron-builder --mac dmg --publish always",
     "publish:linux": "npm run backend:build && npm run build && electron-builder --linux AppImage --x64 --publish always",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "test:python": "python -m pytest",
+    "test:python": "node scripts/run-python-tests.cjs",
     "test:electron": "node scripts/run-electron-tests.cjs",
     "test:contracts": "node scripts/frontend_contract_tests.cjs",
     "preview": "vite preview",

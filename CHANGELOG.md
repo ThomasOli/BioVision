@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.2] - 2026-08-26
+
+### Training and inference reliability
+
+- Enforce immutable OBB and landmark artifact provenance across training, promotion, and inference.
+- Freeze validation cohorts and add deterministic mirrored validation for directional schemas.
+- Validate exact landmark ID mappings and normalized crop geometry for CNN and dlib predictors.
+- Pin orientation-safe OBB augmentations and prevent landmark-derived direction fallbacks.
+- Preserve OBB direction and mirrored landmark coordinates through crop normalization and inverse mapping.
+- Gate landmark predictor training until a verified OBB detector is active.
+
+### HITL workflow
+
+- Clarify review, correction, approval, and training-data commit states in the inference UI.
+- Add transactional HITL commits with rollback-safe recovery and deterministic source staging.
+- Verify all orientation modes through mocked live retraining and inference flows.
+
 ## [0.1.0] - 2026-04-13
 
 ### Initial Release

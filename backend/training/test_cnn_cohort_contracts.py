@@ -1,8 +1,12 @@
 import os
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import cv2
+import numpy as np
 
 from backend.bv_utils import lineage
 from backend.training import train_cnn_model
@@ -236,6 +240,190 @@ class CnnValidationCohortTests(unittest.TestCase):
             train_cnn_model._hash_torch_state_dict(clone.state_dict()),
             baseline,
         )
+
+    def test_initializer_state_hash_supports_scalar_batchnorm_buffers(self):
+        model = train_cnn_model.torch.nn.Sequential(
+            train_cnn_model.torch.nn.Conv2d(3, 4, kernel_size=3),
+            train_cnn_model.torch.nn.BatchNorm2d(4),
+        )
+        scalar_buffers = {
+            name: tensor
+            for name, tensor in model.state_dict().items()
+            if tensor.ndim == 0
+        }
+        self.assertTrue(scalar_buffers)
+        first = train_cnn_model._hash_torch_state_dict(model.state_dict())
+        second = train_cnn_model._hash_torch_state_dict(model.state_dict())
+        self.assertEqual(len(first), 64)
+        self.assertEqual(first, second)
+
+    def test_prepared_validation_records_are_used_without_resplitting_train(self):
+        train = [("train.png", {"00": (10, 20)})]
+        validation = [("validation.png", {"00": (30, 40)})]
+        test = [("test.png", {"00": (50, 60)})]
+        source_map = {
+            os.path.normcase(os.path.abspath("train.png")): "source:train",
+            os.path.normcase(os.path.abspath("validation.png")): "source:validation",
+            os.path.normcase(os.path.abspath("test.png")): "source:test",
+        }
+        with patch.object(
+            train_cnn_model,
+            "_split_train_val_records",
+            side_effect=AssertionError("prepared validation must not be re-split"),
+        ):
+            resolved_train, resolved_validation, meta = (
+                train_cnn_model._resolve_cnn_train_validation_records(
+                    train,
+                    validation,
+                    test,
+                    prepared_validation_available=True,
+                    split_info={"validation_cohort_revision": "frozen-revision"},
+                    source_ids_by_path=source_map,
+                    adaptive_source_ids=set(),
+                    run_seed=42,
+                    legacy_assignment_path="unused.json",
+                )
+            )
+        self.assertEqual(resolved_train, train)
+        self.assertEqual(resolved_validation, validation)
+        self.assertEqual(meta["strategy"], "prepared_frozen_validation_xml")
+        self.assertEqual(meta["validation_cohort_revision"], "frozen-revision")
+
+    def test_cnn_contract_rejects_source_leakage_before_training(self):
+        train = [("train.png", {"00": (10, 20)})]
+        validation = [("validation.png", {"00": (30, 40)})]
+        source_map = {
+            os.path.normcase(os.path.abspath("train.png")): "source:same",
+            os.path.normcase(os.path.abspath("validation.png")): "source:same",
+        }
+        with self.assertRaisesRegex(RuntimeError, "overlap at the original source level"):
+            train_cnn_model._assert_cnn_split_and_label_contract(
+                train,
+                validation,
+                [],
+                landmark_keys=["00"],
+                source_ids_by_path=source_map,
+            )
+
+    def test_cnn_parser_rejects_missing_xml_image_instead_of_dropping_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            xml_path = os.path.join(root, "validation_Fish.xml")
+            dataset = ET.Element("dataset")
+            images = ET.SubElement(dataset, "images")
+            image = ET.SubElement(images, "image", file="missing.png")
+            box = ET.SubElement(image, "box", left="0", top="0", width="512", height="512")
+            ET.SubElement(box, "part", name="00", x="10", y="20")
+            ET.ElementTree(dataset).write(xml_path, encoding="utf-8", xml_declaration=True)
+
+            with self.assertRaisesRegex(RuntimeError, "references a missing file"):
+                train_cnn_model._parse_dlib_xml(xml_path, role="validation")
+
+    def test_cnn_contract_rejects_a_universally_missing_schema_part(self):
+        with tempfile.TemporaryDirectory() as root:
+            image_path = os.path.join(root, "train.png")
+            self.assertTrue(cv2.imwrite(image_path, np.zeros((512, 512, 3), dtype=np.uint8)))
+            with self.assertRaisesRegex(RuntimeError, "expected exactly.*00.*01"):
+                train_cnn_model._assert_cnn_split_and_label_contract(
+                    [(image_path, {"00": (10, 20)})],
+                    [],
+                    [],
+                    landmark_keys=["00", "01"],
+                )
+
+    def test_cnn_rotation_keeps_landmark_on_transformed_pixels(self):
+        image = np.zeros((512, 512, 3), dtype=np.uint8)
+        cv2.circle(image, (350, 220), 7, (255, 255, 255), thickness=-1)
+        dataset = train_cnn_model.LandmarkDataset(
+            [],
+            ["00"],
+            augment=True,
+            seed=7,
+            flip_prob=0.0,
+            vertical_flip_prob=0.0,
+            rotation_range=(12.0, 12.0),
+            scale_range=(1.0, 1.0),
+            translate_ratio=0.0,
+            occlusion_prob=0.0,
+        )
+        augmented, coords = dataset._apply_geometric_augment(
+            image,
+            np.asarray([[350.0, 220.0]], dtype=np.float32),
+        )
+        ys, xs = np.nonzero(augmented[:, :, 0] > 160)
+        self.assertGreater(len(xs), 20)
+        self.assertLess(abs(float(xs.mean()) - float(coords[0, 0])), 1.5)
+        self.assertLess(abs(float(ys.mean()) - float(coords[0, 1])), 1.5)
+
+    def test_cnn_affine_falls_back_instead_of_clamping_out_of_frame_label(self):
+        image = np.zeros((512, 512, 3), dtype=np.uint8)
+        dataset = train_cnn_model.LandmarkDataset(
+            [],
+            ["00"],
+            augment=True,
+            seed=7,
+            flip_prob=0.0,
+            vertical_flip_prob=0.0,
+            rotation_range=(45.0, 45.0),
+            scale_range=(1.0, 1.0),
+            translate_ratio=0.0,
+            occlusion_prob=0.0,
+        )
+        _augmented, coords = dataset._apply_geometric_augment(
+            image,
+            np.asarray([[2.0, 2.0]], dtype=np.float32),
+        )
+        np.testing.assert_allclose(coords, [[2.0, 2.0]], atol=1e-6)
+
+    def test_cnn_bilateral_mirror_swaps_semantic_landmark_channels(self):
+        image = np.zeros((512, 512, 3), dtype=np.uint8)
+        dataset = train_cnn_model.LandmarkDataset(
+            [],
+            ["left", "right"],
+            augment=True,
+            seed=11,
+            flip_prob=1.0,
+            vertical_flip_prob=0.0,
+            rotation_range=(0.0, 0.0),
+            scale_range=(1.0, 1.0),
+            translate_ratio=0.0,
+            bilateral_index_pairs=[(0, 1)],
+            occlusion_prob=0.0,
+        )
+        _augmented, coords = dataset._apply_geometric_augment(
+            image,
+            np.asarray([[100.0, 200.0], [400.0, 300.0]], dtype=np.float32),
+        )
+        np.testing.assert_allclose(
+            coords,
+            [[111.0, 300.0], [411.0, 200.0]],
+            atol=1e-6,
+        )
+
+    def test_cnn_failed_run_is_finalized_with_diagnostics(self):
+        with tempfile.TemporaryDirectory() as root:
+            run_dir = os.path.join(root, "debug", "models", "cnn", "Fish", "run-fail")
+
+            def fail_impl(project_root, tag, **kwargs):
+                os.makedirs(run_dir, exist_ok=True)
+                train_cnn_model.dio.write_run_manifest(
+                    run_dir,
+                    model_type="cnn",
+                    tag=tag,
+                    project_root=project_root,
+                    extra={"status": "started"},
+                )
+                kwargs["_run_context"].update(
+                    {"run_dir": run_dir, "project_root": project_root, "tag": tag}
+                )
+                raise RuntimeError("synthetic CNN failure")
+
+            with patch.object(train_cnn_model, "_train_cnn_model_impl", side_effect=fail_impl):
+                with self.assertRaisesRegex(RuntimeError, "synthetic CNN failure"):
+                    train_cnn_model.train_cnn_model(root, "Fish")
+            manifest = lineage.read_json(os.path.join(run_dir, "run_manifest.json"))
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["failure"]["type"], "RuntimeError")
+            self.assertIn("synthetic CNN failure", manifest["failure"]["traceback"])
 
     def test_preparation_source_map_groups_distinct_augmented_crops(self):
         with tempfile.TemporaryDirectory() as root:

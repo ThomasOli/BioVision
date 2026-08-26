@@ -5,6 +5,7 @@ import sys
 import json
 import math
 import time
+import traceback
 import xml.etree.ElementTree as ET
 import cv2
 import dlib
@@ -15,7 +16,11 @@ if _BACKEND_ROOT not in sys.path:
 import bv_utils.debug_io as dio
 import bv_utils.lineage as lineage
 import bv_utils.orientation_utils as ou
-from bv_utils.landmark_artifacts import bundle_id_mapping
+from bv_utils.landmark_artifacts import (
+    bundle_id_mapping,
+    expected_dlib_part_names,
+    load_and_validate_id_mapping,
+)
 
 STANDARD_SIZE = 512
 DLIB_PROMOTION_MIN_ABSOLUTE_IMPROVEMENT = 1e-4
@@ -88,8 +93,8 @@ def _build_dlib_validation_evaluator_protocol(id_mapping: dict) -> dict:
                 ],
                 "xmlBoxSelection": "first_box",
                 "targetPartOrdering": "numeric_then_lexical_part_name",
-                "missingOrUnreadableSamplePolicy": "skip",
-                "predictionPartCount": "min(predicted_parts,target_parts)",
+                "missingOrUnreadableSamplePolicy": "fail_preflight_and_abort_publication_on_mid_run_change",
+                "predictionPartCount": "must_equal_target_parts",
             },
             "landmarkOrder": landmark_order,
             "metricDefinitions": {
@@ -245,6 +250,140 @@ def _assert_effective_dlib_dataset_unchanged(
         )
 
 
+def _read_dlib_split_source_map(debug_dir: str, tag: str) -> dict[str, str]:
+    split_path = os.path.join(debug_dir, f"split_info_{tag}.json")
+    split_info = lineage.read_json_strict(
+        split_path,
+        description="dlib dataset split_info manifest",
+        missing_default={},
+    )
+    if not isinstance(split_info, dict):
+        raise RuntimeError(f"The dlib split manifest at {split_path} must be a JSON object.")
+    source_map = {}
+    for field in (
+        "train_file_source_ids",
+        "validation_file_source_ids",
+        "test_file_source_ids",
+    ):
+        raw = split_info.get(field, {})
+        if not isinstance(raw, dict):
+            raise RuntimeError(
+                f"The dlib split manifest has a malformed {field}; re-run dataset preparation."
+            )
+        source_map.update(
+            {
+                os.path.normcase(os.path.abspath(str(path))): str(source_id)
+                for path, source_id in raw.items()
+                if source_id
+            }
+        )
+    return source_map
+
+
+def _validate_dlib_training_contract(
+    role_paths: dict[str, str],
+    *,
+    debug_dir: str,
+    tag: str,
+    expected_parts,
+):
+    """Validate canonical geometry, fixed labels, and source-disjoint cohorts."""
+    source_map = _read_dlib_split_source_map(debug_dir, tag)
+    expected_parts = {str(name) for name in expected_parts}
+    if not expected_parts:
+        raise RuntimeError("The immutable landmark mapping declares no dlib XML parts.")
+    failures = []
+    role_sources = {}
+    role_counts = {}
+
+    for role, xml_path in role_paths.items():
+        role_sources[role] = set()
+        role_counts[role] = 0
+        if not xml_path or not os.path.exists(xml_path):
+            continue
+        try:
+            root = ET.parse(xml_path).getroot()
+        except Exception as exc:
+            raise RuntimeError(f"The {role} XML is unreadable: {xml_path}: {exc}") from exc
+        images_node = root.find("images")
+        if images_node is None:
+            failures.append(f"{role}:{xml_path} has no <images> collection")
+            continue
+        for image_node in images_node.findall("image") if images_node is not None else []:
+            image_reference = image_node.get("file", "")
+            if not image_reference:
+                failures.append(f"{role}:image entry has no file reference")
+                continue
+            image_path = _resolve_xml_image_path(xml_path, image_reference)
+            image = cv2.imread(image_path)
+            if image is None:
+                failures.append(f"{role}:{image_path} is unreadable")
+                continue
+            height, width = image.shape[:2]
+            if (width, height) != (STANDARD_SIZE, STANDARD_SIZE):
+                failures.append(
+                    f"{role}:{os.path.basename(image_path)} is {width}x{height}; "
+                    f"expected {STANDARD_SIZE}x{STANDARD_SIZE} canonical crop"
+                )
+            normalized_path = os.path.normcase(os.path.abspath(image_path))
+            source_id = source_map.get(normalized_path)
+            if not source_id:
+                source_id = f"sha256:{lineage.sha256_file(image_path)}"
+            role_sources[role].add(source_id)
+
+            boxes = image_node.findall("box")
+            if len(boxes) != 1:
+                failures.append(
+                    f"{role}:{os.path.basename(image_path)} has {len(boxes)} landmark boxes; expected exactly one"
+                )
+                continue
+            for box in boxes:
+                raw_names = [str(part.get("name") or "") for part in box.findall("part")]
+                names = set(raw_names)
+                if len(raw_names) != len(names):
+                    failures.append(
+                        f"{role}:{os.path.basename(image_path)} contains duplicate landmark part names"
+                    )
+                if expected_parts is not None and names != expected_parts:
+                    failures.append(
+                        f"{role}:{os.path.basename(image_path)} has landmark parts "
+                        f"{sorted(names)}; expected {sorted(expected_parts)}"
+                    )
+                for part in box.findall("part"):
+                    x = int(part.get("x", -1))
+                    y = int(part.get("y", -1))
+                    if not (0 <= x < width and 0 <= y < height):
+                        failures.append(
+                            f"{role}:{os.path.basename(image_path)} part {part.get('name')} "
+                            f"is out of bounds at ({x}, {y})"
+                        )
+                role_counts[role] += 1
+
+    if role_counts.get("train", 0) == 0:
+        failures.append("train cohort contains no complete landmark boxes")
+    overlap = (
+        (role_sources.get("train", set()) & role_sources.get("validation", set()))
+        | (role_sources.get("train", set()) & role_sources.get("test", set()))
+        | (role_sources.get("validation", set()) & role_sources.get("test", set()))
+    )
+    if overlap:
+        failures.append(
+            "train/validation/test cohorts overlap at the original source level: "
+            f"{sorted(overlap)}"
+        )
+    if failures:
+        preview = failures[:25]
+        suffix = f"; ... and {len(failures) - len(preview)} more" if len(failures) > len(preview) else ""
+        raise RuntimeError(
+            "dlib canonical crop/landmark contract failed: " + "; ".join(preview) + suffix
+        )
+    return {
+        "landmarkParts": sorted(expected_parts),
+        "sourceCounts": {role: len(values) for role, values in role_sources.items()},
+        "sampleCounts": role_counts,
+    }
+
+
 def _build_dlib_training_protocol(params_log: dict, effective_dataset_revision: str) -> dict:
     excluded = {"model_id", "artifact_tag", "run_id", "augmented_xml"}
     parameters = {
@@ -337,12 +476,20 @@ def _resolve_orientation_mode(project_root, tag):
     return "invariant"
 
 
+def _rotate_point_unclamped(x, y, cx, cy, angle_deg):
+    """Rotate a label with the exact OpenCV image-space affine transform."""
+    # Use the same transform as cv2.warpAffine below.  Image coordinates have a
+    # downward-positive y axis, so the usual Cartesian rotation formula has the
+    # opposite sign and silently separates labels from pixels.
+    matrix = cv2.getRotationMatrix2D((float(cx), float(cy)), float(angle_deg), 1.0)
+    xr = float(matrix[0, 0] * x + matrix[0, 1] * y + matrix[0, 2])
+    yr = float(matrix[1, 0] * x + matrix[1, 1] * y + matrix[1, 2])
+    return xr, yr
+
+
 def _rotate_point(x, y, cx, cy, angle_deg):
-    """Rotate point (x, y) around (cx, cy) by angle_deg, clamped to [0, STANDARD_SIZE-1]."""
-    rad = math.radians(angle_deg)
-    cos_a, sin_a = math.cos(rad), math.sin(rad)
-    xr = cx + (x - cx) * cos_a - (y - cy) * sin_a
-    yr = cy + (x - cx) * sin_a + (y - cy) * cos_a
+    """Backward-compatible bounded point rotation helper."""
+    xr, yr = _rotate_point_unclamped(x, y, cx, cy, angle_deg)
     return (
         max(0.0, min(STANDARD_SIZE - 1, xr)),
         max(0.0, min(STANDARD_SIZE - 1, yr)),
@@ -478,16 +625,28 @@ def augment_training_data(
             if kind == "rotate":
                 angle = float(spec.get("angle", 0.0))
                 M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+                rotated_parts = [
+                    (name, *_rotate_point_unclamped(x, y, cx, cy, angle))
+                    for name, x, y in parts
+                ]
+                if any(
+                    rx < 0.0
+                    or rx > STANDARD_SIZE - 1
+                    or ry < 0.0
+                    or ry > STANDARD_SIZE - 1
+                    for _name, rx, ry in rotated_parts
+                ):
+                    # A clamped coordinate would label an edge pixel after the
+                    # actual feature rotated out of frame. Skip that synthetic
+                    # copy instead of injecting a false target.
+                    continue
                 aug_img = cv2.warpAffine(
                     img,
                     M,
                     (STANDARD_SIZE, STANDARD_SIZE),
                     borderMode=cv2.BORDER_REPLICATE,
                 )
-                aug_parts = [
-                    (name, *_rotate_point(x, y, cx, cy, angle))
-                    for name, x, y in parts
-                ]
+                aug_parts = rotated_parts
                 if bool(spec.get("flip", False)):
                     aug_img = cv2.flip(aug_img, 1)
                     aug_parts = [
@@ -505,7 +664,8 @@ def augment_training_data(
 
             aug_img = _apply_photo_jitter(aug_img, rng, photo_jitter_profile)
             out_path = os.path.join(aug_dir, f"{base}{spec.get('suffix', '_aug')}.png")
-            cv2.imwrite(out_path, aug_img)
+            if not cv2.imwrite(out_path, aug_img):
+                raise RuntimeError(f"Failed to write augmented dlib crop: {out_path}")
             augmented_entries.append((out_path, aug_parts))
 
     if not augmented_entries:
@@ -744,7 +904,12 @@ def _compute_dlib_per_image_errors(xml_path: str, predictor_path: str) -> list:
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         det = dlib.rectangle(0, 0, STANDARD_SIZE - 1, STANDARD_SIZE - 1)
         shape = predictor(img_rgb, det)
-        n = min(shape.num_parts, len(gt_parts))
+        if shape.num_parts != len(gt_parts):
+            raise RuntimeError(
+                f"dlib predictor emitted {shape.num_parts} parts for {img_file}; "
+                f"the immutable schema requires {len(gt_parts)}"
+            )
+        n = shape.num_parts
         if n == 0:
             continue
         names = sorted(
@@ -786,7 +951,12 @@ def _compute_dlib_per_image_error_details(xml_path: str, predictor_path: str) ->
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         det = dlib.rectangle(0, 0, STANDARD_SIZE - 1, STANDARD_SIZE - 1)
         shape = predictor(img_rgb, det)
-        n = min(shape.num_parts, len(gt_parts))
+        if shape.num_parts != len(gt_parts):
+            raise RuntimeError(
+                f"dlib predictor emitted {shape.num_parts} parts for {img_file}; "
+                f"the immutable schema requires {len(gt_parts)}"
+            )
+        n = shape.num_parts
         if n == 0:
             continue
         names = sorted(
@@ -872,8 +1042,8 @@ def _dlib_validation_stability_gate(per_image_errors, mean_error, median_error):
     }
 
 
-def train_shape_model(project_root, tag, custom_options=None,
-                      aug_angles=None, aug_flip=None):
+def _train_shape_model_impl(project_root, tag, custom_options=None,
+                            aug_angles=None, aug_flip=None, _run_context=None):
     """
     Train a dlib shape predictor model.
 
@@ -893,7 +1063,31 @@ def train_shape_model(project_root, tag, custom_options=None,
     debug_dir = os.path.join(project_root, "debug")
     os.makedirs(modeldir, exist_ok=True)
     os.makedirs(debug_dir, exist_ok=True)
+    train_xml = os.path.join(xmldir, f"train_{tag}.xml")
+    validation_xml = os.path.join(xmldir, f"validation_{tag}.xml")
+    test_xml = os.path.join(xmldir, f"test_{tag}.xml")
+    robustness_xml = os.path.join(xmldir, f"robustness_{tag}.xml")
+    if not os.path.exists(train_xml):
+        raise FileNotFoundError(f"Train XML not found at {train_xml}")
+    id_mapping_path = os.path.join(debug_dir, f"id_mapping_{tag}.json")
+    prepared_id_mapping = load_and_validate_id_mapping(id_mapping_path)
+    expected_parts = expected_dlib_part_names(prepared_id_mapping)
+    split_contract = _validate_dlib_training_contract(
+        {
+            "train": train_xml,
+            "validation": validation_xml,
+            "test": test_xml,
+            "robustness": robustness_xml,
+        },
+        debug_dir=debug_dir,
+        tag=tag,
+        expected_parts=expected_parts,
+    )
     run_dir, run_id = dio.create_model_run_dir(project_root, "dlib", tag)
+    if isinstance(_run_context, dict):
+        _run_context.update(
+            {"run_dir": run_dir, "project_root": project_root, "tag": tag}
+        )
     model_id = lineage.build_model_id("dlib", run_id)
     artifact_tag = lineage.build_artifact_tag(tag, run_id)
     artifact_dir = lineage.create_model_artifact_dir(project_root, "dlib", run_id)
@@ -905,17 +1099,12 @@ def train_shape_model(project_root, tag, custom_options=None,
         extra={"status": "started"},
     )
 
-    train_xml = os.path.join(xmldir, f"train_{tag}.xml")
-    validation_xml = os.path.join(xmldir, f"validation_{tag}.xml")
-    test_xml = os.path.join(xmldir, f"test_{tag}.xml")
     # Train directly into an immutable run directory. Compatibility aliases are
     # published only after training and evaluation complete successfully.
     predictor_path = os.path.join(artifact_dir, "predictor.dat")
 
-    if not os.path.exists(train_xml):
-        raise FileNotFoundError(f"Train XML not found at {train_xml}")
     artifact_id_mapping_path, id_mapping_descriptor, artifact_id_mapping = bundle_id_mapping(
-        os.path.join(debug_dir, f"id_mapping_{tag}.json"),
+        id_mapping_path,
         artifact_dir,
     )
     print("PROGRESS 8 loading_dataset", file=sys.stderr)
@@ -949,9 +1138,8 @@ def train_shape_model(project_root, tag, custom_options=None,
     # ── Pre-training augmentation ──────────────────────────────────────────────
     # Augmentation Router: model-aware angle selection.
     # Explicit aug_angles override → forwarded verbatim (API compat).
-    # None → router selects based on orientation mode:
-    #   directional/axial → ±5° (mean-shape stability)
-    #   invariant/bilateral → [-30, -15, 15, 30] (no chirality to protect)
+    # None → router selects the schema-safe ±6° envelope. Schema mode
+    # still controls whether horizontal flips and bilateral ID swaps are used.
     aug_angles = _resolve_dlib_aug_angles(orientation_mode, aug_angles)
     raw_augmentation_seed = (custom_options or {}).get(
         "augmentation_seed",
@@ -1036,6 +1224,7 @@ def train_shape_model(project_root, tag, custom_options=None,
         "run_id": run_id,
         "raw_num_images": raw_num_images,
         "raw_num_landmarks": raw_num_landmarks,
+        "split_contract": split_contract,
         "source_counts": {
             "train": raw_num_images,
             "validation": count_landmarks_in_xml(validation_xml)[0] if os.path.exists(validation_xml) else 0,
@@ -1079,6 +1268,7 @@ def train_shape_model(project_root, tag, custom_options=None,
         "trainReport": train_xml,
         **({"validation": validation_xml} if os.path.isfile(validation_xml) else {}),
         **({"test": test_xml} if os.path.isfile(test_xml) else {}),
+        **({"robustness": robustness_xml} if os.path.isfile(robustness_xml) else {}),
     }
     effective_dataset = _build_effective_dlib_dataset_snapshot(role_paths, artifact_dir)
     effective_dataset_path = os.path.join(artifact_dir, "effective_dataset.json")
@@ -1269,6 +1459,54 @@ def train_shape_model(project_root, tag, custom_options=None,
             "sampleCount": 0,
         }
 
+    robustness_landmark_count = (
+        count_landmarks_in_xml(robustness_xml)[0]
+        if os.path.exists(robustness_xml)
+        else 0
+    )
+    if robustness_landmark_count > 0:
+        robustness_error = dlib.test_shape_predictor(robustness_xml, predictor_path)
+        robustness_per_image = _compute_dlib_per_image_errors(
+            robustness_xml,
+            predictor_path,
+        )
+        robustness_median_error = (
+            float(np.median(robustness_per_image)) if robustness_per_image else None
+        )
+        robustness_evaluation = {
+            "status": "measured",
+            "role": "report_only",
+            "affectsPromotion": False,
+            "protocol": "deterministic_validation_obb_scale_v1",
+            "sourceCohort": "frozen_validation",
+            "sampleCount": len(robustness_per_image),
+            "meanError": float(robustness_error),
+            "medianNormalizedError": robustness_median_error,
+            "medianDegradationVsValidation": (
+                float(robustness_median_error - validation_median_error)
+                if robustness_median_error is not None
+                and validation_median_error is not None
+                and np.isfinite(validation_median_error)
+                else None
+            ),
+        }
+        print("ROBUSTNESS_ERROR", robustness_error)
+        print("ROBUSTNESS_MEDIAN_ERROR", round(robustness_median_error, 6))
+    else:
+        robustness_evaluation = {
+            "status": "unavailable",
+            "role": "report_only",
+            "affectsPromotion": False,
+            "protocol": "deterministic_validation_obb_scale_v1",
+            "sourceCohort": "frozen_validation",
+            "sampleCount": 0,
+            "reason": (
+                "missing_robustness_cohort"
+                if not os.path.exists(robustness_xml)
+                else "empty_robustness_cohort"
+            ),
+        }
+
     _assert_effective_dlib_dataset_unchanged(role_paths, effective_dataset)
 
     stability_gate = _dlib_validation_stability_gate(
@@ -1320,6 +1558,7 @@ def train_shape_model(project_root, tag, custom_options=None,
         "validation_error_details": validation_error_details,
         "test_error_details": test_error_details,
         "test_evaluation": test_evaluation,
+        "robustness_evaluation": robustness_evaluation,
         "num_images": num_images,
         "num_landmarks": num_landmarks,
     }
@@ -1353,6 +1592,7 @@ def train_shape_model(project_root, tag, custom_options=None,
             "train_xml": train_xml,
             "validation_xml": validation_xml if os.path.exists(validation_xml) else None,
             "test_xml": test_xml if os.path.exists(test_xml) else None,
+            "robustness_xml": robustness_xml if os.path.exists(robustness_xml) else None,
             "augmented_xml": actual_train_xml if actual_train_xml != train_xml else None,
         },
     )
@@ -1372,6 +1612,7 @@ def train_shape_model(project_root, tag, custom_options=None,
             "validation_median_error": validation_median_error,
             "test_error": test_error,
             "test_median_error": test_median_error,
+            "robustness_evaluation": robustness_evaluation,
             "unstable": unstable,
             "instability_warning": instability_warning,
         },
@@ -1431,6 +1672,7 @@ def train_shape_model(project_root, tag, custom_options=None,
         "lineage": lineage_payload,
         "validationEvaluatorProtocol": validation_evaluator_protocol,
         "testEvaluation": test_evaluation,
+        "robustnessEvaluation": robustness_evaluation,
         "promotionPolicy": _dlib_promotion_policy(),
     }
     lineage.atomic_write_json(artifact_manifest_path, artifact_manifest)
@@ -1490,6 +1732,37 @@ def train_shape_model(project_root, tag, custom_options=None,
     )
 
     return results
+
+
+def train_shape_model(project_root, tag, custom_options=None,
+                      aug_angles=None, aug_flip=None):
+    """Run dlib training and durably finalize any post-preflight failure."""
+    run_context = {}
+    try:
+        return _train_shape_model_impl(
+            project_root,
+            tag,
+            custom_options=custom_options,
+            aug_angles=aug_angles,
+            aug_flip=aug_flip,
+            _run_context=run_context,
+        )
+    except Exception as exc:
+        run_dir = run_context.get("run_dir")
+        if run_dir:
+            try:
+                dio.write_failed_run_manifest(
+                    run_dir,
+                    model_type="dlib",
+                    tag=run_context.get("tag", tag),
+                    project_root=run_context.get("project_root", project_root),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    traceback_text=traceback.format_exc(),
+                )
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":

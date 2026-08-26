@@ -42,8 +42,10 @@ interface TrainModelDialogProps {
   setPredictorType?: (type: "dlib" | "cnn") => void;
   // OBB detector training (Phase 3 - step before landmarker)
   obbDetectorReady?: boolean;
-  /** Show the OBB detector step — true when user has finalized boxes (flat or OBB) */
+  /** Show step 1 whenever a session is active. */
   showObbStep?: boolean;
+  /** Finalized OBB annotations exist, so step 1 can be run. */
+  canTrainObb?: boolean;
   isTrainingObb?: boolean;
   handleTrainObbDetector?: () => Promise<void>;
   obbTrainingMessage?: string;
@@ -120,6 +122,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
   trainingProgress = null,
   obbDetectorReady = false,
   showObbStep = false,
+  canTrainObb = false,
   isTrainingObb = false,
   handleTrainObbDetector,
   obbTrainingMessage,
@@ -178,7 +181,9 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
     trimmed.length > 0 &&
     nameOk &&
     !isTraining &&
-    (!showObbStep || obbDetectorReady || useImportedXml);
+    showObbStep &&
+    obbDetectorReady;
+  const showLandmarkStep = showObbStep && obbDetectorReady;
 
   const helperText = useMemo(() => {
     if (!touched)
@@ -366,7 +371,9 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
             Train new model
           </DialogTitle>
           <DialogDescription className="text-xs">
-            Give your model a clear, versioned name (Ctrl/Cmd+Enter to start).
+            {showLandmarkStep
+              ? "Step 2 is unlocked. Configure and train the landmark predictor."
+              : "Step 1: train and verify the session OBB detector to unlock landmark training."}
           </DialogDescription>
           </div>
         </DialogHeader>
@@ -437,7 +444,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
           </details>
         )}
 
-        {(showObbStep || obbDetectorReady) && (
+        {showObbStep && (
           <div className={`rounded-md border px-3 py-2 mb-1 ${obbDetectorReady ? "border-green-500/40 bg-green-500/5" : "border-amber-500/40 bg-amber-500/5"}`}>
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
@@ -449,7 +456,9 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                     ? (obbTrainingProgress?.message ?? obbTrainingMessage ?? "OBB detector training in progress.")
                     : obbDetectorReady
                       ? (obbTrainingMessage ?? "Retrain to update with new annotations.")
-                      : (obbTrainingMessage ?? "Train the orientation detector before landmarking.")}
+                      : !canTrainObb
+                        ? "Finalize at least one image with an accepted box before training the OBB detector."
+                        : (obbTrainingMessage ?? "Train the orientation detector before landmarking.")}
                 </p>
               </div>
               {handleTrainObbDetector && (
@@ -457,7 +466,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
                   size="sm"
                   variant="outline"
                   className="shrink-0 text-xs h-7"
-                  disabled={isTrainingObb || isTraining}
+                  disabled={isTrainingObb || isTraining || !canTrainObb}
                   onClick={handleTrainObbDetector}
                 >
                   {isTrainingObb
@@ -603,13 +612,13 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
           </div>
         )}
         {/* Step 2 label — only once OBB detector is ready */}
-        {obbDetectorReady && (
+        {showLandmarkStep && (
           <p className="text-[11px] font-semibold text-muted-foreground px-1">
             Step 2: Train Landmark Predictor
           </p>
         )}
 
-        {showObbStep && !obbDetectorReady && (
+        {showObbStep && !showLandmarkStep && (
           <p className="text-[11px] text-muted-foreground px-1 py-2">
             Train the OBB detector above before configuring the landmark predictor.
           </p>
@@ -662,6 +671,7 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
           </details>
         )}
 
+        {showLandmarkStep && (
         <div className="space-y-4 py-4">
           <div className="space-y-2">
             <Label htmlFor="model-name" className="text-sm font-medium">
@@ -1016,11 +1026,12 @@ export const TrainModelDialog: React.FC<TrainModelDialogProps> = ({
             </div>
           )}
             </div>
+        )}
             </div>
           </ScrollArea>
         </div>
 
-        {(!showObbStep || obbDetectorReady || useImportedXml) && <DialogFooter className="shrink-0 gap-2 px-6 pb-6 pt-2 sm:gap-0">
+        {showLandmarkStep && <DialogFooter className="shrink-0 gap-2 px-6 pb-6 pt-2 sm:gap-0">
           <Button
             variant="outline"
             onClick={handleClose}

@@ -31,6 +31,9 @@ def normalize_orientation_payload(raw_class_id: Any, orientation_policy: Mapping
       class_id = 0
     class_id = 0 if class_id <= 0 else 1
 
+    if mode in {"axial", "invariant"}:
+        class_id = 0
+
     if mode == "bilateral":
         orientation = "up" if class_id == 0 else "down"
     elif mode == "directional":

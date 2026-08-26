@@ -95,6 +95,55 @@ def load_and_validate_id_mapping(path: str) -> dict[str, Any]:
     return payload
 
 
+def expected_dlib_part_names(payload: dict[str, Any]) -> list[str]:
+    """Return the exact XML part-name contract declared by an ID mapping.
+
+    New training runs must not infer their output width from whatever labels
+    happen to survive XML parsing.  The preparation sidecar is authoritative.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("Landmark ID mapping must contain a JSON object.")
+    index_mapping = payload.get("dlib_index_to_original")
+    name_mapping = payload.get("dlib_name_to_original")
+    if not isinstance(index_mapping, dict) or not index_mapping:
+        raise ValueError("Landmark ID mapping is missing dlib_index_to_original.")
+    if not isinstance(name_mapping, dict) or not name_mapping:
+        raise ValueError(
+            "Landmark ID mapping is missing dlib_name_to_original; re-run dataset preparation."
+        )
+    try:
+        index_ids = {int(value) for value in index_mapping.values()}
+        normalized_names = {
+            str(name): int(original_id)
+            for name, original_id in name_mapping.items()
+        }
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Landmark ID mapping contains invalid part-name/schema-ID values.") from exc
+    if any(not name for name in normalized_names):
+        raise ValueError("Landmark ID mapping contains an empty dlib part name.")
+    if len(normalized_names) != len(index_mapping):
+        raise ValueError(
+            "Landmark ID mapping part-name count does not match dlib_index_to_original."
+        )
+    if set(normalized_names.values()) != index_ids:
+        raise ValueError(
+            "Landmark ID mapping part names do not cover the declared schema landmark IDs exactly."
+        )
+    declared_order = payload.get("part_names_sorted")
+    if declared_order is not None:
+        if not isinstance(declared_order, list) or [str(value) for value in declared_order] != sorted(
+            normalized_names,
+            key=lambda name: (int(name) if name.isdigit() else float("inf"), name),
+        ):
+            raise ValueError(
+                "Landmark ID mapping part_names_sorted is inconsistent with dlib_name_to_original."
+            )
+    return sorted(
+        normalized_names,
+        key=lambda name: (int(name) if name.isdigit() else float("inf"), name),
+    )
+
+
 def bundle_id_mapping(source_path: str, artifact_dir: str):
     """Validate and copy a training mapping into an immutable artifact directory."""
     payload = load_and_validate_id_mapping(source_path)

@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  isVerifiedTrainedObbDetector,
   resolveTrainedObbDetector,
   resolveZeroShotDetector,
   validateObbPromotionCandidate,
@@ -98,6 +99,7 @@ test("maps exact active alias bytes to immutable OBB provenance and contract", (
   });
 
   assert.equal(resolved.blocking, false);
+  assert.equal(isVerifiedTrainedObbDetector(resolved), true);
   assert.equal(resolved.provenance.modelId, "obb:run-1");
   assert.match(resolved.provenance.artifactSha256 || "", /^[a-f0-9]{64}$/);
 });
@@ -114,7 +116,13 @@ test("blocks an alias that does not map to the active immutable artifact", (t) =
   });
 
   assert.equal(resolved.blocking, true);
+  assert.equal(isVerifiedTrainedObbDetector(resolved), false);
   assert.ok(resolved.issues.some((issue) => issue.code === "obb_active_alias_registry_mismatch"));
+});
+
+test("landmark training stays locked when no trained OBB detector exists", () => {
+  assert.equal(isVerifiedTrainedObbDetector(undefined), false);
+  assert.equal(isVerifiedTrainedObbDetector(null), false);
 });
 
 test("blocks an active config alias that does not match immutable config bytes", (t) => {

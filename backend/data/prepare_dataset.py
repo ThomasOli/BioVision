@@ -18,6 +18,7 @@ if _BACKEND_ROOT not in _sys.path:
 from bv_utils.image_utils import load_image, safe_imread, safe_imwrite
 import bv_utils.orientation_utils as ou
 import bv_utils.lineage as lineage
+from data.export_yolo_dataset import _resolve_obb_class_id
 
 
 def _ascii_safe_base(name):
@@ -172,13 +173,50 @@ def _resolve_landmark_training_boxes(payload):
                 # Older finalized snapshots did not retain these landmark-only
                 # fields. Recover them only from the matching accepted geometry;
                 # unmatched drafts remain excluded.
-                for field in ("landmarks", "trainingTargets"):
+                for field in (
+                    "landmarks",
+                    "trainingTargets",
+                    "class_id",
+                    "orientation_override",
+                    "orientation_hint",
+                ):
                     if field not in merged and field in legacy_match:
                         merged[field] = legacy_match[field]
             resolved.append(merged)
         return resolved, True
     legacy_boxes = payload.get("boxes")
     return (legacy_boxes if isinstance(legacy_boxes, list) else []), False
+
+
+def _resolve_predictor_training_class_id(
+    box,
+    landmarks,
+    *,
+    orientation_mode,
+    orientation_policy,
+    head_landmark_id,
+    tail_landmark_id,
+    source_label,
+):
+    """Use only the detector's saved arrow/class contract for crop routing."""
+    if orientation_mode not in {"directional", "bilateral"}:
+        return 0
+    candidate = dict(box or {})
+    candidate["landmarks"] = list(landmarks or [])
+    try:
+        return _resolve_obb_class_id(
+            candidate,
+            orientation_class_enabled=True,
+            head_id=head_landmark_id,
+            tail_id=tail_landmark_id,
+            orientation_policy=orientation_policy,
+            require_trusted=True,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{source_label}: predictor crop orientation is unresolved ({exc}). "
+            "Review and save the OBB direction arrow before landmark training."
+        ) from exc
 
 
 def _validate_training_landmark_contract(json_paths, required_ids):
@@ -1273,6 +1311,8 @@ def standardize_crop(
     crop, crop_meta, debug = ou.apply_obb_geometry(
         crop, crop_meta, class_id, orientation_policy or {}
     )
+    if mirror:
+        crop = cv2.flip(crop, 1)
 
     M = np.array(crop_meta["affine_M"], dtype=np.float64)
     lm_pts = np.array([[lm["x"], lm["y"]] for lm in landmarks], dtype=np.float64)
@@ -1297,6 +1337,8 @@ def standardize_crop(
         if was_rotated_180:
             x512 = (STANDARD_SIZE - 1) - x512
             y512 = (STANDARD_SIZE - 1) - y512
+        if mirror:
+            x512 = (STANDARD_SIZE - 1) - x512
         landmark["x"] = float(np.clip(x512, 0, STANDARD_SIZE - 1))
         landmark["y"] = float(np.clip(y512, 0, STANDARD_SIZE - 1))
 
@@ -1310,6 +1352,7 @@ def standardize_crop(
         },
         "mirrored": bool(was_flipped) ^ bool(mirror),
         "manual_mirror_requested": bool(mirror),
+        "manual_mirror_applied": bool(mirror),
         "canonical_flip_applied": was_flipped,
         "canonicalization": debug,
         "canonicalization_source": "obb_geometry",
@@ -1531,6 +1574,65 @@ def _augment_train_entries_with_box_scale(train_entries, corrected_dir, profile,
     return augmented_entries, box_scale_log
 
 
+def _build_report_only_box_robustness_entries(
+    validation_entries,
+    corrected_dir,
+    orientation_policy,
+    scale_factors=(0.92, 1.08),
+):
+    """Create deterministic validation crop perturbations without changing promotion data."""
+    robustness_dir = os.path.join(corrected_dir, "robustness")
+    os.makedirs(robustness_dir, exist_ok=True)
+    generated = []
+    image_cache = {}
+    for index, entry in enumerate(validation_entries):
+        source_path = entry.get("source_full_image_path")
+        source_box = entry.get("source_box")
+        source_landmarks = entry.get("source_landmarks")
+        if not source_path or not isinstance(source_box, dict) or not isinstance(source_landmarks, list):
+            continue
+        full_img = image_cache.get(source_path)
+        if full_img is None:
+            full_img = safe_imread(source_path)
+            if full_img is None:
+                continue
+            image_cache[source_path] = full_img
+        base_name = os.path.splitext(os.path.basename(entry["path"]))[0]
+        for scale_factor in scale_factors:
+            scaled_box = _scale_obb_about_center(source_box, float(scale_factor))
+            if scaled_box is None:
+                continue
+            try:
+                crop, landmarks, _meta = standardize_crop(
+                    full_img,
+                    scaled_box,
+                    source_landmarks,
+                    mirror=False,
+                    orientation_policy=orientation_policy,
+                )
+            except (TypeError, ValueError):
+                continue
+            if crop is None or not landmarks:
+                continue
+            scale_tag = str(round(float(scale_factor), 4)).replace(".", "p")
+            output_path = os.path.join(
+                robustness_dir,
+                f"{base_name}_detector_scale_{scale_tag}_{index:05d}.png",
+            )
+            safe_imwrite(output_path, crop)
+            generated.append(
+                {
+                    "path": output_path,
+                    "landmarks": landmarks,
+                    "source_image": entry.get("source_image"),
+                    "source_id": entry.get("source_id"),
+                    "box_index": entry.get("box_index", 0),
+                    "detector_box_scale": float(scale_factor),
+                }
+            )
+    return generated
+
+
 def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                      target_orientation='left'):
     """
@@ -1669,7 +1771,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
         ]
 
         # Multi-specimen mode: each box has its own bounding region and landmarks
-        if json_boxes and any(box.get("left", 0) != 0 or box.get("top", 0) != 0 for box in json_boxes):
+        if json_boxes:
             # Multi-specimen: boxes have specific regions
             image_boxes = []
             for box_data in json_boxes:
@@ -1729,15 +1831,15 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                             "angle": derived_obb["angle"],
                         }
                     )
-                if box_data.get("class_id") is not None:
-                    box_coords["class_id"] = box_data["class_id"]
-                else:
-                    box_coords["class_id"] = ou.derive_class_id_from_landmarks(
-                        valid_lm,
-                        mode=orientation_mode,
-                        head_id=head_landmark_id,
-                        tail_id=tail_landmark_id,
-                    )
+                box_coords["class_id"] = _resolve_predictor_training_class_id(
+                    box_data,
+                    valid_lm,
+                    orientation_mode=orientation_mode,
+                    orientation_policy=orientation_policy,
+                    head_landmark_id=head_landmark_id,
+                    tail_landmark_id=tail_landmark_id,
+                    source_label=f"{os.path.basename(jp)} box {len(image_boxes)}",
+                )
 
                 # Detect orientation for this individual specimen.
                 # The flip is deferred to standardize_crop (mirror=was_mirrored) so that
@@ -1838,11 +1940,14 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "bottom": int(round(derived_obb["bottom"])),
                 "obbCorners": derived_obb["obbCorners"],
                 "angle": derived_obb["angle"],
-                "class_id": ou.derive_class_id_from_landmarks(
+                "class_id": _resolve_predictor_training_class_id(
+                    {},
                     valid_lm,
-                    mode=orientation_mode,
-                    head_id=head_landmark_id,
-                    tail_id=tail_landmark_id,
+                    orientation_mode=orientation_mode,
+                    orientation_policy=orientation_policy,
+                    head_landmark_id=head_landmark_id,
+                    tail_landmark_id=tail_landmark_id,
+                    source_label=f"{os.path.basename(jp)} legacy specimen",
                 ),
             }
 
@@ -2051,6 +2156,13 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             }
             for e in boxscale_augmented_entries
         )
+    robustness_scale_factors = (0.92, 1.08)
+    robustness_entries = _build_report_only_box_robustness_entries(
+        validation_entries,
+        corrected_dir,
+        orientation_policy,
+        scale_factors=robustness_scale_factors,
+    )
 
     def write_xml(entries, path):
         root = ET.Element("dataset")
@@ -2068,9 +2180,11 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     train_path = os.path.join(xml_dir, f"train_{tag}.xml")
     validation_path = os.path.join(xml_dir, f"validation_{tag}.xml")
     test_path = os.path.join(xml_dir, f"test_{tag}.xml")
+    robustness_path = os.path.join(xml_dir, f"robustness_{tag}.xml")
     write_xml(train_entries, train_path)
     write_xml(validation_entries, validation_path)
     write_xml(test_entries, test_path)
+    write_xml(robustness_entries, robustness_path)
     print(
         "PROGRESS_JSON " + json.dumps(
             {
@@ -2081,6 +2195,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "train_crops": int(len(train_entries)),
                 "validation_crops": int(len(validation_entries)),
                 "test_crops": int(len(test_entries)),
+                "robustness_crops": int(len(robustness_entries)),
             }
         ),
         file=sys.stderr,
@@ -2114,6 +2229,14 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "training_prep_box_scale_profile": prep_box_scale_profile,
                 "cnn_recommended_box_jitter_profile": cnn_recommended_box_jitter,
                 "training_prep_box_scale_added_crops": len(boxscale_augmented_entries),
+                "report_only_robustness": {
+                    "protocol": "deterministic_validation_obb_scale_v1",
+                    "role": "report_only",
+                    "affects_promotion": False,
+                    "scale_factors": list(robustness_scale_factors),
+                    "sample_count": len(robustness_entries),
+                    "xml_path": robustness_path,
+                },
             }
         }, f, indent=2)
 
@@ -2180,6 +2303,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             "train_boxscale_crops_added": len(boxscale_augmented_entries),
             "validation_crops": len(validation_entries),
             "test_crops": len(test_entries),
+            "robustness_crops": len(robustness_entries),
             "total_crops": len(standardized_entries),
             "train_sources": sorted(train_source_set),
             "validation_sources": sorted(validation_source_set),
@@ -2224,6 +2348,14 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
             "train_files": [e["path"] for e in train_entries],
             "validation_files": [e["path"] for e in validation_entries],
             "test_files": [e["path"] for e in test_entries],
+            "robustness_files": [e["path"] for e in robustness_entries],
+            "robustness_protocol": {
+                "name": "deterministic_validation_obb_scale_v1",
+                "role": "report_only",
+                "affects_promotion": False,
+                "source_cohort": "frozen_validation",
+                "scale_factors": list(robustness_scale_factors),
+            },
             "train_file_source_ids": {
                 os.path.normcase(os.path.abspath(e["path"])): e.get("source_id")
                 for e in train_entries
@@ -2250,6 +2382,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
                 "train_xml": train_path,
                 "validation_xml": validation_path,
                 "test_xml": test_path,
+                "robustness_xml": robustness_path,
             }
         ),
         file=sys.stderr,
@@ -2258,6 +2391,7 @@ def json_to_dlib_xml(project_root, tag, test_split=0.2, seed=42, max_dim=1500,
     print(train_path)
     print(validation_path)
     print(test_path)
+    print(robustness_path)
 
 
 if __name__ == "__main__":

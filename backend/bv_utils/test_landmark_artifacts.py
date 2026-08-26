@@ -9,6 +9,7 @@ from backend.bv_utils import lineage
 from backend.bv_utils.landmark_artifacts import (
     ImmutableLandmarkArtifactError,
     bundle_id_mapping,
+    expected_dlib_part_names,
     resolve_landmark_runtime,
 )
 
@@ -103,6 +104,20 @@ class ImmutableLandmarkArtifactTests(unittest.TestCase):
             "manifest": manifest,
             "record": record,
         }
+
+    def test_training_part_contract_requires_exact_named_schema_coverage(self):
+        payload = self._mapping_payload()
+        payload.update(
+            {
+                "dlib_name_to_original": {"00": 3, "01": 12},
+                "part_names_sorted": ["00", "01"],
+            }
+        )
+        self.assertEqual(expected_dlib_part_names(payload), ["00", "01"])
+
+        payload["dlib_name_to_original"] = {"00": 3}
+        with self.assertRaisesRegex(ValueError, "count does not match"):
+            expected_dlib_part_names(payload)
 
     def test_dlib_registry_and_resolver_use_verified_artifact_sidecar(self):
         with tempfile.TemporaryDirectory() as root:

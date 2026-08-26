@@ -2,6 +2,8 @@ import json
 import os
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -9,9 +11,11 @@ import numpy as np
 from backend.bv_utils import lineage
 from backend.data.prepare_dataset import (
     _build_landmark_template,
+    _build_report_only_box_robustness_entries,
     _require_explicit_orientation_policy,
     _required_schema_landmark_ids,
     _resolve_landmark_training_boxes,
+    _resolve_predictor_training_class_id,
     _source_content_id,
     _stable_landmark_split,
     _validate_training_landmark_contract,
@@ -20,6 +24,92 @@ from backend.data.prepare_dataset import (
 
 
 class LandmarkContractTests(unittest.TestCase):
+    def test_report_only_detector_box_scale_cohort_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as root:
+            image_path = os.path.join(root, "source.png")
+            image = np.zeros((120, 160, 3), dtype=np.uint8)
+            cv2.circle(image, (60, 55), 6, (255, 255, 255), thickness=-1)
+            self.assertTrue(cv2.imwrite(image_path, image))
+            entry = {
+                "path": os.path.join(root, "canonical_crop.png"),
+                "source_full_image_path": image_path,
+                "source_box": {
+                    "left": 20,
+                    "top": 20,
+                    "width": 100,
+                    "height": 70,
+                    "obbCorners": [[20, 20], [120, 20], [120, 90], [20, 90]],
+                    "class_id": 0,
+                },
+                "source_landmarks": [{"id": 1, "x": 60, "y": 55}],
+                "source_image": "source.png",
+                "source_id": "sha256:source",
+                "box_index": 0,
+            }
+            first = _build_report_only_box_robustness_entries(
+                [entry],
+                root,
+                {"mode": "invariant", "obbLevelingMode": "on"},
+            )
+            first_hashes = [lineage.sha256_file(item["path"]) for item in first]
+            repeated = _build_report_only_box_robustness_entries(
+                [entry],
+                root,
+                {"mode": "invariant", "obbLevelingMode": "on"},
+            )
+            self.assertEqual([item["detector_box_scale"] for item in first], [0.92, 1.08])
+            self.assertEqual(
+                [lineage.sha256_file(item["path"]) for item in repeated],
+                first_hashes,
+            )
+
+    def test_predictor_crop_class_uses_saved_direction_without_landmark_anchors(self):
+        resolved = _resolve_predictor_training_class_id(
+            {"class_id": 1},
+            [{"id": 7, "x": 20, "y": 30}],
+            orientation_mode="directional",
+            orientation_policy={"mode": "directional", "targetOrientation": "left"},
+            head_landmark_id=None,
+            tail_landmark_id=None,
+            source_label="sample.json box 0",
+        )
+        self.assertEqual(resolved, 1)
+
+    def test_predictor_crop_class_fails_closed_when_direction_is_unresolved(self):
+        with self.assertRaisesRegex(RuntimeError, "Review and save the OBB direction arrow"):
+            _resolve_predictor_training_class_id(
+                {},
+                [{"id": 7, "x": 20, "y": 30}],
+                orientation_mode="directional",
+                orientation_policy={"mode": "directional", "targetOrientation": "left"},
+                head_landmark_id=None,
+                tail_landmark_id=None,
+                source_label="sample.json box 0",
+            )
+
+    def test_finalized_box_recovers_legacy_direction_metadata_by_geometry(self):
+        payload = {
+            "boxes": [
+                {
+                    "left": 0,
+                    "top": 0,
+                    "width": 100,
+                    "height": 80,
+                    "class_id": 1,
+                    "landmarks": [{"id": 1, "x": 20, "y": 30}],
+                }
+            ],
+            "finalizedDetection": {
+                "acceptedBoxes": [
+                    {"left": 0, "top": 0, "width": 100, "height": 80}
+                ]
+            },
+        }
+        boxes, declared = _resolve_landmark_training_boxes(payload)
+        self.assertTrue(declared)
+        self.assertEqual(boxes[0]["class_id"], 1)
+        self.assertEqual(boxes[0]["landmarks"][0]["id"], 1)
+
     def test_landmark_template_is_derived_from_training_entries_only(self):
         train_entries = [
             {"landmarks": [{"id": 3, "x": 100.0, "y": 200.0}]},
@@ -345,6 +435,73 @@ class LandmarkContractTests(unittest.TestCase):
             self.assertEqual(len({os.path.normcase(path) for path in crop_paths}), 2)
             self.assertEqual(len({lineage.sha256_file(path) for path in crop_paths}), 2)
             self.assertTrue(all(os.path.isfile(path) for path in crop_paths))
+
+    def test_anchorless_directional_origin_boxes_flow_through_predictor_prep(self):
+        with tempfile.TemporaryDirectory() as root:
+            images_dir = os.path.join(root, "images")
+            labels_dir = os.path.join(root, "labels")
+            os.makedirs(images_dir)
+            os.makedirs(labels_dir)
+            with open(os.path.join(root, "session.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "orientationPolicy": {
+                            "mode": "directional",
+                            "targetOrientation": "left",
+                            "obbLevelingMode": "on",
+                        },
+                        "orientationPolicyConfigured": True,
+                        "landmarkTemplate": [
+                            {"index": 1, "name": "point a"},
+                            {"index": 2, "name": "point b"},
+                        ],
+                    },
+                    handle,
+                )
+            for index in range(8):
+                filename = f"origin-{index}.png"
+                image = np.full((80, 100, 3), 30 + index * 10, dtype=np.uint8)
+                image[0, index + 1, 0] = 255
+                self.assertTrue(cv2.imwrite(os.path.join(images_dir, filename), image))
+                box = {
+                    "left": 0,
+                    "top": 0,
+                    "width": 80,
+                    "height": 60,
+                    "obbCorners": [[0, 0], [80, 0], [80, 60], [0, 60]],
+                    "class_id": index % 2,
+                    "landmarks": [
+                        {"id": 1, "x": 25, "y": 25},
+                        {"id": 2, "x": 55, "y": 35},
+                    ],
+                }
+                with open(
+                    os.path.join(labels_dir, f"origin-{index}.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump({"imageFilename": filename, "boxes": [box]}, handle)
+
+            json_to_dlib_xml(root, "OriginDirectional", test_split=0.2, seed=31)
+
+            orientation = json.loads(
+                Path(root, "debug", "orientation_OriginDirectional.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(
+                all(entry.get("mode") == "multi-specimen" for entry in orientation["images"])
+            )
+            validation_xml = Path(root, "xml", "validation_OriginDirectional.xml")
+            robustness_xml = Path(root, "xml", "robustness_OriginDirectional.xml")
+            validation_count = len(
+                ET.parse(validation_xml).getroot().findall("./images/image")
+            )
+            robustness_count = len(
+                ET.parse(robustness_xml).getroot().findall("./images/image")
+            )
+            self.assertGreater(validation_count, 0)
+            self.assertEqual(robustness_count, validation_count * 2)
 
     def test_frozen_test_source_rejects_later_hitl_provenance(self):
         with tempfile.TemporaryDirectory() as root:

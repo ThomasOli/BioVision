@@ -41,7 +41,7 @@ export interface BoundingBox {
   // OBB fields (set when annotated via the session OBB detector or manual OBB tool)
   angle?: number;                  // OBB rotation angle in degrees
   obbCorners?: [number, number][]; // 4 corners [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
-  class_id?: number;               // 0=canonical (left/up), 1=mirror (right/down), from OBB orientation
+  class_id?: number;               // Native OBB class: directional 0=left/1=right; bilateral 0=up/1=down; axial/invariant=0
   orientation_override?: OrientationLabel;
   orientation_hint?: {
     orientation?: StoredOrientationLabel;

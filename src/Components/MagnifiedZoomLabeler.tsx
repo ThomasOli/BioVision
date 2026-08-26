@@ -625,16 +625,20 @@ const MagnifiedImageLabeler: React.FC<MagnifiedImageLabelerProps> = ({
             obbCorners: [[bLeft, bTop], [bRight, bTop], [bRight, bBottom], [bLeft, bBottom]],
             angle: 0,
             class_id: defaultClassId ?? 0,
-            orientation_hint: {
-              orientation:
-                getOrientationHintForClassId(
-                  normalizedOrientationMode,
-                  defaultClassId ?? 0,
-                  effectiveBilateralClassAxis
-                ) ?? drawDefaultOrientation,
-              confidence: 1.0,
-              source: "user_draw_default",
-            },
+            ...(getOrientationRenderMode(normalizedOrientationMode) === "arrow"
+              ? {
+                  orientation_hint: {
+                    orientation:
+                      getOrientationHintForClassId(
+                        normalizedOrientationMode,
+                        defaultClassId ?? 0,
+                        effectiveBilateralClassAxis
+                      ) ?? drawDefaultOrientation,
+                    confidence: 1.0,
+                    source: "user_draw_default",
+                  },
+                }
+              : {}),
             source: "manual",
           });
           pendingSelectRef.current = true;

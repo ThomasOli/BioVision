@@ -17,6 +17,13 @@ import {
   FileJson,
   FileSpreadsheet,
   Square,
+  AlertCircle,
+  CheckCircle2,
+  CircleDot,
+  Database,
+  MousePointer2,
+  Pencil,
+  RotateCcw,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useDispatch, useSelector } from "react-redux";
@@ -66,6 +73,10 @@ import {
   getModelKey,
   modelMatchesKey,
 } from "@/lib/modelIdentity";
+import {
+  HitlReviewStatusKey,
+  resolveHitlReviewUiState,
+} from "@/lib/hitlReviewUi";
 import { setActiveSpecies, removeSpecies, updateSpecies } from "@/state/speciesState/speciesSlice";
 import type { AppDispatch, RootState } from "@/state/store";
 
@@ -79,10 +90,56 @@ const STAGE_LABELS: Record<string, string> = {
   done: "Complete",
 };
 
-const SIDEBAR_MIN_WIDTH = 240;
+const SIDEBAR_MIN_WIDTH = 280;
 const SIDEBAR_MAX_WIDTH = 560;
-const SIDEBAR_DEFAULT_WIDTH = 288;
+const SIDEBAR_DEFAULT_WIDTH = 336;
 const SIDEBAR_WIDTH_STORAGE_KEY = "biovision.inference.sidebarWidth";
+
+const HITL_STATUS_STYLES: Record<
+  HitlReviewStatusKey,
+  { badge: string; panel: string; dot: string }
+> = {
+  awaiting_inference: {
+    badge: "bg-slate-500/15 text-slate-600 dark:text-slate-300",
+    panel: "border-slate-500/30 bg-slate-500/5",
+    dot: "bg-slate-500",
+  },
+  restoring: {
+    badge: "bg-slate-500/15 text-slate-600 dark:text-slate-300",
+    panel: "border-slate-500/30 bg-slate-500/5",
+    dot: "bg-slate-500",
+  },
+  needs_review: {
+    badge: "bg-blue-500/15 text-blue-700 dark:text-blue-300",
+    panel: "border-blue-500/30 bg-blue-500/5",
+    dot: "bg-blue-500",
+  },
+  changes_pending: {
+    badge: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+    panel: "border-amber-500/30 bg-amber-500/5",
+    dot: "bg-amber-500",
+  },
+  draft_saved: {
+    badge: "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300",
+    panel: "border-cyan-500/30 bg-cyan-500/5",
+    dot: "bg-cyan-500",
+  },
+  approved: {
+    badge: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+    panel: "border-emerald-500/30 bg-emerald-500/5",
+    dot: "bg-emerald-500",
+  },
+  commit_failed: {
+    badge: "bg-red-500/15 text-red-700 dark:text-red-300",
+    panel: "border-red-500/40 bg-red-500/5",
+    dot: "bg-red-500",
+  },
+  added_to_training: {
+    badge: "bg-indigo-500/15 text-indigo-700 dark:text-indigo-300",
+    panel: "border-indigo-500/30 bg-indigo-500/5",
+    dot: "bg-indigo-500",
+  },
+};
 
 interface InferencePageProps {
   onNavigate: (view: AppView) => void;
@@ -2609,10 +2666,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
 
     setIsUpdatingReviewStatus(true);
     try {
+      const hasPendingEdits = editedImageIndices.has(index);
       const persisted = await persistReviewDraft(index, {
         specimens: getSpecimensForImageIndex(index),
-        edited: editedImageIndices.has(index),
-        saved: savedImageIndices.has(index),
+        // Approval is also the explicit save boundary. Persisting `edited: true`
+        // would intentionally invalidate reviewComplete in the HITL contract.
+        edited: false,
+        ...(hasPendingEdits ? { wasEdited: true } : {}),
+        saved: reviewComplete ? true : savedImageIndices.has(index),
         reviewComplete,
         ...(reviewComplete ? {} : { committedAt: null }),
       });
@@ -2630,6 +2691,17 @@ export const InferencePage: React.FC<InferencePageProps> = ({
         else next.delete(index);
         return next;
       });
+      if (reviewComplete) {
+        setSavedImageIndices((previous) => new Set(previous).add(index));
+        setEditedImageIndices((previous) => {
+          const next = new Set(previous);
+          next.delete(index);
+          return next;
+        });
+        toast.success("Image approved and ready to add to training data.");
+      } else {
+        toast.message("Review reopened. Any new edit will require approval again.");
+      }
       if (!reviewComplete) {
         setCommittedImageIndices((previous) => {
           const next = new Set(previous);
@@ -2675,8 +2747,9 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       for (const idx of editedTargets) {
         const persisted = await persistReviewDraft(idx, {
           specimens: getSpecimensForImageIndex(idx),
-          edited: true,
-          saved: savedImageIndices.has(idx),
+          edited: false,
+          wasEdited: true,
+          saved: true,
           reviewComplete: true,
         });
         if (!persisted) {
@@ -2736,7 +2809,6 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     images,
     persistReviewDraft,
     reviewFinalizedImageIndices,
-    savedImageIndices,
   ]);
 
   const handleRemoveSpecimen = useCallback((specimenIndex: number) => {
@@ -3130,6 +3202,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
 
       if (width >= MIN_SIZE && height >= MIN_SIZE) {
         const updated = JSON.parse(JSON.stringify(liveSpecimensRef.current || [])) as PredictedSpecimen[];
+        const newClassId = getClassIdForOrientationLabel(
+          activeOrientationMode,
+          drawDefaultOrientation,
+          activeBilateralClassAxis
+        ) ?? 0;
         const newSpecimen: PredictedSpecimen = {
           box: {
             left: x1,
@@ -3140,12 +3217,17 @@ export const InferencePage: React.FC<InferencePageProps> = ({
             bottom: y1 + height,
             obbCorners: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
             angle: 0,
-            orientation_override: drawDefaultOrientation,
-            orientation_hint: {
-              orientation: drawDefaultOrientation,
-              confidence: 1.0,
-              source: "user_draw_default",
-            },
+            class_id: newClassId,
+            ...(showOrientationControls
+              ? {
+                  orientation_override: drawDefaultOrientation,
+                  orientation_hint: {
+                    orientation: drawDefaultOrientation,
+                    confidence: 1.0,
+                    source: "user_draw_default",
+                  },
+                }
+              : {}),
           },
           landmarks: [],
           num_landmarks: 0,
@@ -3259,9 +3341,31 @@ export const InferencePage: React.FC<InferencePageProps> = ({
       : eligibleInferenceCount > 0
         ? `Run landmark inference on ${eligibleInferenceCount} unseen or failed image${eligibleInferenceCount === 1 ? "" : "s"}`
         : "All detected images already have landmark results";
-  const currentEdited = isReviewStateHydrated && editedImageIndices.has(currentIndex);
-  const currentSaved = isReviewStateHydrated && !currentEdited && savedImageIndices.has(currentIndex);
   const currentCommitted = isReviewStateHydrated && committedImageIndices.has(currentIndex);
+  const getReviewUiStateForIndex = (index: number) => {
+    const image = images[index];
+    return resolveHitlReviewUiState({
+      hasResults: Boolean(image?.results),
+      hydrated: isReviewStateHydrated,
+      edited: editedImageIndices.has(index),
+      saved: savedImageIndices.has(index),
+      approved: reviewFinalizedImageIndices.has(index),
+      committed: committedImageIndices.has(index),
+      commitFailed: commitFailures.has((image?.name || "").toLowerCase()),
+    });
+  };
+  const currentReviewUiState = getReviewUiStateForIndex(currentIndex);
+  const currentReviewStatusStyle = HITL_STATUS_STYLES[currentReviewUiState.key];
+  const approvedPendingCommitCount = images.reduce(
+    (count, image, index) =>
+      count +
+      (Boolean(image.results) &&
+      reviewFinalizedImageIndices.has(index) &&
+      !committedImageIndices.has(index)
+        ? 1
+        : 0),
+    0
+  );
   const currentPriority = reviewPriorities.get(currentIndex);
   const highestPriorityPendingIndex = Array.from(reviewPriorities.entries())
     .filter(([index]) => !reviewFinalizedImageIndices.has(index))
@@ -3272,6 +3376,12 @@ export const InferencePage: React.FC<InferencePageProps> = ({
     isCommittingReview ||
     isUpdatingReviewStatus ||
     !currentImage?.results ||
+    !inferenceSessionId;
+  const reviewBatchActionsDisabled =
+    isRunning ||
+    isSavingCorrections ||
+    isCommittingReview ||
+    isUpdatingReviewStatus ||
     !inferenceSessionId;
   const selectedSpecimenResolvedIndex =
     currentSpecimenCount > 0
@@ -3566,25 +3676,14 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                 title="Toggle detected region box"
               >
                 <Square className="mr-2 h-4 w-4" />
-                {showBoundingBox ? "Boxes On" : "Boxes Off"}
+                {showBoundingBox ? "OBBs visible" : "OBBs hidden"}
               </Button>
-              {currentCommitted ? (
-                <span className="rounded bg-indigo-500/15 px-2 py-1 text-xs font-semibold text-indigo-600">
-                  Committed
+              {currentImage?.results && (
+                <span className={cn("flex items-center gap-1.5 rounded px-2 py-1 text-xs font-semibold", currentReviewStatusStyle.badge)}>
+                  <span className={cn("h-1.5 w-1.5 rounded-full", currentReviewStatusStyle.dot)} />
+                  {currentReviewUiState.label}
                 </span>
-              ) : currentEdited ? (
-                <span className="rounded bg-amber-500/15 px-2 py-1 text-xs font-semibold text-amber-600">
-                  Edited
-                </span>
-              ) : currentSaved ? (
-                <span className="rounded bg-emerald-500/15 px-2 py-1 text-xs font-semibold text-emerald-600">
-                  Saved
-                </span>
-              ) : currentImage?.results && !isReviewStateHydrated ? (
-                <span className="rounded bg-slate-500/15 px-2 py-1 text-xs font-semibold text-slate-600">
-                  Restoring
-                </span>
-              ) : null}
+              )}
             </div>
           )}
           <motion.div {...buttonHover} {...buttonTap}>
@@ -3733,42 +3832,87 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                 </Card>
               </motion.div>
 
-              {/* Review Controls */}
+              {/* Human review workflow */}
               {hasInferenceResults && (
                 <motion.div
                   variants={cardHover}
                   initial="initial"
                   whileHover="hover"
                 >
-                  <Card className="border-border/50 bg-card/50 backdrop-blur-sm">
-                    <CardHeader className="pb-3">
-                      <CardTitle className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
-                        Review
-                      </CardTitle>
+                  <Card className="overflow-hidden border-border/60 bg-card/70 shadow-sm backdrop-blur-sm">
+                    <CardHeader className="space-y-2 border-b border-border/50 bg-muted/20 pb-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <div className="rounded-md bg-primary/10 p-1.5 text-primary">
+                            <Pencil className="h-4 w-4" />
+                          </div>
+                          <div>
+                            <CardTitle className="text-sm font-semibold">Human review</CardTitle>
+                            <p className="mt-0.5 text-[11px] text-muted-foreground">
+                              Correct, approve, then add to training.
+                            </p>
+                          </div>
+                        </div>
+                        <span className={cn("flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-semibold", currentReviewStatusStyle.badge)}>
+                          <span className={cn("h-1.5 w-1.5 rounded-full", currentReviewStatusStyle.dot)} />
+                          {currentReviewUiState.label}
+                        </span>
+                      </div>
                     </CardHeader>
-                    <CardContent className="space-y-3">
-                      <div className="flex items-center justify-between rounded-md border border-border/70 px-2 py-1.5">
-                        <span className="text-[11px] font-medium text-muted-foreground">
-                          Current Image Review
-                        </span>
-                        <span
-                          className={cn(
-                            "rounded px-1.5 py-0.5 text-[10px] font-semibold",
-                            reviewFinalizedImageIndices.has(currentIndex)
-                              ? "bg-emerald-500/15 text-emerald-600"
-                              : "bg-amber-500/15 text-amber-600"
+                    <CardContent className="space-y-4 pt-4">
+                      <div className="grid grid-cols-3 gap-1" aria-label="Review workflow">
+                        {[
+                          { step: 1, label: "Edit", Icon: Pencil },
+                          { step: 2, label: "Approve", Icon: CheckCircle2 },
+                          { step: 3, label: "Training", Icon: Database },
+                        ].map(({ step, label, Icon }) => {
+                          const reached = currentReviewUiState.workflowStep >= step;
+                          const active = currentReviewUiState.workflowStep === step;
+                          return (
+                            <div
+                              key={step}
+                              className={cn(
+                                "flex flex-col items-center gap-1 rounded-md border px-1 py-2 text-[10px] transition-colors",
+                                reached ? "border-primary/30 bg-primary/5 text-foreground" : "border-border/50 text-muted-foreground",
+                                active && "ring-1 ring-primary/30"
+                              )}
+                            >
+                              <div className={cn("rounded-full p-1", reached ? "bg-primary text-primary-foreground" : "bg-muted")}>
+                                <Icon className="h-3 w-3" />
+                              </div>
+                              <span className="font-semibold">{step}. {label}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <div className={cn("rounded-lg border p-3", currentReviewStatusStyle.panel)}>
+                        <div className="flex items-start gap-2">
+                          {currentReviewUiState.key === "commit_failed" ? (
+                            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
+                          ) : currentReviewUiState.key === "added_to_training" || currentReviewUiState.key === "approved" ? (
+                            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                          ) : (
+                            <CircleDot className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
                           )}
-                        >
-                          {reviewFinalizedImageIndices.has(currentIndex)
-                            ? "Complete"
-                            : "In Progress"}
-                        </span>
+                          <div>
+                            <p className="text-xs font-semibold">{currentReviewUiState.label}</p>
+                            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+                              {currentReviewUiState.description}
+                            </p>
+                            {currentReviewUiState.key === "commit_failed" && currentImage && (
+                              <p className="mt-1 text-[10px] text-red-600">
+                                {commitFailures.get((currentImage.name || "").toLowerCase())}
+                              </p>
+                            )}
+                          </div>
+                        </div>
                       </div>
 
                       {currentPriority && (
                         <div className="flex items-center justify-between rounded-md border border-border/70 px-2 py-1.5">
                           <span className="text-[11px] font-medium text-muted-foreground">
-                            Review priority
+                            Suggested priority
                           </span>
                           <span
                             className={cn(
@@ -3785,79 +3929,38 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                       )}
 
                       {retrainingBatch && (
-                        <div className="rounded-md border border-border/70 px-2 py-2 text-[10px] text-muted-foreground">
-                          <div className="mb-1 font-semibold text-foreground">Retraining batch</div>
+                        <div className="rounded-md border border-border/60 bg-muted/20 px-2 py-2 text-[10px] text-muted-foreground">
+                          <div className="mb-1 font-semibold text-foreground">Training-data queue</div>
                           <div>
                             {retrainingBatch.newSamples} new · {retrainingBatch.corrected} corrected ·{" "}
                             {retrainingBatch.unchanged} unchanged · {retrainingBatch.rejected} rejected
                           </div>
                           <div className="mt-1">
-                            {retrainingBatch.pendingReview} awaiting review · {retrainingBatch.pendingCommit} ready to commit
+                            {retrainingBatch.pendingReview} need review / {approvedPendingCommitCount} approved and ready
                           </div>
                         </div>
                       )}
 
-                      <div className="grid grid-cols-1 gap-2">
+                      <div className="space-y-2 border-t border-border/50 pt-3">
+                        <div>
+                          <p className="text-xs font-semibold">1. Correct annotations</p>
+                          <p className="mt-0.5 text-[10px] leading-relaxed text-muted-foreground">
+                            Drag a landmark to reposition it. Drag inside an OBB to move it, its corners to resize it, or the top handle to rotate it.
+                          </p>
+                        </div>
                         <Button
-                          variant="outline"
+                          variant="ghost"
                           size="sm"
                           disabled={highestPriorityPendingIndex === undefined}
-                          className="justify-start"
+                          className="w-full justify-start text-muted-foreground"
                           onClick={() => {
                             if (highestPriorityPendingIndex !== undefined) {
                               setCurrentIndex(highestPriorityPendingIndex);
                             }
                           }}
                         >
-                          Review Highest Priority
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={reviewActionsDisabled || !currentImage?.results}
-                          className="justify-start"
-                          onClick={() => void handleSetCurrentReviewComplete(true)}
-                        >
-                          Mark Review Complete
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={reviewActionsDisabled || !currentImage?.results}
-                          className="justify-start"
-                          onClick={() => void handleSetCurrentReviewComplete(false)}
-                        >
-                          Mark In Progress
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={handleSaveAllCorrections}
-                          disabled={reviewActionsDisabled}
-                          title="Persist edited review drafts in this inference session"
-                          className="justify-start"
-                        >
-                          {isSavingCorrections && !isCommittingReview ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <Save className="mr-2 h-4 w-4" />
-                          )}
-                          Save All Changes
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={handleCommitReviewComplete}
-                          disabled={reviewActionsDisabled}
-                          title="Commit review-complete images into schema training data"
-                          className="justify-start"
-                        >
-                          {isCommittingReview ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <Save className="mr-2 h-4 w-4" />
-                          )}
-                          Commit to Training Data
+                          <MousePointer2 className="mr-2 h-4 w-4" />
+                          Go to highest-priority review
                         </Button>
                       </div>
 
@@ -3871,11 +3974,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             drawToCanvas(currentSpecimens);
                           }}
                           disabled={reviewActionsDisabled}
-                          title="Toggle manual bounding-box drawing mode"
+                          title="Draw a new oriented bounding box on the image"
                           className="justify-start"
                         >
                           <Square className="mr-2 h-4 w-4" />
-                          {isDrawBoxMode ? "Drawing" : "Draw Box"}
+                          {isDrawBoxMode ? "Drawing OBB..." : "Draw new OBB"}
                         </Button>
                         {isDrawBoxMode && showOrientationControls && (
                           <Button
@@ -3897,7 +4000,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                                 handleSetSpecimenOrientation(selectedSpecimenResolvedIndex, next);
                               }
                             }}
-                            title="Toggle head direction (selected box and new boxes)"
+                            title="Change the direction assigned to the selected and newly drawn OBB"
                             className="justify-start text-xs"
                           >
                             {getOrientationToggleLabel(activeOrientationMode, drawDefaultOrientation, activeBilateralClassAxis)}
@@ -3908,20 +4011,23 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                           size="sm"
                           onClick={handleDeleteSelectedSpecimen}
                           disabled={reviewActionsDisabled || currentSpecimenCount === 0}
-                          title="Delete selected detection box and its landmarks"
+                          title="Delete the selected OBB and its landmarks; the removed detection becomes a hard negative"
                           className="justify-start text-destructive hover:bg-destructive/10 hover:text-destructive"
                         >
                           <Trash2 className="mr-2 h-4 w-4" />
-                          Delete Box
+                          Delete selected
                         </Button>
                       </div>
 
                       {showOrientationControls && currentSpecimenCount > 0 && selectedSpecimenResolvedIndex !== null && (
-                        <div className="space-y-2 rounded-md border border-border/70 bg-background/70 p-2">
+                        <div className="space-y-2 rounded-md border border-border/70 bg-background/70 p-2.5">
                           <div className="flex items-center justify-between">
-                            <span className="text-[11px] font-medium text-muted-foreground">
-                              Selected Box {selectedSpecimenResolvedIndex + 1} / {currentSpecimenCount}
-                            </span>
+                            <div>
+                              <span className="text-[11px] font-semibold">
+                                Selected OBB {selectedSpecimenResolvedIndex + 1} of {currentSpecimenCount}
+                              </span>
+                              <p className="text-[10px] text-muted-foreground">Edits apply to this specimen.</p>
+                            </div>
                             <div className="flex items-center gap-1">
                               <Button
                                 variant="outline"
@@ -3954,7 +4060,16 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                               </Button>
                             </div>
                           </div>
-                          <div className="grid grid-cols-2 gap-1">
+                          <div className="border-t border-border/50 pt-2">
+                            <div className="mb-1.5 flex items-center justify-between gap-2">
+                              <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                                Direction arrow
+                              </span>
+                              <span className="text-[10px] text-muted-foreground">
+                                Native-facing side
+                              </span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-1">
                             {(() => {
                               const primaryOrientation =
                                 getOrientationLabelForClassId(
@@ -3999,15 +4114,107 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                                 </>
                               );
                             })()}
+                            </div>
                           </div>
                         </div>
                       )}
 
+                      <div className="space-y-2 border-t border-border/50 pt-3">
+                        <div>
+                          <p className="text-xs font-semibold">2. Approve this image</p>
+                          <p className="mt-0.5 text-[10px] leading-relaxed text-muted-foreground">
+                            Approval saves the current corrections. Any later edit automatically returns the image to review.
+                          </p>
+                        </div>
+                        {currentCommitted ? (
+                          <div className="rounded-md bg-indigo-500/10 px-2.5 py-2 text-[10px] text-indigo-700 dark:text-indigo-300">
+                            Already in the training set. Edit the canvas to create a new revision.
+                          </div>
+                        ) : reviewFinalizedImageIndices.has(currentIndex) ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={reviewActionsDisabled}
+                            className="w-full justify-start"
+                            onClick={() => void handleSetCurrentReviewComplete(false)}
+                          >
+                            <RotateCcw className="mr-2 h-4 w-4" />
+                            Reopen review
+                          </Button>
+                        ) : (
+                          <Button
+                            size="sm"
+                            disabled={reviewActionsDisabled || !currentImage?.results}
+                            className="w-full justify-start"
+                            onClick={() => void handleSetCurrentReviewComplete(true)}
+                          >
+                            {isUpdatingReviewStatus ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <CheckCircle2 className="mr-2 h-4 w-4" />
+                            )}
+                            Approve image
+                          </Button>
+                        )}
+                        {editedImageIndices.size > 0 && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleSaveAllCorrections}
+                            disabled={reviewBatchActionsDisabled}
+                            title="Confirm that every edited draft is persisted without approving it"
+                            className="w-full justify-start text-muted-foreground"
+                          >
+                            {isSavingCorrections && !isCommittingReview ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <Save className="mr-2 h-4 w-4" />
+                            )}
+                            Save all drafts without approving
+                          </Button>
+                        )}
+                      </div>
+
+                      <div className="space-y-2 rounded-lg border border-primary/20 bg-primary/5 p-3">
+                        <div>
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-xs font-semibold">3. Add to training data</p>
+                            <span className="rounded-full bg-background px-2 py-0.5 text-[10px] font-semibold">
+                              {approvedPendingCommitCount} ready
+                            </span>
+                          </div>
+                          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+                            Adds every approved review directly to this schema. No JSON or XML export is required.
+                          </p>
+                        </div>
+                        <Button
+                          size="sm"
+                          onClick={handleCommitReviewComplete}
+                          disabled={reviewBatchActionsDisabled || approvedPendingCommitCount === 0}
+                          title="Add all approved reviews to the schema training set"
+                          className="w-full justify-start"
+                        >
+                          {isCommittingReview ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Database className="mr-2 h-4 w-4" />
+                          )}
+                          Add approved reviews ({approvedPendingCommitCount})
+                        </Button>
+                      </div>
+
+                      <div className="space-y-2 border-t border-border/50 pt-3">
+                        <div>
+                          <p className="text-xs font-semibold">Download results</p>
+                          <p className="mt-0.5 text-[10px] leading-relaxed text-muted-foreground">
+                            Optional report files only. Downloads are not used by the HITL training workflow.
+                          </p>
+                        </div>
                       <Popover>
                         <PopoverTrigger asChild>
                           <Button variant="outline" size="sm" className="w-full justify-start">
                             <Download className="mr-2 h-4 w-4" />
-                            Export Results
+                            Download JSON or CSV
                           </Button>
                         </PopoverTrigger>
                         <PopoverContent align="start" className="w-40 p-1">
@@ -4018,7 +4225,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             onClick={() => handleExport("json")}
                           >
                             <FileJson className="mr-2 h-4 w-4" />
-                            JSON
+                            JSON report
                           </Button>
                           <Button
                             variant="ghost"
@@ -4027,10 +4234,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                             onClick={() => handleExport("csv")}
                           >
                             <FileSpreadsheet className="mr-2 h-4 w-4" />
-                            CSV
+                            CSV report
                           </Button>
                         </PopoverContent>
                       </Popover>
+                      </div>
                     </CardContent>
                   </Card>
                 </motion.div>
@@ -4076,7 +4284,10 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                         animate="animate"
                         className="space-y-2"
                       >
-                        {images.map((img, idx) => (
+                        {images.map((img, idx) => {
+                          const reviewState = getReviewUiStateForIndex(idx);
+                          const reviewStyle = HITL_STATUS_STYLES[reviewState.key];
+                          return (
                           <motion.div
                             key={img.path}
                             variants={staggerItem}
@@ -4085,9 +4296,7 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                               idx === currentIndex
                                 ? "border-primary bg-primary/5"
                                 : "border-border/50",
-                              idx !== currentIndex && img.results && !editedImageIndices.has(idx) && !savedImageIndices.has(idx) && "border-green-500/50",
-                              idx !== currentIndex && editedImageIndices.has(idx) && "border-amber-500/60 bg-amber-500/5",
-                              idx !== currentIndex && !editedImageIndices.has(idx) && savedImageIndices.has(idx) && "border-emerald-500/60 bg-emerald-500/5",
+                              idx !== currentIndex && img.results && reviewStyle.panel,
                               img.error && "border-destructive/50",
                               commitFailures.has((img.name || "").toLowerCase()) && "border-red-500/60 bg-red-500/5"
                             )}
@@ -4114,37 +4323,13 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                                 {reviewPriorities.get(idx)?.band}
                               </span>
                             )}
-                            {img.results && committedImageIndices.has(idx) && (
-                              <span className="shrink-0 rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-600">
-                                Committed
-                              </span>
-                            )}
-                            {img.results && !isReviewStateHydrated && (
-                              <span className="shrink-0 rounded bg-slate-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">
-                                Restoring
-                              </span>
-                            )}
-                            {img.results && isReviewStateHydrated && !committedImageIndices.has(idx) && editedImageIndices.has(idx) && (
-                              <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600">
-                                Edited
-                              </span>
-                            )}
-                            {img.results && isReviewStateHydrated && !committedImageIndices.has(idx) && !editedImageIndices.has(idx) && savedImageIndices.has(idx) && (
-                              <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-600">
-                                Saved
-                              </span>
-                            )}
-                            {img.results && isReviewStateHydrated && !savedImageIndices.has(idx) && !editedImageIndices.has(idx) && (
-                              <span className="shrink-0 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-blue-600">
-                                Ready
-                              </span>
-                            )}
-                            {commitFailures.has((img.name || "").toLowerCase()) && (
+                            {img.results && (
                               <span
-                                className="shrink-0 rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-red-600"
-                                title={commitFailures.get((img.name || "").toLowerCase())}
+                                className={cn("flex max-w-[140px] shrink-0 items-center gap-1 truncate rounded px-1.5 py-0.5 text-[10px] font-semibold", reviewStyle.badge)}
+                                title={reviewState.description}
                               >
-                                Failed
+                                <span className={cn("h-1.5 w-1.5 rounded-full", reviewStyle.dot)} />
+                                <span className="truncate">{reviewState.label}</span>
                               </span>
                             )}
                             {img.error && (
@@ -4162,7 +4347,8 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                               <X className="h-3 w-3" />
                             </Button>
                           </motion.div>
-                        ))}
+                          );
+                        })}
                       </motion.div>
                     )}
                   </CardContent>
@@ -4207,6 +4393,26 @@ export const InferencePage: React.FC<InferencePageProps> = ({
           ) : (
             <>
               {/* Canvas Ã¢â‚¬â€ drag landmarks to correct them */}
+              {currentImage?.results && (
+                <div className="mb-3 flex w-full max-w-5xl shrink-0 flex-wrap items-center gap-2 rounded-xl border border-border/60 bg-background/80 px-3 py-2 text-[11px] shadow-sm backdrop-blur">
+                  <div className="mr-1 flex items-center gap-1.5 font-semibold text-foreground">
+                    <MousePointer2 className="h-3.5 w-3.5 text-primary" />
+                    Edit on canvas
+                  </div>
+                  <span className="rounded-full bg-muted px-2 py-1 text-muted-foreground">
+                    Drag points: move landmarks
+                  </span>
+                  <span className="rounded-full bg-muted px-2 py-1 text-muted-foreground">
+                    Drag OBB: move / resize / rotate
+                  </span>
+                  <span className={cn(
+                    "rounded-full px-2 py-1 font-medium",
+                    isDrawBoxMode ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"
+                  )}>
+                    {isDrawBoxMode ? "Draw mode: drag to create an OBB" : "Use Draw new OBB for missing specimens"}
+                  </span>
+                </div>
+              )}
               <div className="relative flex-1 overflow-hidden">
                 <canvas
                   ref={canvasRef}
@@ -4267,30 +4473,15 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                           ? ` across ${currentSpecimenCount} specimens`
                           : ""}
                       </p>
-                      {currentSpecimenCount > 0 && (
-                        <p className="text-muted-foreground/70">
-                          Drag landmarks and bounding box corners, then save review to include this image in training-data commit.
-                        </p>
-                      )}
                       {isDrawBoxMode && (
-                        <p className="text-emerald-600">
-                          Draw-box mode is on. Drag on the image to add a new detection box.
+                          <p className="text-emerald-600">
+                          Draw mode is active. Drag on the image to add a new OBB.
                         </p>
                       )}
-                      {currentSpecimenCount > 0 && (
-                        <p className="text-muted-foreground/70">
-                          Use the Review panel in the sidebar to set orientation, add/delete boxes, and save corrections.
-                        </p>
-                      )}
-                      {currentCommitted && (
-                        <p className="font-medium text-indigo-600">Committed to schema training data.</p>
-                      )}
-                      {!currentCommitted && currentEdited && (
-                        <p className="font-medium text-amber-600">Edited locally. Save to persist corrections.</p>
-                      )}
-                      {!currentCommitted && !currentEdited && currentSaved && (
-                        <p className="font-medium text-emerald-600">Saved in inference session.</p>
-                      )}
+                      <p className="text-muted-foreground/80">
+                        <span className="font-semibold text-foreground">{currentReviewUiState.label}.</span>{" "}
+                        {currentReviewUiState.description}
+                      </p>
                       {currentImage.results.image_dimensions && (
                         <p className="text-muted-foreground/70">
                           Image: {currentImage.results.image_dimensions.width} x {currentImage.results.image_dimensions.height}px
@@ -4298,11 +4489,11 @@ export const InferencePage: React.FC<InferencePageProps> = ({
                       )}
                       {currentSpecimenCount > 1 ? (
                         <p className="text-muted-foreground/70">
-                          Detection boxes: {currentSpecimenCount}
+                          OBBs: {currentSpecimenCount}
                         </p>
                       ) : currentSpecimenCount === 1 && currentSpecimens[0]?.box ? (
                         <p className="text-muted-foreground/70">
-                          Detection box: ({Math.round(currentSpecimens[0].box.left)}, {Math.round(currentSpecimens[0].box.top)}){" -> "}
+                          OBB: ({Math.round(currentSpecimens[0].box.left)}, {Math.round(currentSpecimens[0].box.top)}){" -> "}
                           ({Math.round(currentSpecimens[0].box.left + currentSpecimens[0].box.width)}, {Math.round(currentSpecimens[0].box.top + currentSpecimens[0].box.height)})
                         </p>
                       ) : null}

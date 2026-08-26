@@ -153,6 +153,7 @@ def sanitize_orientation_policy(
     landmark_template: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     inferred = infer_orientation_policy_from_template(landmark_template)
+    has_explicit_policy = isinstance(policy, Mapping)
     raw = dict(policy or {})
 
     mode = _safe_orientation_mode(raw.get("mode", inferred.get("mode")))
@@ -160,10 +161,12 @@ def sanitize_orientation_policy(
         raw.get("targetOrientation", inferred.get("targetOrientation"))
     )
     head_categories = _safe_list_of_str(
-        raw.get("headCategories"), inferred.get("headCategories", ["head"])
+        raw.get("headCategories"),
+        [] if has_explicit_policy else inferred.get("headCategories", ["head"]),
     )
     tail_categories = _safe_list_of_str(
-        raw.get("tailCategories"), inferred.get("tailCategories", ["tail"])
+        raw.get("tailCategories"),
+        [] if has_explicit_policy else inferred.get("tailCategories", ["tail"]),
     )
     direction_priority = _safe_direction_priority(raw.get("directionPriority", "auto"))
     try:
@@ -176,7 +179,10 @@ def sanitize_orientation_policy(
         training_prep_box_jitter = "auto"
 
     anterior_anchor_ids = []
-    raw_anterior_anchor_ids = raw.get("anteriorAnchorIds", inferred.get("anteriorAnchorIds", []))
+    raw_anterior_anchor_ids = raw.get(
+        "anteriorAnchorIds",
+        [] if has_explicit_policy else inferred.get("anteriorAnchorIds", []),
+    )
     if isinstance(raw_anterior_anchor_ids, (list, tuple)):
         for item in raw_anterior_anchor_ids:
             try:
@@ -187,7 +193,10 @@ def sanitize_orientation_policy(
                 anterior_anchor_ids.append(value)
 
     posterior_anchor_ids = []
-    raw_posterior_anchor_ids = raw.get("posteriorAnchorIds", inferred.get("posteriorAnchorIds", []))
+    raw_posterior_anchor_ids = raw.get(
+        "posteriorAnchorIds",
+        [] if has_explicit_policy else inferred.get("posteriorAnchorIds", []),
+    )
     if isinstance(raw_posterior_anchor_ids, (list, tuple)):
         for item in raw_posterior_anchor_ids:
             try:
@@ -224,8 +233,8 @@ def sanitize_orientation_policy(
     }
     if mode == "directional":
         out["targetOrientation"] = target_orientation
-        out["headCategories"] = head_categories or ["head"]
-        out["tailCategories"] = tail_categories or ["tail"]
+        out["headCategories"] = head_categories
+        out["tailCategories"] = tail_categories
     if mode == "bilateral" and bilateral_pairs:
         out["bilateralPairs"] = bilateral_pairs
     if mode == "bilateral":
@@ -294,13 +303,13 @@ def resolve_head_tail_landmark_ids(
     template = load_session_landmark_template(project_root)
     if policy is None:
         policy = load_orientation_policy(project_root)
-    mode = _safe_orientation_mode(policy.get("mode"))
     head_categories = _safe_list_of_str(policy.get("headCategories"), ["head"])
     tail_categories = _safe_list_of_str(policy.get("tailCategories"), ["tail"])
 
-    # Directional mode needs a deterministic head anchor for orientation checks.
+    # Landmark IDs are legacy/import fallbacks only. Never invent a directional
+    # anchor from landmark order when the saved OBB arrow/class is absent.
     head_id = resolve_landmark_id_from_categories(
-        template, head_categories, fallback_to_min=(mode == "directional")
+        template, head_categories, fallback_to_min=False
     )
     tail_id = resolve_landmark_id_from_categories(template, tail_categories, fallback_to_min=False)
     return head_id, tail_id
@@ -445,8 +454,8 @@ def get_schema_augmentation_profile(
     if eng == "dlib":
         # With OBB leveling, the specimen is already axis-aligned in the 512×512 crop.
         # Tight rotation angles (±6°) preserve sub-pixel spatial stability.
-        # Axial schemas no longer need 180° augmentation: apply_obb_geometry handles
-        # the canonical flip via class_id at both training and inference time.
+        # Axial schemas are pole-invariant and one-class. Horizontal flips expose
+        # the opposite pole without inventing a detector direction class.
         profiles = {
             "directional": {"angles": [-6.0, -3.0, 3.0, 6.0], "flip": False},
             "bilateral": {"angles": [-6.0, -3.0, 3.0, 6.0], "flip": True},
@@ -491,8 +500,8 @@ def get_schema_augmentation_profile(
                 "scale_range": (0.95, 1.05),
                 "translate_ratio": 0.03,
             },
-            # Axial: 180° augmentation retained for CNN (class_id-based flip is primary
-            # but CNN benefits from rotate_180 augmentation for axial variation).
+            # Axial is one-class/pole-invariant, so CNN sees both pole orderings
+            # explicitly through half-turn augmentation.
             "axial": {
                 "flip_prob": 0.5,
                 "vertical_flip_prob": 0.0,
@@ -775,40 +784,6 @@ def get_box_jitter_profile(mode: str | None, *, engine: str) -> dict[str, Any]:
                 "translate_ratio": 0.0,
                 "scale_range": (0.95, 1.05),
                 "strategy": "scale_only_pre_standardize",
-            },
-        }
-        return dict(profiles.get(resolved_mode, profiles["invariant"]))
-
-    if False and eng == "dlib":
-        # Geometric lock: OBB-leveled crops occupy the canvas tightly.
-        # Cap translate at ±3% and scale at ±5% max to avoid wasting model
-        # capacity on a spatially wandering specimen.
-        profiles = {
-            "directional": {
-                "enabled": True,
-                "copies_per_sample": 1,
-                "translate_ratio": 0.0,
-                "scale_range": (0.98, 1.02),
-                "strategy": "scale_only_pre_standardize",
-            },
-            "bilateral": {
-                "enabled": True,
-                "copies_per_sample": 1,
-                "translate_ratio": 0.0,
-                "scale_range": (0.97, 1.03),
-                "strategy": "scale_only_pre_standardize",
-            },
-            "axial": {
-                "enabled": True,
-                "copies_per_sample": 1,
-                "translate_ratio": 0.03,   # tightened from 0.035 (±3% max)
-                "scale_range": (0.95, 1.05),
-            },
-            "invariant": {
-                "enabled": True,
-                "copies_per_sample": 2,
-                "translate_ratio": 0.03,   # tightened from 0.04 (±3% max)
-                "scale_range": (0.95, 1.05),  # tightened from (0.94, 1.06)
             },
         }
         return dict(profiles.get(resolved_mode, profiles["invariant"]))
@@ -1734,7 +1709,8 @@ def map_to_original(
     sx = float(metadata.get("scale_x", metadata.get("scale", 1.0))) or 1.0
     sy = float(metadata.get("scale_y", metadata.get("scale", 1.0))) or 1.0
     ox, oy = metadata["crop_origin"]
-    angle = float(metadata.get("rotation", 0.0))
+    leveling_applied = metadata.get("leveling_applied")
+    angle = 0.0 if leveling_applied is False else float(metadata.get("rotation", 0.0))
     pad_left, pad_top, _pad_right, _pad_bottom = _get_standardized_padding(
         metadata,
         sx=sx,
@@ -1746,12 +1722,17 @@ def map_to_original(
 
     mapped: list[dict[str, Any]] = []
     canonical_flip_applied = bool(metadata.get("canonical_flip_applied", False))
-    effective_flip = bool(was_flipped) ^ canonical_flip_applied
+    manual_mirror_applied = bool(metadata.get("manual_mirror_applied", False))
+    effective_flip = bool(was_flipped) ^ canonical_flip_applied ^ manual_mirror_applied
     rotated_180 = bool(metadata.get("rotated_180", False))
 
     # Use exact inverse affine when available (OBB-deskewed crops).
     affine_M_raw = metadata.get("affine_M")
-    use_exact_affine = bool(metadata.get("obb_deskewed")) and affine_M_raw is not None
+    use_exact_affine = (
+        bool(metadata.get("obb_deskewed"))
+        and leveling_applied is not False
+        and affine_M_raw is not None
+    )
 
     if use_exact_affine:
         M = np.array(affine_M_raw, dtype=np.float64)
@@ -1964,10 +1945,14 @@ def extract_obb_crop(
             borderValue=0,
         )
     else:
-        # Pixels untouched; M is still stored for coordinate transforms
+        # Pixels and coordinates remain in the source image frame.
         rotated = image
 
-    transformed_pts = cv2.transform(pts.reshape(1, -1, 2), M).reshape(-1, 2)
+    transformed_pts = (
+        cv2.transform(pts.reshape(1, -1, 2), M).reshape(-1, 2)
+        if apply_leveling
+        else pts.copy()
+    )
     min_x = float(np.min(transformed_pts[:, 0]))
     max_x = float(np.max(transformed_pts[:, 0]))
     min_y = float(np.min(transformed_pts[:, 1]))
@@ -1997,7 +1982,8 @@ def extract_obb_crop(
         "center": [cx_i, cy_i],
         "crop_origin": [x1, y1],
         "crop_size": [cw, ch],
-        "rotation": float(angle),
+        "rotation": float(angle if apply_leveling else 0.0),
+        "source_obb_rotation": float(angle),
         "scale_x": float(letterbox_meta["scale"]),
         "scale_y": float(letterbox_meta["scale"]),
         "scale": float(letterbox_meta["scale"]),
@@ -2008,8 +1994,9 @@ def extract_obb_crop(
         "padding_coordinate_space": "standardized",
         "fill_color": list(fill_color),
         "fill_strategy": "median_perimeter",
-        "obb_deskewed": True,
-        "affine_M": M.tolist(),       # 2×3 matrix for downstream landmark remapping
+        "obb_deskewed": bool(apply_leveling),
+        "affine_M": M.tolist() if apply_leveling else None,
+        "source_affine_M": M.tolist(),
         "leveling_applied": bool(apply_leveling),
     }
     return crop_512, meta
