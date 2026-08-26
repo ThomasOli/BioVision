@@ -67,6 +67,7 @@ jobs:
           pip install -r backend/requirements.txt
           pip install -r requirements-dev.txt
           python -c "import pkg_resources; assert hasattr(pkg_resources, 'NullProvider'), 'PyInstaller requires pkg_resources.NullProvider'"
+          python -c "import cv2, numpy, torch; assert numpy.__version__ == '1.26.4'; torch.tensor([1]).numpy(); print('Runtime ABI check:', cv2.__version__, numpy.__version__, torch.__version__)"
 
       - name: Install Node dependencies
         run: npm ci

@@ -17,8 +17,11 @@
 # ------------------------------------------------------------------------------
 # Core runtime dependencies
 # ------------------------------------------------------------------------------
-opencv-python>=4.8.0
-numpy>=1.24.0
+# Keep PyTorch's NumPy bridge working on every release target, including Intel
+# macOS. OpenCV 4.12+ requires NumPy 2 on Python 3.9+, while the supported
+# PyTorch builds still require the NumPy 1.x ABI for tensor conversion.
+opencv-python==4.11.0.86
+numpy==1.26.4
 Pillow>=10.0.0
 
 # Landmark model training / inference
