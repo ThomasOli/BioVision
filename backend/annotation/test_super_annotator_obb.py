@@ -436,6 +436,7 @@ class MockedObbTrainingRunTests(unittest.TestCase):
                 "yaml_path": str(dataset_yaml),
                 "warnings": [],
                 "synthetic": {},
+                "validation_cohort": _locked_cohort(),
             }
             annotator = SuperAnnotator()
 
@@ -527,6 +528,31 @@ class MockedObbTrainingRunTests(unittest.TestCase):
             train_kwargs = _FakeYolo.instances[0].train_kwargs
             self.assertEqual(train_kwargs["seed"], 12345)
             self.assertIs(train_kwargs["deterministic"], True)
+            self.assertEqual(
+                {
+                    key: train_kwargs[key]
+                    for key in (
+                        "fliplr", "flipud", "degrees", "translate", "scale",
+                        "shear", "perspective", "hsv_h", "hsv_s", "hsv_v",
+                        "mosaic", "mixup", "copy_paste",
+                    )
+                },
+                {
+                    "fliplr": 0.0,
+                    "flipud": 0.0,
+                    "degrees": 180.0,
+                    "translate": 0.1,
+                    "scale": 0.5,
+                    "shear": 0.0,
+                    "perspective": 0.0,
+                    "hsv_h": 0.015,
+                    "hsv_s": 0.7,
+                    "hsv_v": 0.4,
+                    "mosaic": 0.0,
+                    "mixup": 0.0,
+                    "copy_paste": 0.0,
+                },
+            )
 
             manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
             descriptor = manifest["trainingProtocol"]
@@ -578,6 +604,13 @@ class MockedObbTrainingRunTests(unittest.TestCase):
             self.assertEqual(hyperparameters["horizontalFlipProbability"], 0.0)
             self.assertEqual(hyperparameters["verticalFlipProbability"], 0.0)
             self.assertEqual(hyperparameters["mosaicProbability"], 0.0)
+            self.assertEqual(hyperparameters["closeMosaicEpochs"], 0)
+            self.assertEqual(hyperparameters["mixupProbability"], 0.0)
+            self.assertEqual(hyperparameters["copyPasteProbability"], 0.0)
+            self.assertEqual(hyperparameters["translationFraction"], 0.1)
+            self.assertEqual(hyperparameters["scaleGain"], 0.5)
+            self.assertEqual(hyperparameters["shearDegrees"], 0.0)
+            self.assertEqual(hyperparameters["perspectiveFraction"], 0.0)
             self.assertAlmostEqual(hyperparameters["validationNmsIou"], 0.41)
             self.assertAlmostEqual(hyperparameters["classificationLossGain"], 1.7)
             self.assertAlmostEqual(hyperparameters["boxLossGain"], 4.2)
@@ -865,7 +898,7 @@ class MockedObbTrainingRunTests(unittest.TestCase):
                 "candidate_not_promoted",
             )
 
-    def test_first_model_without_frozen_validation_remains_candidate(self):
+    def test_training_stops_before_fit_without_frozen_validation(self):
         fake_ultralytics = types.ModuleType("ultralytics")
         fake_ultralytics.YOLO = _FakeYolo
         _FakeYolo.instances.clear()
@@ -905,18 +938,14 @@ class MockedObbTrainingRunTests(unittest.TestCase):
                     sam2_enabled=False,
                 )
 
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(result["model_status"], "candidate")
-            self.assertFalse(result["promotion"]["promoted"])
-            self.assertEqual(
-                result["promotion"]["reason"],
-                "candidate_missing_frozen_validation_cohort",
-            )
+            self.assertEqual(result["status"], "error")
+            self.assertIn("stopped before fitting", result["error"])
+            self.assertEqual(_FakeYolo.instances, [])
             self.assertFalse(
                 Path(session_dir, "models", "session_obb_detector.pt").exists()
             )
 
-    def test_first_directional_model_without_full_validation_class_coverage_is_candidate(self):
+    def test_first_directional_model_uses_mirrored_evaluator_class_coverage(self):
         fake_ultralytics = types.ModuleType("ultralytics")
         fake_ultralytics.YOLO = _FakeYolo
         fake_ultralytics.__version__ = "mock-obb-class-coverage-1.0"
@@ -927,7 +956,10 @@ class MockedObbTrainingRunTests(unittest.TestCase):
             Path(session_dir, "session.json").write_text(
                 json.dumps(
                     {
-                        "orientationPolicy": {"mode": "directional"},
+                        "orientationPolicy": {
+                            "mode": "directional",
+                            "targetOrientation": "left",
+                        },
                         "orientationPolicyConfigured": True,
                         "schemaSemanticFingerprint": "v2-obb-directional-test",
                         "schemaSemanticVersion": 2,
@@ -940,8 +972,17 @@ class MockedObbTrainingRunTests(unittest.TestCase):
             dataset_yaml.write_text("path: .\n", encoding="utf-8")
             validation_cohort = {
                 **_locked_cohort_v2("v", "c"),
+                "format_version": 3,
                 "expected_class_count": 2,
                 "real_class_histogram": {"0": 2, "1": 0},
+                "evaluator_class_histogram": {"0": 2, "1": 2},
+                "evaluation_sample_count": 4,
+                "derivation": {
+                    "type": "horizontal_mirror",
+                    "version": 1,
+                    "source": "frozen_real_validation",
+                    "class_transform": "binary_swap",
+                },
             }
             export_result = {
                 "ok": True,
@@ -964,11 +1005,11 @@ class MockedObbTrainingRunTests(unittest.TestCase):
                 )
 
             self.assertTrue(result["ok"], result)
-            self.assertEqual(result["model_status"], "candidate")
-            self.assertFalse(result["promotion"]["promoted"])
+            self.assertEqual(result["model_status"], "active")
+            self.assertTrue(result["promotion"]["promoted"])
             self.assertEqual(
                 result["promotion"]["reason"],
-                "candidate_validation_class_coverage_incomplete",
+                "first_validated_obb_model",
             )
             persisted_cohort = result["promotion"]["candidateCohort"]
             self.assertEqual(persisted_cohort["expectedClassCount"], 2)
@@ -976,11 +1017,16 @@ class MockedObbTrainingRunTests(unittest.TestCase):
                 persisted_cohort["realClassHistogram"],
                 {"0": 2, "1": 0},
             )
+            self.assertEqual(
+                persisted_cohort["evaluatorClassHistogram"],
+                {"0": 2, "1": 2},
+            )
+            self.assertEqual(persisted_cohort["evaluationSampleCount"], 4)
             policy = result["promotion"]["improvementPolicy"]
             self.assertTrue(policy["requireAllConfiguredValidationClasses"])
             self.assertEqual(policy["minimumValidationSamples"], 2)
             self.assertEqual(policy["minimumValidationGroups"], 2)
-            self.assertFalse(
+            self.assertTrue(
                 Path(session_dir, "models", "session_obb_detector.pt").exists()
             )
             registry = json.loads(

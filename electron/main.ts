@@ -26,6 +26,7 @@ import {
 } from "./hitlPersistence";
 import { compareModelSchemaContract } from "./modelCompatibility";
 import {
+  isVerifiedTrainedObbDetector,
   resolveTrainedObbDetector,
   resolveZeroShotDetector,
   validateObbPromotionCandidate,
@@ -1105,20 +1106,26 @@ function normalizeOrientationPolicy(
   landmarkTemplate: unknown
 ): NormalizedOrientationPolicy {
   const inferred = inferOrientationPolicyFromTemplate(landmarkTemplate);
-  const raw = rawPolicy && typeof rawPolicy === "object" ? (rawPolicy as Record<string, unknown>) : {};
+  const hasExplicitPolicy = Boolean(rawPolicy && typeof rawPolicy === "object");
+  const raw = hasExplicitPolicy ? (rawPolicy as Record<string, unknown>) : {};
 
   const mode = normalizeOrientationMode(raw.mode ?? inferred.mode);
   const rawTarget = String(raw.targetOrientation || inferred.targetOrientation || "left").trim().toLowerCase();
   const targetOrientation = rawTarget === "right" ? "right" : "left";
 
-  const headFallback = inferred.headCategories.length > 0 ? inferred.headCategories : ["head"];
-  const tailFallback =
-    inferred.tailCategories.length > 0 ? inferred.tailCategories : ["tail", "caudal-fin"];
-  const headCategories = normalizeCategoryList(raw.headCategories);
-  const tailCategories = normalizeCategoryList(raw.tailCategories);
+  const headCategories = normalizeCategoryList(
+    hasExplicitPolicy ? raw.headCategories : inferred.headCategories
+  );
+  const tailCategories = normalizeCategoryList(
+    hasExplicitPolicy ? raw.tailCategories : inferred.tailCategories
+  );
 
-  const anteriorAnchorIds = normalizeAnchorIdList(raw.anteriorAnchorIds ?? inferred.anteriorAnchorIds);
-  const posteriorAnchorIds = normalizeAnchorIdList(raw.posteriorAnchorIds ?? inferred.posteriorAnchorIds);
+  const anteriorAnchorIds = normalizeAnchorIdList(
+    hasExplicitPolicy ? raw.anteriorAnchorIds : inferred.anteriorAnchorIds
+  );
+  const posteriorAnchorIds = normalizeAnchorIdList(
+    hasExplicitPolicy ? raw.posteriorAnchorIds : inferred.posteriorAnchorIds
+  );
 
   const normalizedPairs: [number, number][] = [];
   if (Array.isArray(raw.bilateralPairs)) {
@@ -1138,8 +1145,8 @@ function normalizeOrientationPolicy(
   const rawObbLevelingMode = String(raw.obbLevelingMode || inferred.obbLevelingMode || "on").trim().toLowerCase();
   const policy: NormalizedOrientationPolicy = {
     mode,
-    headCategories: mode === "directional" ? (headCategories.length > 0 ? headCategories : headFallback) : [],
-    tailCategories: mode === "directional" ? (tailCategories.length > 0 ? tailCategories : tailFallback) : [],
+    headCategories: mode === "directional" ? headCategories : [],
+    tailCategories: mode === "directional" ? tailCategories : [],
     anteriorAnchorIds,
     posteriorAnchorIds,
     bilateralPairs: mode === "bilateral" ? normalizedPairs : [],
@@ -1220,17 +1227,42 @@ function resolveSessionObbDetectorForCompatibility(
   speciesId: string
 ): ObbDetectorResolution | undefined {
   const effectiveRoot = getEffectiveRoot(speciesId);
+  return resolveObbDetectorForEffectiveRoot(effectiveRoot);
+}
+
+function resolveObbDetectorForEffectiveRoot(
+  effectiveRoot: string
+): ObbDetectorResolution | undefined {
   const aliasPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
   if (!fs.existsSync(aliasPath)) return undefined;
-  const session = loadSessionOrientationPolicyForCompatibility(speciesId);
   const rawSession = safeReadJson(path.join(effectiveRoot, "session.json")) || {};
+  const template = Array.isArray(rawSession.landmarkTemplate)
+    ? rawSession.landmarkTemplate
+    : [];
+  const schemaSemanticFingerprint = computeSessionSchemaSemanticFingerprint(
+    template,
+    rawSession.orientationPolicy
+  );
   return resolveTrainedObbDetector({
     aliasPath,
     registryPath: path.join(effectiveRoot, "models", "obb_registry.json"),
-    sessionSemanticFingerprint: session.schemaSemanticFingerprint,
-    sessionSemanticVersion: session.schemaSemanticVersion,
+    sessionSemanticFingerprint: schemaSemanticFingerprint,
+    sessionSemanticVersion: schemaSemanticFingerprint
+      ? SCHEMA_SEMANTIC_VERSION
+      : undefined,
     sessionOrientationContract: rawSession.orientationPolicy,
   });
+}
+
+function landmarkTrainingObbGateError(
+  resolution: ObbDetectorResolution | undefined
+): string | null {
+  if (isVerifiedTrainedObbDetector(resolution)) return null;
+  const detail = resolution?.issues.find((issue) => issue.severity === "error")?.message;
+  return (
+    "Landmark predictor training is locked until this session has a verified, active OBB detector. " +
+    (detail || "Train and promote the OBB detector in step 1, then retry.")
+  );
 }
 
 function loadModelTrainingProfileForCompatibility(
@@ -1560,7 +1592,6 @@ async function evaluateModelCompatibility(args: {
     // OBB alias also satisfies the immutable session schema contract.
     const effectiveRoot = getEffectiveRoot(args.speciesId);
     const obbDetectorPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
-    const obbDetectorExists = fs.existsSync(obbDetectorPath);
     const obbDetector = resolveSessionObbDetectorForCompatibility(args.speciesId);
     if (obbDetector) {
       issues.push(...obbDetector.issues);
@@ -1576,8 +1607,10 @@ async function evaluateModelCompatibility(args: {
       sessionPolicy: session.policy,
       modelProfile: profile,
       runtime,
-      obbDetectorReady: obbDetectorExists,
-      obbDetectorPath: obbDetectorExists ? obbDetectorPath : undefined,
+      obbDetectorReady: isVerifiedTrainedObbDetector(obbDetector),
+      obbDetectorPath: isVerifiedTrainedObbDetector(obbDetector)
+        ? obbDetectorPath
+        : undefined,
       ...(obbDetector ? { obbDetector } : {}),
     };
   } catch (error: any) {
@@ -2613,9 +2646,10 @@ function getImportedOrientationLabelForClassId(
   classId: number | undefined | null
 ): "left" | "right" | "up" | "down" | undefined {
   if (classId !== 0 && classId !== 1) return undefined;
-  if (orientationPolicy.mode === "invariant") return undefined;
-  if (orientationPolicy.mode === "axial") {
-    return classId === 0 ? "up" : "down";
+  // Axial and invariant schemas are one-class contracts.  They can render an
+  // undirected centerline, but must not persist a directional arrow/hint.
+  if (orientationPolicy.mode === "invariant" || orientationPolicy.mode === "axial") {
+    return undefined;
   }
   if (
     orientationPolicy.mode === "bilateral" &&
@@ -2701,7 +2735,7 @@ function deriveImportedClassId(
   geometryConfig?: ImportGeometryConfig,
   obbCorners?: ImportedObbCorners | null
 ): number | undefined {
-  if (orientationPolicy.mode === "invariant") return 0;
+  if (orientationPolicy.mode === "invariant" || orientationPolicy.mode === "axial") return 0;
   const { head, tail } = resolveImportedSemanticAnchors(
     landmarks,
     orientationPolicy,
@@ -2709,9 +2743,6 @@ function deriveImportedClassId(
     geometryConfig
   );
   if (!head || !tail) return 0;
-  if (orientationPolicy.mode === "axial") {
-    return Number(head.y) < Number(tail.y) ? 0 : 1;
-  }
   if (
     orientationPolicy.mode === "bilateral" &&
     orientationPolicy.bilateralClassAxis === "vertical_obb"
@@ -3884,6 +3915,12 @@ ipcMain.handle(
       if (orientationIssue) {
         return { ok: false, error: orientationIssue };
       }
+      const obbGateError = landmarkTrainingObbGateError(
+        resolveObbDetectorForEffectiveRoot(effectiveRoot)
+      );
+      if (obbGateError) {
+        return { ok: false, error: obbGateError, obbDetectorReady: false };
+      }
 
       if (useImportedXml) {
         const gate = await verifyImportedXmlContract({ effectiveRoot, modelName });
@@ -4000,6 +4037,10 @@ ipcMain.handle("ml:train", async (_event, modelName: string, options?: TrainOpti
     ensureTrainingLayout(effectiveRoot);
     const orientationIssue = readExplicitSessionOrientationIssue(effectiveRoot);
     if (orientationIssue) throw new Error(orientationIssue);
+    const obbGateError = landmarkTrainingObbGateError(
+      resolveObbDetectorForEffectiveRoot(effectiveRoot)
+    );
+    if (obbGateError) throw new Error(obbGateError);
     emitTrainProgress(3, "preflight", "Validating training inputs...");
 
     if (options?.useImportedXml) {
@@ -8312,9 +8353,10 @@ ipcMain.handle(
         }
       }
       const effectiveRoot = getEffectiveRoot(args.speciesId);
-      const obbDetectorPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
       meta = meta && typeof meta === "object" ? meta : {};
-      meta.obbDetectorReady = fs.existsSync(obbDetectorPath);
+      meta.obbDetectorReady = isVerifiedTrainedObbDetector(
+        resolveObbDetectorForEffectiveRoot(effectiveRoot)
+      );
       meta.obbTrainingSettings = readNormalizedSessionObbTrainingSettings(meta);
       meta.obbDetectionSettings = readNormalizedSessionObbDetectionSettings(meta);
       meta.obbTrainingSettingsCustomized = readSessionObbTrainingSettingsCustomized(meta);
@@ -10979,13 +11021,23 @@ ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, option
       return { ok: false, error: result.error ?? "OBB detector training failed" };
     }
 
-    // Mark session as obb_detector_ready
+    const trainedObbResolution = resolveObbDetectorForEffectiveRoot(sessionDir);
+    const verifiedObbReady = isVerifiedTrainedObbDetector(trainedObbResolution);
+    if (result?.model_status === "active" && !verifiedObbReady) {
+      return {
+        ok: false,
+        error:
+          "OBB training produced an active artifact, but immutable artifact/schema verification failed. " +
+          (trainedObbResolution?.issues[0]?.message || "Landmark training remains locked."),
+      };
+    }
+
+    // Persist only verified readiness; alias existence alone must never unlock
+    // landmark predictor training.
     if (fs.existsSync(sessionJsonPath)) {
       try {
         const session = safeReadJson(sessionJsonPath) ?? {};
-        (session as any).obbDetectorReady = fs.existsSync(
-          path.join(sessionDir, "models", "session_obb_detector.pt")
-        );
+        (session as any).obbDetectorReady = verifiedObbReady;
         (session as any).obbTrainingSettings = resolvedTrainingSettings;
         atomicWriteJsonSync(sessionJsonPath, session);
       } catch (_e) {
@@ -11003,6 +11055,7 @@ ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, option
       perClass: Array.isArray(result?.per_class) ? result.per_class : [],
       modelId: result?.model_id ?? null,
       modelStatus: result?.model_status ?? null,
+      obbDetectorReady: verifiedObbReady,
       promotion: result?.promotion ?? null,
       warnings: Array.isArray(result?.warnings) ? result.warnings : [],
     };
@@ -11268,4 +11321,3 @@ app.on("activate", () => {
     createWindow();
   }
 });
-

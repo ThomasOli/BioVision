@@ -47,7 +47,7 @@ function inferEditorOrientationPolicy(landmarks: LandmarkDefinition[]): Orientat
     (landmarks || []).map((landmark) => String(landmark.category || "").trim().toLowerCase()).filter(Boolean)
   );
   if (categories.has("head") || categories.has("tail") || categories.has("caudal-fin")) {
-    return { mode: "directional", targetOrientation: "left", headCategories: ["head"], tailCategories: ["tail", "caudal-fin"] };
+    return { mode: "directional", targetOrientation: "left" };
   }
   return { mode: "invariant" };
 }
@@ -64,8 +64,6 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({
   const [landmarks, setLandmarks] = useState<LandmarkDefinition[]>([]);
   const [otherLabels, setOtherLabels] = useState<Record<number, string>>({});
   const [orientationMode, setOrientationMode] = useState<OrientationPolicy["mode"]>("invariant");
-  const [anteriorAnchorIds, setAnteriorAnchorIds] = useState<number[]>([]);
-  const [posteriorAnchorIds, setPosteriorAnchorIds] = useState<number[]>([]);
 
   useEffect(() => {
     if (!open) return;
@@ -75,16 +73,6 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({
     setSchemaDescription(initialSchema?.description || "");
     setLandmarks(normalizedLandmarks);
     setOrientationMode(initialPolicy.mode);
-    setAnteriorAnchorIds(
-      Array.isArray(initialPolicy.anteriorAnchorIds)
-        ? initialPolicy.anteriorAnchorIds.map((id) => Number(id)).filter((id) => Number.isFinite(id))
-        : []
-    );
-    setPosteriorAnchorIds(
-      Array.isArray(initialPolicy.posteriorAnchorIds)
-        ? initialPolicy.posteriorAnchorIds.map((id) => Number(id)).filter((id) => Number.isFinite(id))
-        : []
-    );
     const nextOtherLabels: Record<number, string> = {};
     normalizedLandmarks.forEach((landmark, index) => {
       const category = String(landmark.category || "").trim();
@@ -108,18 +96,6 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({
     ]);
   };
 
-  const toggleAnchorId = (
-    currentIds: number[],
-    setter: React.Dispatch<React.SetStateAction<number[]>>,
-    id: number
-  ) => {
-    setter(
-      currentIds.includes(id)
-        ? currentIds.filter((value) => value !== id)
-        : [...currentIds, id].sort((a, b) => a - b)
-    );
-  };
-
   const updateLandmark = (index: number, updates: Partial<LandmarkDefinition>) => {
     setLandmarks(landmarks.map((landmark, position) => (
       position === index ? { ...landmark, ...updates } : landmark
@@ -127,7 +103,6 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({
   };
 
   const removeLandmark = (index: number) => {
-    const removedId = Number(landmarks[index]?.index ?? index + 1);
     const filtered = landmarks.filter((_, position) => position !== index);
     const reindexed = filtered.map((landmark, position) => ({
       ...landmark,
@@ -140,12 +115,6 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({
       if (otherLabels[oldIndex] !== undefined) nextOther[position] = otherLabels[oldIndex];
     });
     setOtherLabels(nextOther);
-    const remapAnchorIds = (ids: number[]) =>
-      ids
-        .filter((id) => id !== removedId)
-        .map((id) => (id > removedId ? id - 1 : id));
-    setAnteriorAnchorIds((current) => remapAnchorIds(current));
-    setPosteriorAnchorIds((current) => remapAnchorIds(current));
   };
 
   const dialogTitle = useMemo(() => {
@@ -165,11 +134,6 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({
       toast.error("At least one landmark is required");
       return;
     }
-    if (orientationMode !== "invariant" && (anteriorAnchorIds.length === 0 || posteriorAnchorIds.length === 0)) {
-      toast.error("Select at least one anterior and one posterior anchor landmark.");
-      return;
-    }
-
     const resolvedLandmarks = landmarks.map((landmark, index) => {
       if (landmark.category === "other") {
         const customCategory = (otherLabels[index] || "").trim();
@@ -188,8 +152,6 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({
         mode: orientationMode,
         ...(orientationMode === "directional" ? { targetOrientation: "left" as const } : {}),
         ...(orientationMode === "bilateral" ? { bilateralClassAxis: "vertical_obb" as const } : {}),
-        ...(anteriorAnchorIds.length > 0 ? { anteriorAnchorIds } : {}),
-        ...(posteriorAnchorIds.length > 0 ? { posteriorAnchorIds } : {}),
       },
     });
   };
@@ -333,50 +295,6 @@ export const CustomSchemaEditor: React.FC<CustomSchemaEditorProps> = ({
             </ScrollArea>
           </div>
 
-          {orientationMode !== "invariant" && landmarks.length > 0 && (
-            <div className="space-y-3">
-              <div>
-                <Label>Anterior Anchors</Label>
-                <p className="text-xs text-muted-foreground">
-                  Selected landmarks are averaged into an anterior anchor centroid during preannotated import.
-                </p>
-              </div>
-              <ScrollArea className="h-36 rounded-md border bg-muted/20 px-3 py-2">
-                <div className="grid grid-cols-2 gap-2 pr-3">
-                  {landmarks.map((landmark) => (
-                    <label key={`anterior-${landmark.index}`} className="flex items-center gap-2 rounded-md px-1 py-1 text-xs hover:bg-muted/40">
-                      <input
-                        type="checkbox"
-                        checked={anteriorAnchorIds.includes(Number(landmark.index))}
-                        onChange={() => toggleAnchorId(anteriorAnchorIds, setAnteriorAnchorIds, Number(landmark.index))}
-                      />
-                      <span>{landmark.name} (#{landmark.index})</span>
-                    </label>
-                  ))}
-                </div>
-              </ScrollArea>
-              <div>
-                <Label>Posterior Anchors</Label>
-                <p className="text-xs text-muted-foreground">
-                  Selected landmarks are averaged into a posterior anchor centroid during preannotated import.
-                </p>
-              </div>
-              <ScrollArea className="h-36 rounded-md border bg-muted/20 px-3 py-2">
-                <div className="grid grid-cols-2 gap-2 pr-3">
-                  {landmarks.map((landmark) => (
-                    <label key={`posterior-${landmark.index}`} className="flex items-center gap-2 rounded-md px-1 py-1 text-xs hover:bg-muted/40">
-                      <input
-                        type="checkbox"
-                        checked={posteriorAnchorIds.includes(Number(landmark.index))}
-                        onChange={() => toggleAnchorId(posteriorAnchorIds, setPosteriorAnchorIds, Number(landmark.index))}
-                      />
-                      <span>{landmark.name} (#{landmark.index})</span>
-                    </label>
-                  ))}
-                </div>
-              </ScrollArea>
-            </div>
-          )}
         </div>
 
         <DialogFooter>

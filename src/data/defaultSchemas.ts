@@ -9,7 +9,8 @@ export const DEFAULT_SCHEMAS: LandmarkSchema[] = [
     name: "Fly Wing (Drosophila) Landmarks",
     description: "12-point schema for Drosophila wing morphometric analysis",
     orientationPolicy: {
-      mode: "invariant",
+      mode: "directional",
+      targetOrientation: "left",
     },
     landmarks: [
       // Margin Intersections (1–6)
@@ -36,10 +37,6 @@ export const DEFAULT_SCHEMAS: LandmarkSchema[] = [
     orientationPolicy: {
       mode: "directional",
       targetOrientation: "left",
-      headCategories: ["head"],
-      tailCategories: ["caudal-fin"],
-      anteriorAnchorIds: [1],
-      posteriorAnchorIds: [4, 5],
     },
     landmarks: [
       { index: 1,  name: "Snout Tip",             description: "Tip of upper jaw",                          category: "head" },

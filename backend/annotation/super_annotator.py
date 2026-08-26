@@ -334,6 +334,15 @@ def _normalize_obb_cohort(value):
     except (TypeError, ValueError):
         group_count = 0
     try:
+        evaluation_sample_count = int(
+            value.get(
+                "evaluation_sample_count",
+                value.get("evaluationSampleCount", sample_count),
+            )
+        )
+    except (TypeError, ValueError):
+        evaluation_sample_count = sample_count
+    try:
         format_version = int(value.get("format_version", value.get("formatVersion", 1)))
     except (TypeError, ValueError):
         format_version = 1
@@ -362,6 +371,27 @@ def _normalize_obb_cohort(value):
         str(class_id): parsed_class_histogram.get(str(class_id), 0)
         for class_id in range(max(0, expected_class_count))
     }
+    raw_evaluator_histogram = value.get(
+        "evaluator_class_histogram",
+        value.get("evaluatorClassHistogram", raw_class_histogram),
+    )
+    parsed_evaluator_histogram = {}
+    if isinstance(raw_evaluator_histogram, dict):
+        for raw_class_id, raw_count in raw_evaluator_histogram.items():
+            try:
+                class_id = int(raw_class_id)
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                continue
+            if class_id < 0:
+                continue
+            parsed_evaluator_histogram[str(class_id)] = max(0, count)
+    normalized_evaluator_histogram = {
+        str(class_id): parsed_evaluator_histogram.get(str(class_id), 0)
+        for class_id in range(max(0, expected_class_count))
+    }
+    derivation = value.get("derivation")
+    normalized_derivation = dict(derivation) if isinstance(derivation, dict) else None
     return {
         "formatVersion": format_version,
         "revision": revision or None,
@@ -369,9 +399,12 @@ def _normalize_obb_cohort(value):
         "exportManifestSha256": export_manifest_sha256 or None,
         "splitProfileKey": str(split_profile_key) if split_profile_key is not None else None,
         "sampleCount": max(0, sample_count),
+        "evaluationSampleCount": max(0, evaluation_sample_count),
         "groupCount": max(0, group_count),
         "expectedClassCount": max(0, expected_class_count),
         "realClassHistogram": normalized_class_histogram,
+        "evaluatorClassHistogram": normalized_evaluator_histogram,
+        "derivation": normalized_derivation,
         "frozen": bool(value.get("frozen", False)),
         "reportOnly": bool(value.get("report_only", value.get("reportOnly", False))),
     }
@@ -393,7 +426,7 @@ def _obb_validation_class_coverage_complete(cohort):
     # their comparability; current directional/bilateral exports always declare 2.
     if expected_class_count <= 1:
         return True
-    histogram = cohort.get("realClassHistogram")
+    histogram = cohort.get("evaluatorClassHistogram", cohort.get("realClassHistogram"))
     if not isinstance(histogram, dict):
         return False
     return all(
@@ -2043,6 +2076,45 @@ class SuperAnnotator:
         if not export_result.get("ok"):
             return {"status": "error", "error": export_result.get("error", "OBB dataset export failed")}
 
+        validation_cohort = export_result.get("validation_cohort")
+        if not isinstance(validation_cohort, dict) or not validation_cohort.get("frozen"):
+            histogram = (
+                validation_cohort.get(
+                    "evaluator_class_histogram",
+                    validation_cohort.get("real_class_histogram", {}),
+                )
+                if isinstance(validation_cohort, dict)
+                else {}
+            )
+            expected_class_count = int(
+                validation_cohort.get("expected_class_count", 0)
+                if isinstance(validation_cohort, dict)
+                else 0
+            )
+            missing_class_ids = [
+                class_id
+                for class_id in range(max(0, expected_class_count))
+                if int(histogram.get(str(class_id), 0) or 0) <= 0
+            ]
+            if missing_class_ids:
+                detail = (
+                    f" Frozen validation lacks evaluator orientation class IDs {missing_class_ids}. "
+                    "Review the saved OBB direction arrows before retrying."
+                )
+            else:
+                detail = (
+                    " Finalize at least two independent source groups so BioVision can freeze "
+                    "a validation cohort."
+                )
+            return {
+                "status": "error",
+                "error": (
+                    "OBB training stopped before fitting because its promotion evaluator is not ready."
+                    + detail
+                ),
+                "warnings": list(export_result.get("warnings", [])),
+            }
+
         warnings = list(export_result.get("warnings", []))
         synthetic_stats = export_result.get("synthetic", {}) if isinstance(export_result.get("synthetic"), dict) else {}
         if sam2_enabled and int(synthetic_stats.get("segments_total", 0)) <= 0:
@@ -2276,6 +2348,15 @@ class SuperAnnotator:
                 fliplr=0.0,         # horizontal flip corrupts orientation labels (left vs right class)
                 flipud=0.0,         # biological specimens should not train on upside-down flips
                 degrees=resolved_degrees,
+                translate=0.1,      # pin Ultralytics geometry defaults for reproducibility
+                scale=0.5,
+                shear=0.0,
+                perspective=0.0,
+                hsv_h=0.015,
+                hsv_s=0.7,
+                hsv_v=0.4,
+                mixup=0.0,
+                copy_paste=0.0,
                 iou=float(iou_loss),   # NMS IoU threshold for validation during training
                 cls=float(cls_loss),   # classification loss gain
                 box=float(box_loss),   # box regression loss gain
@@ -2601,6 +2682,16 @@ class SuperAnnotator:
             "patience": resolved_patience,
             "cosineLearningRate": True,
             "mosaicProbability": 0.0,
+            "closeMosaicEpochs": 0,
+            "mixupProbability": 0.0,
+            "copyPasteProbability": 0.0,
+            "translationFraction": 0.1,
+            "scaleGain": 0.5,
+            "shearDegrees": 0.0,
+            "perspectiveFraction": 0.0,
+            "hsvHueGain": 0.015,
+            "hsvSaturationGain": 0.7,
+            "hsvValueGain": 0.4,
             "amp": resolved_amp,
             "plots": resolved_plots,
             "orientationSchema": orientation_schema,
@@ -3136,11 +3227,13 @@ class SuperAnnotator:
         return detections[:max(1, int(resolved["top_k"]))]
 
     # ------------------------------------------------------------------
-    # OBB class_id tagging from placed landmarks
+    # OBB class_id tagging from the saved arrow contract
     # ------------------------------------------------------------------
     def tag_class_ids(self, session_dir, boxes, orientation_policy=None):
         """
-        Compute class_id for each box from placed landmarks / anchor geometry.
+        Preserve each box's explicit class_id / stored orientation arrow.
+        Boxes without either value fail closed; landmark geometry is never used
+        to invent a detector direction class.
 
         class_id encoding:
           directional: 0=left-facing (canonical), 1=right-facing

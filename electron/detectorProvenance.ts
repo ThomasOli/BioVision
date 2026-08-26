@@ -28,6 +28,25 @@ export type ObbDetectorResolution = {
   orientationContract?: Record<string, unknown>;
 };
 
+/**
+ * Landmark training is downstream of the active OBB detector.  An alias file
+ * by itself is not enough to unlock that stage: it must map to one immutable,
+ * active registry artifact and satisfy the current schema/orientation
+ * contract without warnings or blocking integrity errors.
+ */
+export function isVerifiedTrainedObbDetector(
+  resolution: ObbDetectorResolution | null | undefined
+): boolean {
+  return Boolean(
+    resolution &&
+      resolution.provenance.kind === "trained_obb" &&
+      resolution.provenance.artifactSha256 &&
+      resolution.compatible &&
+      !resolution.blocking &&
+      resolution.issues.length === 0
+  );
+}
+
 const normalizeStringList = (value: unknown): string[] => {
   if (!Array.isArray(value)) return [];
   return [...new Set(

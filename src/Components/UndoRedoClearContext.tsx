@@ -485,6 +485,9 @@ export const UndoRedoClearContextProvider = ({ children }: React.PropsWithChildr
   );
 
   const flipAllBoxOrientations = useCallback(() => {
+    if (activeOrientationMode === "axial" || activeOrientationMode === "invariant") {
+      return;
+    }
     setImages((prevImages) => {
       return prevImages.map((img) => {
         if (!img.boxes?.length) return img;

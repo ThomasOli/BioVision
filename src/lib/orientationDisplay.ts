@@ -119,6 +119,10 @@ export function getOrientationLabelForClassId(
   bilateralClassAxis?: string | null
 ): StoredOrientationLabel | null {
   if (classId !== 0 && classId !== 1) return null;
+  const normalizedMode = normalizeOrientationMode(orientationMode);
+  if ((normalizedMode === "axial" || normalizedMode === "invariant") && classId !== 0) {
+    return null;
+  }
   return classId === 0
     ? getSessionPrimaryOrientation(orientationMode, bilateralClassAxis)
     : getSessionSecondaryOrientation(orientationMode, bilateralClassAxis);
@@ -129,11 +133,14 @@ export function getClassIdForOrientationLabel(
   orientation: string | undefined | null,
   bilateralClassAxis?: string | null
 ): 0 | 1 | null {
+  const normalizedMode = normalizeOrientationMode(orientationMode);
   const normalized = normalizeOrientationLabelForSession(
     orientationMode,
     orientation,
     bilateralClassAxis
   );
+  if (normalized === "uncertain") return null;
+  if (normalizedMode === "axial" || normalizedMode === "invariant") return 0;
   if (normalized === getSessionPrimaryOrientation(orientationMode, bilateralClassAxis)) return 0;
   if (normalized === getSessionSecondaryOrientation(orientationMode, bilateralClassAxis)) return 1;
   return null;
@@ -267,9 +274,9 @@ export function getOrientationToggleLabel(
     orientation,
     bilateralClassAxis
   );
-  if (display === "up") return "\u2191 Head";
-  if (display === "down") return "Head \u2193";
-  return display === "left" ? "\u2190 Head" : "Head \u2192";
+  if (display === "up") return "\u2191 Direction";
+  if (display === "down") return "Direction \u2193";
+  return display === "left" ? "\u2190 Direction" : "Direction \u2192";
 }
 
 export function getOrientationOptionLabel(

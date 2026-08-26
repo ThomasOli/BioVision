@@ -145,8 +145,6 @@ function buildForkedSessionId(baseSessionId: string, schemaFingerprint: string):
 function inferDefaultOrientationPolicy(
   landmarkTemplate: LandmarkDefinition[]
 ): OrientationPolicy {
-  const byName = (name: string) =>
-    landmarkTemplate.find((lm) => String(lm.name || "").trim().toLowerCase() === name)?.index;
   const categories = new Set(
     (landmarkTemplate || [])
       .map((lm) => (lm.category || "").trim().toLowerCase())
@@ -155,20 +153,10 @@ function inferDefaultOrientationPolicy(
   const hasHead = categories.has("head");
   const hasTail = categories.has("tail");
   const hasCaudalTail = categories.has("caudal-fin");
-  const tailCategories = ["tail", "caudal-fin"].filter((cat) => categories.has(cat));
   if (hasHead || hasTail || hasCaudalTail) {
-    const snoutTip = byName("snout tip");
-    const upperCaudal = byName("upper caudal peduncle");
-    const lowerCaudal = byName("lower caudal peduncle");
     return {
       mode: "directional",
       targetOrientation: "left",
-      headCategories: ["head"],
-      tailCategories: tailCategories.length > 0 ? tailCategories : ["tail", "caudal-fin"],
-      ...(Number.isFinite(Number(snoutTip)) ? { anteriorAnchorIds: [Number(snoutTip)] } : {}),
-      ...(Number.isFinite(Number(upperCaudal)) && Number.isFinite(Number(lowerCaudal))
-        ? { posteriorAnchorIds: [Number(upperCaudal), Number(lowerCaudal)] }
-        : {}),
     };
   }
   return {
@@ -200,8 +188,8 @@ type PendingSessionLaunch =
 
 const ORIENTATION_MODE_LABELS: Record<OrientationPolicy["mode"], { title: string; description: string }> = {
   directional: {
-    title: "Directional (Head/Tail)",
-    description: "Use for strict head/tail objects (for example side-view fish or isolated single wings).",
+    title: "Directional (Native Arrow)",
+    description: "Use when one OBB edge represents a stable native direction, such as a fish's front or an isolated wing's distal edge/root axis.",
   },
   bilateral: {
     title: "Mirrored / Bilateral",
@@ -219,7 +207,7 @@ const ORIENTATION_MODE_LABELS: Record<OrientationPolicy["mode"], { title: string
 
 const ORIENTATION_MODE_DETAILS: Record<OrientationPolicy["mode"], string> = {
   directional:
-    "Backend goal: the OBB detector levels the crop to the major axis, then class_id enforces a canonical facing direction (head-left). Best for side-view organisms.",
+    "Backend goal: the OBB detector levels the crop to the major axis, then the saved OBB arrow/class enforces the schema's canonical facing direction. Best for one-sided or otherwise directional specimens.",
   bilateral:
     "Backend goal: the OBB detector levels the crop along the symmetry axis; class_id encodes canonical up/down orientation for vertically symmetric specimens.",
   axial:
@@ -228,34 +216,11 @@ const ORIENTATION_MODE_DETAILS: Record<OrientationPolicy["mode"], string> = {
     "Backend goal: OBB crops the specimen without orientation enforcement; wide rotational augmentation (±6° dlib, full 360° CNN) exploits complete angular coverage.",
 };
 
-function buildOrientationPolicy(
-  mode: OrientationPolicy["mode"],
-  landmarkTemplate: LandmarkDefinition[]
-): OrientationPolicy {
-  const categories = new Set(
-    (landmarkTemplate || [])
-      .map((lm) => (lm.category || "").trim().toLowerCase())
-      .filter(Boolean)
-  );
-  const hasHead = categories.has("head");
-  const hasTail = categories.has("tail");
-  const hasCaudalTail = categories.has("caudal-fin");
-  const tailCategories = ["tail", "caudal-fin"].filter((cat) => categories.has(cat));
-
+function buildOrientationPolicy(mode: OrientationPolicy["mode"]): OrientationPolicy {
   if (mode === "directional") {
-    const snoutTip = landmarkTemplate.find((lm) => String(lm.name || "").trim().toLowerCase() === "snout tip")?.index;
-    const upperCaudal = landmarkTemplate.find((lm) => String(lm.name || "").trim().toLowerCase() === "upper caudal peduncle")?.index;
-    const lowerCaudal = landmarkTemplate.find((lm) => String(lm.name || "").trim().toLowerCase() === "lower caudal peduncle")?.index;
     return {
       mode,
       targetOrientation: "left",
-      headCategories: hasHead ? ["head"] : [],
-      tailCategories:
-        hasTail || hasCaudalTail ? (tailCategories.length > 0 ? tailCategories : ["tail", "caudal-fin"]) : [],
-      ...(Number.isFinite(Number(snoutTip)) ? { anteriorAnchorIds: [Number(snoutTip)] } : {}),
-      ...(Number.isFinite(Number(upperCaudal)) && Number.isFinite(Number(lowerCaudal))
-        ? { posteriorAnchorIds: [Number(upperCaudal), Number(lowerCaudal)] }
-        : {}),
     };
   }
   if (mode === "bilateral") {
@@ -486,10 +451,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const confirmOrientationSelection = async () => {
     if (!pendingSessionLaunch) return;
     const launch = pendingSessionLaunch;
-    const builtPolicy = buildOrientationPolicy(
-      selectedOrientationMode,
-      launch.landmarkTemplate
-    );
+    const builtPolicy = buildOrientationPolicy(selectedOrientationMode);
     const policy: OrientationPolicy = {
       ...builtPolicy,
       ...(Array.isArray(launch.orientationPolicy?.anteriorAnchorIds) && launch.orientationPolicy.anteriorAnchorIds.length > 0
@@ -648,22 +610,26 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       createdAt: new Date().toISOString(),
     };
 
-    dispatch(addSpecies(newSpecies));
-    dispatch(clearFiles());
-
     try {
-      await window.api.sessionCreate(
+      const result = await window.api.sessionCreate(
         speciesId,
         name,
         landmarkTemplate,
         orientationPolicy,
         schemaMetadata
       );
+      if (!result?.ok) {
+        toast.error(result?.error || "Failed to create session directory.");
+        return;
+      }
     } catch (err) {
       console.error("Failed to create session on disk:", err);
       toast.error("Failed to create session directory.");
+      return;
     }
 
+    dispatch(addSpecies(newSpecies));
+    dispatch(clearFiles());
     onNavigate("workspace");
   };
 
@@ -752,16 +718,27 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         schemaFingerprint,
       });
     } else {
-      openOrientationDialogForLaunch({
-        type: "create",
-        speciesId: resolved.speciesId,
-        name: schema.name,
-        landmarkTemplate: schema.landmarks,
-        orientationPolicy: schema.orientationPolicy,
-        schemaKind: "default",
-        schemaSourceId: schema.id,
-        schemaFingerprint,
-      });
+      // A built-in schema's orientation policy is part of its versioned
+      // scientific contract. Use "Edit as custom" when different semantics
+      // are needed instead of silently mutating the preset at launch.
+      const orientationPolicy =
+        schema.orientationPolicy || inferDefaultOrientationPolicy(schema.landmarks);
+      await createNewSession(
+        resolved.speciesId,
+        schema.name,
+        schema.landmarks,
+        orientationPolicy,
+        {
+          schemaKind: "default",
+          schemaSourceId: schema.id,
+          schemaFingerprint,
+          schemaSemanticFingerprint: computeSchemaSemanticFingerprint(
+            schema.landmarks,
+            orientationPolicy
+          ),
+          schemaSemanticVersion: SCHEMA_SEMANTIC_VERSION,
+        }
+      );
     }
   };
 

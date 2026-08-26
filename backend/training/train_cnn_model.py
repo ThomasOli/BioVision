@@ -21,6 +21,7 @@ import math
 import argparse
 import random
 import time
+import traceback
 from contextlib import nullcontext
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -37,7 +38,11 @@ if _BACKEND_ROOT not in _sys.path:
 import bv_utils.debug_io as dio
 import bv_utils.lineage as lineage
 import bv_utils.orientation_utils as ou
-from bv_utils.landmark_artifacts import bundle_id_mapping
+from bv_utils.landmark_artifacts import (
+    bundle_id_mapping,
+    expected_dlib_part_names,
+    load_and_validate_id_mapping,
+)
 
 try:
     import torch
@@ -304,7 +309,11 @@ def _hash_torch_state_dict(state_dict):
         digest.update(b"\0")
         digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
         digest.update(b"\0")
-        digest.update(tensor.view(torch.uint8).numpy().tobytes(order="C"))
+        # ``state_dict`` includes zero-dimensional integer buffers such as
+        # BatchNorm's ``num_batches_tracked``.  PyTorch 2.10 rejects changing
+        # the element size of a scalar dtype view.  Flatten first so every
+        # tensor, including scalars, has a byte-addressable last dimension.
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes(order="C"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -462,36 +471,72 @@ def _build_cnn_bilateral_index_pairs(project_root, tag, landmark_keys, orientati
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
-def _parse_dlib_xml(xml_path):
+def _parse_dlib_xml(xml_path, *, role="dataset"):
     """
     Parse a dlib training XML and return list of (image_path, landmarks_dict).
     landmarks_dict: {part_name_str: (x, y)}  — only valid (non-negative) parts.
     """
     if not os.path.exists(xml_path):
-        return []
-    tree = ET.parse(xml_path)
+        raise FileNotFoundError(f"The {role} XML does not exist: {xml_path}")
+    try:
+        tree = ET.parse(xml_path)
+    except Exception as exc:
+        raise RuntimeError(f"The {role} XML is unreadable: {xml_path}: {exc}") from exc
     root = tree.getroot()
     images_el = root.find("images")
     if images_el is None:
-        return []
+        raise RuntimeError(f"The {role} XML has no <images> collection: {xml_path}")
 
     records = []
-    for img_el in images_el.findall("image"):
+    failures = []
+    for image_index, img_el in enumerate(images_el.findall("image"), start=1):
         img_file = img_el.get("file", "")
-        if not img_file or not os.path.exists(img_file):
+        if not img_file:
+            failures.append(f"image {image_index} has no file reference")
             continue
-        box_el = img_el.find("box")
-        if box_el is None:
+        if not os.path.isabs(img_file):
+            img_file = os.path.abspath(os.path.join(os.path.dirname(xml_path), img_file))
+        else:
+            img_file = os.path.abspath(img_file)
+        if not os.path.isfile(img_file):
+            failures.append(f"image {image_index} references a missing file: {img_file}")
             continue
+        boxes = img_el.findall("box")
+        if len(boxes) != 1:
+            failures.append(
+                f"image {image_index} ({os.path.basename(img_file)}) has {len(boxes)} boxes; expected exactly one"
+            )
+            continue
+        box_el = boxes[0]
         parts = {}
         for p in box_el.findall("part"):
             name = p.get("name")
-            x = int(p.get("x", -1))
-            y = int(p.get("y", -1))
-            if name is not None and x >= 0 and y >= 0:
-                parts[name] = (x, y)
-        if parts:
-            records.append((img_file, parts))
+            if name is None or not str(name):
+                failures.append(f"image {image_index} contains a part with no name")
+                continue
+            name = str(name)
+            if name in parts:
+                failures.append(
+                    f"image {image_index} ({os.path.basename(img_file)}) duplicates part {name!r}"
+                )
+                continue
+            try:
+                x = int(p.get("x"))
+                y = int(p.get("y"))
+            except (TypeError, ValueError):
+                failures.append(
+                    f"image {image_index} ({os.path.basename(img_file)}) has invalid coordinates for part {name!r}"
+                )
+                continue
+            parts[name] = (x, y)
+        if not parts:
+            failures.append(f"image {image_index} ({os.path.basename(img_file)}) has no landmarks")
+            continue
+        records.append((img_file, parts))
+    if failures:
+        preview = failures[:25]
+        suffix = f"; ... and {len(failures) - len(preview)} more" if len(failures) > len(preview) else ""
+        raise RuntimeError(f"The {role} XML contract failed: " + "; ".join(preview) + suffix)
     return records
 
 
@@ -533,6 +578,7 @@ def _build_effective_cnn_dataset(
     train_records,
     val_records,
     test_records,
+    robustness_records=None,
     *,
     landmark_keys,
     source_ids_by_path=None,
@@ -544,14 +590,12 @@ def _build_effective_cnn_dataset(
         image_path, parts = record
         landmarks = []
         for key in ordered_landmark_keys:
-            present = key in parts
-            point = parts.get(key, (STANDARD_SIZE // 2, STANDARD_SIZE // 2))
+            point = parts[key]
             landmarks.append(
                 {
                     "part": key,
                     "x": int(point[0]),
                     "y": int(point[1]),
-                    "present": bool(present),
                 }
             )
         payload = {
@@ -586,6 +630,7 @@ def _build_effective_cnn_dataset(
         "train": _split_descriptor("train", train_records),
         "validation": _split_descriptor("validation", val_records),
         "test": _split_descriptor("test", test_records),
+        "robustness": _split_descriptor("robustness", robustness_records or []),
     }
     revision_payload = {
         "formatVersion": 1,
@@ -603,6 +648,7 @@ def _assert_effective_cnn_dataset_unchanged(
     train_records,
     val_records,
     test_records,
+    robustness_records=None,
     *,
     landmark_keys,
     source_ids_by_path,
@@ -613,6 +659,7 @@ def _assert_effective_cnn_dataset_unchanged(
         train_records,
         val_records,
         test_records,
+        robustness_records,
         landmark_keys=landmark_keys,
         source_ids_by_path=source_ids_by_path,
     )
@@ -727,7 +774,11 @@ def _read_split_info_strict(split_info_path):
             f"The CNN dataset split_info manifest at {split_info_path} must be a JSON object. "
             "Re-run dataset preparation rather than training with degraded source identity."
         )
-    for field in ("train_file_source_ids", "test_file_source_ids"):
+    for field in (
+        "train_file_source_ids",
+        "validation_file_source_ids",
+        "test_file_source_ids",
+    ):
         if field in split_info and not isinstance(split_info[field], dict):
             raise RuntimeError(
                 f"The CNN dataset split_info manifest at {split_info_path} has a malformed "
@@ -1207,6 +1258,142 @@ def _split_train_val_records(
     }
 
 
+def _record_source_set(records, source_ids_by_path=None):
+    return {
+        _record_source_key(image_path, source_ids_by_path)
+        for image_path, _parts in records
+    }
+
+
+def _assert_cnn_split_and_label_contract(
+    train_records,
+    val_records,
+    test_records,
+    robustness_records=None,
+    *,
+    landmark_keys,
+    source_ids_by_path=None,
+    adaptive_source_ids=None,
+):
+    """Fail closed on leakage or labels that would silently train as crop centers."""
+    records_by_split = {
+        "train": list(train_records),
+        "validation": list(val_records),
+        "test": list(test_records),
+        "robustness": list(robustness_records or []),
+    }
+    sources = {
+        name: _record_source_set(records, source_ids_by_path)
+        for name, records in records_by_split.items()
+    }
+    overlap = (
+        (sources["train"] & sources["validation"])
+        | (sources["train"] & sources["test"])
+        | (sources["validation"] & sources["test"])
+    )
+    if overlap:
+        raise RuntimeError(
+            "CNN train/validation/test cohorts overlap at the original source level: "
+            f"{sorted(overlap)}. Re-run dataset preparation before training."
+        )
+
+    adaptive = {str(source_id) for source_id in (adaptive_source_ids or set())}
+    contaminated = sorted(adaptive & (sources["validation"] | sources["test"]))
+    if contaminated:
+        raise RuntimeError(
+            "CNN validation/test cohorts contain model-assisted or HITL sources: "
+            f"{contaminated}. Reviewed data must remain train-only."
+        )
+
+    expected = set(landmark_keys)
+    failures = []
+    for split_name, records in records_by_split.items():
+        for image_path, parts in records:
+            actual = set(parts)
+            missing = sorted(expected - actual)
+            unexpected = sorted(actual - expected)
+            if missing or unexpected:
+                failures.append(
+                    f"{split_name}:{os.path.basename(image_path)} has parts {sorted(actual)}; "
+                    f"expected exactly {sorted(expected)}"
+                )
+                continue
+            image = cv2.imread(image_path)
+            if image is None:
+                failures.append(f"{split_name}:{image_path} is unreadable")
+                continue
+            height, width = image.shape[:2]
+            if (width, height) != (STANDARD_SIZE, STANDARD_SIZE):
+                failures.append(
+                    f"{split_name}:{os.path.basename(image_path)} is {width}x{height}; "
+                    f"expected {STANDARD_SIZE}x{STANDARD_SIZE} canonical crop"
+                )
+                continue
+            invalid = [
+                name
+                for name in landmark_keys
+                if not (
+                    0 <= float(parts[name][0]) <= width - 1
+                    and 0 <= float(parts[name][1]) <= height - 1
+                )
+            ]
+            if invalid:
+                failures.append(
+                    f"{split_name}:{os.path.basename(image_path)} has out-of-bounds parts {invalid}"
+                )
+    if failures:
+        preview = failures[:25]
+        suffix = f"; ... and {len(failures) - len(preview)} more" if len(failures) > len(preview) else ""
+        raise RuntimeError(
+            "CNN canonical crop/landmark contract failed: " + "; ".join(preview) + suffix
+        )
+    return sources
+
+
+def _resolve_cnn_train_validation_records(
+    train_records_all,
+    prepared_validation_records,
+    test_records,
+    *,
+    prepared_validation_available,
+    split_info,
+    source_ids_by_path,
+    adaptive_source_ids,
+    run_seed,
+    legacy_assignment_path,
+):
+    """Use preparation's frozen validation split, with a legacy XML fallback."""
+    if prepared_validation_available:
+        split_meta = {
+            "strategy": "prepared_frozen_validation_xml",
+            "train_sources": sorted(
+                _record_source_set(train_records_all, source_ids_by_path)
+            ),
+            "val_sources": sorted(
+                _record_source_set(prepared_validation_records, source_ids_by_path)
+            ),
+            "adaptive_train_sources": sorted(
+                set(adaptive_source_ids)
+                & _record_source_set(train_records_all, source_ids_by_path)
+            ),
+            "validation_cohort_revision": split_info.get(
+                "validation_cohort_revision"
+            ),
+        }
+        return list(train_records_all), list(prepared_validation_records), split_meta
+
+    train_records, val_records, split_meta = _split_train_val_records(
+        train_records_all,
+        val_fraction=TRAIN_VAL_FRACTION,
+        seed=run_seed,
+        assignment_path=legacy_assignment_path,
+        source_ids_by_path=source_ids_by_path,
+        adaptive_source_ids=adaptive_source_ids,
+    )
+    split_meta = {**split_meta, "strategy": "legacy_train_xml_resplit"}
+    return train_records, val_records, split_meta
+
+
 def _should_restore_validation_checkpoint(validation_available, best_model_state):
     """Return true only when an independent validation cohort ranked a state.
 
@@ -1285,16 +1472,39 @@ class LandmarkDataset(Dataset):
             img = cv2.flip(img, 0)
             coords[:, 1] = (h - 1) - coords[:, 1]
 
-        angle = float(self._rng.uniform(self.rotation_range[0], self.rotation_range[1]))
-        if self.rotate_180_prob > 0.0 and self._rng.random() < self.rotate_180_prob:
-            angle += 180.0
-        scale = float(self._rng.uniform(self.scale_range[0], self.scale_range[1]))
-        tx = float(self._rng.uniform(-self.translate_ratio * w, self.translate_ratio * w))
-        ty = float(self._rng.uniform(-self.translate_ratio * h, self.translate_ratio * h))
+        # Do not clamp a landmark whose transformed visual feature left the
+        # frame: that creates a false label on the image edge. Resample a small
+        # bounded number of times and fall back to the already-applied mirrors
+        # if no affine keeps the complete landmark contract visible.
+        ones = np.ones((coords.shape[0], 1), dtype=np.float32)
+        hom = np.concatenate([coords, ones], axis=1)  # [N,3]
+        M = None
+        coords_aug = None
+        for _attempt in range(8):
+            angle = float(self._rng.uniform(self.rotation_range[0], self.rotation_range[1]))
+            if self.rotate_180_prob > 0.0 and self._rng.random() < self.rotate_180_prob:
+                angle += 180.0
+            scale = float(self._rng.uniform(self.scale_range[0], self.scale_range[1]))
+            tx = float(self._rng.uniform(-self.translate_ratio * w, self.translate_ratio * w))
+            ty = float(self._rng.uniform(-self.translate_ratio * h, self.translate_ratio * h))
 
-        M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, scale)
-        M[0, 2] += tx
-        M[1, 2] += ty
+            candidate = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, scale)
+            candidate[0, 2] += tx
+            candidate[1, 2] += ty
+            candidate_coords = hom @ candidate.T
+            if bool(
+                np.all(candidate_coords[:, 0] >= 0.0)
+                and np.all(candidate_coords[:, 0] <= float(w - 1))
+                and np.all(candidate_coords[:, 1] >= 0.0)
+                and np.all(candidate_coords[:, 1] <= float(h - 1))
+            ):
+                M = candidate
+                coords_aug = candidate_coords.astype(np.float32, copy=False)
+                break
+
+        if M is None or coords_aug is None:
+            M = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+            coords_aug = coords
 
         img = cv2.warpAffine(
             img,
@@ -1304,11 +1514,6 @@ class LandmarkDataset(Dataset):
             borderMode=cv2.BORDER_REPLICATE,
         )
 
-        ones = np.ones((coords.shape[0], 1), dtype=np.float32)
-        hom = np.concatenate([coords, ones], axis=1)  # [N,3]
-        coords_aug = hom @ M.T  # [N,2]
-        coords_aug[:, 0] = np.clip(coords_aug[:, 0], 0.0, float(w - 1))
-        coords_aug[:, 1] = np.clip(coords_aug[:, 1], 0.0, float(h - 1))
         img = self._apply_occlusion_dropout(img)
         return img, coords_aug
 
@@ -1339,12 +1544,15 @@ class LandmarkDataset(Dataset):
         img_path, parts = self.records[idx]
         img = cv2.imread(img_path)
         if img is None:
-            # Return zeros on read failure (rare, but avoids crash)
-            img = np.zeros((STANDARD_SIZE, STANDARD_SIZE, 3), dtype=np.uint8)
+            raise RuntimeError(f"CNN canonical crop became unreadable: {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         coords = []
         for key in self.landmark_keys:
-            x, y = parts.get(key, (STANDARD_SIZE // 2, STANDARD_SIZE // 2))
+            if key not in parts:
+                raise RuntimeError(
+                    f"CNN canonical crop {img_path} is missing required landmark part {key!r}"
+                )
+            x, y = parts[key]
             coords.append((float(x), float(y)))
 
         coords_np = np.asarray(coords, dtype=np.float32)
@@ -1747,9 +1955,9 @@ def _build_heldout_crop_report(
     return entries
 
 
-def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
-                    model_variant="simplebaseline", device_override=None,
-                    seed=CNN_DEFAULT_RUN_SEED):
+def _train_cnn_model_impl(project_root, tag, epochs=None, lr=None, batch_size=None,
+                          model_variant="simplebaseline", device_override=None,
+                          seed=CNN_DEFAULT_RUN_SEED, _run_context=None):
     """
     Train a CNN landmark predictor for a given session + model tag.
 
@@ -1771,15 +1979,28 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     os.makedirs(modeldir, exist_ok=True)
     os.makedirs(debug_dir, exist_ok=True)
     train_xml = os.path.join(xmldir, f"train_{tag}.xml")
+    validation_xml = os.path.join(xmldir, f"validation_{tag}.xml")
     test_xml = os.path.join(xmldir, f"test_{tag}.xml")
+    robustness_xml = os.path.join(xmldir, f"robustness_{tag}.xml")
 
     if not os.path.exists(train_xml):
         raise FileNotFoundError(f"train_{tag}.xml not found at {train_xml}. "
                                 "Run prepare_dataset.py first.")
 
+    id_mapping_path = os.path.join(debug_dir, f"id_mapping_{tag}.json")
+    prepared_id_mapping = load_and_validate_id_mapping(id_mapping_path)
+    landmark_keys = expected_dlib_part_names(prepared_id_mapping)
+
     # Parse records
-    train_records_all = _parse_dlib_xml(train_xml)
-    test_records = _parse_dlib_xml(test_xml) if os.path.exists(test_xml) else []
+    train_records_all = _parse_dlib_xml(train_xml, role="train")
+    prepared_validation_available = os.path.exists(validation_xml)
+    prepared_validation_records = (
+        _parse_dlib_xml(validation_xml, role="validation") if prepared_validation_available else []
+    )
+    test_records = _parse_dlib_xml(test_xml, role="test") if os.path.exists(test_xml) else []
+    robustness_records = (
+        _parse_dlib_xml(robustness_xml, role="robustness") if os.path.exists(robustness_xml) else []
+    )
 
     if not train_records_all:
         raise ValueError(f"No valid training samples found in {train_xml}")
@@ -1791,7 +2012,11 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         os.path.join(debug_dir, f"split_info_{tag}.json")
     )
     raw_source_ids_by_path = {}
-    for field in ("train_file_source_ids", "test_file_source_ids"):
+    for field in (
+        "train_file_source_ids",
+        "validation_file_source_ids",
+        "test_file_source_ids",
+    ):
         value = split_info.get(field, {})
         if isinstance(value, dict):
             raw_source_ids_by_path.update(value)
@@ -1804,18 +2029,41 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         split_info,
         debug_dir=debug_dir,
     )
-    train_records, val_records, split_meta = _split_train_val_records(
+    legacy_assignment_path = os.path.join(
+        debug_dir, "cohorts", "cnn_validation_v1.json"
+    )
+    train_records, val_records, split_meta = _resolve_cnn_train_validation_records(
         train_records_all,
-        val_fraction=TRAIN_VAL_FRACTION,
-        seed=run_seed,
-        assignment_path=os.path.join(debug_dir, "cohorts", "cnn_validation_v1.json"),
+        prepared_validation_records,
+        test_records,
+        prepared_validation_available=prepared_validation_available,
+        split_info=split_info,
         source_ids_by_path=source_ids_by_path,
         adaptive_source_ids=adaptive_source_ids,
+        run_seed=run_seed,
+        legacy_assignment_path=legacy_assignment_path,
     )
     if not train_records:
         raise ValueError("CNN training split produced no train records.")
 
+    # Determine the fixed output contract before creating a run. Missing labels
+    # must never fall through to LandmarkDataset's legacy center placeholder.
+    n_landmarks = len(landmark_keys)
+    _assert_cnn_split_and_label_contract(
+        train_records,
+        val_records,
+        test_records,
+        robustness_records,
+        landmark_keys=landmark_keys,
+        source_ids_by_path=source_ids_by_path,
+        adaptive_source_ids=adaptive_source_ids,
+    )
+
     run_dir, run_id = dio.create_model_run_dir(project_root, "cnn", tag)
+    if isinstance(_run_context, dict):
+        _run_context.update(
+            {"run_dir": run_dir, "project_root": project_root, "tag": tag}
+        )
     model_id = lineage.build_model_id("cnn", run_id)
     artifact_tag = lineage.build_artifact_tag(tag, run_id)
     artifact_dir = lineage.create_model_artifact_dir(project_root, "cnn", run_id)
@@ -1827,7 +2075,6 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         extra={"status": "started"},
     )
 
-    id_mapping_path = os.path.join(debug_dir, f"id_mapping_{tag}.json")
     artifact_id_mapping_path, id_mapping_descriptor, id_map = bundle_id_mapping(
         id_mapping_path,
         artifact_dir,
@@ -1866,7 +2113,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         _record_source_key(path, source_ids_by_path) for path, _ in test_records
     })
     source_count_for_bucket = len({
-        _record_source_key(path, source_ids_by_path) for path, _ in train_records_all
+        _record_source_key(path, source_ids_by_path) for path, _ in train_records
     })
 
     adaptive_profile, size_bucket = _resolve_cnn_training_profile(
@@ -1892,15 +2139,11 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     resolved_dropout = float(adaptive_profile["dropout"])
     resolved_patience = int(adaptive_profile.get("early_stop_patience", 20))
 
-    # Determine landmark keys (part names that exist in all training records)
-    landmark_keys = _collect_landmark_ids(train_records)
-    n_landmarks = len(landmark_keys)
-    if n_landmarks == 0:
-        raise ValueError("No common landmarks found across all training images.")
     effective_dataset = _build_effective_cnn_dataset(
         train_records,
         val_records,
         test_records,
+        robustness_records,
         landmark_keys=landmark_keys,
         source_ids_by_path=source_ids_by_path,
     )
@@ -2020,7 +2263,10 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "effective_dataset": effective_dataset,
         "effective_dataset_revision": effective_dataset["revision"],
         "train_xml": train_xml,
+        "validation_xml": validation_xml if prepared_validation_available else None,
         "test_xml": test_xml if os.path.exists(test_xml) else None,
+        "split_strategy": split_meta.get("strategy"),
+        "validation_cohort_revision": split_meta.get("validation_cohort_revision"),
         "dataset_size_bucket": size_bucket,
         "source_count_for_bucket": source_count_for_bucket,
         "train_source_count": train_source_count,
@@ -2159,6 +2405,29 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     else:
         test_loader_seed = None
 
+    robustness_loader = None
+    if robustness_records:
+        robustness_ds = LandmarkDataset(
+            robustness_records,
+            landmark_keys,
+            transform=val_transform,
+            augment=False,
+            seed=run_seed,
+        )
+        robustness_generator, robustness_loader_seed = _make_dataloader_generator(
+            run_seed,
+            5,
+        )
+        robustness_loader = DataLoader(
+            robustness_ds,
+            batch_size=resolved_batch_size,
+            shuffle=False,
+            generator=robustness_generator,
+            **loader_kwargs,
+        )
+    else:
+        robustness_loader_seed = None
+
     # Train-set loader without augmentation for final error computation
     train_val_ds = LandmarkDataset(
         train_records,
@@ -2180,6 +2449,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "trainShuffle": train_loader_seed,
         "validation": val_loader_seed,
         "test": test_loader_seed,
+        "reportOnlyRobustness": robustness_loader_seed,
         "trainEvaluation": train_eval_loader_seed,
     }
     train_params_log["reproducibility"] = reproducibility_protocol
@@ -2536,6 +2806,38 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     train_stats = _compute_error_stats(model, train_val_loader, device)
     val_stats = _compute_error_stats(model, val_loader, device) if val_loader else None
     test_stats = _compute_error_stats(model, test_loader, device) if test_loader else None
+    robustness_stats = (
+        _compute_error_stats(model, robustness_loader, device)
+        if robustness_loader
+        else None
+    )
+    robustness_evaluation = {
+        "status": "measured" if robustness_stats is not None else "unavailable",
+        "role": "report_only",
+        "affectsPromotion": False,
+        "protocol": "deterministic_validation_obb_scale_v1",
+        "sourceCohort": "frozen_validation",
+        "sampleCount": len(robustness_records),
+        **(
+            {
+                "meanNormalizedError": float(robustness_stats["mean"]),
+                "medianNormalizedError": float(robustness_stats["median"]),
+                "medianDegradationVsValidation": (
+                    float(robustness_stats["median"] - val_stats["median"])
+                    if val_stats is not None
+                    else None
+                ),
+            }
+            if robustness_stats is not None
+            else {
+                "reason": (
+                    "missing_robustness_cohort"
+                    if not os.path.exists(robustness_xml)
+                    else "empty_robustness_cohort"
+                )
+            }
+        ),
+    }
     stability_gate = _cnn_validation_stability_gate(val_stats)
     heldout_crop_report = _build_heldout_crop_report(
         model,
@@ -2549,6 +2851,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         train_records,
         val_records,
         test_records,
+        robustness_records,
         landmark_keys=landmark_keys,
         source_ids_by_path=source_ids_by_path,
         expected=effective_dataset,
@@ -2598,6 +2901,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "stop_reason": stop_reason,
         "early_stopping_available": validation_available,
         "validation_stability_gate": stability_gate,
+        "robustness_evaluation": robustness_evaluation,
         "source_counts": {
             "train": int(train_source_count),
             "val": int(val_source_count),
@@ -2673,12 +2977,12 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     baseline_model_id = (
         str(baseline_record.get("modelId")) if baseline_record else None
     )
+    lineage_split_paths = [os.path.join(debug_dir, f"split_info_{tag}.json")]
+    if split_meta.get("strategy") == "legacy_train_xml_resplit":
+        lineage_split_paths.append(legacy_assignment_path)
     lineage_payload = lineage.build_run_lineage(
         project_root,
-        split_paths=[
-            os.path.join(debug_dir, f"split_info_{tag}.json"),
-            os.path.join(debug_dir, "cohorts", "cnn_validation_v1.json"),
-        ],
+        split_paths=lineage_split_paths,
         # This trainer constructs a fresh torchvision backbone for every run;
         # it does not load the prior BioVision artifact.  Keep the prior active
         # model solely as the promotion baseline and record the real weight
@@ -2728,6 +3032,12 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
         "effectiveDatasetRevision": effective_dataset["revision"],
         "trainingProtocolRevision": training_protocol["revision"],
         "promotionPolicy": _cnn_promotion_policy(),
+        "robustnessMeanError": (
+            float(robustness_stats["mean"]) if robustness_stats is not None else None
+        ),
+        "robustnessMedianError": (
+            float(robustness_stats["median"]) if robustness_stats is not None else None
+        ),
     }
     artifact_manifest_path = os.path.join(artifact_dir, "manifest.json")
     lineage.atomic_write_json(
@@ -2776,6 +3086,7 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
             "metrics": metrics,
             "lineage": lineage_payload,
             "validationEvaluatorProtocol": validation_evaluator_protocol,
+            "robustnessEvaluation": robustness_evaluation,
         },
     )
 
@@ -2827,6 +3138,41 @@ def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
     print("PROMOTION_JSON", json.dumps(registry_record.get("promotion", {}), sort_keys=True))
     print(f"CNN run debug saved to: {run_dir}", file=sys.stderr)
     return results
+
+
+def train_cnn_model(project_root, tag, epochs=None, lr=None, batch_size=None,
+                    model_variant="simplebaseline", device_override=None,
+                    seed=CNN_DEFAULT_RUN_SEED):
+    """Run CNN training and durably finalize any post-preflight failure."""
+    run_context = {}
+    try:
+        return _train_cnn_model_impl(
+            project_root,
+            tag,
+            epochs=epochs,
+            lr=lr,
+            batch_size=batch_size,
+            model_variant=model_variant,
+            device_override=device_override,
+            seed=seed,
+            _run_context=run_context,
+        )
+    except Exception as exc:
+        run_dir = run_context.get("run_dir")
+        if run_dir:
+            try:
+                dio.write_failed_run_manifest(
+                    run_dir,
+                    model_type="cnn",
+                    tag=run_context.get("tag", tag),
+                    project_root=run_context.get("project_root", project_root),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    traceback_text=traceback.format_exc(),
+                )
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":

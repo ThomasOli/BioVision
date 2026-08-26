@@ -36,7 +36,9 @@ from bv_utils.orientation_utils import (
 
 OBB_SPLIT_ASSIGNMENTS_VERSION = 2
 OBB_LEGACY_SPLIT_ASSIGNMENTS_VERSION = 1
-OBB_EXPORT_MANIFEST_VERSION = 2
+OBB_EXPORT_MANIFEST_VERSION = 4
+OBB_DIRECTIONAL_VALIDATION_MIRROR_VERSION = 1
+OBB_CLASS_BALANCED_TRAINING_DERIVATIVE_VERSION = 1
 MAX_REAL_OBB_PADDING_RATIO = 2.0
 MAX_REAL_OBB_PADDING_PIXELS = 8192
 MAX_REAL_OBB_RIGHT_ANGLE_COSINE = 0.10
@@ -592,134 +594,8 @@ def _get_box_explicit_orientation(box_dict, orientation_policy=None, minimum_hin
     return None
 
 
-def _compute_box_orientation(box_dict, head_id, tail_id):
-    """
-    Determine left/right specimen orientation from box landmarks.
-
-    Returns:
-      "left" | "right" | None
-    """
-    explicit = _get_box_explicit_orientation(box_dict, {"mode": "directional"})
-    if explicit in {"left", "right"}:
-        return explicit
-
-    landmarks = [
-        lm for lm in box_dict.get("landmarks", [])
-        if not lm.get("isSkipped")
-        and lm.get("x", -1) >= 0
-        and lm.get("y", -1) >= 0
-    ]
-    if len(landmarks) < 2:
-        return None
-
-    head_lm = None
-    if head_id is not None:
-        head_lm = next((lm for lm in landmarks if int(lm.get("id", -1)) == int(head_id)), None)
-    if head_lm is None:
-        try:
-            head_lm = min(landmarks, key=lambda lm: int(lm.get("id", 0)))
-        except Exception:
-            return None
-
-    tail_lm = None
-    if tail_id is not None:
-        tail_lm = next((lm for lm in landmarks if int(lm.get("id", -1)) == int(tail_id)), None)
-    if tail_lm is None:
-        others = [lm for lm in landmarks if int(lm.get("id", -99999)) != int(head_lm.get("id", -99998))]
-        if not others:
-            return None
-        hx, hy = float(head_lm["x"]), float(head_lm["y"])
-        tail_lm = max(others, key=lambda lm: math.hypot(float(lm["x"]) - hx, float(lm["y"]) - hy))
-
-    return "left" if float(head_lm["x"]) < float(tail_lm["x"]) else "right"
-
-
 def _resolve_bilateral_class_axis(orientation_policy):
     return "vertical_obb"
-
-
-def _get_box_vertical_axis(box_dict):
-    obb_corners = box_dict.get("obbCorners") or box_dict.get("obb_corners")
-    if isinstance(obb_corners, list) and len(obb_corners) == 4:
-        try:
-            cp0, cp1, cp2, cp3 = [
-                (float(point[0]), float(point[1])) for point in obb_corners
-            ]
-        except Exception:
-            cp0 = cp1 = cp2 = cp3 = None
-    else:
-        cp0 = cp1 = cp2 = cp3 = None
-
-    if cp0 is None:
-        xyxy = _box_xyxy_from_xywh_box(box_dict) or _box_xyxy_from_meta_box(box_dict)
-        if xyxy is None:
-            return None
-        left, top, right, bottom = xyxy
-        cp0 = (left, top)
-        cp1 = (right, top)
-        cp2 = (right, bottom)
-        cp3 = (left, bottom)
-
-    center_x = (cp0[0] + cp1[0] + cp2[0] + cp3[0]) / 4.0
-    center_y = (cp0[1] + cp1[1] + cp2[1] + cp3[1]) / 4.0
-    top_mid_x = (cp0[0] + cp1[0]) / 2.0
-    top_mid_y = (cp0[1] + cp1[1]) / 2.0
-    up_x = top_mid_x - center_x
-    up_y = top_mid_y - center_y
-    mag = math.hypot(up_x, up_y)
-    if mag <= 1e-6:
-        return None
-    return (center_x, center_y), (up_x / mag, up_y / mag)
-
-
-def _resolve_landmark_centroid(box_dict, landmark_ids):
-    if not landmark_ids:
-        return None
-    pts = []
-    for lm in box_dict.get("landmarks", []):
-        if lm.get("isSkipped"):
-            continue
-        lm_id = _safe_int(lm.get("id"), None)
-        x = _safe_float(lm.get("x"), None)
-        y = _safe_float(lm.get("y"), None)
-        if lm_id is None or x is None or y is None:
-            continue
-        if int(lm_id) in landmark_ids:
-            pts.append((float(x), float(y)))
-    if not pts:
-        return None
-    return (
-        sum(point[0] for point in pts) / float(len(pts)),
-        sum(point[1] for point in pts) / float(len(pts)),
-    )
-
-
-def _compute_box_bilateral_orientation(box_dict, head_id, tail_id, orientation_policy=None):
-    explicit = _get_box_explicit_orientation(
-        box_dict,
-        {"mode": "bilateral", "bilateralClassAxis": "vertical_obb"},
-    )
-    if explicit in {"up", "down"}:
-        return explicit
-
-    anterior_ids = set((orientation_policy or {}).get("anteriorAnchorIds") or [])
-    posterior_ids = set((orientation_policy or {}).get("posteriorAnchorIds") or [])
-    head_xy = _resolve_landmark_centroid(box_dict, anterior_ids)
-    tail_xy = _resolve_landmark_centroid(box_dict, posterior_ids)
-    points = (head_xy, tail_xy) if head_xy and tail_xy else _extract_head_tail_points(box_dict, head_id, tail_id)
-    if not points:
-        return None
-    axis = _get_box_vertical_axis(box_dict)
-    if axis is None:
-        return "up" if float(points[0][1]) < float(points[1][1]) else "down"
-
-    (center_x, center_y), (up_x, up_y) = axis
-    head_xy, tail_xy = points
-    head_proj = (head_xy[0] - center_x) * up_x + (head_xy[1] - center_y) * up_y
-    tail_proj = (tail_xy[0] - center_x) * up_x + (tail_xy[1] - center_y) * up_y
-    if abs(head_proj - tail_proj) <= 1e-6:
-        return "up" if float(head_xy[1]) < float(tail_xy[1]) else "down"
-    return "up" if head_proj > tail_proj else "down"
 
 
 def _extract_head_tail_points(box_dict, head_id, tail_id):
@@ -736,64 +612,27 @@ def _extract_head_tail_points(box_dict, head_id, tail_id):
     if len(landmarks) < 2:
         return None
 
-    head_lm = None
-    if head_id is not None:
-        head_lm = next((lm for lm in landmarks if int(lm.get("id", -1)) == int(head_id)), None)
-    if head_lm is None:
-        try:
-            head_lm = min(landmarks, key=lambda lm: int(lm.get("id", 0)))
-        except Exception:
-            return None
+    if head_id is None or tail_id is None:
+        return None
 
-    tail_lm = None
-    if tail_id is not None:
-        tail_lm = next((lm for lm in landmarks if int(lm.get("id", -1)) == int(tail_id)), None)
+    head_lm = next(
+        (lm for lm in landmarks if int(lm.get("id", -1)) == int(head_id)),
+        None,
+    )
+    if head_lm is None:
+        return None
+
+    tail_lm = next(
+        (lm for lm in landmarks if int(lm.get("id", -1)) == int(tail_id)),
+        None,
+    )
     if tail_lm is None:
-        others = [lm for lm in landmarks if int(lm.get("id", -99999)) != int(head_lm.get("id", -99998))]
-        if not others:
-            return None
-        hx, hy = float(head_lm["x"]), float(head_lm["y"])
-        tail_lm = max(others, key=lambda lm: math.hypot(float(lm["x"]) - hx, float(lm["y"]) - hy))
+        return None
 
     return (
         (float(head_lm["x"]), float(head_lm["y"])),
         (float(tail_lm["x"]), float(tail_lm["y"])),
     )
-
-
-def _compute_box_directional_orientation(box_dict, orientation_policy=None, head_id=None, tail_id=None):
-    explicit = _get_box_explicit_orientation(box_dict, {"mode": "directional"})
-    if explicit in {"left", "right"}:
-        return explicit
-
-    anterior_ids = set((orientation_policy or {}).get("anteriorAnchorIds") or [])
-    posterior_ids = set((orientation_policy or {}).get("posteriorAnchorIds") or [])
-    head_xy = _resolve_landmark_centroid(box_dict, anterior_ids)
-    tail_xy = _resolve_landmark_centroid(box_dict, posterior_ids)
-    if head_xy is not None and tail_xy is not None:
-        obb_corners = box_dict.get("obbCorners") or box_dict.get("obb_corners")
-        if isinstance(obb_corners, list) and len(obb_corners) == 4:
-            try:
-                cp0, cp1, cp2, cp3 = [(float(point[0]), float(point[1])) for point in obb_corners]
-                center_x = (cp0[0] + cp1[0] + cp2[0] + cp3[0]) / 4.0
-                center_y = (cp0[1] + cp1[1] + cp2[1] + cp3[1]) / 4.0
-                right_mid_x = (cp1[0] + cp2[0]) / 2.0
-                right_mid_y = (cp1[1] + cp2[1]) / 2.0
-                axis_x = right_mid_x - center_x
-                axis_y = right_mid_y - center_y
-                mag = math.hypot(axis_x, axis_y)
-                if mag > 1e-6:
-                    axis_x /= mag
-                    axis_y /= mag
-                    head_proj = (head_xy[0] - center_x) * axis_x + (head_xy[1] - center_y) * axis_y
-                    tail_proj = (tail_xy[0] - center_x) * axis_x + (tail_xy[1] - center_y) * axis_y
-                    if abs(head_proj - tail_proj) > 1e-6:
-                        return "left" if head_proj < tail_proj else "right"
-            except Exception:
-                pass
-        return "left" if float(head_xy[0]) < float(tail_xy[0]) else "right"
-
-    return _compute_box_orientation(box_dict, head_id, tail_id)
 
 
 def _norm_path(path_value):
@@ -1135,15 +974,17 @@ def _resolve_obb_class_id(
     Resolve class id used by OBB export.
     Priority:
       1) explicit box.class_id
-      2) stored orientation metadata
-      3) orientation from landmarks (legacy compatibility)
+      2) stored, reviewed OBB orientation metadata
 
-    Directional/bilateral exports fail closed when no trusted class can be
-    resolved; they must never silently label an uncertain specimen as class 0.
+    Directional/bilateral exports fail closed when neither is present. Landmark
+    geometry is intentionally not a direction source: the saved OBB arrow is the
+    native orientation contract.
     """
     if not orientation_class_enabled:
         return 0
 
+    mode = str((orientation_policy or {}).get("mode", "directional")).strip().lower()
+    bilateral_axis = _resolve_bilateral_class_axis(orientation_policy)
     orientation_override = str(box.get("orientation_override", "")).strip().lower()
     if require_trusted and orientation_override == "uncertain":
         raise ValueError(
@@ -1162,14 +1003,31 @@ def _resolve_obb_class_id(
                 ) from exc
         else:
             if not require_trusted or resolved_class_id in {0, 1}:
+                if require_trusted:
+                    explicit_orientation = _get_box_explicit_orientation(
+                        box,
+                        orientation_policy,
+                    )
+                    expected_orientation = (
+                        ("up", "down")[resolved_class_id]
+                        if mode == "bilateral" and bilateral_axis == "vertical_obb"
+                        else ("left", "right")[resolved_class_id]
+                    )
+                    if (
+                        explicit_orientation is not None
+                        and explicit_orientation != expected_orientation
+                    ):
+                        raise ValueError(
+                            f"explicit class_id {resolved_class_id} conflicts with "
+                            f"orientation metadata {explicit_orientation!r}; expected "
+                            f"{expected_orientation!r}"
+                        )
                 return resolved_class_id
         if require_trusted:
             raise ValueError(
                 f"explicit class_id {resolved_class_id} is out of range; expected 0 or 1"
             )
 
-    mode = str((orientation_policy or {}).get("mode", "directional")).strip().lower()
-    bilateral_axis = _resolve_bilateral_class_axis(orientation_policy)
     explicit_orientation = _get_box_explicit_orientation(box, orientation_policy)
     if mode == "bilateral" and bilateral_axis == "vertical_obb":
         if explicit_orientation == "down":
@@ -1183,34 +1041,14 @@ def _resolve_obb_class_id(
             return 0
 
     if mode == "bilateral":
-        orientation = _compute_box_bilateral_orientation(box, head_id, tail_id)
-        if orientation == "down":
-            return 1
-        if orientation == "up":
-            return 0
-        if require_trusted:
-            raise ValueError(
-                "could not resolve a trusted up/down orientation from accepted metadata "
-                "or landmarks; review this box before training"
-            )
-        return 0
-
-    orientation = _compute_box_directional_orientation(
-        box,
-        orientation_policy=orientation_policy,
-        head_id=head_id,
-        tail_id=tail_id,
-    )
-    if orientation == "right":
-        return 1
-    if orientation == "left":
-        return 0
-    if require_trusted:
         raise ValueError(
-            "could not resolve a trusted left/right orientation from accepted metadata "
-            "or landmarks; review this box before training"
+            "could not resolve a trusted up/down orientation from the saved OBB arrow; "
+            "review this box before training"
         )
-    return 0
+    raise ValueError(
+        "could not resolve a trusted left/right orientation from the saved OBB arrow; "
+        "review this box before training"
+    )
 
 
 def _sample_class_histogram(
@@ -2133,7 +1971,20 @@ def _select_and_persist_obb_splits(
     known_groups = {group_id for group_id in group_indices if group_id in group_assignments}
     new_groups = [group_id for group_id in group_indices if group_id not in known_groups]
 
+    orientation_mode = str((orientation_policy or {}).get("mode", "invariant")).strip().lower()
+    directional_validation_mirror_enabled = bool(
+        orientation_class_enabled and orientation_mode == "directional"
+    )
     expected_validation_class_ids = {0, 1} if orientation_class_enabled else {0}
+
+    def _evaluation_class_ids(real_class_ids):
+        effective = set(real_class_ids)
+        if directional_validation_mirror_enabled:
+            effective.update(
+                1 - class_id for class_id in real_class_ids if class_id in {0, 1}
+            )
+        return effective
+
     group_class_ids = {}
     for group_id, indices in group_indices.items():
         class_ids = set()
@@ -2159,9 +2010,10 @@ def _select_and_persist_obb_splits(
         validation_groups = {
             group_id for group_id, split in assignments.items() if split == "validation"
         }
-        observed_classes = set()
+        real_observed_classes = set()
         for group_id in validation_groups:
-            observed_classes.update(group_class_ids.get(group_id, set()))
+            real_observed_classes.update(group_class_ids.get(group_id, set()))
+        observed_classes = _evaluation_class_ids(real_observed_classes)
         complete = bool(
             float(val_ratio) <= 0
             or (
@@ -2198,6 +2050,7 @@ def _select_and_persist_obb_splits(
             chosen.append(selected)
             remaining.remove(selected)
             observed.update(group_class_ids.get(selected, set()))
+            observed = _evaluation_class_ids(observed)
 
         # Independent evidence is required even when one group contains every
         # class. Fill only to two groups during evaluator bootstrap.
@@ -2210,6 +2063,7 @@ def _select_and_persist_obb_splits(
             chosen.append(selected)
             remaining.remove(selected)
             observed.update(group_class_ids.get(selected, set()))
+            observed = _evaluation_class_ids(observed)
         return chosen
 
     if not profile_had_assignments:
@@ -2397,6 +2251,9 @@ def _select_and_persist_obb_splits(
         final_validation_classes,
         validation_evaluator_complete,
     ) = _validation_readiness(group_assignments)
+    final_validation_real_classes = set()
+    for group_id in final_validation_groups:
+        final_validation_real_classes.update(group_class_ids.get(group_id, set()))
     profile["sample_count_at_last_export"] = len(samples)
     profile["train_count_at_last_export"] = len(train_set)
     profile["val_count_at_last_export"] = len(val_set)
@@ -2410,6 +2267,19 @@ def _select_and_persist_obb_splits(
     profile["validation_group_count"] = len(final_validation_groups)
     profile["validation_expected_class_ids"] = sorted(expected_validation_class_ids)
     profile["validation_observed_class_ids"] = sorted(final_validation_classes)
+    profile["validation_real_observed_class_ids"] = sorted(
+        final_validation_real_classes
+    )
+    profile["validation_derivation"] = (
+        {
+            "type": "horizontal_mirror",
+            "version": OBB_DIRECTIONAL_VALIDATION_MIRROR_VERSION,
+            "source": "frozen_real_validation",
+            "class_transform": "binary_swap",
+        }
+        if directional_validation_mirror_enabled
+        else None
+    )
     profile["validation_missing_class_ids"] = sorted(
         expected_validation_class_ids - final_validation_classes
     )
@@ -2479,6 +2349,10 @@ def _select_and_persist_obb_splits(
         expected_validation_class_ids
     )
     split_stats["validation_observed_class_ids"] = sorted(final_validation_classes)
+    split_stats["validation_real_observed_class_ids"] = sorted(
+        final_validation_real_classes
+    )
+    split_stats["validation_derivation"] = profile["validation_derivation"]
     split_stats["validation_missing_class_ids"] = sorted(
         expected_validation_class_ids - final_validation_classes
     )
@@ -2619,6 +2493,7 @@ def _augment_segment_chip(
     rot_range=(-60.0, 60.0),
     flip_prob=0.5,
     head_tail_chip=None,
+    rotation_enabled=True,
 ):
     """
     Apply orientation and shape augmentations to one chip.
@@ -2685,7 +2560,9 @@ def _augment_segment_chip(
         points[:, 1] *= sy
 
     # Random rotation with expanded canvas to avoid clipping.
-    if orientation_schema == "bilateral":
+    if not rotation_enabled:
+        angle = 0.0
+    elif orientation_schema == "bilateral":
         angle = 180.0 if rng.random() < 0.5 else 0.0
     elif orientation_schema == "axial":
         angle = 180.0 if rng.random() < 0.5 else 0.0
@@ -2987,6 +2864,104 @@ def _apply_schema_class_transform(base_class_id, aug_info, orientation_schema):
     return class_id
 
 
+def _mirror_directional_obb_label_lines(lines):
+    """Mirror exported directional OBB labels without consulting landmarks.
+
+    The saved arrow/class is the native direction contract. A horizontal mirror
+    reverses that class and reverses the vertex winding back to the canonical
+    [LT, RT, RB, LB] ordering expected by the existing exporter.
+    """
+    mirrored_lines = []
+    class_histogram = {}
+    for raw_line in lines:
+        fields = str(raw_line or "").strip().split()
+        if not fields:
+            continue
+        if len(fields) != 9:
+            raise ValueError(
+                "Directional validation mirroring requires YOLO OBB labels with "
+                "one class ID and four normalized corner pairs."
+            )
+        try:
+            class_id = int(fields[0])
+            coordinates = [float(value) for value in fields[1:]]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Directional validation mirroring encountered a malformed OBB label."
+            ) from exc
+        if class_id not in {0, 1}:
+            raise ValueError(
+                f"Directional validation mirroring requires class IDs in {{0, 1}}, got {class_id}."
+            )
+        points = [
+            (coordinates[index], coordinates[index + 1])
+            for index in range(0, 8, 2)
+        ]
+        reflected = [
+            (_clamp(1.0 - x, 0.0, 1.0), _clamp(y, 0.0, 1.0))
+            for x, y in points
+        ]
+        # Reflection reverses winding. Reorder mirrored [RT, LT, LB, RB] to
+        # canonical [LT, RT, RB, LB] while preserving the same physical box.
+        canonical = [reflected[index] for index in (1, 0, 3, 2)]
+        mirrored_class_id = 1 - class_id
+        flattened = [coordinate for point in canonical for coordinate in point]
+        mirrored_lines.append(
+            f"{mirrored_class_id} "
+            + " ".join(f"{value:.6f}" for value in flattened)
+        )
+        class_histogram[mirrored_class_id] = (
+            class_histogram.get(mirrored_class_id, 0) + 1
+        )
+    return mirrored_lines, class_histogram
+
+
+def _rotate_bilateral_obb_label_lines_180(lines):
+    """Rotate bilateral OBB labels by 180 degrees and swap the pole class."""
+    rotated_lines = []
+    class_histogram = {}
+    for raw_line in lines:
+        fields = str(raw_line or "").strip().split()
+        if not fields:
+            continue
+        if len(fields) != 9:
+            raise ValueError(
+                "Bilateral training rotation requires YOLO OBB labels with "
+                "one class ID and four normalized corner pairs."
+            )
+        try:
+            class_id = int(fields[0])
+            coordinates = [float(value) for value in fields[1:]]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Bilateral training rotation encountered a malformed OBB label."
+            ) from exc
+        if class_id not in {0, 1}:
+            raise ValueError(
+                f"Bilateral training rotation requires class IDs in {{0, 1}}, got {class_id}."
+            )
+        points = [
+            (coordinates[index], coordinates[index + 1])
+            for index in range(0, 8, 2)
+        ]
+        transformed = [
+            (_clamp(1.0 - x, 0.0, 1.0), _clamp(1.0 - y, 0.0, 1.0))
+            for x, y in points
+        ]
+        # A half turn preserves winding but shifts the canonical starting corner.
+        canonical = [transformed[index] for index in (2, 3, 0, 1)]
+        rotated_class_id = 1 - class_id
+        flattened = [coordinate for point in canonical for coordinate in point]
+        rotated_lines.append(
+            f"{rotated_class_id} "
+            + " ".join(f"{value:.6f}" for value in flattened)
+        )
+        class_histogram[rotated_class_id] = (
+            class_histogram.get(rotated_class_id, 0) + 1
+        )
+    return rotated_lines, class_histogram
+
+
 def _compute_obb_from_placed_chip(aug_rgba, offset_x, offset_y, canvas_w, canvas_h, force_axis_aligned=False):
     """Return 8 normalized corner coords (x1 y1 x2 y2 x3 y3 x4 y4) for OBB label."""
     alpha = aug_rgba[:, :, 3]
@@ -3054,6 +3029,7 @@ def _generate_synthetic_obb_images(
     n_per_segment=15,
     max_objects=4,
     max_images=None,
+    max_instances=None,
     seed=0,
     split="train",
     manifest=None,
@@ -3102,6 +3078,13 @@ def _generate_synthetic_obb_images(
     for i in range(total_iters):
         if max_images is not None and n_generated >= int(max_images):
             break
+        remaining_instances = (
+            None
+            if max_instances is None
+            else max(0, int(max_instances) - n_instances_generated)
+        )
+        if remaining_instances == 0:
+            break
 
         canvas_size = rng.choice([768, 896, 1024])
         bg = _random_canvas_background(canvas_size, canvas_size, rng)
@@ -3113,6 +3096,8 @@ def _generate_synthetic_obb_images(
             target_objects = rng.randint(2, max(2, int(max_objects)))
         else:
             target_objects = 1
+        if remaining_instances is not None:
+            target_objects = min(target_objects, remaining_instances)
 
         seg_indices = list(range(len(segments)))
         rng.shuffle(seg_indices)
@@ -3140,6 +3125,9 @@ def _generate_synthetic_obb_images(
                 orientation_schema=orientation_schema,
                 rot_range=rotation_range,
                 head_tail_chip=head_tail_chip,
+                # Ultralytics supplies the bounded small-angle transform. Keep
+                # offline transforms only where they encode class/pole semantics.
+                rotation_enabled=orientation_schema in {"bilateral", "axial"},
             )
 
             class_id = _apply_schema_class_transform(base_class_id, aug_info, orientation_schema)
@@ -3185,6 +3173,8 @@ def _generate_synthetic_obb_images(
             })
 
         min_required = 2 if len(segments) > 1 else 1
+        if remaining_instances is not None:
+            min_required = min(min_required, remaining_instances)
         if len(labels) < min_required:
             continue
         if max_images is not None and n_generated >= int(max_images):
@@ -3204,6 +3194,11 @@ def _generate_synthetic_obb_images(
     return {
         "num_generated": n_generated,
         "num_instances_generated": n_instances_generated,
+        "max_images": None if max_images is None else int(max_images),
+        "max_instances": None if max_instances is None else int(max_instances),
+        "offline_rotation_policy": (
+            "semantic_only" if orientation_schema in {"bilateral", "axial"} else "disabled"
+        ),
         "class_histogram": synthetic_class_hist,
         **seg_stats,
     }
@@ -3586,13 +3581,240 @@ def export_obb_dataset(
                 {"phase": "write_real", "current": i + 1, "total": total_samples},
             )
 
+    # Preserve the naturally observed histogram for scientific reporting, then
+    # add one deterministic train-only class counterpart per real train image.
+    # This guarantees both detector classes receive equal effective exposure
+    # even when a small source cohort happens to contain only one orientation.
+    training_derivatives = []
+    training_derivative_histogram = {}
+    if orientation_class_enabled and resolved_mode in {"directional", "bilateral"}:
+        natural_train_histogram = real_class_hist_by_split["train"]
+        missing_natural_classes = sorted({0, 1} - set(natural_train_histogram))
+        if missing_natural_classes:
+            warnings.append(
+                "Natural real training annotations lack orientation class IDs "
+                f"{missing_natural_classes}; deterministic train-only derivatives provide "
+                "model exposure, but additional natural examples are still recommended."
+            )
+        training_entries = sorted(
+            (entry for entry in real_export_manifest if entry["split"] == "train"),
+            key=lambda entry: entry["sample_id"],
+        )
+        for entry in training_entries:
+            source_image_path = os.path.join(out_dir, entry["exported_image"])
+            source_label_path = os.path.join(out_dir, entry["exported_label"])
+            source_image = safe_imread(source_image_path)
+            if source_image is None or source_image.size == 0:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Could not decode a real training image while creating its "
+                        f"class-balanced derivative: {entry['exported_image']}"
+                    ),
+                    "warnings": warnings,
+                }
+            try:
+                with open(source_label_path, "r", encoding="utf-8") as handle:
+                    source_lines = [line.strip() for line in handle if line.strip()]
+                if resolved_mode == "directional":
+                    derivative_image = cv2.flip(source_image, 1)
+                    derivative_lines, derivative_histogram = _mirror_directional_obb_label_lines(
+                        source_lines
+                    )
+                    transform = "horizontal_mirror"
+                else:
+                    derivative_image = cv2.rotate(source_image, cv2.ROTATE_180)
+                    derivative_lines, derivative_histogram = _rotate_bilateral_obb_label_lines_180(
+                        source_lines
+                    )
+                    transform = "rotate_180"
+            except (OSError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Could not create a deterministic class-balanced training derivative for "
+                        f"'{entry['source_image']}': {exc}"
+                    ),
+                    "warnings": warnings,
+                }
+
+            source_name = os.path.basename(entry["exported_image"])
+            source_stem, source_extension = os.path.splitext(source_name)
+            derivative_stem = (
+                f"__train_class_balance_v{OBB_CLASS_BALANCED_TRAINING_DERIVATIVE_VERSION}__"
+                f"{source_stem}"
+            )
+            derivative_image_path = os.path.join(
+                out_dir, "images", "train", derivative_stem + source_extension
+            )
+            derivative_label_path = os.path.join(
+                out_dir, "labels", "train", derivative_stem + ".txt"
+            )
+            if not safe_imwrite(derivative_image_path, derivative_image):
+                return {
+                    "ok": False,
+                    "error": f"Could not write training derivative '{derivative_image_path}'.",
+                    "warnings": warnings,
+                }
+            try:
+                with open(derivative_label_path, "w", encoding="utf-8") as handle:
+                    handle.write("\n".join(derivative_lines) + "\n" if derivative_lines else "")
+            except OSError as exc:
+                return {
+                    "ok": False,
+                    "error": f"Could not write training derivative labels '{derivative_label_path}': {exc}",
+                    "warnings": warnings,
+                }
+            _merge_class_histograms(training_derivative_histogram, derivative_histogram)
+            training_derivatives.append(
+                {
+                    "derivative_id": hashlib.sha256(
+                        (
+                            f"obb-class-balanced-training-v"
+                            f"{OBB_CLASS_BALANCED_TRAINING_DERIVATIVE_VERSION}\0"
+                            f"{entry['sample_id']}\0{resolved_mode}"
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "source_sample_id": entry["sample_id"],
+                    "source_group_id": entry["group_id"],
+                    "transform": transform,
+                    "class_transform": "binary_swap",
+                    "image": os.path.relpath(derivative_image_path, out_dir).replace("\\", "/"),
+                    "image_sha256": _sha256_file(derivative_image_path),
+                    "label": os.path.relpath(derivative_label_path, out_dir).replace("\\", "/"),
+                    "label_sha256": _sha256_file(derivative_label_path),
+                    "class_histogram": {
+                        str(class_id): int(count)
+                        for class_id, count in sorted(derivative_histogram.items())
+                    },
+                }
+            )
+
+    # Directional schemas use the user-selected OBB arrow/class as their native
+    # direction. Mirror each frozen real validation image deterministically so
+    # the evaluator measures the opposite class without requiring duplicate
+    # manual annotations. These derivatives remain validation-only and retain
+    # their source group identity in the cohort manifest.
+    evaluator_class_hist_by_split = {
+        split_name: dict(histogram)
+        for split_name, histogram in real_class_hist_by_split.items()
+    }
+    validation_derivatives = []
+    if orientation_class_enabled and resolved_mode == "directional":
+        validation_entries = sorted(
+            (
+                entry
+                for entry in real_export_manifest
+                if entry["split"] == "val"
+            ),
+            key=lambda entry: entry["sample_id"],
+        )
+        for entry in validation_entries:
+            source_image_path = os.path.join(out_dir, entry["exported_image"])
+            source_label_path = os.path.join(out_dir, entry["exported_label"])
+            source_image = safe_imread(source_image_path)
+            if source_image is None or source_image.size == 0:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Could not decode a frozen validation image while creating its "
+                        f"directional mirror: {entry['exported_image']}"
+                    ),
+                    "warnings": warnings,
+                }
+            try:
+                with open(source_label_path, "r", encoding="utf-8") as handle:
+                    source_lines = [line.strip() for line in handle if line.strip()]
+                mirrored_lines, mirrored_histogram = _mirror_directional_obb_label_lines(
+                    source_lines
+                )
+            except (OSError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Could not create a deterministic directional validation mirror for "
+                        f"'{entry['source_image']}': {exc}"
+                    ),
+                    "warnings": warnings,
+                }
+
+            source_export_name = os.path.basename(entry["exported_image"])
+            source_stem, source_extension = os.path.splitext(source_export_name)
+            derivative_stem = (
+                f"__eval_directional_mirror_v{OBB_DIRECTIONAL_VALIDATION_MIRROR_VERSION}__"
+                f"{source_stem}"
+            )
+            derivative_image_path = os.path.join(
+                out_dir,
+                "images",
+                "val",
+                derivative_stem + source_extension,
+            )
+            derivative_label_path = os.path.join(
+                out_dir,
+                "labels",
+                "val",
+                derivative_stem + ".txt",
+            )
+            if not safe_imwrite(derivative_image_path, cv2.flip(source_image, 1)):
+                return {
+                    "ok": False,
+                    "error": (
+                        "Could not write deterministic directional validation mirror "
+                        f"'{derivative_image_path}'."
+                    ),
+                    "warnings": warnings,
+                }
+            try:
+                with open(derivative_label_path, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        "\n".join(mirrored_lines) + "\n" if mirrored_lines else ""
+                    )
+            except OSError as exc:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Could not write deterministic directional validation labels "
+                        f"'{derivative_label_path}': {exc}"
+                    ),
+                    "warnings": warnings,
+                }
+            for class_id, count in mirrored_histogram.items():
+                evaluator_histogram = evaluator_class_hist_by_split["val"]
+                evaluator_histogram[int(class_id)] = (
+                    evaluator_histogram.get(int(class_id), 0) + int(count)
+                )
+            validation_derivatives.append(
+                {
+                    "derivative_id": hashlib.sha256(
+                        (
+                            f"obb-directional-validation-mirror-v"
+                            f"{OBB_DIRECTIONAL_VALIDATION_MIRROR_VERSION}\0"
+                            f"{entry['sample_id']}"
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "source_sample_id": entry["sample_id"],
+                    "source_group_id": entry["group_id"],
+                    "transform": "horizontal_mirror",
+                    "class_transform": "binary_swap",
+                    "image": os.path.relpath(derivative_image_path, out_dir).replace("\\", "/"),
+                    "image_sha256": _sha256_file(derivative_image_path),
+                    "label": os.path.relpath(derivative_label_path, out_dir).replace("\\", "/"),
+                    "label_sha256": _sha256_file(derivative_label_path),
+                    "class_histogram": {
+                        str(class_id): int(count)
+                        for class_id, count in sorted(mirrored_histogram.items())
+                    },
+                }
+            )
+
     # Write dataset.yaml
     nc = 2 if orientation_class_enabled else 1
     names = class_names if orientation_class_enabled else ["specimen"]
     if orientation_class_enabled:
         expected_class_ids = set(range(nc))
         for split_name, scientific_name in (("val", "validation"), ("test", "test")):
-            split_hist = real_class_hist_by_split[split_name]
+            split_hist = evaluator_class_hist_by_split[split_name]
             split_image_count = sum(
                 1 for entry in real_export_manifest if entry["split"] == split_name
             )
@@ -3600,7 +3822,8 @@ def export_obb_dataset(
             if split_image_count > 0 and missing_classes:
                 warnings.append(
                     f"Frozen {scientific_name} OBB cohort lacks orientation class IDs "
-                    f"{missing_classes}; its class-specific metrics will be incomplete."
+                    f"{missing_classes} after schema-aware evaluation transforms; "
+                    "its class-specific metrics will be incomplete."
                 )
     yaml_path = os.path.join(out_dir, "dataset.yaml")
     val_split_path = "images/train" if not val_set else "images/val"
@@ -3630,6 +3853,11 @@ def export_obb_dataset(
     n_real_train = sum(
         1 for i in range(len(samples)) if i not in val_set and i not in test_set
     )
+    n_real_train_instances = sum(
+        int(entry.get("boxes_exported", 0))
+        for entry in real_export_manifest
+        if entry["split"] == "train"
+    )
     max_synth = max(0, int(n_real_train * SYNTHETIC_RATIO))
 
     synth_stats = {"num_generated": 0, "num_instances_generated": 0}
@@ -3656,6 +3884,7 @@ def export_obb_dataset(
             n_per_segment=15,
             max_objects=4,
             max_images=max_synth,
+            max_instances=n_real_train_instances,
             seed=seed + 1,
             split="train",
             manifest=synth_manifest,
@@ -3691,6 +3920,37 @@ def export_obb_dataset(
             "Dataset will use real annotated images only."
         )
         report_progress("Synthetic augmentation skipped.", 8.9, {"phase": "synthetic_skipped"})
+
+    effective_training_class_histogram = dict(real_class_hist_by_split["train"])
+    _merge_class_histograms(
+        effective_training_class_histogram,
+        training_derivative_histogram,
+    )
+    _merge_class_histograms(
+        effective_training_class_histogram,
+        {
+            int(class_id): int(count)
+            for class_id, count in dict(synth_stats.get("class_histogram", {})).items()
+        },
+    )
+    if orientation_class_enabled:
+        missing_effective_classes = sorted(
+            {0, 1}
+            - {
+                int(class_id)
+                for class_id, count in effective_training_class_histogram.items()
+                if int(count) > 0
+            }
+        )
+        if missing_effective_classes:
+            return {
+                "ok": False,
+                "error": (
+                    "Effective OBB training data lacks required orientation class IDs "
+                    f"{missing_effective_classes}; verify the saved OBB direction classes."
+                ),
+                "warnings": warnings,
+            }
 
     synthetic_files = []
     synthetic_image_dir = os.path.join(out_dir, "images", "train")
@@ -3738,6 +3998,28 @@ def export_obb_dataset(
         "synthetic_manifest_sha256": (
             _sha256_file(synth_manifest_path) if synth_manifest_path else None
         ),
+        "validation_derivative_files": [
+            {
+                "derivative_id": entry["derivative_id"],
+                "source_sample_id": entry["source_sample_id"],
+                "image_sha256": entry["image_sha256"],
+                "label_sha256": entry["label_sha256"],
+                "transform": entry["transform"],
+                "class_transform": entry["class_transform"],
+            }
+            for entry in validation_derivatives
+        ],
+        "training_derivative_files": [
+            {
+                "derivative_id": entry["derivative_id"],
+                "source_sample_id": entry["source_sample_id"],
+                "image_sha256": entry["image_sha256"],
+                "label_sha256": entry["label_sha256"],
+                "transform": entry["transform"],
+                "class_transform": entry["class_transform"],
+            }
+            for entry in training_derivatives
+        ],
     }
     effective_dataset = {
         **effective_dataset_material,
@@ -3747,6 +4029,12 @@ def export_obb_dataset(
     def build_exported_cohort(split_name, scientific_name, revision, frozen, report_only):
         split_class_histogram = {
             str(class_id): int(real_class_hist_by_split[split_name].get(class_id, 0))
+            for class_id in range(nc)
+        }
+        evaluator_class_histogram = {
+            str(class_id): int(
+                evaluator_class_hist_by_split[split_name].get(class_id, 0)
+            )
             for class_id in range(nc)
         }
         members = sorted(
@@ -3763,19 +4051,38 @@ def export_obb_dataset(
             ),
             key=lambda entry: entry["sample_id"],
         )
+        derivatives = (
+            sorted(validation_derivatives, key=lambda entry: entry["derivative_id"])
+            if split_name == "val"
+            else []
+        )
+        derivation = (
+            {
+                "type": "horizontal_mirror",
+                "version": OBB_DIRECTIONAL_VALIDATION_MIRROR_VERSION,
+                "source": "frozen_real_validation",
+                "class_transform": "binary_swap",
+            }
+            if split_name == "val" and resolved_mode == "directional"
+            else None
+        )
+        format_version = 3 if derivation else 2
         material = {
-            "format_version": 2,
+            "format_version": format_version,
             "split_assignments_version": OBB_SPLIT_ASSIGNMENTS_VERSION,
             "split_profile_key": split_stats.get("profile_key"),
             "cohort": scientific_name,
             "expected_class_count": int(nc),
             "real_class_histogram": split_class_histogram,
+            "evaluator_class_histogram": evaluator_class_histogram,
+            "derivation": derivation,
+            "derivatives": derivatives,
             "members": members,
         }
         material_sha256 = _json_sha256(material)
         normalized_revision = str(revision or "").strip() or None
         return {
-            "format_version": 2,
+            "format_version": format_version,
             "revision": (
                 f"{split_stats.get('profile_key')}@{normalized_revision}"
                 if normalized_revision
@@ -3785,11 +4092,15 @@ def export_obb_dataset(
             "export_manifest_sha256": material_sha256,
             "split_profile_key": split_stats.get("profile_key"),
             "sample_count": len(members),
+            "evaluation_sample_count": len(members) + len(derivatives),
             "group_count": len({entry["group_id"] for entry in members}),
             "expected_class_count": int(nc),
             "real_class_histogram": split_class_histogram,
+            "evaluator_class_histogram": evaluator_class_histogram,
+            "derivation": derivation,
             "frozen": bool(frozen and normalized_revision),
             "report_only": bool(report_only),
+            "derivatives": derivatives,
             "members": members,
         }
 
@@ -3809,7 +4120,7 @@ def export_obb_dataset(
     )
     cohort_manifest_path = os.path.join(out_dir, "cohort_manifest.json")
     cohort_manifest = {
-        "format_version": 2,
+        "format_version": 3 if resolved_mode == "directional" else 2,
         "split_profile_key": split_stats.get("profile_key"),
         "assignment_revision": split_stats.get("assignment_revision"),
         "disjoint": dict(split_stats.get("cohort_disjoint", {})),
@@ -3858,6 +4169,8 @@ def export_obb_dataset(
         "test_cohort_frozen": bool(split_stats.get("test_cohort_frozen", False)),
         "test_cohort": test_cohort,
         "real_images": real_export_manifest,
+        "training_derivatives": training_derivatives,
+        "validation_derivatives": validation_derivatives,
         "synthetic": synth_stats,
         "synthetic_manifest": (
             {
@@ -3869,6 +4182,9 @@ def export_obb_dataset(
         ),
         "effective_dataset": effective_dataset,
         "real_class_histogram_by_split": real_class_hist_by_split,
+        "training_derivative_class_histogram": training_derivative_histogram,
+        "effective_training_class_histogram": effective_training_class_histogram,
+        "evaluator_class_histogram_by_split": evaluator_class_hist_by_split,
     }
     try:
         _atomic_write_json(export_manifest_path, export_manifest)
@@ -3911,5 +4227,10 @@ def export_obb_dataset(
         "warnings": warnings,
         "real_class_histogram": real_class_hist,
         "real_class_histogram_by_split": real_class_hist_by_split,
+        "training_derivative_class_histogram": training_derivative_histogram,
+        "effective_training_class_histogram": effective_training_class_histogram,
         "synthetic_class_histogram": synth_stats.get("class_histogram", {}),
+        "training_derivatives": training_derivatives,
+        "validation_derivatives": validation_derivatives,
+        "evaluator_class_histogram_by_split": evaluator_class_hist_by_split,
     }

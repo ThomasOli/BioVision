@@ -15,6 +15,7 @@ from backend.detection.detect_specimen import (
     detect_multiple_with_yolo,
     detect_with_yolo,
 )
+from backend.detection.detection_utils import normalize_orientation_payload
 
 
 def build_obb(cx, cy, width, height, angle_deg):
@@ -29,6 +30,30 @@ def build_obb(cx, cy, width, height, angle_deg):
         [cx + cos_a * (half_w) - sin_a * (half_h), cy + sin_a * (half_w) + cos_a * (half_h)],
         [cx + cos_a * (-half_w) - sin_a * (half_h), cy + sin_a * (-half_w) + cos_a * (half_h)],
     ]
+
+
+class DetectorOrientationPayloadTests(unittest.TestCase):
+    def test_all_schema_modes_emit_only_their_native_class_contract(self):
+        self.assertEqual(
+            normalize_orientation_payload(1, {"mode": "directional"}),
+            {
+                "class_id": 1,
+                "orientation_hint": {"orientation": "right", "source": "obb_class_id"},
+            },
+        )
+        self.assertEqual(
+            normalize_orientation_payload(1, {"mode": "bilateral", "bilateralClassAxis": "vertical_obb"}),
+            {
+                "class_id": 1,
+                "orientation_hint": {"orientation": "down", "source": "obb_class_id"},
+            },
+        )
+        for mode in ("axial", "invariant"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    normalize_orientation_payload(1, {"mode": mode}),
+                    {"class_id": 0},
+                )
 
 
 class CanonicalizeDetectorObbCornersTests(unittest.TestCase):

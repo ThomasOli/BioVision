@@ -15,6 +15,7 @@ import {
 } from "../state/filesState/fileSlice";
 import Landmark from "./Landmark";
 import { TrainModelDialog } from "./PopUp";
+import { resolveTrainingPipelineGate } from "@/lib/trainingPipelineGate";
 import { DetectionModeSelector, DetectionMode } from "./DetectionModeSelector";
 import type {
   ObbDetectionSettings,
@@ -100,6 +101,44 @@ const getRecommendationReason = (bucket: "starvation" | "balanced" | "deep"): st
   return "Recommended for large datasets";
 };
 
+const summarizeObbCandidateResult = (
+  map50: number | null | undefined,
+  reason: string | undefined,
+  warnings: unknown[]
+): { message: string; missingOrientationClass: boolean } => {
+  const normalizedWarnings = warnings.map((warning) => String(warning || "").trim()).filter(Boolean);
+  const paddingCount = normalizedWarnings.filter((warning) => /padded canvas/i.test(warning)).length;
+  const missingClassWarnings = normalizedWarnings.filter((warning) =>
+    /lacks orientation class IDs/i.test(warning)
+  );
+  const otherWarnings = normalizedWarnings.filter(
+    (warning) => !/padded canvas|lacks orientation class IDs/i.test(warning)
+  );
+  const mapText = typeof map50 === "number" ? ` (mAP50: ${map50.toFixed(3)})` : "";
+  let explanation = reason ? reason.replace(/_/g, " ") : "promotion requirements were not met";
+  if (reason === "candidate_missing_frozen_validation_cohort" && missingClassWarnings.length > 0) {
+    explanation =
+      "the frozen real-image validation cohort does not contain every configured orientation class. The native direction arrow is still authoritative, and class-aware mirrored training examples remain valid";
+  } else if (reason === "candidate_missing_frozen_validation_cohort") {
+    explanation =
+      "validation could not be frozen. Finalize at least two independent image groups, then retrain";
+  }
+  const notes = [
+    paddingCount > 0
+      ? `${paddingCount} image${paddingCount === 1 ? " was" : "s were"} safely padded to preserve OBB geometry.`
+      : "",
+    ...otherWarnings.slice(0, 2),
+    otherWarnings.length > 2 ? `${otherWarnings.length - 2} additional warnings are available in the training log.` : "",
+  ].filter(Boolean);
+  return {
+    message:
+      `OBB candidate retained${mapText}; the active detector was not changed because ${explanation}. ` +
+      "The candidate is saved in My Models for review." +
+      (notes.length > 0 ? ` ${notes.join(" ")}` : ""),
+    missingOrientationClass: missingClassWarnings.length > 0,
+  };
+};
+
 const Menu: React.FC<MenuProps> = ({
   onColorChange,
   onOpacityChange,
@@ -183,11 +222,13 @@ const Menu: React.FC<MenuProps> = ({
   const finalizedImageCount = useSelector(selectTerminalFinalizedImageCount);
   const hasWorkspaceData = workspaceImageCount > 0;
 
-  // showObbStep: unlocks the "Train OBB Detector" step only once the user has
-  // finalized at least one image (clicked "Finalize This Image").
   const hasFinalizedBoxes = useSelector(selectHasTerminalFinalizedBoxes);
   const canTrain = hasFinalizedBoxes && !isTraining;
-  const showObbStep = hasFinalizedBoxes;
+  const trainingPipelineGate = resolveTrainingPipelineGate({
+    hasActiveSession: Boolean(activeSpeciesId),
+    hasFinalizedBoxes,
+    obbDetectorVerified: obbDetectorReady,
+  });
 
   useEffect(() => {
     const fetchProjectRoot = async () => {
@@ -419,16 +460,15 @@ const Menu: React.FC<MenuProps> = ({
         samEnabled,
       });
       if (result?.ok) {
+        setObbDetectorReady(Boolean(result.obbDetectorReady));
         const mapStr = typeof result.map50 === "number" ? ` (mAP50: ${result.map50.toFixed(3)})` : "";
-        const warningText = Array.isArray(result.warnings) && result.warnings.length > 0
-          ? ` Warnings: ${result.warnings.join(" ")}`
-          : "";
         if (result.modelStatus === "candidate") {
-          const reason = result.promotion?.reason
-            ? ` ${result.promotion.reason.replace(/_/g, " ")}.`
-            : "";
-          const message = `OBB candidate retained${mapStr}; active detector unchanged.${reason}${warningText}`;
-          setObbTrainingMessage(message);
+          const summary = summarizeObbCandidateResult(
+            result.map50,
+            result.promotion?.reason,
+            Array.isArray(result.warnings) ? result.warnings : []
+          );
+          setObbTrainingMessage(summary.message);
           setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
             percent: 100,
             stage: "candidate",
@@ -436,8 +476,15 @@ const Menu: React.FC<MenuProps> = ({
             details: prev?.details,
           }));
         } else {
-          setObbDetectorReady(true);
-          setObbTrainingMessage(`OBB detector trained${mapStr} — active and ready.${warningText}`);
+          const paddingCount = Array.isArray(result.warnings)
+            ? result.warnings.filter((warning: unknown) => /padded canvas/i.test(String(warning))).length
+            : 0;
+          setObbTrainingMessage(
+            `OBB detector trained${mapStr} — active and ready.` +
+            (paddingCount > 0
+              ? ` ${paddingCount} image${paddingCount === 1 ? " was" : "s were"} safely padded to preserve OBB geometry.`
+              : "")
+          );
           setObbTrainingProgress((prev: ObbTrainProgressEvent | null) => ({
             percent: 100,
             stage: "done",
@@ -551,6 +598,10 @@ const Menu: React.FC<MenuProps> = ({
   const handleTrainConfirm = async () => {
     const name = modelName.trim();
     if (!name) return;
+    if (!obbDetectorReady) {
+      toast.error("Train and verify the session OBB detector in step 1 before landmark training.");
+      return;
+    }
 
     let unsubscribeTrainProgress: (() => void) | null = null;
     try {
@@ -666,7 +717,7 @@ const Menu: React.FC<MenuProps> = ({
     });
     // runPreflight is recreated on render but captures the same vars already listed as deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openTrainDialog, modelName, activeSpeciesId, hasWorkspaceData, predictorType]);
+  }, [openTrainDialog, modelName, activeSpeciesId, hasWorkspaceData, predictorType, obbDetectorReady]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -717,7 +768,8 @@ const Menu: React.FC<MenuProps> = ({
           cnnVariantWarning={cnnVariantWarning}
           trainingProgress={trainingProgress}
           obbDetectorReady={obbDetectorReady}
-          showObbStep={showObbStep}
+          showObbStep={trainingPipelineGate.showObbStep}
+          canTrainObb={trainingPipelineGate.canTrainObb}
           isTrainingObb={isTrainingObb}
           handleTrainObbDetector={handleTrainObbDetector}
           obbTrainingMessage={obbTrainingMessage}

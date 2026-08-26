@@ -96,6 +96,35 @@ class OrientationTransformTests(unittest.TestCase):
         restored_legacy = ou.map_to_original(standardized_landmarks, legacy_meta, image_shape=image.shape[:2])
         self.assert_round_trip_close(landmarks, restored_legacy, tolerance=1.1)
 
+    def test_manual_mirror_transforms_pixels_labels_and_inverse_mapping_together(self):
+        ramp = np.tile(np.arange(620, dtype=np.uint8), (420, 1))
+        image = np.dstack([ramp, ramp, ramp])
+        corners = build_obb(310.0, 210.0, 280.0, 110.0, 0.0)
+        box = {"obbCorners": corners, "class_id": 0}
+        landmarks = [{"id": 1, "x": 250.0, "y": 200.0}]
+        policy = {"mode": "invariant", "obbLevelingMode": "off"}
+
+        base_crop, base_landmarks, _base_meta = prepare_standardize_crop(
+            image, box, landmarks, mirror=False, orientation_policy=policy
+        )
+        mirrored_crop, mirrored_landmarks, mirrored_meta = prepare_standardize_crop(
+            image, box, landmarks, mirror=True, orientation_policy=policy
+        )
+
+        self.assertTrue(np.array_equal(mirrored_crop, cv2.flip(base_crop, 1)))
+        self.assertAlmostEqual(
+            mirrored_landmarks[0]["x"],
+            (ou.STANDARD_SIZE - 1) - base_landmarks[0]["x"],
+            places=5,
+        )
+        self.assertTrue(mirrored_meta["manual_mirror_applied"])
+        restored = ou.map_to_original(
+            mirrored_landmarks,
+            mirrored_meta,
+            image_shape=image.shape[:2],
+        )
+        self.assert_round_trip_close(landmarks, restored, tolerance=0.2)
+
     def test_landmark_ids_three_and_twelve_do_not_imply_bilateral_schema(self):
         policy = ou.infer_orientation_policy_from_template(
             [
@@ -104,6 +133,40 @@ class OrientationTransformTests(unittest.TestCase):
             ]
         )
         self.assertEqual(policy["mode"], "invariant")
+
+    def test_explicit_directional_policy_does_not_infer_landmark_anchors(self):
+        fish_template = [
+            {"index": 1, "name": "Snout Tip", "category": "head"},
+            {"index": 4, "name": "Upper Caudal Peduncle", "category": "caudal-fin"},
+            {"index": 5, "name": "Lower Caudal Peduncle", "category": "caudal-fin"},
+        ]
+        explicit = ou.sanitize_orientation_policy(
+            {"mode": "directional", "targetOrientation": "left"},
+            fish_template,
+        )
+        self.assertEqual(explicit["anteriorAnchorIds"], [])
+        self.assertEqual(explicit["posteriorAnchorIds"], [])
+        self.assertEqual(explicit["headCategories"], [])
+        self.assertEqual(explicit["tailCategories"], [])
+
+        legacy = ou.sanitize_orientation_policy(None, fish_template)
+        self.assertEqual(legacy["anteriorAnchorIds"], [1])
+        self.assertEqual(legacy["posteriorAnchorIds"], [4, 5])
+
+    def test_directional_class_routes_to_native_canonical_facing(self):
+        crop = np.arange(24 * 32 * 3, dtype=np.uint8).reshape((24, 32, 3))
+        native, native_metadata, native_debug = ou.apply_obb_geometry(
+            crop.copy(), {}, 0, {"mode": "directional", "targetOrientation": "left"}
+        )
+        mirrored, mirrored_metadata, mirrored_debug = ou.apply_obb_geometry(
+            crop.copy(), {}, 1, {"mode": "directional", "targetOrientation": "left"}
+        )
+        self.assertTrue(np.array_equal(native, crop))
+        self.assertFalse(native_metadata.get("canonical_flip_applied", False))
+        self.assertFalse(native_debug["flip_applied"])
+        self.assertTrue(np.array_equal(mirrored, cv2.flip(crop, 1)))
+        self.assertTrue(mirrored_metadata["canonical_flip_applied"])
+        self.assertTrue(mirrored_debug["flip_applied"])
 
     def test_landmark_derived_obb_keeps_rectangular_geometry_beyond_image_edge(self):
         derived = ou.derive_obb_from_landmarks(
@@ -204,6 +267,35 @@ class OrientationTransformTests(unittest.TestCase):
         crop = np.zeros((32, 32, 3), dtype=np.uint8)
         with self.assertRaisesRegex(ValueError, "bilateralClassAxis"):
             ou.apply_obb_geometry(crop, {}, 1, {"mode": "bilateral"})
+
+    def test_rotated_obb_leveling_off_round_trips_without_phantom_rotation(self):
+        image = np.zeros((280, 420, 3), dtype=np.uint8)
+        corners = build_obb(210.0, 140.0, 240.0, 100.0, 27.0)
+        landmarks = [
+            {"id": 1, "x": 175.0, "y": 120.0},
+            {"id": 2, "x": 245.0, "y": 160.0},
+        ]
+
+        _crop, metadata = ou.extract_obb_crop(
+            image,
+            corners,
+            pad_ratio=0.05,
+            apply_leveling=False,
+        )
+        standardized = ou.remap_landmarks_to_standard(landmarks, metadata)
+        restored = ou.map_to_original(
+            standardized,
+            metadata,
+            image_shape=image.shape[:2],
+        )
+
+        self.assertFalse(metadata["obb_deskewed"])
+        self.assertFalse(metadata["leveling_applied"])
+        self.assertAlmostEqual(metadata["rotation"], 0.0)
+        self.assertAlmostEqual(metadata["source_obb_rotation"], 27.0, places=4)
+        self.assertIsNone(metadata["affine_M"])
+        self.assertIsNotNone(metadata["source_affine_M"])
+        self.assert_round_trip_close(landmarks, restored, tolerance=1.1)
 
     def test_uncertainty_metadata_survives_mapping_and_flip_disagreement_is_measured(self):
         image = np.zeros((120, 160, 3), dtype=np.uint8)

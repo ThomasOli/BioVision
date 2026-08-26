@@ -672,35 +672,9 @@ def _predict_with_orientation_lock(
                 "orientation_hint": orientation_hint,
             }
 
-        # Legacy detector path: no orientation hint available.
-        # Re-enable dual-candidate template/orientation scoring so directional
-        # models do not silently mirror right-facing specimens.
-        resolved_target = target_orientation
-        if resolved_target not in ("left", "right"):
-            resolved_target = str((orientation_policy or {}).get("targetOrientation", "")).strip().lower()
-            if resolved_target not in ("left", "right"):
-                resolved_target = None
-
-        landmarks_512, was_flipped, orientation_debug = ou.select_orientation(
-            crop_512,
-            predict_fn,
-            target_orientation=resolved_target,
-            landmark_template=landmark_template,
-            head_id=head_landmark_id,
-            tail_id=tail_landmark_id,
-            orientation_hint_original=None,
+        raise ValueError(
+            "Directional landmark inference requires the detector's saved OBB direction arrow."
         )
-        if not isinstance(orientation_debug, dict):
-            orientation_debug = {}
-        orientation_debug["locked_from_canonicalization"] = False
-        orientation_debug["orientation_warning"] = {
-            "code": "missing_orientation_hint",
-            "message": (
-                "Directional schema without detector orientation hint: "
-                "using dual-candidate orientation selection."
-            ),
-        }
-        return landmarks_512, was_flipped, orientation_debug
 
     if orientation_mode == "bilateral" and orientation_hint in ("up", "down"):
         primary = predict_fn(crop_512) or []
@@ -721,6 +695,10 @@ def _predict_with_orientation_lock(
             "lock_direction_confidence": direction_conf,
             "orientation_hint": orientation_hint,
         }
+    if orientation_mode == "bilateral":
+        raise ValueError(
+            "Bilateral landmark inference requires the detector's saved OBB direction arrow."
+        )
 
     lock_orientation = ou.should_lock_orientation_from_canonicalization(
         canonicalization_debug,
@@ -1131,16 +1109,65 @@ def _ensure_obb_box_geometry(box, *, context="box", image_shape=None):
             )
         )
 
+    class_id_was_provided = bool(
+        box.get("_class_id_was_provided", "class_id" in box and box.get("class_id") is not None)
+    )
     normalized = {
         **box,
         **aabb,
         "obbCorners": corners,
         "angle": float(angle),
         "class_id": int(box.get("class_id", 0)),
+        # Keep this internal provenance bit across detector-space/original-space
+        # normalization.  A missing legacy class must remain distinguishable
+        # from an explicit native class 0 so directional fallback is not locked
+        # to the wrong crop.
+        "_class_id_was_provided": class_id_was_provided,
     }
     if isinstance(box.get("orientation_hint"), dict):
         normalized["orientation_hint"] = dict(box.get("orientation_hint"))
     return normalized
+
+
+def _resolve_box_geometry_orientation(box, orientation_policy):
+    """Resolve the mutually dependent OBB class and predictor orientation lock.
+
+    Current detectors and review tools store both fields.  Older callers may
+    provide only one, so derive the missing half without treating an absent
+    class as an explicit class 0.  Contradictory vector metadata is rejected:
+    using one value for crop geometry and another for the predictor lock would
+    otherwise create a silent double-or-missed flip.
+    """
+    mode = ou.get_orientation_mode(orientation_policy or {})
+    if mode not in {"directional", "bilateral"}:
+        return 0, None
+
+    class_was_provided = bool(box.get("_class_id_was_provided", False))
+    class_id = int(box.get("class_id", 0))
+    if class_was_provided and class_id not in {0, 1}:
+        raise ValueError(f"provided OBB class_id must be 0 or 1, got {class_id}")
+
+    hint = _resolve_orientation_hint_from_box(
+        box,
+        min_confidence=0.25,
+        min_dx_ratio=0.06,
+    )
+    labels = ("left", "right") if mode == "directional" else ("up", "down")
+    hint_class_id = labels.index(hint) if hint in labels else None
+
+    if class_was_provided and hint_class_id is not None and class_id != hint_class_id:
+        raise ValueError(
+            f"provided OBB class_id {class_id} conflicts with {mode} orientation hint {hint!r}"
+        )
+    if not class_was_provided and hint_class_id is not None:
+        class_id = int(hint_class_id)
+    if not class_was_provided and hint_class_id is None:
+        raise ValueError(
+            f"{mode} OBB inference requires a saved detector class or direction arrow"
+        )
+    if hint is None and class_was_provided:
+        hint = labels[class_id]
+    return class_id, hint
 
 
 def _load_and_resize_for_inference(image_path, max_dim=1500):
@@ -1318,10 +1345,9 @@ def _run_obb_inference_on_box(
     head_landmark_id,
     tail_landmark_id,
 ):
-    orientation_hint = _resolve_orientation_hint_from_box(
+    geometry_class_id, orientation_hint = _resolve_box_geometry_orientation(
         box,
-        min_confidence=0.25,
-        min_dx_ratio=0.06,
+        orientation_policy,
     )
     apply_leveling = (orientation_policy.get("obbLevelingMode", "on") == "on")
     cropped, crop_meta = ou.extract_standardized_obb_crop(
@@ -1332,7 +1358,7 @@ def _run_obb_inference_on_box(
     cropped, crop_meta, canonicalization_debug = ou.apply_obb_geometry(
         cropped,
         crop_meta,
-        int(box.get("class_id", 0)),
+        geometry_class_id,
         orientation_policy,
     )
     if isinstance(canonicalization_debug, dict):
@@ -1385,7 +1411,11 @@ def _run_obb_inference_on_box(
     landmarks = sorted(landmarks, key=lambda lm: lm["id"])
     return {
         "landmarks": landmarks,
-        "detected_box": dict(box),
+        "detected_box": {
+            key: value
+            for key, value in box.items()
+            if key != "_class_id_was_provided"
+        },
         "orientation_hint": box.get("orientation_hint"),
         "orientation_debug": orientation_debug,
         "inference_metadata": _build_inference_metadata(
@@ -1454,7 +1484,7 @@ def predict_image(project_root, tag, image_path, yolo_model_path=None, input_box
     )
 
     # Run dlib on the standardized 512x512 image (full-image rect)
-    rect = dlib.rectangle(0, 0, STANDARD_SIZE, STANDARD_SIZE)
+    rect = dlib.rectangle(0, 0, STANDARD_SIZE - 1, STANDARD_SIZE - 1)
     predictor = dlib.shape_predictor(predictor_path)
     predict_fn = _make_dlib_predict_fn(predictor, rect, index_to_original)
     print("PROGRESS 65 predicting", file=sys.stderr)
@@ -1566,7 +1596,7 @@ def predict_multi_specimen(
 
     # Load dlib predictor
     predictor = dlib.shape_predictor(predictor_path)
-    rect = dlib.rectangle(0, 0, STANDARD_SIZE, STANDARD_SIZE)
+    rect = dlib.rectangle(0, 0, STANDARD_SIZE - 1, STANDARD_SIZE - 1)
     predict_fn = _make_dlib_predict_fn(predictor, rect, index_to_original)
 
     specimens = []

@@ -257,9 +257,10 @@ export const HelpPanel: React.FC<HelpPanelProps> = ({ open, onOpenChange }) => {
                     <div className="space-y-2">
                       <p className="font-medium text-foreground">Orientation Schemas</p>
                       <p>
-                        Directional is for strict head/tail objects. Bilateral is for up/down symmetry
-                        along a primary biological axis. Axial is for elongated specimens with an axis but
-                        no true polarity. Invariant is for objects with no stable directional axis.
+                        Directional uses the OBB arrow to mark a stable native-facing edge; it does not
+                        require head/tail landmarks. Bilateral is for up/down symmetry along a primary
+                        biological axis. Axial is for elongated specimens with an axis but no true polarity.
+                        Invariant is for objects with no stable directional axis.
                       </p>
                       <p>
                         The OBB detector levels specimen crops to a canonical orientation before landmark

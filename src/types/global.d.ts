@@ -960,6 +960,7 @@ interface SessionMeta {
         modelPath?: string;
         modelId?: string | null;
         modelStatus?: "active" | "candidate" | "deprecated" | null;
+        obbDetectorReady?: boolean;
         promotion?: {
           promoted?: boolean;
           reason?: string;

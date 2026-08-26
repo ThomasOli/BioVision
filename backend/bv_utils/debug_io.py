@@ -106,6 +106,39 @@ def write_run_manifest(
     return write_run_json(run_dir, "run_manifest.json", manifest)
 
 
+def write_failed_run_manifest(
+    run_dir: str,
+    *,
+    model_type: str,
+    tag: str,
+    project_root: str,
+    error_type: str,
+    error_message: str,
+    traceback_text: str | None = None,
+) -> str:
+    """Finalize an already-created run without hiding its original timestamp."""
+    manifest_path = os.path.join(run_dir, "run_manifest.json")
+    existing = read_json(manifest_path, default={})
+    manifest = dict(existing) if isinstance(existing, dict) else {}
+    manifest.setdefault("created_at", _utc_now_iso())
+    manifest.update(
+        {
+            "model_type": model_type,
+            "tag": tag,
+            "project_root": os.path.abspath(project_root),
+            "run_id": os.path.basename(run_dir),
+            "status": "failed",
+            "failed_at": _utc_now_iso(),
+            "failure": {
+                "type": str(error_type),
+                "message": str(error_message),
+                "traceback": str(traceback_text or ""),
+            },
+        }
+    )
+    return write_json(manifest_path, manifest)
+
+
 def copy_json_if_exists(src_path: str, dst_dir: str, dst_name: str | None = None) -> str | None:
     if not os.path.exists(src_path):
         return None
