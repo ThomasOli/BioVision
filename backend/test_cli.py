@@ -192,4 +192,6 @@ class TestBundlingContract:
         with open(PACKAGE_JSON, "r", encoding="utf-8") as handle:
             scripts = json.load(handle)["scripts"]
         for name in ("dist", "dist:win", "dist:mac", "dist:linux", "publish", "publish:win", "publish:mac", "publish:linux"):
-            assert scripts[name].startswith("npm run release:assets &&"), name
+            assert scripts[name].startswith(
+                "npm run release:privacy && npm run release:assets &&"
+            ), name
