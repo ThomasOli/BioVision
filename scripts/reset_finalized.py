@@ -5,7 +5,7 @@ Usage:
     python scripts/reset_finalized.py <session_dir>
 
 Example:
-    python scripts/reset_finalized.py "sessions/schema-fish-morphometrics"
+    python scripts/reset_finalized.py "sessions/schema-example"
 
 What it does:
   1. Removes the `finalizedDetection` key from every label JSON in <session_dir>/labels/
