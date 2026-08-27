@@ -1694,6 +1694,55 @@ class ObbInferenceConfigurationTests(unittest.TestCase):
         )
         self.assertTrue(annotator.yolo_model.predict_kwargs["agnostic_nms"])
 
+    def test_yolo_prompt_encoding_uses_bundled_clip_checkpoint(self):
+        clip_calls = []
+        clip_module = types.ModuleType("clip")
+
+        def original_load(name, *args, **kwargs):
+            clip_calls.append((name, args, kwargs))
+            return object(), object()
+
+        clip_module.load = original_load
+
+        class PromptModel:
+            def __init__(self):
+                self.model = types.SimpleNamespace(clip_model=None)
+
+            def set_classes(self, _classes):
+                import clip
+
+                clip.load("ViT-B/32", device="cpu")
+
+        annotator = SuperAnnotator()
+        annotator.yolo_model = PromptModel()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = os.path.join(temp_dir, "ViT-B-32.pt")
+            Path(clip_path).write_bytes(b"pinned clip")
+            with patch.dict(sys.modules, {"clip": clip_module}), patch.object(
+                annotator,
+                "_find_runtime_asset",
+                return_value=clip_path,
+            ):
+                annotator._set_yolo_classes(["specimen"])
+
+        self.assertEqual(clip_calls[0][0], clip_path)
+        self.assertIs(clip_module.load, original_load)
+
+    def test_frozen_yolo_prompt_encoding_fails_closed_without_clip_weights(self):
+        annotator = SuperAnnotator()
+        annotator.yolo_model = types.SimpleNamespace(
+            model=types.SimpleNamespace(clip_model=None),
+            set_classes=lambda _classes: None,
+        )
+        with patch.object(annotator, "_find_runtime_asset", return_value=None), patch.object(
+            super_annotator_module.sys,
+            "frozen",
+            True,
+            create=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "missing bundled CLIP weights"):
+                annotator._set_yolo_classes(["specimen"])
+
 
 if __name__ == "__main__":
     unittest.main()

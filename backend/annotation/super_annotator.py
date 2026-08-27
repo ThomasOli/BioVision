@@ -50,6 +50,7 @@ from bv_utils.landmark_artifacts import (
     ImmutableLandmarkArtifactError,
     resolve_landmark_runtime,
 )
+from bv_utils.runtime_assets import find_runtime_asset
 from detection.obb_utils import (
     iter_ultralytics_obb,
     load_obb_confidence_threshold,
@@ -873,10 +874,14 @@ class SuperAnnotator:
         if "No module named 'clip'" in msg or 'No module named "clip"' in msg:
             return (
                 "Missing Python dependency 'clip' required by YOLO-World text prompts. "
-                "Install in this venv, then restart app: "
-                "pip install git+https://github.com/openai/CLIP.git"
+                "Install the pinned BioVision backend requirements, then restart the app."
             )
         return msg
+
+    @staticmethod
+    def _find_runtime_asset(filename):
+        """Resolve a model asset without relying on the process working directory."""
+        return find_runtime_asset(filename)
 
     def _set_yolo_classes(self, classes):
         """Call set_classes and fix CUDA/CPU device mismatch for text features.
@@ -895,7 +900,33 @@ class SuperAnnotator:
                 clip_model.device = actual_device
         except Exception:
             pass
-        self.yolo_model.set_classes(classes)
+
+        # Ultralytics calls clip.load("ViT-B/32") internally. In a packaged app
+        # that default attempts a first-run download into the user's home cache.
+        # Temporarily map that symbolic name to the immutable bundled checkpoint
+        # so arbitrary annotation prompts work fully offline.
+        clip_module = None
+        original_clip_load = None
+        bundled_clip = self._find_runtime_asset("ViT-B-32.pt")
+        if bundled_clip is None and getattr(sys, "frozen", False):
+            raise RuntimeError(
+                "Packaged YOLO-World runtime is missing bundled CLIP weights ViT-B-32.pt."
+            )
+        if bundled_clip is not None:
+            import clip as clip_module
+
+            original_clip_load = clip_module.load
+
+            def load_bundled_clip(name, *args, **kwargs):
+                resolved_name = bundled_clip if str(name) == "ViT-B/32" else name
+                return original_clip_load(resolved_name, *args, **kwargs)
+
+            clip_module.load = load_bundled_clip
+        try:
+            self.yolo_model.set_classes(classes)
+        finally:
+            if clip_module is not None and original_clip_load is not None:
+                clip_module.load = original_clip_load
 
     @staticmethod
     def _build_class_prompts(class_name):
@@ -1037,7 +1068,7 @@ class SuperAnnotator:
     # ------------------------------------------------------------------
     def init_models(self):
         """Load models based on detected capabilities. Idempotent Ã¢â‚¬â€ safe to call multiple times."""
-        if self.yolo_init_attempted and self.mode not in (None, "unknown"):
+        if self.yolo_init_attempted and self.yolo_model is not None and self.mode not in (None, "unknown"):
             return {
                 "status": "already_initialized",
                 "yolo_ready": self.yolo_model is not None,
@@ -1058,7 +1089,12 @@ class SuperAnnotator:
             try:
                 send_progress("Loading YOLO-World model...", 10, "init")
                 from ultralytics import YOLOWorld
-                self.yolo_model = YOLOWorld("yolov8s-worldv2.pt")
+                yolo_world_path = self._find_runtime_asset("yolov8s-worldv2.pt")
+                if yolo_world_path is None and getattr(sys, "frozen", False):
+                    raise RuntimeError(
+                        "Packaged YOLO-World runtime is missing bundled weights yolov8s-worldv2.pt."
+                    )
+                self.yolo_model = YOLOWorld(yolo_world_path or "yolov8s-worldv2.pt")
                 # Smoke-test open-vocabulary text encoder so missing CLIP is caught at init,
                 # not only during first detection call.
                 self._set_yolo_classes(["object"])
@@ -1076,7 +1112,12 @@ class SuperAnnotator:
             try:
                 send_progress("Loading SAM2 model...", 40, "init")
                 from ultralytics import SAM
-                self.sam2_model = SAM("sam2_b.pt")
+                sam2_path = self._find_runtime_asset("sam2_b.pt")
+                if sam2_path is None and getattr(sys, "frozen", False):
+                    raise RuntimeError(
+                        "Packaged SAM2 runtime is missing bundled weights sam2_b.pt."
+                    )
+                self.sam2_model = SAM(sam2_path or "sam2_b.pt")
                 sam2_loaded = True
                 logger.info("SAM2 loaded successfully")
             except Exception as e:
@@ -1100,6 +1141,8 @@ class SuperAnnotator:
             "gpu": self.gpu,
             "yolo_loaded": yolo_loaded,
             "sam2_loaded": sam2_loaded,
+            "yolo_error": self.yolo_init_error,
+            "sam2_error": self.sam2_init_error,
         }
 
     # ------------------------------------------------------------------

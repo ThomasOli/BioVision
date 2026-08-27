@@ -69,6 +69,10 @@ function main() {
     "--hidden-import", "detection.detect_specimen",
     "--hidden-import", "annotation.super_annotator",
     "--hidden-import", "hardware_probe",
+    // Ultralytics imports CLIP dynamically only when YOLO-World receives text
+    // prompts, so PyInstaller cannot discover it from the static import graph.
+    "--hidden-import", "clip",
+    "--collect-all", "clip",
     // Add the backend directory to the search path
     "--paths", backendDir,
     cliScript,

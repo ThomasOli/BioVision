@@ -10520,6 +10520,13 @@ function getSuperAnnotatorRuntimeState(result?: {
   return "not_started";
 }
 
+function isYoloRuntimeReady(result?: {
+  yolo_loaded?: boolean;
+  yolo_ready?: boolean;
+}): boolean {
+  return result?.yolo_loaded === true || result?.yolo_ready === true;
+}
+
 const SAM2_MINIMUM_REQUIREMENTS_CACHE_TTL_MS = 30_000;
 let sam2MinimumRequirementsCache:
   | { ok: boolean; error?: string; checkedAtMs: number }
@@ -10941,6 +10948,44 @@ ipcMain.handle("ml:check-super-annotator", async () => {
   }
 });
 
+ipcMain.handle("ml:init-super-annotator", async () => {
+  const pythonResolution = getPythonResolution();
+  warnIfUsingSystemPython(pythonResolution);
+  try {
+    const initResult = await superAnnotator.send({ cmd: "init" });
+    const checkResult = await superAnnotator.send({ cmd: "check" });
+    const yoloReady = isYoloRuntimeReady({ ...initResult, ...checkResult });
+    superAnnotator.initCompleted = yoloReady || checkResult?.sam2_ready === true;
+    if (superAnnotator.initCompleted) {
+      kickAllSegmentSaveQueues();
+    }
+    const error = checkResult?.yolo_error ?? initResult?.yolo_error ?? null;
+    return {
+      ok: yoloReady,
+      ...initResult,
+      ...checkResult,
+      runtimeState: getSuperAnnotatorRuntimeState(checkResult),
+      statusSource: "python_check" as CapabilityStatusSource,
+      pythonPath: pythonResolution.pythonPath,
+      usingRepoVenv: pythonResolution.usingRepoVenv,
+      ...(error ? { error } : {}),
+    };
+  } catch (e: any) {
+    superAnnotator.initCompleted = false;
+    return {
+      ok: false,
+      mode: "unknown",
+      yolo_ready: false,
+      sam2_ready: false,
+      runtimeState: "failed" as SuperAnnotatorRuntimeState,
+      statusSource: "local_estimate" as CapabilityStatusSource,
+      pythonPath: pythonResolution.pythonPath,
+      usingRepoVenv: pythonResolution.usingRepoVenv,
+      error: e?.message || "Failed to initialize the AI annotation runtime.",
+    };
+  }
+});
+
 ipcMain.handle("ml:train-obb-detector", async (_event, speciesId: string, options?: {
   epochs?: number;
   batch?: number;
@@ -11090,10 +11135,13 @@ ipcMain.handle(
       // Ensure models are initialized. Use initCompleted (not isRunning) so that
       // if the process was started by a prior command (e.g. check-super-annotator)
       // without loading models, we still call init before running annotation.
+      let initResult: any = null;
       if (!superAnnotator.initCompleted) {
-        await superAnnotator.send({ cmd: "init" });
-        superAnnotator.initCompleted = true;
-        kickAllSegmentSaveQueues();
+        initResult = await superAnnotator.send({ cmd: "init" });
+        superAnnotator.initCompleted = isYoloRuntimeReady(initResult) || initResult?.sam2_loaded === true;
+        if (superAnnotator.initCompleted) {
+          kickAllSegmentSaveQueues();
+        }
       }
 
       // Resolve session root
@@ -11137,6 +11185,15 @@ ipcMain.handle(
 
       const sessionObbPath = path.join(effectiveRoot, "models", "session_obb_detector.pt");
       const finetunedModel = fs.existsSync(sessionObbPath) ? sessionObbPath : undefined;
+      if (!finetunedModel && initResult && !isYoloRuntimeReady(initResult)) {
+        return {
+          ok: false,
+          objects: [],
+          error:
+            initResult?.yolo_error ||
+            "YOLO-World could not initialize. Reinstall BioVision with the bundled annotation assets.",
+        };
+      }
       const detector = finetunedModel
         ? resolveTrainedObbDetector({
             aliasPath: finetunedModel,

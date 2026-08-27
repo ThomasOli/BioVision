@@ -21,6 +21,18 @@
       "filter": [
         "**/*"
       ]
+    },
+    {
+      "from": "yolov8s-worldv2.pt",
+      "to": "yolov8s-worldv2.pt"
+    },
+    {
+      "from": "ViT-B-32.pt",
+      "to": "ViT-B-32.pt"
+    },
+    {
+      "from": "sam2_b.pt",
+      "to": "sam2_b.pt"
     }
   ],
   "extraMetadata": {

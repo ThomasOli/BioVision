@@ -100,6 +100,9 @@ class TestDispatcherErrorPaths:
 
 BUILD_SCRIPT = os.path.join(REPO_ROOT, "scripts", "build-python-backend.js")
 ELECTRON_MAIN = os.path.join(REPO_ROOT, "electron", "main.ts")
+ELECTRON_BUILDER = os.path.join(REPO_ROOT, "electron-builder.json5")
+PACKAGE_JSON = os.path.join(REPO_ROOT, "package.json")
+REQUIREMENTS = os.path.join(BACKEND_DIR, "requirements.txt")
 
 
 def _hidden_imports() -> set[str]:
@@ -165,3 +168,28 @@ class TestBundlingContract:
         payload = json.loads(result.stdout)
         assert payload["ok"], payload["failures"]
         assert set(payload["checked"]) == set(SCRIPT_MAP)
+
+    def test_yolo_world_text_encoder_is_frozen_with_its_data(self):
+        with open(BUILD_SCRIPT, "r", encoding="utf-8") as handle:
+            build_source = handle.read()
+        assert "clip" in _hidden_imports()
+        assert re.search(r'"--collect-all",\s*"clip"', build_source)
+
+    def test_release_builds_prepare_and_package_pinned_annotation_assets(self):
+        with open(REQUIREMENTS, "r", encoding="utf-8") as handle:
+            requirements = handle.read()
+        assert (
+            "clip @ git+https://github.com/ultralytics/CLIP.git"
+            "@68dce32140994dfcb645a1320c4ebdc034fc19fd"
+        ) in requirements
+
+        with open(ELECTRON_BUILDER, "r", encoding="utf-8") as handle:
+            builder = handle.read()
+        assert '"from": "yolov8s-worldv2.pt"' in builder
+        assert '"from": "ViT-B-32.pt"' in builder
+        assert '"from": "sam2_b.pt"' in builder
+
+        with open(PACKAGE_JSON, "r", encoding="utf-8") as handle:
+            scripts = json.load(handle)["scripts"]
+        for name in ("dist", "dist:win", "dist:mac", "dist:linux", "publish", "publish:win", "publish:mac", "publish:linux"):
+            assert scripts[name].startswith("npm run release:assets &&"), name

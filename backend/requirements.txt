@@ -9,7 +9,7 @@
 # - creates venv
 # - selects the correct torch build (CUDA/MPS/CPU)
 # - installs this requirements file
-# - installs CLIP (optional, for YOLO-World text prompts)
+# - installs the pinned CLIP text encoder required by YOLO-World prompts
 #
 # Manual install (after activating venv):
 #   pip install -r backend/requirements.txt
@@ -34,6 +34,11 @@ dlib>=19.24.0
 # Detection + SAM2/YOLO pipeline
 ultralytics==8.4.14
 
+# YOLO-World resolves arbitrary user prompts through CLIP. Pin the exact
+# Ultralytics-compatible source revision so release builds cannot omit it or
+# silently change when upstream moves.
+clip @ git+https://github.com/ultralytics/CLIP.git@68dce32140994dfcb645a1320c4ebdc034fc19fd
+
 # Orientation PCA quality path (fallback exists if missing, but this improves it)
 scikit-learn>=1.3.0
 
@@ -46,6 +51,4 @@ psutil>=5.9.0
 # torch / torchvision / torchaudio:
 #   Do NOT add here; setup_backend.py installs the correct CUDA/MPS/CPU build.
 #
-# OpenAI CLIP:
-#   setup_backend.py installs from:
-#   git+https://github.com/openai/CLIP.git
+# CLIP is pinned above because it is a required YOLO-World runtime dependency.

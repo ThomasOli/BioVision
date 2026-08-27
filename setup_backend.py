@@ -38,7 +38,10 @@ TORCH_CUDA_WHEELS: dict[str, str] = {
     "11.8": "https://download.pytorch.org/whl/cu118",
 }
 
-CLIP_URL = "git+https://github.com/openai/CLIP.git"
+CLIP_URL = (
+    "git+https://github.com/ultralytics/CLIP.git"
+    "@68dce32140994dfcb645a1320c4ebdc034fc19fd"
+)
 
 # ── Terminal helpers ───────────────────────────────────────────────────────────
 
@@ -327,7 +330,7 @@ def install_requirements() -> None:
 # ── Step 9: Install CLIP ───────────────────────────────────────────────────────
 
 def install_clip() -> None:
-    step("Installing OpenAI CLIP")
+    step("Verifying YOLO-World CLIP")
     py = str(venv_python())
 
     # Check if already installed
@@ -339,15 +342,15 @@ def install_clip() -> None:
     if not _command_exists("git"):
         warn("Git not found on PATH - CLIP install skipped")
         warn("Install Git, then run:")
-        warn("  pip install git+https://github.com/openai/CLIP.git")
+        warn(f"  pip install {CLIP_URL}")
         return
 
     try:
         _check([py, "-m", "pip", "install", CLIP_URL])
         ok("CLIP installed")
     except subprocess.CalledProcessError:
-        warn("CLIP install failed - text-prompt detection will be unavailable")
-        warn("You can retry manually: pip install git+https://github.com/openai/CLIP.git")
+        warn("CLIP install failed - YOLO-World text-prompt detection will be unavailable")
+        warn(f"You can retry manually: pip install {CLIP_URL}")
 
 def print_summary(cuda_ver: str | None, free_gb: float) -> None:
     py    = str(venv_python())
@@ -427,4 +430,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\nSetup interrupted.")
         sys.exit(1)
-

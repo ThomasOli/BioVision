@@ -413,4 +413,16 @@ const orientationDisplaySource = fs.readFileSync(
 assert.doesNotMatch(orientationDisplaySource, /Head \u2192|\u2190 Head|Head \u2193|\u2191 Head/);
 assert.match(orientationDisplaySource, /Direction/);
 
+assert.match(
+  electronMainSource,
+  /ipcMain\.handle\("ml:init-super-annotator"/,
+  "the preload initialization request must have a main-process handler"
+);
+assert.match(electronMainSource, /function isYoloRuntimeReady\(/);
+assert.doesNotMatch(
+  electronMainSource,
+  /await superAnnotator\.send\(\{ cmd: "init" \}\);\s*superAnnotator\.initCompleted = true;/,
+  "a failed YOLO-World initialization must not be marked ready"
+);
+
 console.log("Frontend contract tests passed.");

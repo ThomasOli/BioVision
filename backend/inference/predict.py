@@ -20,6 +20,7 @@ from bv_utils.image_utils import load_image
 import bv_utils.orientation_utils as ou
 import bv_utils.debug_io as dio
 from bv_utils.landmark_artifacts import resolve_landmark_runtime
+from bv_utils.runtime_assets import find_runtime_asset
 
 STANDARD_SIZE = ou.STANDARD_SIZE
 
@@ -411,7 +412,10 @@ def _get_sam2_model():
     try:
         from ultralytics import SAM
 
-        _SAM2_MODEL = SAM("sam2_b.pt")
+        sam2_path = find_runtime_asset("sam2_b.pt")
+        if sam2_path is None and getattr(sys, "frozen", False):
+            raise RuntimeError("Packaged SAM2 runtime is missing bundled weights sam2_b.pt.")
+        _SAM2_MODEL = SAM(sam2_path or "sam2_b.pt")
         return _SAM2_MODEL
     except Exception as exc:
         _SAM2_UNAVAILABLE_REASON = str(exc)
